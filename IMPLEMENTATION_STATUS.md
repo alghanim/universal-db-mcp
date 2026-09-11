@@ -174,6 +174,30 @@ defects:
   restart), Gate A-negative 6/6 with valid machine-readable evidence,
   Gate C 11 passed / 0 failed / 2 skipped with the heavy engines
   (Oracle, MSSQL) exercised live.
+- **Live agent-consumption test (2026-09-11/12): 49/60 checks passed.**
+  Eight parallel agents drove the real stdio server with
+  `config.mockdbs.yaml` against the running mock containers as genuine
+  tool calls. The 11 failures triaged as: 6 environmental (MSSQL ODBC
+  Driver 18 absent on the macOS staging host — the error text now points
+  the operator at `options.odbc_driver` as designed; Db2 clidriver auth
+  under emulation; one test-spec column-name mismatch the server
+  rejected cleanly), 1 unexercisable (cursor pagination: fixtures sit
+  below the 50-row page size — known), and **3 real bugs, fixed and
+  live re-verified**: (1) bound parameters were impossible end-to-end —
+  the guard parsed `%s` as modulo and PyMySQL rejected `?`/`:name`; the
+  guard now masks pyformat placeholders outside string literals for
+  validation (no bypass — the masked AST takes the identical
+  authorization walk) and a shared `translate_paramstyle` rewrites
+  markers onto each driver's spelling after validation; (2)
+  `db_search_metadata` aborted the whole call on one dead connection —
+  Db2's raw ibm_db exceptions on the catalog paths are now wrapped as
+  ConnectorError and the tool degrades with a per-connection warning;
+  (3) cell truncation was silent on the remote query paths (cell cut to
+  `max_cell_bytes` with `truncated=false`) — postgres/mysql/_and the
+  other engines_ now report `truncated=true` plus a warning naming the
+  truncated columns. SQLite's generic (unnamed) truncation warning and
+  `db_explain` ignoring its `parameters` argument are recorded in the
+  review archive as residual polish, not claimed as fixed.
 
 ## 2. Implemented, NOT verified (code-complete, honest capability state)
 

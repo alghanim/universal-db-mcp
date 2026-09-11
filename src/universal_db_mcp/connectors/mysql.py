@@ -30,10 +30,17 @@ from universal_db_mcp.connectors.base import (
     TableSummary,
     ViewInfo,
 )
-from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module, translated_driver_errors
+from universal_db_mcp.connectors.driver_helpers import (
+    cell_truncated_json,
+    cell_truncation_warning,
+    open_module,
+    translated_driver_errors,
+    truncated_column_names,
+)
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
+from universal_db_mcp.security.sql_guard import translate_paramstyle
 
 # PyMySQL FIELD_TYPE codes -> stable column labels (driver-derived, not
 # data-derived).
@@ -387,11 +394,18 @@ class MySQLConnector(DatabaseConnector):
             return self._execute(spec)
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
+        # The guard accepts qmark/named placeholders as opaque markers;
+        # PyMySQL only understands format/pyformat (%s, %(name)s), so rewrite
+        # them onto the driver's spelling after validation. Raised outside
+        # translated_driver_errors() so a parameter-style mismatch keeps its
+        # VALIDATION category instead of becoming a CONNECTION error.
+        sql, parameters = translate_paramstyle(spec.sql, spec.parameters, backslash_escapes=True)
         with translated_driver_errors():
             conn = self._connect()
             start = time.monotonic()
             truncated = False
             truncation_cause = "row limit"
+            cell_truncated_cols: list[str] = []
             rows: list[list[Any]] = []
             approx_bytes = 0
             conn_closed = False
@@ -406,7 +420,7 @@ class MySQLConnector(DatabaseConnector):
                 # empty tuple included — so an unparameterised statement with a
                 # literal '%' (LIKE 'a%') would fail client-side. Pass None
                 # when nothing is bound so the SQL is sent verbatim.
-                cur.execute(spec.sql, spec.parameters or None)
+                cur.execute(sql, parameters or None)
                 cols = [(d[0], "unknown") for d in cur.description or []]
                 col_labels = [_MYSQL_TYPE_LABELS.get(d[1], "unknown") for d in (cur.description or [])]
                 while True:
@@ -415,6 +429,9 @@ class MySQLConnector(DatabaseConnector):
                         break
                     for raw in batch:
                         vals, _labels, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                        cell_truncated_cols.extend(
+                            truncated_column_names(cols, raw, spec.max_cell_bytes)
+                        )
                         approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
                         if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
                             truncated = True
@@ -432,13 +449,22 @@ class MySQLConnector(DatabaseConnector):
                         conn.close()
                         conn_closed = True
                         break
+                warnings: list[str] = []
+                if truncated:
+                    warnings.append(f"result truncated by {truncation_cause}")
+                if cell_truncated_cols:
+                    # A cell cut to the byte limit must never be reported as
+                    # an intact result: name the columns (live test
+                    # 2026-09-11 found this path reporting truncated=false
+                    # after a silent cut).
+                    warnings.append(cell_truncation_warning(cell_truncated_cols, spec.max_cell_bytes))
                 return QueryOutcome(
                     columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
                     rows=rows,
-                    truncated=truncated,
+                    truncated=truncated or bool(cell_truncated_cols),
                     rows_seen=len(rows),
                     elapsed_ms=int((time.monotonic() - start) * 1000),
-                    warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
+                    warnings=warnings,
                 )
             finally:
                 try:

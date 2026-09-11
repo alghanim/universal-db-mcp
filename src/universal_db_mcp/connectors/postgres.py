@@ -29,11 +29,14 @@ from universal_db_mcp.connectors.base import (
 )
 from universal_db_mcp.connectors.driver_helpers import (
     cell_truncated_json,
+    cell_truncation_warning,
     open_module,
+    truncated_column_names,
 )
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
+from universal_db_mcp.security.sql_guard import translate_paramstyle
 
 
 class PostgresConnector(DatabaseConnector):
@@ -422,10 +425,20 @@ class PostgresConnector(DatabaseConnector):
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
         start = time.monotonic()
         truncated = False
+        cell_truncated_cols: list[str] = []
         rows: list[list[Any]] = []
         approx_bytes = 0
         import json
 
+        # psycopg's paramstyle is format/pyformat (%s / %(name)s); the guard
+        # also admits :name markers, so rewrite those onto the driver's
+        # spelling after validation. A bare '?' reaches the server untouched
+        # (JSONB key-exists operator), so qmark is not translated here.
+        # Raised before the ConnectorError boundary so a parameter-style
+        # mismatch keeps its VALIDATION category.
+        sql, parameters = spec.sql, spec.parameters
+        if isinstance(parameters, dict):
+            sql, parameters = translate_paramstyle(sql, parameters, backslash_escapes=False)
         try:
             conn = self._connect()
             self._cancel_target = conn
@@ -436,8 +449,8 @@ class PostgresConnector(DatabaseConnector):
             # row/byte ceilings stop the transfer early instead of after the
             # full result has been buffered client-side.
             with conn.cursor(name="udbmcp_query") as cur:
-                args: Any = tuple(spec.parameters) if isinstance(spec.parameters, (list, tuple)) else spec.parameters
-                cur.execute(spec.sql, args)
+                args: Any = tuple(parameters) if isinstance(parameters, (list, tuple)) else parameters
+                cur.execute(sql, args)
                 cols = [(d[0], self._PG_OID_TYPES.get(d.type_code, "unknown")) for d in (cur.description or [])]
                 col_labels = [c[1] for c in cols]
                 while True:
@@ -446,6 +459,9 @@ class PostgresConnector(DatabaseConnector):
                         break
                     for raw in batch:
                         vals, labels, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                        cell_truncated_cols.extend(
+                            truncated_column_names(cols, raw, spec.max_cell_bytes)
+                        )
                         if not col_labels:
                             col_labels = labels
                         approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
@@ -459,13 +475,21 @@ class PostgresConnector(DatabaseConnector):
                         except Exception:  # noqa: BLE001, S110
                             pass
                         break
+            warnings: list[str] = []
+            if truncated:
+                warnings.append("result truncated by limits")
+            if cell_truncated_cols:
+                # A cell cut to the byte limit must never be reported as an
+                # intact result: name the columns (live test 2026-09-11 found
+                # this path reporting truncated=false after a silent cut).
+                warnings.append(cell_truncation_warning(cell_truncated_cols, spec.max_cell_bytes))
             return QueryOutcome(
                 columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
                 rows=rows,
-                truncated=truncated,
+                truncated=truncated or bool(cell_truncated_cols),
                 rows_seen=len(rows),
                 elapsed_ms=int((time.monotonic() - start) * 1000),
-                warnings=["result truncated by limits"] if truncated else [],
+                warnings=warnings,
             )
         except Exception as exc:
             raise ConnectorError(scrub_exception(exc)) from exc

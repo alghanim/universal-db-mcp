@@ -27,7 +27,13 @@ from universal_db_mcp.connectors.base import (
     TableSummary,
     ViewInfo,
 )
-from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module, translated_driver_errors
+from universal_db_mcp.connectors.driver_helpers import (
+    cell_truncated_json,
+    cell_truncation_warning,
+    open_module,
+    translated_driver_errors,
+    truncated_column_names,
+)
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
@@ -305,6 +311,7 @@ class ClickHouseConnector(DatabaseConnector):
             start = time.monotonic()
             truncated = False
             truncation_cause = "row limit"
+            cell_truncated_cols: list[str] = []
             rows: list[list[Any]] = []
             approx_bytes = 0
             import json
@@ -314,22 +321,28 @@ class ClickHouseConnector(DatabaseConnector):
                 cols = [(n, "unknown") for n in result.column_names]
                 labels: list[str] = []
                 for raw in result.result_rows:
-                    vals, lab, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                    vals, lab, cell_tr = cell_truncated_json(raw, spec.max_cell_bytes)
                     if not labels:
                         labels = lab
+                    if cell_tr:
+                        cell_truncated_cols.extend(truncated_column_names(cols, raw, spec.max_cell_bytes))
                     approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
                     if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
                         truncated = True
                         truncation_cause = "row limit" if len(rows) >= spec.max_rows else "byte limit"
                         break
                     rows.append(vals)
+                warnings = [f"result truncated by {truncation_cause}"] if truncated else []
+                if cell_truncated_cols:
+                    truncated = True
+                    warnings.append(cell_truncation_warning(cell_truncated_cols, spec.max_cell_bytes))
                 return QueryOutcome(
                     columns=[(c[0], t) for c, t in zip(cols, labels or ["unknown"] * len(cols), strict=True)],
                     rows=rows,
                     truncated=truncated,
                     rows_seen=len(rows),
                     elapsed_ms=int((time.monotonic() - start) * 1000),
-                    warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
+                    warnings=warnings,
                 )
             finally:
                 self._cancel_query_id = None

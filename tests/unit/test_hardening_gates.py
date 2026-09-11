@@ -6221,3 +6221,397 @@ def test_final_db2_tls_script_fails_closed_on_non_icu_probe_failure(tmp_path) ->
     assert "libgsk8km_64.so" in combined
     assert "--icu-source-dir" not in combined.split("libgsk8km_64.so")[0]
     assert not (home / "server.kdb").exists(), "must fail closed before creating the real keydb"
+
+
+# ---------------- live 8-agent MCP test regressions (db2 degradation + cell truncation reporting)
+
+
+def _db2_connector():  # type: ignore[no-untyped-def]
+    """A real Db2Connector that never dials: tests swap ``_connect``, so no
+    ibm_db socket is ever opened."""
+    import os
+
+    from universal_db_mcp.config import ConnectionConfig, ResolvedConnection, SecurityConfig
+    from universal_db_mcp.connectors.db2 import Db2Connector
+    from universal_db_mcp.security.policy import EffectivePolicy
+
+    os.environ.setdefault("UDBMCP_TEST_U", "x")
+    cfg = ConnectionConfig.model_validate(
+        {
+            "type": "db2",
+            "family": "luw",
+            "host": "127.0.0.1",
+            "port": 50002,
+            "database": "TESTDB",
+            "username_env": "UDBMCP_TEST_U",
+        }
+    )
+    resolved = ResolvedConnection("mock_db2", cfg)
+    return Db2Connector(resolved, EffectivePolicy.build(SecurityConfig(), resolved))
+
+
+def test_db2_metadata_driver_errors_become_connector_error() -> None:
+    """ibm_db raises its own exception type on connect/catalog failure; on the
+    metadata path it used to escape raw, so db_search_metadata's
+    per-connection except (ConnectorError/ToolFailure/DriverUnavailableError)
+    never saw it and the WHOLE tool call aborted as INTERNAL_ERROR (live:
+    `Exception: [IBM][CLI Driver] SQL30082N ...`)."""
+    from universal_db_mcp.connectors.base import ConnectorError
+
+    conn = _db2_connector()
+
+    def _boom() -> None:
+        raise RuntimeError("[IBM][CLI Driver] SQL30082N  Security processing failed")
+
+    conn._connect = _boom  # type: ignore[method-assign]
+    with pytest.raises(ConnectorError, match="SQL30082N"):
+        conn.list_tables(None, {"table"}, None)
+    with pytest.raises(ConnectorError):
+        conn.list_schemas(None, None)
+    with pytest.raises(ConnectorError):
+        conn.list_columns("S", "T")
+    with pytest.raises(ConnectorError):
+        conn.get_statistics("S", "T")
+    with pytest.raises(ConnectorError):
+        conn.get_foreign_keys("S", "T")
+
+
+@pytest.mark.anyio
+async def test_db2_raw_driver_failure_degrades_db_search_metadata(tmp_path, sqlite_db) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end: a failing db2 connection must degrade to a per-connection
+    warning while healthy connections still return matches."""
+    import os
+
+    from universal_db_mcp.config import load_resolved
+    from universal_db_mcp.connectors.db2 import Db2Connector
+    from universal_db_mcp.security.policy import EffectivePolicy
+    from universal_db_mcp.server import AppContext, build_server
+
+    os.environ.setdefault("UDBMCP_TEST_U", "x")
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        f"""
+application:
+  airgapped: true
+  transport: stdio
+  metadata_cache_path: {tmp_path}/meta-cache.sqlite
+  audit_path: {tmp_path}/audit.jsonl
+  telemetry_enabled: false
+
+security:
+  read_only: true
+  default_deny_objects: true
+  require_remote_tls: false
+  max_concurrent_queries: 4
+
+connections:
+  demo_sqlite:
+    type: sqlite
+    database: {sqlite_db}
+    read_only: true
+  mock_db2:
+    type: db2
+    family: luw
+    host: 127.0.0.1
+    port: 50002
+    database: TESTDB
+    username_env: UDBMCP_TEST_U
+""",
+        encoding="utf-8",
+    )
+    cfg, resolved = load_resolved(cfg_path)
+    app = AppContext(cfg, resolved)
+    policy = EffectivePolicy.build(cfg.security, resolved["mock_db2"])
+    db2 = Db2Connector(resolved["mock_db2"], policy)
+
+    def _boom() -> None:
+        raise RuntimeError("[IBM][CLI Driver] SQL30082N  Security processing failed")
+
+    db2._connect = _boom  # type: ignore[method-assign]
+    app.connectors["mock_db2"] = db2
+
+    mcp = build_server(app)
+    res = await mcp.call_tool("db_search_metadata", {"query": "customers"})
+    assert not res.is_error, res
+    data = res.structured_content["data"]
+    assert "customers" in [m["name"] for m in data["matches"]]
+    warnings = res.structured_content.get("warnings", [])
+    assert any("mock_db2" in w and "skipped" in w for w in warnings), warnings
+
+
+def test_db2_cell_truncation_sets_flag_and_names_column(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The remote query path cut an over-long cell to max_cell_bytes while the
+    outcome reported truncated=false and no warning (live:
+    SELECT repeat('x', 20000) came back as an 8192-char cell, truncated=false,
+    warnings=[]). The shared adapter's cell-truncation flag must surface."""
+    import sys
+    import types
+
+    from universal_db_mcp.connectors.base import QuerySpec
+
+    conn = _db2_connector()
+    state = {"rows": [["x" * 20000]]}
+
+    class _Cur:
+        description = [("BIG_TEXT", None)]
+
+        def execute(self, sql: str, args: object = None) -> None:
+            return None
+
+        def fetchmany(self, n: int) -> list:
+            out = state["rows"]
+            state["rows"] = []
+            return out
+
+    class _Conn:
+        def cursor(self):  # type: ignore[no-untyped-def]
+            return _Cur()
+
+    class _FakeDbi(types.ModuleType):
+        @staticmethod
+        def Connection(raw: object) -> _Conn:
+            return _Conn()
+
+    class _FakeModule:
+        def close(self, raw: object) -> None:
+            pass
+
+    monkeypatch.setitem(sys.modules, "ibm_db_dbi", _FakeDbi("ibm_db_dbi"))
+    conn._module = _FakeModule()  # type: ignore[attr-defined]
+    conn._connect = lambda: object()  # type: ignore[method-assign]
+    out = conn._execute(QuerySpec(sql="SELECT big_text", max_rows=10, max_cell_bytes=8192))
+    assert out.truncated is True
+    assert len(out.rows[0][0]) == 8192
+    assert any("BIG_TEXT" in w for w in out.warnings), out.warnings
+
+
+def test_clickhouse_cell_truncation_sets_flag_and_names_column(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Same silent-truncation gap on the ClickHouse streaming path."""
+    import universal_db_mcp.connectors.clickhouse as ch_module
+    from universal_db_mcp.connectors.base import QuerySpec
+
+    class _Res:
+        def __init__(self, rows: list, names: list) -> None:
+            self.result_rows = rows
+            self.column_names = names
+
+    class _Client:
+        def __init__(self) -> None:
+            self.params: dict = {}
+
+        def query(self, sql: str, parameters: object = None) -> _Res:
+            return _Res([["x" * 20000]], ["big_text"])
+
+        def close(self) -> None:
+            pass
+
+    fake_module = type("M", (), {"get_client": staticmethod(lambda **kw: _Client())})
+    monkeypatch.setattr(ch_module, "open_module", lambda name, hint: fake_module)
+    conn = _clickhouse_connector()
+    out = conn._execute(QuerySpec(sql="SELECT big_text FROM t", max_rows=10, max_cell_bytes=8192))
+    assert out.truncated is True
+    assert len(out.rows[0][0]) == 8192
+    assert any("big_text" in w for w in out.warnings), out.warnings
+
+
+@pytest.mark.anyio
+async def test_db_query_envelope_reports_cell_truncation(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end through db_query's response builder: an over-long cell must
+    produce envelope.truncated=true plus a warning naming the column."""
+    import os
+
+    import universal_db_mcp.connectors.clickhouse as ch_module
+    from universal_db_mcp.config import load_resolved
+    from universal_db_mcp.server import AppContext, build_server
+
+    class _Res:
+        def __init__(self, rows: list, names: list) -> None:
+            self.result_rows = rows
+            self.column_names = names
+
+    class _Client:
+        def __init__(self) -> None:
+            self.params: dict = {}
+
+        def query(self, sql: str, parameters: object = None) -> _Res:
+            if sql.startswith("SELECT database, name, engine"):
+                return _Res([["main", "t", "MergeTree", 1]], ["database", "name", "engine", "total_rows"])
+            if sql == "SELECT 1":
+                return _Res([["1"]], ["v"])
+            return _Res([["x" * 20000]], ["big_text"])
+
+        def close(self) -> None:
+            pass
+
+    fake_module = type("M", (), {"get_client": staticmethod(lambda **kw: _Client())})
+    monkeypatch.setattr(ch_module, "open_module", lambda name, hint: fake_module)
+
+    os.environ.setdefault("UDBMCP_TEST_U", "x")
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        f"""
+application:
+  airgapped: true
+  transport: stdio
+  metadata_cache_path: {tmp_path}/meta-cache.sqlite
+  audit_path: {tmp_path}/audit.jsonl
+  telemetry_enabled: false
+
+security:
+  read_only: true
+  default_deny_objects: true
+  require_remote_tls: false
+  max_concurrent_queries: 4
+
+connections:
+  ch1:
+    type: clickhouse
+    host: 127.0.0.1
+    port: 8124
+    database: main
+    username_env: UDBMCP_TEST_U
+""",
+        encoding="utf-8",
+    )
+    cfg, resolved = load_resolved(cfg_path)
+    app = AppContext(cfg, resolved)
+    mcp = build_server(app)
+    res = await mcp.call_tool(
+        "db_query",
+        {"connection_id": "ch1", "sql": "SELECT big_text FROM t LIMIT 1"},
+    )
+    assert not res.is_error, res
+    sc = res.structured_content
+    assert len(sc["data"]["rows"][0][0]) == 8192
+    assert sc.get("truncated") is True
+    assert any("big_text" in w for w in sc.get("warnings", [])), sc.get("warnings")
+
+
+# ------------------------------------------------- bound-parameter paramstyle
+
+
+def _param_guard(engine: str):  # type: ignore[no-untyped-def]
+    """A SqlGuard wired the same way as the guard battery (tests/unit/test_sql_guard.py)."""
+    from test_sql_guard import FakePolicy
+
+    from universal_db_mcp.security.sql_guard import SqlGuard, StaticResolver
+
+    policy = FakePolicy(engine=engine)
+    resolver = StaticResolver({(None, "t"), ("main", "t")})
+    return SqlGuard(engine, policy, resolver)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+def test_guard_tolerates_driver_paramstyle_placeholders(engine: str) -> None:
+    """sqlglot tokenizes '%' as modulo in every dialect except postgres, so a
+    statement using the driver's own pyformat placeholders (%s / %(name)s)
+    used to be unvalidatable ('could not be parsed under the mysql dialect').
+    The guard must treat them as opaque parameter markers in every dialect."""
+    guard = _param_guard(engine)
+    result = guard.validate_select("SELECT * FROM t WHERE a = %s AND b > %(n)s")
+    assert result.kind == "select"
+    assert [(r.schema, r.name) for r in result.tables] == [(None, "t")]
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+def test_guard_still_denies_behind_placeholder_masks(engine: str) -> None:
+    """Placeholder tolerance is not a bypass: the masked parse still walks the
+    full AST, so dynamic tables, hidden DML and garbage remain denied."""
+    guard = _param_guard(engine)
+    with pytest.raises(ToolFailure, match="dynamic table"):
+        guard.validate_select("SELECT * FROM %s")
+    with pytest.raises(ToolFailure, match="disallowed construct"):
+        guard.validate_select("WITH x AS (DELETE FROM t WHERE a = %s) SELECT * FROM x")
+    with pytest.raises(ToolFailure, match="could not be parsed"):
+        guard.validate_select("SELECT * FROM t WHERE a = %q AND b > 2")
+    # A genuine modulo expression parses on the primary path and is untouched.
+    assert guard.validate_select("SELECT 5 % 3 AS m FROM t").kind == "select"
+
+
+def test_guard_placeholder_masking_respects_string_literals() -> None:
+    """A '%' inside a string literal is data: masking must not rewrite it
+    (the statement still validates via its real trailing placeholder)."""
+    from universal_db_mcp.security.sql_guard import mask_pyformat_placeholders
+
+    masked = mask_pyformat_placeholders("SELECT * FROM t WHERE b LIKE '100%s' AND id = %s -- tail %s")
+    assert "LIKE '100%s'" in masked
+    assert masked.count("?") == 1
+    guard = _param_guard("mysql")
+    assert guard.validate_select("SELECT * FROM t WHERE b LIKE '100%s' AND id = %s").kind == "select"
+
+
+def test_mysql_connector_translates_paramstyle_before_driver() -> None:
+    """PyMySQL only understands format/pyformat. The guard tolerates qmark/
+    named markers, so the connector must map them 1:1 onto %s / %(name)s
+    AFTER validation (never bypassing it) and reject ambiguous mixes instead
+    of letting the driver misformat them."""
+    pymysql = pytest.importorskip("pymysql")
+    conn = _mysql_connector()
+    state = _mysql_fake_state(conn)
+    conn._connect = lambda: _MySQLFakeConn(state)  # type: ignore[method-assign]
+
+    conn._execute(QuerySpec(sql="SELECT * FROM t WHERE a = ? AND b > ?", parameters=[1, 2]))
+    assert state["calls"][-1] == ("SELECT * FROM t WHERE a = %s AND b > %s", [1, 2])
+
+    conn._execute(QuerySpec(sql="SELECT * FROM t WHERE a = :x AND c = :y", parameters={"x": 1, "y": 2}))
+    assert state["calls"][-1] == ("SELECT * FROM t WHERE a = %(x)s AND c = %(y)s", {"x": 1, "y": 2})
+
+    # A '?' inside a string literal is data, never a placeholder.
+    conn._execute(QuerySpec(sql="SELECT * FROM t WHERE note = 'what?' AND id = :id", parameters={"id": 1}))
+    assert state["calls"][-1][0] == "SELECT * FROM t WHERE note = 'what?' AND id = %(id)s"
+
+    # Prove the contract against the real driver's client-side formatter: the
+    # translated statement + values mogrify without error (the pre-fix qmark
+    # form raised TypeError, the :name form produced server-side 1064).
+    class _LiteralConn:
+        def literal(self, obj: object) -> str:
+            return repr(obj)
+
+    cur = pymysql.cursors.Cursor.__new__(pymysql.cursors.Cursor)
+    cur.connection = _LiteralConn()
+    assert cur.mogrify("SELECT * FROM t WHERE a = %s AND b > %s", [1, 2])
+    assert cur.mogrify("SELECT * FROM t WHERE a = %(x)s", {"x": 1})
+    with pytest.raises((TypeError, ValueError)):
+        cur.mogrify("SELECT * FROM t WHERE a = ? AND b > ?", [1, 2])
+
+    for sql, params in [
+        ("SELECT * FROM t WHERE a = ? AND b = :y", {"y": 1}),  # mixed styles
+        ("SELECT * FROM t WHERE a = :missing", {"x": 1}),  # unsupplied name
+        ("SELECT * FROM t WHERE a = :x", [1]),  # named placeholders, positional values
+        ("SELECT * FROM t WHERE a = %(x)s", [1]),  # pyformat names, positional values
+        ("SELECT * FROM t WHERE a = ? AND b = %s", [1, 2]),  # mixed positional styles
+    ]:
+        with pytest.raises(ToolFailure, match="VALIDATION_ERROR"):
+            conn._execute(QuerySpec(sql=sql, parameters=params))
+
+
+@pytest.mark.anyio
+async def test_parameterized_query_reaches_driver_through_execution_service(anyio_backend: str) -> None:
+    """Live-style end-to-end: the exact db_query flow (guard.validate_select ->
+    QuerySpec -> ExecutionService.run_bounded -> connector) must deliver the
+    parameterized SQL to the driver with its parameters intact, in the
+    driver's own paramstyle."""
+    from test_sql_guard import FakePolicy
+
+    from universal_db_mcp.security.sql_guard import SqlGuard, StaticResolver
+
+    conn = _mysql_connector()
+    state = _mysql_fake_state(conn)
+    conn._connect = lambda: _MySQLFakeConn(state)  # type: ignore[method-assign]
+
+    policy = FakePolicy(engine="mysql")
+    guard = SqlGuard("mysql", policy, StaticResolver({(None, "t")}))  # type: ignore[arg-type]
+    sql = "SELECT * FROM t WHERE a = ? AND b > ?"
+    validated = guard.validate_select(sql)  # qmark parses natively
+    assert validated.kind == "select"
+    # ... and the pyformat spelling the driver will receive validates too
+    # (this exact shape was POLICY_VIOLATION before the fix).
+    assert guard.validate_select("SELECT * FROM t WHERE a = %s AND b > %s").kind == "select"
+
+    svc = ExecutionService(max_concurrent=2)
+    spec = QuerySpec(sql=sql, parameters=[1, 5], max_rows=10)
+    outcome = await svc.run_bounded(conn, lambda c: c.execute_query(spec), 5.0, description="t")
+    assert outcome.rows == []  # fake cursor streams nothing
+    driver_sql, driver_params = state["calls"][-1]
+    assert driver_sql == "SELECT * FROM t WHERE a = %s AND b > %s"
+    assert driver_params == [1, 5]

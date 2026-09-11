@@ -18,6 +18,7 @@ accounts. Design:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -120,6 +121,189 @@ _EXECUTABLE_COMMENT = re.compile(r"/\*!")
 
 _PLACEHOLDER_OK = re.compile(r"^[%?$:@][0-9a-zA-Z_]*$")
 
+# DBAPI format/pyformat placeholders: positional ``%s`` and named
+# ``%(name)s``. The lookahead keeps ``%s`` from matching the start of a
+# longer identifier-like token; ``%(name)s`` is fully delimited already.
+_PYFORMAT_NAMED_RE = re.compile(r"%\([A-Za-z_][A-Za-z0-9_$]*\)s")
+_PYFORMAT_POS_RE = re.compile(r"%s(?![0-9a-zA-Z_$\"'`\]])")
+# SQLAlchemy-style named placeholders ``:name``. The lookarounds keep
+# PostgreSQL's ``::`` cast operator (and ``x :`` chains) out of the match.
+_NAMED_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_$]*)(?!:)")
+_QMARK_RE = re.compile(r"\?")
+
+
+def _rewrite_code_segments(
+    sql: str,
+    transform: Callable[[str], str],
+    *,
+    backslash_escapes: bool,
+) -> tuple[str, str]:
+    """Rewrite the code segments of ``sql`` and return a pair:
+
+    1. ``sql`` with ``transform`` applied to every code segment, leaving
+       string literals ('...'), quoted identifiers ("...", `...`, [...])
+       and comments (-- ..., /- * ... */) verbatim — so a placeholder-shaped
+       token inside a literal is never rewritten;
+    2. a same-length "code view" where literals and comments are blanked to
+       spaces — placeholder DETECTION must run against this view, because a
+       ``?`` or ``%s`` inside a literal is data, not a placeholder.
+
+    ``backslash_escapes`` selects the string-literal escaping rules: MySQL
+    (and its drivers) treat ``\\'`` as an escaped quote;
+    standard-conforming PostgreSQL does not. Being wrong in either
+    direction only *skips* a rewrite (a stray placeholder survives), which
+    then fails at parse time or in the driver — a rewrite is never
+    fabricated inside a literal.
+    """
+    out: list[str] = []
+    view: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(sql)
+
+    def flush() -> None:
+        if buf:
+            out.append(transform("".join(buf)))
+            view.append("".join(buf))
+            buf.clear()
+
+    def blank(span: str) -> None:
+        out.append(span)
+        view.append(" " * len(span))
+
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1 : i + 2]
+        if ch == "-" and nxt == "-":
+            flush()
+            j = sql.find("\n", i)
+            j = n if j == -1 else j + 1
+            blank(sql[i:j])
+            i = j
+        elif ch == "/" and nxt == "*":
+            flush()
+            j = sql.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            blank(sql[i:j])
+            i = j
+        elif ch in ("'", '"', "`", "["):
+            quote = "]" if ch == "[" else ch
+            flush()
+            start = i
+            i += 1
+            while i < n:
+                c = sql[i]
+                if backslash_escapes and c == "\\":
+                    i += 2
+                    continue
+                if c == quote:
+                    if sql[i + 1 : i + 2] == quote:  # doubled quote escape
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            span = sql[start:i]
+            out.append(span)  # literals pass through untouched ...
+            view.append(" " * len(span))  # ... and are invisible to detection
+        else:
+            buf.append(ch)
+            i += 1
+    flush()
+    return "".join(out), "".join(view)
+
+
+def mask_pyformat_placeholders(sql: str) -> str:
+    """Rewrite format/pyformat placeholders (``%s``, ``%(name)s``) to qmark
+    (``?``) outside literals.
+
+    sqlglot's tokenizer reads ``%`` as the modulo operator in most dialects
+    (mysql, clickhouse, oracle, t-sql, sqlite), so a statement using the
+    driver's own paramstyle cannot be parsed there; the postgres dialect is
+    the only one that tokenizes ``%s`` as a placeholder natively. The guard
+    parses the original text first and only falls back to this masked text
+    when that parse fails, so nothing that parsed before changes. The masked
+    AST still goes through the full validation walk, where ``exp.Placeholder``
+    is an opaque parameter marker and every other check (denied constructs,
+    dangerous/unknown functions, object resolution) applies unchanged.
+    """
+    rewritten, _ = _rewrite_code_segments(
+        sql, lambda seg: _PYFORMAT_POS_RE.sub("?", _PYFORMAT_NAMED_RE.sub("?", seg)),
+        backslash_escapes=True,
+    )
+    return rewritten
+
+
+def translate_paramstyle(
+    sql: str,
+    parameters: Any,
+    *,
+    backslash_escapes: bool,
+    qmark_is_placeholder: bool = True,
+) -> tuple[str, Any]:
+    """Translate a validated statement's placeholders into the format/
+    pyformat paramstyle its DBAPI driver expects (PyMySQL and psycopg both
+    use ``%s`` / ``%(name)s``), based on how the values were supplied.
+
+    The guard tolerates qmark/named placeholders as opaque parameter
+    markers; this maps them 1:1 onto the driver's spelling AFTER validation,
+    outside literals, so it cannot bypass guard checks (same statement, same
+    placeholders, different syntax). Combinations that cannot be mapped
+    unambiguously — values whose shape does not match the placeholder style
+    in the statement — are rejected instead of being handed to the driver to
+    misformat. ``qmark_is_placeholder=False`` (psycopg: ``?`` is never a
+    placeholder there, it reaches the server as the JSONB key-exists
+    operator) leaves ``?`` alone entirely.
+    """
+    if parameters is None:
+        return sql, None
+    _, view = _rewrite_code_segments(sql, lambda seg: seg, backslash_escapes=backslash_escapes)
+
+    if isinstance(parameters, dict):
+        if _PYFORMAT_POS_RE.search(view) or (qmark_is_placeholder and _QMARK_RE.search(view)):
+            raise ToolFailure(
+                ErrorCategory.VALIDATION,
+                "named parameters were supplied but the statement uses "
+                "positional placeholders (%s"
+                + (" or ?" if qmark_is_placeholder else "")
+                + "); use :name / %(name)s placeholders or positional values",
+            )
+        missing = {m.group(1) for m in _NAMED_RE.finditer(view) if m.group(1) not in parameters}
+        if missing:
+            raise ToolFailure(
+                ErrorCategory.VALIDATION,
+                f"statement references parameter names that were not supplied: {sorted(missing)}",
+            )
+        rewritten, _ = _rewrite_code_segments(
+            sql,
+            lambda seg: _NAMED_RE.sub(lambda m: "%(" + m.group(1) + ")s", seg),
+            backslash_escapes=backslash_escapes,
+        )
+        return rewritten, parameters
+    if isinstance(parameters, (list, tuple)):
+        if _NAMED_RE.search(view) or _PYFORMAT_NAMED_RE.search(view):
+            raise ToolFailure(
+                ErrorCategory.VALIDATION,
+                "positional parameters were supplied but the statement uses "
+                "named placeholders (:name or %(name)s); supply a mapping instead",
+            )
+        if _PYFORMAT_POS_RE.search(view):
+            if qmark_is_placeholder and _QMARK_RE.search(view):
+                raise ToolFailure(
+                    ErrorCategory.VALIDATION,
+                    "statement mixes positional placeholder styles (? and %s); use one style",
+                )
+            return sql, parameters  # already format paramstyle: pass through
+        if not qmark_is_placeholder or not _QMARK_RE.search(view):
+            return sql, parameters  # nothing to translate
+        rewritten, _ = _rewrite_code_segments(
+            sql, lambda seg: _QMARK_RE.sub("%s", seg), backslash_escapes=backslash_escapes
+        )
+        return rewritten, parameters
+    # Anything else is passed through unchanged; the driver reports the
+    # mismatch the same way it did before this translation existed.
+    return sql, parameters
+
 
 def sqlglot_dialect(engine: str) -> str:
     """Map a config engine type to the sqlglot dialect used for validation/rendering."""
@@ -196,14 +380,32 @@ class SqlGuard:
         stripped = sql.strip().rstrip(";").strip()
         if not stripped:
             raise ToolFailure(ErrorCategory.VALIDATION, "empty statement")
-        try:
-            statements = sqlglot.parse(stripped, read=self._dialect)
-        except (sqlglot.errors.ParseError, ValueError, RecursionError) as exc:
+        # Primary parse: the text exactly as submitted. Only if that fails do
+        # we retry a view with format/pyformat placeholders (%s, %(name)s)
+        # masked to qmark — sqlglot's tokenizer reads '%' as modulo in most
+        # dialects, which used to make the drivers' own paramstyle
+        # unvalidatable. The masked view can only turn a placeholder into
+        # another placeholder, and whatever AST it yields goes through the
+        # same full walk below, so this fallback never approves anything the
+        # statement-shaped validation would otherwise deny.
+        candidates = [stripped]
+        masked = mask_pyformat_placeholders(stripped)
+        if masked != stripped:
+            candidates.append(masked)
+        last_exc: Exception | None = None
+        for candidate in candidates:
+            try:
+                statements = sqlglot.parse(candidate, read=self._dialect)
+                break
+            except (sqlglot.errors.ParseError, ValueError, RecursionError) as exc:
+                last_exc = exc
+        else:
             # A parser failure (or unsupported dialect / pathological nesting)
             # is never approval.
             raise _deny(
-                f"statement could not be parsed under the '{self._dialect}' dialect; refusing unvalidated SQL ({exc})"
-            ) from exc
+                f"statement could not be parsed under the '{self._dialect}' dialect; "
+                f"refusing unvalidated SQL ({last_exc})"
+            ) from last_exc
         if len(statements) != 1:
             raise _deny("exactly one statement is permitted")
         root = statements[0]

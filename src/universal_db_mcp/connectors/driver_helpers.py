@@ -63,6 +63,32 @@ def cell_truncated_json(raw: Any, max_cell_bytes: int) -> tuple[list[Any], list[
     return vals, labels, truncated
 
 
+def truncated_cell_indices(raw: Any, max_cell_bytes: int) -> list[int]:
+    """Indices of the cells in one driver row whose adapted form exceeded the
+    cell limit, so connectors can name the affected columns in their
+    truncation warning instead of reporting an anonymous cut."""
+    return [i for i, v in enumerate(raw) if _adapt_one(v, max_cell_bytes)[2]]
+
+
+def truncated_column_names(columns: list[tuple[str, str]], raw: Any, max_cell_bytes: int) -> list[str]:
+    """Driver-reported column names of the cells in one row that were cut to
+    the cell limit (positional fallback when the driver reports no name)."""
+    names = [c[0] for c in columns]
+    return [
+        names[i] if i < len(names) and names[i] else f"column_{i + 1}"
+        for i in truncated_cell_indices(raw, max_cell_bytes)
+    ]
+
+
+def cell_truncation_warning(column_names: list[str], max_cell_bytes: int) -> str:
+    """One-line warning naming the columns whose cells were truncated."""
+    unique = list(dict.fromkeys(column_names))
+    return (
+        f"cell value(s) in column(s) {', '.join(repr(n) for n in unique)} exceeded "
+        f"the {max_cell_bytes} byte cell limit and were truncated"
+    )
+
+
 def _adapt_one(v: Any, max_cell_bytes: int) -> tuple[Any, str, bool]:
     if v is None:
         return None, "null", False

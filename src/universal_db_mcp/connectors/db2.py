@@ -15,8 +15,10 @@ Per spec §5:
 
 from __future__ import annotations
 
+import functools
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from universal_db_mcp.config import ResolvedConnection
@@ -32,10 +34,32 @@ from universal_db_mcp.connectors.base import (
     TableSummary,
     ViewInfo,
 )
-from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module
+from universal_db_mcp.connectors.driver_helpers import (
+    cell_truncated_json,
+    cell_truncation_warning,
+    open_module,
+    translated_driver_errors,
+    truncated_column_names,
+)
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
+
+
+def _meta_translated(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Metadata/catalog methods surface driver failures as ``ConnectorError``.
+
+    ibm_db raises its own exception type for connect/SQL failures; without
+    this wrapping a raw driver exception escaped the server's per-connection
+    degradation in db_search_metadata and aborted the whole tool call as
+    INTERNAL_ERROR instead of a per-connection warning."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with translated_driver_errors():
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class Db2Connector(DatabaseConnector):
@@ -179,6 +203,7 @@ class Db2Connector(DatabaseConnector):
         except Exception as exc:  # noqa: BLE001, S110
             return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
 
+    @_meta_translated
     def list_schemas(self, catalog: str | None, search: str | None) -> list[str]:
         conn = self._connect()
         try:
@@ -196,6 +221,7 @@ class Db2Connector(DatabaseConnector):
         finally:
             self._module.close(conn)
 
+    @_meta_translated
     def list_tables(self, schema: str | None, kinds: set[str], search: str | None) -> list[TableSummary]:
         conn = self._connect()
         try:
@@ -241,6 +267,7 @@ class Db2Connector(DatabaseConnector):
         finally:
             self._module.close(conn)
 
+    @_meta_translated
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
         conn = self._connect()
         try:
@@ -268,6 +295,7 @@ class Db2Connector(DatabaseConnector):
         finally:
             self._module.close(conn)
 
+    @_meta_translated
     def list_views(self, schema: str | None) -> list[ViewInfo]:
         conn = self._connect()
         try:
@@ -286,6 +314,7 @@ class Db2Connector(DatabaseConnector):
         finally:
             self._module.close(conn)
 
+    @_meta_translated
     def list_synonyms(self, schema: str | None) -> list[SynonymInfo]:
         conn = self._connect()
         try:
@@ -303,6 +332,7 @@ class Db2Connector(DatabaseConnector):
         finally:
             self._module.close(conn)
 
+    @_meta_translated
     def list_routines(self, schema: str | None) -> list[RoutineInfo]:
         conn = self._connect()
         try:
@@ -321,6 +351,7 @@ class Db2Connector(DatabaseConnector):
         finally:
             self._module.close(conn)
 
+    @_meta_translated
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
         conn = self._connect()
         try:
@@ -344,6 +375,7 @@ class Db2Connector(DatabaseConnector):
         finally:
             self._module.close(conn)
 
+    @_meta_translated
     def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:
         conn = self._connect()
         try:
@@ -373,6 +405,7 @@ class Db2Connector(DatabaseConnector):
         raw = self._connect()
         start = time.monotonic()
         truncated = False
+        cell_truncated_cols: list[str] = []
         rows: list[list[Any]] = []
         approx_bytes = 0
         import json
@@ -391,9 +424,11 @@ class Db2Connector(DatabaseConnector):
                 if not batch:
                     break
                 for r in batch:
-                    vals, labels, _ = cell_truncated_json(r, spec.max_cell_bytes)
+                    vals, labels, cell_tr = cell_truncated_json(r, spec.max_cell_bytes)
                     if not col_labels:
                         col_labels = labels
+                    if cell_tr:
+                        cell_truncated_cols.extend(truncated_column_names(cols, r, spec.max_cell_bytes))
                     approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
                     if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
                         truncated = True
@@ -401,13 +436,17 @@ class Db2Connector(DatabaseConnector):
                     rows.append(vals)
                 if truncated:
                     break
+            warnings = ["result truncated by limits"] if truncated else []
+            if cell_truncated_cols:
+                truncated = True
+                warnings.append(cell_truncation_warning(cell_truncated_cols, spec.max_cell_bytes))
             return QueryOutcome(
                 columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
                 rows=rows,
                 truncated=truncated,
                 rows_seen=len(rows),
                 elapsed_ms=int((time.monotonic() - start) * 1000),
-                warnings=["result truncated by limits"] if truncated else [],
+                warnings=warnings,
             )
         finally:
             try:
