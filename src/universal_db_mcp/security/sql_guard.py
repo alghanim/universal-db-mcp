@@ -324,14 +324,21 @@ class SqlGuard:
                 raise _deny("sqlite EXPLAIN requires: EXPLAIN [QUERY PLAN] <select>")
             root = self._parse_single(m.group(2), "explain")
         elif self._dialect in ("postgres", "clickhouse"):
-            m = re.match(r"^EXPLAIN\s+(ANALYZE\s+)?(.+)$", text, re.I | re.S)
+            # PostgreSQL option syntax: EXPLAIN [(option [, ...])] statement
+            # (e.g. EXPLAIN (FORMAT JSON) SELECT ...), plus the bare-token
+            # legacy form EXPLAIN [ANALYZE] statement.
+            m = re.match(r"^EXPLAIN\s*(\([^)]*\))?\s*(?:(ANALYZE)\s+)?(.+)$", text, re.I | re.S)
             if not m:
-                raise _deny("EXPLAIN requires: EXPLAIN [ANALYZE] <statement>")
-            if m.group(1) and not self._policy.allow_explain_analyze:
+                raise _deny("EXPLAIN requires: EXPLAIN [(option [, ...])] [ANALYZE] <statement>")
+            options = m.group(1) or ""
+            # ANALYZE executes the statement (as does the WAL option); both
+            # are gated behind the same explicit policy.
+            analyze_requested = bool(m.group(2)) or bool(re.search(r"\b(?:ANALYZE|WAL)\b", options, re.I))
+            if analyze_requested and not self._policy.allow_explain_analyze:
                 raise _deny(
                     "EXPLAIN ANALYZE executes the statement and is disabled by policy; use EXPLAIN without ANALYZE"
                 )
-            root = self._parse_single(m.group(2), "explain")
+            root = self._parse_single(m.group(3), "explain")
         elif self._dialect == "mysql":
             m = re.match(r"^EXPLAIN\s+(ANALYZE\s+)?(?:FORMAT\s*=\s*(\w+)\s+)?(.+)$", text, re.I | re.S)
             if not m:

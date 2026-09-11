@@ -54,12 +54,12 @@
     {
       "check": "audit-path",
       "status": "ok",
-      "detail": "'/tmp/audit.jsonl' writable"
+      "detail": "'/tmp/audit.jsonl' absent; parent directory '/tmp' is writable"
     },
     {
       "check": "metadata-cache-path",
       "status": "ok",
-      "detail": "'/tmp/metadata-cache.sqlite' writable"
+      "detail": "'/tmp/metadata-cache.sqlite' absent; parent directory '/tmp' is writable"
     }
   ],
   "fatal_count": 0

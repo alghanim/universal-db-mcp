@@ -108,12 +108,36 @@ The unit runs as the dedicated `udbmcp` account with a hardened sandbox
 
 ## Container mode
 
+Before starting, two prerequisites the bundle does **not** satisfy on its own:
+
+1. **The application image tar must have been exported on the staging
+   machine.** `scripts/prepare_offline_bundle.py` only creates the (empty)
+   `images/` directory; `images/universal-db-mcp.tar` exists only if
+   `docs/offline-build.md` steps 4 **and** 4b (`docker build` + `docker
+   save`, then the SHA256SUMS/SIGNATURE refresh) were run. Without them the
+   `docker load` below fails on a missing tar and container mode is not
+   deployable from this bundle — use native mode instead.
+2. **HTTP transport requires a bearer token.** The compose file runs
+   `serve --transport http`, and the server exits immediately with
+   `CONFIG_ERROR: http transport requires application.http_bearer_token_file`
+   unless the mounted config sets that key and the token file exists:
+
+   ```bash
+   openssl rand -hex 32 | sudo tee /run/secrets/udbmcp_http_token >/dev/null
+   sudo chmod 600 /run/secrets/udbmcp_http_token
+   # then in /etc/universal-db-mcp/config.yaml set:
+   #   application:
+   #     http_bearer_token_file: /run/secrets/udbmcp_http_token
+   ```
+
 ```bash
 docker load -i <bundle>/images/udbmcp-baseline-ubuntu24.04-cp312.tar
 docker load -i <bundle>/images/universal-db-mcp.tar
 docker image inspect udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312  # identity check
 docker network create --internal udbmcp-internal   # admin-managed
-docker compose -f packaging/compose.offline.yaml up -d
+# the bundle ships the compose file under operations/, not packaging/
+# (there is no packaging/ directory on the target):
+docker compose -f <bundle>/operations/compose.offline.yaml up -d
 ```
 
 `pull_policy: never` — an absent image fails locally; no registry contact.

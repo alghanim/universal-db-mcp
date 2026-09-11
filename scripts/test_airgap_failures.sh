@@ -31,13 +31,26 @@ RELEASE_PUBKEY="${RELEASE_PUBKEY:-$OUT/demo-keys/udbmcp-release-demo.pub.pem}"
 }
 
 summary() {
-  echo "{"
-  echo "  \"gate\": \"A-negative-failure-modes\","
-  echo "  \"cases\": [$CASES"
-  echo "  ],"
-  echo "  \"status\": \"$([ "$FAILED" = 0 ] && echo passed || echo failed)\""
-} > "$EVID/results.json"
-CASES=""
+  # Assemble results.json with python's json module rather than hand-built
+  # echo lines: the hand-built version emitted malformed JSON (case objects
+  # could lose their closing brace), and this file is parsed by the ledger
+  # and the regression tests.
+  local py
+  py="$(command -v "$PROJECT/.venv/bin/python" 2>/dev/null || command -v python3)"
+  "$py" - "$EVID" "$FAILED" <<'PYEOF'
+import json, pathlib, sys
+evid = pathlib.Path(sys.argv[1])
+failed = sys.argv[2] != "0"
+cases = []
+for p in sorted(evid.glob("*.json")):
+    if p.name == "results.json":
+        continue
+    cases.append(json.loads(p.read_text()))
+out = {"gate": "A-negative-failure-modes", "cases": cases,
+       "status": "failed" if failed else "passed"}
+(evid / "results.json").write_text(json.dumps(out, indent=1) + "\n")
+PYEOF
+}
 
 check() { # name expectation bundle-dir command expected-diagnostic-regex [pubkey-file]
   local name="$1" expect="$2" bundledir="$3" cmd="$4" pattern="${5:-}" keyfile="${6:-$RELEASE_PUBKEY}"
@@ -61,7 +74,6 @@ check() { # name expectation bundle-dir command expected-diagnostic-regex [pubke
   fi
   echo "{\"case\": \"$name\", \"passed\": $passed, \"exit\": $rc, \"diagnostic\": \"$matched\"}" > "$EVID/$name.json"
   printf '%s' "$out" > "$EVID/$name.output.txt"
-  [ "$CASES" = "" ] && CASES="$(cat "$EVID/$name.json")" || CASES="$CASES, $(cat "$EVID/$name.json")"
   if [ "$passed" = true ]; then
     echo "[pass] $name (diagnostic: $matched)"
   else

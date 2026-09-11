@@ -107,7 +107,11 @@ class SQLiteConnector(DatabaseConnector):
         path = connection.config.database
         if not path:
             raise ValueError("sqlite connection requires 'database' path")
-        self._path = Path(path)
+        # Resolve relative paths against the service working directory NOW:
+        # config validation stores the value unresolved, and Path.as_uri()
+        # raises ValueError for relative paths, which would crash every later
+        # operation as INTERNAL instead of failing fast with a clear message.
+        self._path = Path(path).expanduser().resolve()
         self._conn_lock = threading.Lock()
         self._current_conn: sqlite3.Connection | None = None
         self._dbstat_available: bool | None = None  # probed once per connector
@@ -115,9 +119,10 @@ class SQLiteConnector(DatabaseConnector):
     # ---- connection management -------------------------------------------
 
     def _open(self) -> sqlite3.Connection:
-        if not self._path.exists():
+        if not self._path.is_file():
             raise FileNotFoundError(
-                f"configured SQLite data file '{self._path}' does not exist (connection '{self.connection.name}')"
+                f"configured SQLite data file '{self._path}' does not exist or is not a "
+                f"regular file (connection '{self.connection.name}')"
             )
         uri = f"file:{self._path.as_uri()[7:]}?mode=ro"
         conn = sqlite3.connect(

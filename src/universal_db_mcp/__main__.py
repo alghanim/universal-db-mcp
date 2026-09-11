@@ -72,12 +72,15 @@ def _serve(args: argparse.Namespace) -> int:
         return 1
     try:
         cfg, resolved = load_resolved(config_path)
+        # AppContext opens the audit log and the metadata cache; a failure
+        # there (unwritable audit file, corrupt cache file) is a startup
+        # configuration failure and must surface as CONFIG_ERROR, not a
+        # raw traceback.
+        app = AppContext(cfg, resolved)
+        server = build_server(app)
     except Exception as exc:
         print(f"CONFIG_ERROR: {exc}", file=sys.stderr)
         return 1
-
-    app = AppContext(cfg, resolved)
-    server = build_server(app)
 
     transport = args.transport or cfg.application.transport
     if transport == "stdio":
@@ -97,8 +100,12 @@ def _serve_http(cfg, server) -> int:  # type: ignore[no-untyped-def]
     Bearer token is read from a local file (application.http_bearer_token_file).
     Bind defaults to loopback. Origin/host restrictions are enforced by the
     reverse proxy in front of this service (docs/offline-deployment.md)."""
+    from pathlib import Path
+
     import uvicorn
 
+    from universal_db_mcp.config import _check_secret_file_permissions
+    from universal_db_mcp.errors import ConfigError
     from universal_db_mcp.security.redact import SecretMark
 
     token_path = cfg.application.http_bearer_token_file
@@ -108,8 +115,17 @@ def _serve_http(cfg, server) -> int:  # type: ignore[no-untyped-def]
             file=sys.stderr,
         )
         return 1
-    with open(token_path, encoding="utf-8") as fh:
-        raw_token = fh.read().strip()
+    # The bearer token is the only authentication on the HTTP listener: it is
+    # a secret file and must meet the same permission rule as password files
+    # (no group/other access), and a missing/unreadable file is a CONFIG_ERROR
+    # instead of an uncaught traceback.
+    try:
+        token_file = Path(token_path)
+        _check_secret_file_permissions(token_file)
+        raw_token = token_file.read_text(encoding="utf-8").strip()
+    except (ConfigError, OSError) as exc:
+        print(f"CONFIG_ERROR: {exc}", file=sys.stderr)
+        return 1
     if not raw_token:
         print("CONFIG_ERROR: bearer token file is empty", file=sys.stderr)
         return 1

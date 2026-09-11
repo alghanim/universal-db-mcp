@@ -1,5 +1,42 @@
 {
-  "gate": "A-negative-failure-modes",
-  "cases": [{"case": "tampered_wheel", "passed": true, "exit": 1, "diagnostic": "tampered artifact"}, {"case": "missing_wheel", "passed": true, "exit": 1, "diagnostic": "wheel missing from wheelhouse"}, {"case": "incompatible_abi", "passed": true, "exit": 1, "diagnostic": "NOT covered by SHA256SUMS"}, {"case": "untrusted_signature", "passed": true, "exit": 1, "diagnostic": "signature verification FAILED"}, {"case": "missing_licensed_driver", "passed": true, "exit": 1, "diagnostic": "wheel missing"}, {"case": "hostile_pip_env", "passed": true, "exit": 0, "diagnostic": ""}
-  ],
-  "status": "passed"
+ "gate": "A-negative-failure-modes",
+ "cases": [
+  {
+   "case": "hostile_pip_env",
+   "passed": true,
+   "exit": 0,
+   "diagnostic": ""
+  },
+  {
+   "case": "incompatible_abi",
+   "passed": true,
+   "exit": 1,
+   "diagnostic": "NOT covered by SHA256SUMS"
+  },
+  {
+   "case": "missing_licensed_driver",
+   "passed": true,
+   "exit": 1,
+   "diagnostic": "wheel missing"
+  },
+  {
+   "case": "missing_wheel",
+   "passed": true,
+   "exit": 1,
+   "diagnostic": "wheel missing from wheelhouse"
+  },
+  {
+   "case": "tampered_wheel",
+   "passed": true,
+   "exit": 1,
+   "diagnostic": "tampered artifact"
+  },
+  {
+   "case": "untrusted_signature",
+   "passed": true,
+   "exit": 1,
+   "diagnostic": "signature verification FAILED"
+  }
+ ],
+ "status": "passed"
+}

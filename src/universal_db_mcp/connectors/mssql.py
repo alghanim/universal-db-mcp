@@ -37,7 +37,7 @@ from universal_db_mcp.connectors.base import (
     TableSummary,
     ViewInfo,
 )
-from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module
+from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module, translated_driver_errors
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
@@ -106,17 +106,26 @@ class MssqlConnector(DatabaseConnector):
 
     def _connect(self) -> Any:
         self._module = open_module("pyodbc", "pyodbc (manylinux cp312 wheel from the bundle wheelhouse)")
-        drivers = [d for d in self._module.drivers() if "ODBC Driver" in d and "SQL Server" in d]
-        if not drivers:
-            raise RuntimeError(
-                f"'{ODBC_DRIVER_NAME}' is not installed on this machine; it is an "
-                f"administrator-supplied OS package (see bundle os-packages/ and "
-                f"docs/offline-deployment.md). The application cannot download it."
-            )
         cfg = self.connection.config
+        # The driver to use is selectable via options.odbc_driver (config.py
+        # declares it) and defaults to Driver 18. Detection must match the
+        # EXACT name that will be put into the connection string: accepting a
+        # loose "some ODBC SQL Server driver exists" while emitting a hardcoded
+        # name made doctor report success and every connect fail with
+        # "Can't open lib ...".
+        driver_name = str(cfg.options.get("odbc_driver") or ODBC_DRIVER_NAME)
+        installed = self._module.drivers()
+        if driver_name not in installed:
+            raise RuntimeError(
+                f"'{driver_name}' is not installed on this machine (installed "
+                f"SQL Server ODBC drivers: {[d for d in installed if 'SQL Server' in d] or 'none'}); "
+                f"it is an administrator-supplied OS package (see bundle "
+                f"os-packages/ and docs/offline-deployment.md) or select the "
+                f"installed one via options.odbc_driver. The application cannot download it."
+            )
         esc = self._odbc_escape
         parts = [
-            f"Driver={{{ODBC_DRIVER_NAME}}}",
+            f"Driver={esc(driver_name)}",
             # host AND port are brace-quoted TOGETHER: quoting the host alone
             # (port outside the braces) makes ODBC Driver 18 mis-parse the
             # attribute and fail the TLS/cert path even with Encrypt=no.
@@ -222,13 +231,14 @@ class MssqlConnector(DatabaseConnector):
             sql += " WHERE schema_name LIKE ?"
             params.append(f"%{search}%")
         sql += " ORDER BY 1"
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            return [r[0] for r in cur.fetchall()]
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                return [r[0] for r in cur.fetchall()]
+            finally:
+                conn.close()
 
     def list_tables(self, schema: str | None, kinds: set[str], search: str | None) -> list[TableSummary]:
         wanted: list[str] = []
@@ -250,13 +260,14 @@ class MssqlConnector(DatabaseConnector):
         if search:
             sql += " AND table_name LIKE ?"
             params.append(f"%{search}%")
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            finally:
+                conn.close()
         return [TableSummary(schema=r[0], name=r[1], kind="view" if r[2] == "VIEW" else "table") for r in rows]
 
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
@@ -265,13 +276,14 @@ class MssqlConnector(DatabaseConnector):
             "FROM information_schema.columns WHERE table_schema = ? AND table_name = ? "
             "ORDER BY ordinal_position"
         )
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, [schema, table])
-            rows = cur.fetchall()
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, [schema, table])
+                rows = cur.fetchall()
+            finally:
+                conn.close()
         return [
             ColumnInfo(
                 schema=schema,
@@ -291,13 +303,14 @@ class MssqlConnector(DatabaseConnector):
         if schema:
             sql += " WHERE table_schema = ?"
             params.append(schema)
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            finally:
+                conn.close()
         return [ViewInfo(schema=r[0], name=r[1], kind="view", definition_state="not_supported") for r in rows]
 
     def list_synonyms(self, schema: str | None) -> list[SynonymInfo]:
@@ -310,13 +323,14 @@ class MssqlConnector(DatabaseConnector):
         if schema:
             sql += " WHERE routine_schema = ?"
             params.append(schema)
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            finally:
+                conn.close()
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2].lower()) for r in rows]
 
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
@@ -342,13 +356,14 @@ class MssqlConnector(DatabaseConnector):
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fk.name, fkc.constraint_column_id"
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            finally:
+                conn.close()
         # Constraint names are unique per schema only, so group by the full
         # (schema, table, name) triple.
         by_key: dict[tuple[str | None, str | None, str | None], KeyInfo] = {}
@@ -379,13 +394,14 @@ class MssqlConnector(DatabaseConnector):
             "JOIN sys.tables t ON p.object_id = t.object_id "
             "WHERE t.name = ? AND p.index_id IN (0,1)"
         )
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, [table])
-            row = cur.fetchone()
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, [table])
+                row = cur.fetchone()
+            finally:
+                conn.close()
         return {
             "schema": schema,
             "table": table,
@@ -398,49 +414,52 @@ class MssqlConnector(DatabaseConnector):
             return self._execute(spec)
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
-        conn = self._connect()
-        start = time.monotonic()
-        truncated = False
-        rows: list[list[Any]] = []
-        approx_bytes = 0
-        import json
+        with translated_driver_errors():
+            conn = self._connect()
+            start = time.monotonic()
+            truncated = False
+            rows: list[list[Any]] = []
+            approx_bytes = 0
+            import json
 
-        try:
-            cur = conn.cursor()
-            if spec.parameters:
-                cur.execute(spec.sql, tuple(spec.parameters) if isinstance(spec.parameters, list) else spec.parameters)
-            else:
-                cur.execute(spec.sql)
-            cols = [(d[0], "unknown") for d in cur.description or []]
-            col_labels = [
-                getattr(d[1], "__name__", "unknown").lower() if d[1] is not None else "unknown"
-                for d in (cur.description or [])
-            ]
-            while True:
-                batch = cur.fetchmany(200)
-                if not batch:
-                    break
-                for raw in batch:
-                    vals, labels, _ = cell_truncated_json(raw, spec.max_cell_bytes)
-                    if not col_labels:
-                        col_labels = labels
-                    approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
-                    if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
-                        truncated = True
+            try:
+                cur = conn.cursor()
+                if spec.parameters:
+                    cur.execute(
+                        spec.sql, tuple(spec.parameters) if isinstance(spec.parameters, list) else spec.parameters
+                    )
+                else:
+                    cur.execute(spec.sql)
+                cols = [(d[0], "unknown") for d in cur.description or []]
+                col_labels = [
+                    getattr(d[1], "__name__", "unknown").lower() if d[1] is not None else "unknown"
+                    for d in (cur.description or [])
+                ]
+                while True:
+                    batch = cur.fetchmany(200)
+                    if not batch:
                         break
-                    rows.append(vals)
-                if truncated:
-                    break
-            return QueryOutcome(
-                columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
-                rows=rows,
-                truncated=truncated,
-                rows_seen=len(rows),
-                elapsed_ms=int((time.monotonic() - start) * 1000),
-                warnings=["result truncated by limits"] if truncated else [],
-            )
-        finally:
-            conn.close()
+                    for raw in batch:
+                        vals, labels, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                        if not col_labels:
+                            col_labels = labels
+                        approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
+                        if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
+                            truncated = True
+                            break
+                        rows.append(vals)
+                    if truncated:
+                        break
+                return QueryOutcome(
+                    columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
+                    rows=rows,
+                    truncated=truncated,
+                    rows_seen=len(rows),
+                    elapsed_ms=int((time.monotonic() - start) * 1000),
+                    warnings=["result truncated by limits"] if truncated else [],
+                )
+            finally:
+                conn.close()
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
         raise NotImplementedError(

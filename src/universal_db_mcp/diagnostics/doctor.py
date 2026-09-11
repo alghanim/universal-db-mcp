@@ -126,20 +126,63 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
 
             # SQLite data file presence + readability
             if conn.type == "sqlite":
-                dbp = Path(conn.database or "")
-                if not dbp.exists():
-                    results.append(_check(f"connection-{name}-file", False, f"data file '{dbp}' not found", fatal=True))
-                elif not os.access(dbp, os.R_OK):
+                if not conn.database:
                     results.append(
                         _check(
                             f"connection-{name}-file",
                             False,
-                            f"data file '{dbp}' not readable by current user",
+                            "sqlite connection has no 'database' file path configured",
                             fatal=True,
                         )
                     )
                 else:
-                    results.append(_check(f"connection-{name}-file", True, f"data file '{dbp}' readable"))
+                    dbp = Path(conn.database)
+                    if not dbp.exists():
+                        results.append(
+                            _check(f"connection-{name}-file", False, f"data file '{dbp}' not found", fatal=True)
+                        )
+                    elif not os.access(dbp, os.R_OK):
+                        results.append(
+                            _check(
+                                f"connection-{name}-file",
+                                False,
+                                f"data file '{dbp}' not readable by current user",
+                                fatal=True,
+                            )
+                        )
+                    else:
+                        results.append(_check(f"connection-{name}-file", True, f"data file '{dbp}' readable"))
+
+            # oracle: wallet material that the connector will require at
+            # connect time (Thin mode, TCPS). A missing wallet directory is a
+            # guaranteed CONNECTION_ERROR on first use.
+            if conn.type == "oracle":
+                wallet = conn.options.get("wallet_location")
+                if isinstance(wallet, str) and wallet:
+                    wp = Path(wallet)
+                    if not wp.is_dir():
+                        results.append(
+                            _check(
+                                f"connection-{name}-oracle-wallet",
+                                False,
+                                f"oracle wallet directory '{wp}' not found (options.wallet_location)",
+                                fatal=True,
+                            )
+                        )
+                    else:
+                        results.append(
+                            _check(f"connection-{name}-oracle-wallet", True, f"wallet directory '{wp}' present")
+                        )
+                tns_admin = conn.options.get("tns_admin")
+                if isinstance(tns_admin, str) and tns_admin and not Path(tns_admin).is_dir():
+                    results.append(
+                        _check(
+                            f"connection-{name}-oracle-tns-admin",
+                            False,
+                            f"oracle tns_admin directory '{tns_admin}' not found",
+                            fatal=True,
+                        )
+                    )
 
             # driver availability: our connector class AND the real vendor
             # module (a registered class can exist while the driver wheel is
@@ -202,22 +245,95 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
             if not path:
                 results.append(_check(label, True, "not configured (feature disabled)"))
                 continue
-            parent = Path(path).parent
-            try:
-                parent.mkdir(parents=True, exist_ok=True)
-                probe = parent / f".udbmcp-doctor-probe-{os.getpid()}"
-                probe.write_text("x")
-                probe.unlink()
+            fp = Path(path)
+            fatal = label == "metadata-cache-path" or (
+                label == "audit-path" and cfg.application.audit_fail_closed
+            )
+            if fp.is_dir():
+                results.append(_check(label, False, f"'{path}' is a directory, not a file", fatal=True))
+                continue
+            if fp.exists():
+                # Probe the configured file itself: parent-dir writability is
+                # not file writability (e.g. a root-owned 0444 audit.jsonl).
+                if not os.access(fp, os.W_OK):
+                    results.append(
+                        _check(
+                            label,
+                            False,
+                            f"'{path}' exists but is not writable by the current user",
+                            fatal=fatal,
+                        )
+                    )
+                    continue
+                if label == "metadata-cache-path":
+                    # The cache opens the file as SQLite; a corrupted
+                    # (non-SQLite) file is fatal at startup.
+                    import sqlite3
+
+                    try:
+                        cache_conn = sqlite3.connect(f"file:{fp}?mode=rw", uri=True)
+                        try:
+                            cache_conn.execute("PRAGMA schema_version")
+                        finally:
+                            cache_conn.close()
+                    except sqlite3.Error as exc:
+                        results.append(
+                            _check(label, False, f"'{path}' is not a usable SQLite cache file: {exc}", fatal=True)
+                        )
+                        continue
                 results.append(_check(label, True, f"'{path}' writable"))
-            except OSError as exc:
+            else:
+                # Never create directories as a side effect of a diagnostic
+                # (a typo'd path must be surfaced, not silently materialized).
+                parent = fp.parent
+                if not parent.is_dir() or not os.access(parent, os.W_OK):
+                    results.append(
+                        _check(
+                            label,
+                            False,
+                            f"parent directory '{parent}' of '{path}' does not exist or is not writable",
+                            fatal=fatal,
+                        )
+                    )
+                else:
+                    results.append(_check(label, True, f"'{path}' absent; parent directory '{parent}' is writable"))
+
+        # HTTP deployment: the bearer token file is the only authentication on
+        # the listener; verify it exists, is a non-empty regular file and is
+        # not group/world readable.
+        if cfg.application.transport == "http":
+            token_path = cfg.application.http_bearer_token_file
+            if not token_path:
                 results.append(
                     _check(
-                        label,
+                        "http-bearer-token",
                         False,
-                        f"cannot write to '{parent}': {exc}",
-                        fatal=(label == "audit-path" and cfg.application.audit_fail_closed),
+                        "application.transport=http requires application.http_bearer_token_file",
+                        fatal=True,
                     )
                 )
+            else:
+                tp = Path(token_path)
+                if not tp.exists() or not tp.is_file():
+                    results.append(
+                        _check("http-bearer-token", False, f"bearer token file '{tp}' not found", fatal=True)
+                    )
+                elif sys.platform != "win32" and stat.S_IMODE(tp.stat().st_mode) & 0o077:
+                    mode = stat.S_IMODE(tp.stat().st_mode)
+                    results.append(
+                        _check(
+                            "http-bearer-token",
+                            False,
+                            f"bearer token file '{tp}' is group/world readable ({stat.filemode(mode)})",
+                            fatal=True,
+                        )
+                    )
+                else:
+                    results.append(
+                        _check(
+                            "http-bearer-token", True, f"bearer token file '{tp}' present with safe permissions"
+                        )
+                    )
 
         # unsafe secret-file perms double-check (belt and braces)
         for name, conn in cfg.connections.items():
@@ -269,9 +385,9 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                     _check(f"connection-{name}-reachable", False, f"cannot reach {conn.host}:{port}: {exc}", fatal=True)
                 )
 
-    fatal = [r for r in results if r["status"] == "fatal"]
+    fatal_results = [r for r in results if r["status"] == "fatal"]
     return {
-        "healthy": not fatal,
+        "healthy": not fatal_results,
         "checks": results,
-        "fatal_count": len(fatal),
+        "fatal_count": len(fatal_results),
     }

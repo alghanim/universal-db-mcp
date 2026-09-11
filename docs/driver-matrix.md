@@ -6,15 +6,23 @@ docs/acceptance-tests.md). Everything else is labeled truthfully.
 | Engine | Driver (pinned) | Native components | TLS | Cancel | Explain | Integration status |
 | --- | --- | --- | --- | --- | --- | --- |
 | SQLite | stdlib `sqlite3` (CPython 3.12) | none | n/a | `interrupt()` (hard) | EXPLAIN / EXPLAIN QUERY PLAN (non-executing) | **passed** — Gate A/B container runs |
-| PostgreSQL | psycopg 3.3.5 `[binary]` | libpq bundled in wheel | verify-full w/ CA | `connection.cancel()` | EXPLAIN (no ANALYZE) | unverified (no instance in test env) |
-| MySQL/MariaDB | PyMySQL 1.2.0 | none (pure Python) | TLS w/ CA (`ssl` dict) | none (documented) | EXPLAIN (no ANALYZE) | unverified |
-| ClickHouse | clickhouse-connect 1.8.0 | optional lz4/zstd not enabled | HTTPS + CA | `cancel_query()` | EXPLAIN | unverified |
-| Oracle | oracledb 4.0.2 **Thin only** | none in Thin mode | TCPS + wallet (admin-provided) | `connection.cancel()` | unsupported (plan table provisioning required) | unverified |
-| SQL Server | pyodbc 5.3.0 + **Microsoft ODBC Driver 18 (admin-supplied OS package)** | unixODBC + driver .deb | Encrypt=yes, CA | none (documented) | unsupported (SHOWPLAN needs separate batch) | unverified |
+| PostgreSQL | psycopg 3.3.5 `[binary]` | libpq bundled in wheel | verify-full w/ CA | `connection.cancel()` | EXPLAIN (no ANALYZE) | **passed** (Gate C run: roundtrip, db-side permission denial, themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
+| MySQL/MariaDB | PyMySQL 1.2.0 | none (pure Python) | TLS w/ CA (`ssl` dict) | none (documented) | EXPLAIN (no ANALYZE) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
+| ClickHouse | clickhouse-connect 1.8.0 | optional lz4/zstd not enabled | HTTPS + CA | `KILL QUERY` by pinned `query_id` (client has no `cancel_query`) | EXPLAIN | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
+| Oracle | oracledb 4.0.2 **Thin only** | none in Thin mode | TCPS + wallet (admin-provided) | `connection.cancel()` | unsupported (plan table provisioning required) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
+| SQL Server | pyodbc 5.3.0 + **Microsoft ODBC Driver 18 (admin-supplied OS package)** | unixODBC + driver .deb | Encrypt=yes, CA | none (documented) | unsupported (SHOWPLAN needs separate batch) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | IBM Db2 (LUW) | ibm_db 3.2.9 wheel (bundled clidriver) | clidriver in wheel | SSL via cert file | none (documented) | unsupported (explain tables admin-provisioned) | unverified |
 
 Notes:
 
+- **Gate C run (`test-evidence/integration-gateC/`):** 13 tests collected,
+  11 passed, 2 skipped — the two skips are the Db2 tests
+  (`tests/integration/test_connectors.py`, fixture endpoint not provided).
+  The run therefore covers, per engine: PostgreSQL (roundtrip, db-side
+  permission denial, themed data), MySQL, ClickHouse, Oracle, SQL Server
+  (roundtrip + themed data each). "Other capabilities unverified" above means
+  the matrix's TLS/Cancel/Explain columns for those engines are code-level
+  claims, not recorded runs.
 - **The Db2 wheel includes `clidriver`; the target never fetches it, and
   `IBM_DB_HOME` is not used to override the bundled driver.** Import alone
   is not a connectivity test; the bundled driver's operation on the target

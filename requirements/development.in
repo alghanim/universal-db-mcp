@@ -4,3 +4,8 @@ ruff==0.16.6
 mypy==2.3.1
 types-PyYAML==6.0.12.20260906
 build==1.3.0
+# Fallback Ed25519 signer for scripts/prepare_offline_bundle.py and
+# scripts/prepare_baseline_image.sh on hosts whose openssl lacks Ed25519
+# pkeyutl (e.g. macOS LibreSSL). Also used by scripts/verify_bundle.py and
+# the air-gap smoke tests.
+cryptography==50.0.1

@@ -56,7 +56,21 @@ class AuditLog:
             with self._lock:
                 self._rotate_if_needed()
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self._path, "a", encoding="utf-8") as fh:
+                # 0600: the audit trail may contain SQL text and must never be
+                # group/world readable, regardless of the process umask.
+                # fchmod is idempotent and also tightens files created by an
+                # older build with a looser mode.
+                fd = os.open(
+                    self._path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    os.close(fd)
+                    raise
+                with os.fdopen(fd, "a", encoding="utf-8") as fh:
                     fh.write(line)
                     fh.flush()
                     os.fsync(fh.fileno())

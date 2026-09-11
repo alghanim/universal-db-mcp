@@ -75,16 +75,76 @@ if [ "$FAILED" = 0 ]; then
     echo "  \"protocol_probe\": \"failed\"," >> "$RESULT"
   fi
 
-  note "restart test (server starts again cleanly)"
-  if echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' \
-      | UDBMCP_CONFIG=/tmp/nonexistent.yaml timeout 10 "$VENV/python" -m universal_db_mcp serve --transport stdio >/dev/null 2>&1; then
-    : # config error path is expected to exit nonzero but without hanging
+  note "restart test (misconfigured start fails fast; then the server starts again and serves the protocol)"
+  BAD_RC=0
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' \
+    | UDBMCP_CONFIG=/tmp/nonexistent.yaml timeout 10 "$VENV/python" -m universal_db_mcp serve --transport stdio >/dev/null 2>/tmp/bad-start.err || BAD_RC=$?
+  # A misconfigured start must fail fast: nonzero exit (but NOT a timeout
+  # hang, rc=124) with CONFIG_ERROR on stderr. The exit code used to be
+  # discarded inside `if ...; then :; fi`, so a hang or an accepted bad
+  # config produced the same "passed" evidence as a clean rejection.
+  if [ "$BAD_RC" -ne 0 ] && [ "$BAD_RC" -ne 124 ] && grep -q CONFIG_ERROR /tmp/bad-start.err; then
+    note "misconfigured start rejected (rc=$BAD_RC, CONFIG_ERROR on stderr)"
+  else
+    fail "misconfigured start did not fail fast with CONFIG_ERROR (rc=$BAD_RC)"
   fi
-  if "$VENV/python" -m universal_db_mcp version >/dev/null 2>&1; then
-    note "restart/version check passed"
+  # The restart claim needs a SECOND server start with a valid config; the
+  # `version` subcommand is not a server start. Exercise a full initialize
+  # round-trip over stdio against a freshly generated valid config.
+  if "$VENV/python" - "$VENV/python" <<'PYEOF' >/tmp/restart.json 2>/tmp/restart.err; then
+import asyncio
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+
+async def main() -> int:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    venv_python = sys.argv[1]
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "config.yaml"
+        cfg.write_text(
+            f"""
+application:
+  airgapped: true
+  transport: stdio
+  metadata_cache_path: {td}/meta.sqlite
+  audit_path: {td}/audit.jsonl
+  telemetry_enabled: false
+security:
+  read_only: true
+  default_deny_objects: true
+connections:
+  demo_sqlite:
+    type: sqlite
+    database: /tmp/finlink_demo.db
+    read_only: true
+""",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["UDBMCP_CONFIG"] = str(cfg)
+        params = StdioServerParameters(
+            command=venv_python,
+            args=["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+            env=env,
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                init = await session.initialize()
+                return 0 if init.server_info.name == "universal-db-mcp" else 1
+
+
+raise SystemExit(asyncio.run(main()))
+PYEOF
+    note "restart: second server start completed a full initialize round-trip"
     echo "  \"restart\": \"passed\"," >> "$RESULT"
   else
-    fail "restart/version check failed"
+    cp /tmp/restart.err "$EVIDENCE/restart-stderr.txt" 2>/dev/null || true
+    fail "restart: second server start failed (see /tmp/restart.err)"
     echo "  \"restart\": \"failed\"," >> "$RESULT"
   fi
 fi

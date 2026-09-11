@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Shared OS-package (dpkg) installer for the offline bundle scripts.
+# Sourced by install_offline.sh and upgrade_offline.sh; provides:
+#
+#   udbmcp_install_os_packages <bundle-dir> <python-bin> [sudo-prefix]
+#
+# dpkg ONLY — apt is never invoked, so nothing here can reach a network or a
+# vendor repository. Idempotent and VERSION-AWARE:
+#   - a package already installed at exactly the bundled version is skipped;
+#   - an older installed version is upgraded by dpkg -i;
+#   - a NEWER installed version is left untouched (never silently downgraded);
+#   - any other dpkg state (removed-but-not-purged "config-files",
+#     half-installed, unpacked, half-configured, ...) triggers a (re)install,
+#     because `dpkg -s` returns success for every one of those states.
+# After every dpkg -i the resulting state is re-queried and must be exactly
+# "installed", or the whole operation fails loudly.
+
+# shellcheck shell=bash
+
+udbmcp_install_os_packages() {
+  local bundle="$1" py="$2" sudo_ok="${3:-}"
+  local ospkg_dir="$bundle/os-packages"
+
+  if [ -n "$sudo_ok" ]; then
+    _udbmcp_rootrun() { "$sudo_ok" "$@"; }
+  else
+    _udbmcp_rootrun() { "$@"; }
+  fi
+
+  # The bundle may be a root-only staging copy (verify-then-use hardening in
+  # the callers), so probe for .debs in the consuming (privileged) context.
+  # `ls` of a directory prints bare entry names, which keeps the fallback
+  # ordering below and the manifest `file` values comparable.
+  if ! _udbmcp_rootrun ls -1 "$ospkg_dir" 2>/dev/null | grep -q '\.deb$'; then
+    echo "==> no OS packages in bundle os-packages/ (skipping dpkg step)"
+    return 0
+  fi
+
+  echo "==> installing OS packages from bundle os-packages/ (dpkg only, no apt, no network)"
+  command -v dpkg >/dev/null 2>&1 || {
+    echo "FAIL: dpkg not available; cannot install bundle OS packages" >&2
+    return 1
+  }
+  # Privileged execution must actually work before the first package mutation;
+  # a path-derived privilege decision used to be silently skipped here.
+  _udbmcp_rootrun true 2>/dev/null || {
+    echo "FAIL: privileged execution unavailable (run as root, or ensure sudo works);" >&2
+    echo "      installing OS packages always requires root." >&2
+    return 1
+  }
+
+  # Install in the manifest-declared dependency order (unixodbc stack before
+  # msodbcsql18, whose postinst runs `odbcinst`). The manifest read runs in the
+  # consuming context for the same staging reason as above.
+  local order
+  order="$(_udbmcp_rootrun "$py" - "$bundle/manifest.json" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        m = json.load(fh)
+except FileNotFoundError:
+    sys.exit(0)
+for entry in (m.get("os_packages") or {}).get("packages", []):
+    print(entry["file"])
+PYEOF
+)"
+  if [ -z "$order" ]; then
+    # Bundles without a manifest os_packages section: fall back to the
+    # documented order for the Microsoft ODBC / unixODBC closure.
+    order="$(_udbmcp_rootrun ls -1 "$ospkg_dir" 2>/dev/null \
+      | awk '/\.deb$/ {
+          if (/msodbcsql18/) print "9 " $0
+          else if (/unixodbc-/) print "4 " $0
+          else if (/libodbc/) print "5 " $0
+          else if (/libkeyutils1|libkrb5support0|libk5crypto3|libkrb5-3|libltdl7/) print "0 " $0
+          else print "3 " $0
+        }' \
+      | sort -k1,1 -k2 | cut -d' ' -f2-)"
+  fi
+
+  local debfile deb pkg bver inst state iver
+  while IFS= read -r debfile; do
+    [ -n "$debfile" ] || continue
+    deb="$ospkg_dir/$debfile"
+    _udbmcp_rootrun test -f "$deb" || {
+      echo "FAIL: manifest-listed OS package missing from bundle: $debfile" >&2
+      return 1
+    }
+    pkg="$(_udbmcp_rootrun dpkg-deb -f "$deb" Package)"
+    bver="$(_udbmcp_rootrun dpkg-deb -f "$deb" Version)"
+    # ${db:Status-Status} is the single word dpkg -s hides: "installed" only
+    # for genuinely configured packages, "config-files"/"half-installed"/
+    # "unpacked"/... otherwise. Unknown to dpkg -> empty.
+    inst="$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$pkg" 2>/dev/null || true)"
+    state="${inst%% *}"
+    iver="${inst#* }"
+    if [ -z "$inst" ]; then
+      echo "    not present in the dpkg database, installing: $pkg $bver"
+    elif [ "$state" = "installed" ] && [ "$iver" = "$bver" ]; then
+      echo "    already installed at required version, skipping: $pkg $iver"
+      continue
+    elif [ "$state" = "installed" ] && dpkg --compare-versions "$iver" gt "$bver"; then
+      echo "    WARNING: installed $pkg $iver is NEWER than bundled $bver; leaving untouched (no downgrade)" >&2
+      continue
+    elif [ "$state" = "installed" ]; then
+      echo "    upgrading $pkg: $iver -> $bver"
+    else
+      echo "    dpkg state is '${state:-unknown}', not 'installed'; (re)installing: $pkg $bver"
+    fi
+    echo "    dpkg -i: $debfile"
+    # dpkg alone never touches the network; a missing dependency aborts with
+    # dpkg's own dependency error instead of being silently resolved by apt.
+    # The assignments must reach dpkg itself: prefixed onto `sudo` they land in
+    # sudo's own environment, which env_reset strips before exec'ing dpkg, so
+    # msodbcsql18's postinst would never see ACCEPT_EULA and would abort.
+    # `sudo env VAR=... dpkg ...` (and plain `env` when root) sets them in the
+    # child environment dpkg actually runs in.
+    _udbmcp_rootrun env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive dpkg -i "$deb" || {
+      echo "FAIL: dpkg -i $debfile failed." >&2
+      echo "      The bundle ships the full dependency closure in $ospkg_dir;" >&2
+      echo "      check the ordering/manifest (os_packages.install_order)." >&2
+      echo "      Missing base-OS libraries (e.g. libltdl7) must be provided" >&2
+      echo "      by the administrator; apt is never used here." >&2
+      return 1
+    }
+    # Fail loudly if dpkg left the package in any non-installed state (a
+    # failed postinst leaves "half-configured" while dpkg -i still "succeeds"
+    # from dpkg's point of view for that invocation).
+    state="$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)"
+    if [ "$state" != "installed" ]; then
+      echo "FAIL: $pkg is in dpkg state '${state:-unknown}' after dpkg -i (expected 'installed')." >&2
+      return 1
+    fi
+  done < <(printf '%s\n' "$order")
+
+  # The msodbcsql18 postinst registers the driver via odbcinst; verify and
+  # register manually from the shipped odbcinst.ini if that did not happen.
+  if command -v odbcinst >/dev/null 2>&1; then
+    if odbcinst -q -d -n "ODBC Driver 18 for SQL Server" >/dev/null 2>&1; then
+      echo "    ODBC driver registered: ODBC Driver 18 for SQL Server"
+    elif _udbmcp_rootrun test -f /opt/microsoft/msodbcsql18/etc/odbcinst.ini; then
+      echo "    registering ODBC driver from the shipped odbcinst.ini"
+      _udbmcp_rootrun odbcinst -i -d -f /opt/microsoft/msodbcsql18/etc/odbcinst.ini
+    fi
+  fi
+  return 0
+}

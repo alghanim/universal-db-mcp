@@ -28,7 +28,7 @@ from universal_db_mcp.connectors.base import (
     TableSummary,
     ViewInfo,
 )
-from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module
+from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module, translated_driver_errors
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
@@ -179,10 +179,11 @@ class OracleConnector(DatabaseConnector):
             sql += " WHERE username LIKE :1"
             params.append(f"%{search}%")
         sql += " ORDER BY username"
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return [r[0] for r in cur.fetchall()]
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return [r[0] for r in cur.fetchall()]
 
     def list_tables(self, schema: str | None, kinds: set[str], search: str | None) -> list[TableSummary]:
         params: list[Any] = []
@@ -208,10 +209,11 @@ class OracleConnector(DatabaseConnector):
         if not arms:
             return []
         sql = " UNION ALL ".join(arms) + " ORDER BY 1, 2"
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
         return [TableSummary(schema=r[0], name=r[1], kind=r[2].lower()) for r in rows]
 
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
@@ -219,10 +221,11 @@ class OracleConnector(DatabaseConnector):
             "SELECT column_name, data_type, nullable, data_default, column_id "
             "FROM all_tab_columns WHERE owner = :1 AND table_name = :2 ORDER BY column_id"
         )
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, [schema, table])
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, [schema, table])
+                rows = cur.fetchall()
         return [
             ColumnInfo(
                 schema=schema,
@@ -243,10 +246,11 @@ class OracleConnector(DatabaseConnector):
             sql += " WHERE owner = :1"
             params.append(schema)
         sql += " ORDER BY 1, 2"
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
         return [ViewInfo(schema=r[0], name=r[1], kind="view", definition_state="unavailable") for r in rows]
 
     def list_synonyms(self, schema: str | None) -> list[SynonymInfo]:
@@ -255,10 +259,11 @@ class OracleConnector(DatabaseConnector):
         if schema:
             sql += " WHERE owner = :1"
             params.append(schema)
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
         return [
             SynonymInfo(
                 schema=r[0],
@@ -276,10 +281,11 @@ class OracleConnector(DatabaseConnector):
         if schema:
             sql += " AND owner = :1"
             params.append(schema)
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2].lower()) for r in rows]
 
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
@@ -296,10 +302,11 @@ class OracleConnector(DatabaseConnector):
         if table:
             sql += " AND a.table_name = :2"
             params.append(table)
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
         return [
             KeyInfo(
                 kind="foreign_key",
@@ -315,10 +322,11 @@ class OracleConnector(DatabaseConnector):
 
     def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:
         sql = "SELECT num_rows, last_analyzed FROM all_tables WHERE owner = :1 AND table_name = :2"
-        conn = self._shared_meta_conn()
-        with conn.cursor() as cur:
-            cur.execute(sql, [schema, table])
-            row = cur.fetchone()
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, [schema, table])
+                row = cur.fetchone()
         if not row:
             return {"schema": schema, "table": table, "row_estimate": None, "row_estimate_source": "unavailable"}
         return {
@@ -334,51 +342,52 @@ class OracleConnector(DatabaseConnector):
             return self._execute(spec)
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
-        conn = self._connect()
-        self._cancel_target = conn
-        start = time.monotonic()
-        truncated = False
-        truncation_cause = "row limit"
-        rows: list[list[Any]] = []
-        approx_bytes = 0
-        import json
+        with translated_driver_errors():
+            conn = self._connect()
+            self._cancel_target = conn
+            start = time.monotonic()
+            truncated = False
+            truncation_cause = "row limit"
+            rows: list[list[Any]] = []
+            approx_bytes = 0
+            import json
 
-        try:
-            with conn.cursor() as cur:
-                cur.execute(spec.sql, spec.parameters or None)
-                cols = [(d[0], "unknown") for d in cur.description or []]
-                # oracledb description[1] is a Python type object; use its name
-                # (driver-derived, not data-derived).
-                col_labels = [
-                    getattr(d[1], "__name__", "unknown").lower() if d[1] is not None else "unknown"
-                    for d in (cur.description or [])
-                ]
-                while True:
-                    batch = cur.fetchmany(200)
-                    if not batch:
-                        break
-                    for raw in batch:
-                        vals, _labels, _ = cell_truncated_json(raw, spec.max_cell_bytes)
-                        approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
-                        if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
-                            truncated = True
-                            truncation_cause = "row limit" if len(rows) >= spec.max_rows else "byte limit"
-                            conn.cancel()  # stop server-side work
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(spec.sql, spec.parameters or None)
+                    cols = [(d[0], "unknown") for d in cur.description or []]
+                    # oracledb description[1] is a Python type object; use its name
+                    # (driver-derived, not data-derived).
+                    col_labels = [
+                        getattr(d[1], "__name__", "unknown").lower() if d[1] is not None else "unknown"
+                        for d in (cur.description or [])
+                    ]
+                    while True:
+                        batch = cur.fetchmany(200)
+                        if not batch:
                             break
-                        rows.append(vals)
-                    if truncated:
-                        break
-            return QueryOutcome(
-                columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
-                rows=rows,
-                truncated=truncated,
-                rows_seen=len(rows),
-                elapsed_ms=int((time.monotonic() - start) * 1000),
-                warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
-            )
-        finally:
-            self._cancel_target = None
-            conn.close()
+                        for raw in batch:
+                            vals, _labels, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                            approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
+                            if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
+                                truncated = True
+                                truncation_cause = "row limit" if len(rows) >= spec.max_rows else "byte limit"
+                                conn.cancel()  # stop server-side work
+                                break
+                            rows.append(vals)
+                        if truncated:
+                            break
+                return QueryOutcome(
+                    columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
+                    rows=rows,
+                    truncated=truncated,
+                    rows_seen=len(rows),
+                    elapsed_ms=int((time.monotonic() - start) * 1000),
+                    warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
+                )
+            finally:
+                self._cancel_target = None
+                conn.close()
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
         raise NotImplementedError("Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build")

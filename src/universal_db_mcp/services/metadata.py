@@ -9,6 +9,7 @@ entries because the policy fingerprint is part of the key.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -35,6 +36,16 @@ class MetadataCache:
         assert self._path is not None
         conn = sqlite3.connect(self._path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
+        # 0600: the cache reflects authorization-relevant metadata and must
+        # never be group/world readable, regardless of the process umask.
+        # Applied after connect (main db) and after the WAL pragma (-wal and
+        # -shm sidecars are created lazily), idempotently on every open.
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = Path(str(self._path) + suffix)
+            try:
+                os.chmod(sidecar, 0o600)
+            except OSError:
+                pass  # sidecar may not exist yet; not a cache-consistency error
         return conn
 
     def _init_db(self) -> None:

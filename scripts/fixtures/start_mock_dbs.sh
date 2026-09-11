@@ -88,13 +88,18 @@ done
 # Wait until TESTDB is CONNECTABLE: the catalog entry appears before CREATE
 # DATABASE finishes, so seeding too early fails with SQL1035N.
 i=0
+tries=0
 until docker exec udbmcp-db2-db su - db2inst1 -c 'db2 connect to testdb; db2 disconnect testdb' >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "$i" -ge 5 ]; then
     echo "[db2-db] TESTDB not connectable; creating manually"
     docker exec udbmcp-db2-db su - db2inst1 -c 'db2 create database testdb' >/dev/null 2>&1
     i=0
-    [ "$((++tries))" -ge 3 ] && { echo "[db2-db] giving up on TESTDB"; break; } || true
+    tries=$((tries + 1))
+    if [ "$tries" -ge 3 ]; then
+      echo "[db2-db] giving up on TESTDB"
+      break
+    fi
   fi
   sleep 2
 done

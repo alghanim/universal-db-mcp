@@ -14,12 +14,30 @@ from typing import Any
 # type found in responses, errors, or logs is replaced with "<redacted>".
 SECRET_SENTINEL = "\x00udbmcp-secret\x00"  # noqa: S105 - internal marker, not a credential
 
+# Literal values registered by ``SecretMark`` (and any other secret holder).
+# ``redact_text`` scrubs these verbatim — longest first — so that even when a
+# secret is embedded in free text by a driver or library, it is replaced
+# before anything is logged or echoed. Kept in-process only; never serialized.
+_REGISTERED_SECRETS: list[str] = []
+
+
+def register_secret(value: str) -> None:
+    """Record a literal secret value for scrubbing by :func:`redact_text`."""
+    if value and value not in _REGISTERED_SECRETS:
+        _REGISTERED_SECRETS.append(value)
+
 
 @dataclass(slots=True)
 class SecretMark:
     """Carries a secret through internal calls; never serializes its value."""
 
     value: str
+
+    def __post_init__(self) -> None:
+        # Register the literal so that if the value ever reaches free text
+        # (e.g. a driver auth-failure message embedding the username),
+        # redact_text scrubs it before anything is logged or echoed.
+        register_secret(self.value)
 
     def __repr__(self) -> str:  # pragma: no cover - safety net
         return "'<redacted>'"
@@ -35,10 +53,29 @@ def redact_text(text: str) -> str:
     patterns = [
         (re.compile(r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[=:]\s*\S+"), r"\1=<redacted>"),
         (re.compile(r"(?i)(postgres(?:ql)?|mysql|db2|oracle|mssql|clickhouse)://[^\s]+"), r"\1://<redacted-url>"),
+        # Backstop: usernames embedded by driver auth-failure messages.
+        # keyword=value / keyword: value / keyword "value" forms.
+        (re.compile(r"(?i)\b(user(?:name)?|uid|login)\s*[=:]\s*['\"]?[^'\"\s;@]+"), r"\1=<redacted>"),
+        # keyword + quoted value (PG/MSSQL/MySQL style: for user 'svc_ro').
+        (re.compile(r"(?i)\b((?:for\s+)?user(?:name)?|uid|login)\s+(['\"])[^'\"\s;@]+\2"), r"\1 <redacted>"),
+        # keyword + bare value after the specific "for user" phrasing.
+        (re.compile(r"(?i)\b(for user)\s+[^'\"\s;@]+"), r"\1 <redacted>"),
     ]
     out = text
     for pat, repl in patterns:
         out = pat.sub(repl, out)
+    # Registered SecretMark literals, longest first. Matched as standalone
+    # tokens (no adjacent word characters) so a short or generic secret is
+    # still scrubbed wherever it appears as a value, without shredding
+    # unrelated text that merely contains it as a substring.
+    for secret in sorted(_REGISTERED_SECRETS, key=len, reverse=True):
+        if not secret:
+            continue
+        out = re.sub(
+            r"(?<!\w)" + re.escape(secret) + r"(?!\w)",
+            "<redacted>",
+            out,
+        )
     return out
 
 

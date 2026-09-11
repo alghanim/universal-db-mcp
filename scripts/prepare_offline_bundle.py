@@ -78,6 +78,52 @@ def sh(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
     return res
 
 
+def sign_sha256sums(out: Path, signing_key: str) -> str:
+    """Produce out/SIGNATURE: a detached Ed25519 signature over SHA256SUMS.
+
+    OpenSSL 3.x's `pkeyutl -rawin` cannot read a non-seekable stdin pipe
+    ('unable to determine file size for oneshot operation' — Ed25519 is a
+    one-shot signer and pkeyutl needs a seekable -in), so the data is passed
+    through -in/-out files exactly as scripts/verify_bundle.py does on the
+    verification side. If the host openssl still refuses Ed25519 (e.g.
+    LibreSSL), the python cryptography package signs instead — but the
+    fallback is announced and the implementation that produced SIGNATURE is
+    returned, so release provenance is never implicit.
+
+    Returns the name of the implementation that produced SIGNATURE.
+    """
+    sums_path = out / "SHA256SUMS"
+    sig_path = out / "SIGNATURE"
+    data = sums_path.read_bytes()
+    sig_path.unlink(missing_ok=True)  # never leave a partial artifact behind
+    sig = subprocess.run(
+        ["openssl", "pkeyutl", "-sign", "-inkey", signing_key, "-rawin",
+         "-in", str(sums_path), "-out", str(sig_path)],
+        capture_output=True,
+    )
+    if sig.returncode == 0:
+        print("signed with openssl pkeyutl (Ed25519)")
+        return "openssl"
+    # Loud, explicit fallback: report why the primary path failed so the
+    # release record shows which implementation signed the bundle.
+    err = sig.stderr.decode(errors="replace").strip()[:200]
+    print(f"WARNING: openssl Ed25519 signing failed ({err!r}); "
+          "falling back to the python cryptography package")
+    try:
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+        key = load_pem_private_key(Path(signing_key).read_bytes(), password=None)
+        sig_path.write_bytes(key.sign(data))
+    except ImportError as exc:
+        sig_path.unlink(missing_ok=True)
+        raise SystemExit(
+            f"signing failed: openssl error {err!r} and "
+            f"no cryptography fallback installed ({exc})"
+        )
+    print("signed with python cryptography (host openssl lacks Ed25519 pkeyutl)")
+    return "python-cryptography"
+
+
 def wheel_meta(path: Path) -> tuple[str, str]:
     m = WHEEL_RE.match(path.name)
     if not m:
@@ -268,12 +314,23 @@ def main() -> None:
     )
     trusted = Path(args.out) / "trusted-tools"
     trusted.mkdir(parents=True, exist_ok=True)
+    trusted_lib = trusted / "lib"
+    trusted_lib.mkdir(exist_ok=True)
     for name in ("verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh"):
         shutil.copy2(PROJECT / "scripts" / name, trusted / name)
+    # install_offline.sh / upgrade_offline.sh source lib/os_packages.sh from
+    # the directory they run from; a trusted-tools copy without the helper
+    # makes every install abort after verification ("shared OS-package
+    # helper not found") — shipped 2026-09-11 and caught by Gate A/B.
+    shutil.copy2(PROJECT / "scripts" / "lib" / "os_packages.sh", trusted_lib / "os_packages.sh")
+    trusted_names = (
+        "verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh",
+        "lib/os_packages.sh",
+    )
     (trusted / "SHA256SUMS").write_text(
         "".join(
             f"{hashlib.sha256((trusted / n).read_bytes()).hexdigest()}  {n}\n"
-            for n in ("verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh")
+            for n in trusted_names
         )
     )
     ops = out / "operations"
@@ -365,27 +422,7 @@ def main() -> None:
     (out / "SHA256SUMS").write_text("\n".join(sums) + "\n")
 
     if args.signing_key:
-        data = (out / "SHA256SUMS").read_bytes()
-        sig = subprocess.run(
-            ["openssl", "pkeyutl", "-sign", "-inkey", args.signing_key, "-rawin"],
-            input=data, capture_output=True
-        )
-        if sig.returncode == 0:
-            (out / "SIGNATURE").write_bytes(sig.stdout)
-        else:
-            # Staging hosts with LibreSSL reject Ed25519 pkeyutl -rawin; fall
-            # back to the python cryptography package (same primitive).
-            try:
-                from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-                key = load_pem_private_key(Path(args.signing_key).read_bytes(), password=None)
-                (out / "SIGNATURE").write_bytes(key.sign(data))
-                print("signed with python cryptography (host openssl lacks Ed25519 pkeyutl)")
-            except ImportError as exc:
-                raise SystemExit(
-                    f"signing failed: openssl error {sig.stderr.decode()[:200]!r} and "
-                    f"no cryptography fallback installed ({exc})"
-                )
+        sign_sha256sums(out, args.signing_key)
 
     print(f"\nbundle ready: {out}")
     print(f"wheels: {len(wheelhouse)}  missing connector artifacts: {missing or 'none'}")

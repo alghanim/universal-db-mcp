@@ -5,10 +5,16 @@
 # proxies, index URLs are all overridden). OS packages ship in os-packages/
 # and are installed with dpkg ONLY — apt is never invoked, so nothing here
 # can reach a network or a vendor repository.
+#
+# This is a privileged operation: the service account, the state/log
+# directories, dpkg and the root-owned install tree all require root, so the
+# installer runs as root (directly or via sudo). It never chowns the
+# application tree to the invoking operator.
 set -euo pipefail
 
 BUNDLE="${1:?usage: install_offline.sh <bundle-dir> [target-dir]}"
 TARGET="${2:-/opt/universal-db-mcp}"
+ORIG_BUNDLE="$BUNDLE"  # reported at the end; $BUNDLE is redirected to staging
 
 echo "==> verifying bundle first (authenticity REQUIRED)"
 PUBKEY="${UDBMCP_RELEASE_PUBKEY:-}"
@@ -47,14 +53,83 @@ case "$(cd "$(dirname "$VERIFIER")" && pwd -P)" in
     echo "FAIL: UDBMCP_VERIFIER points inside the bundle; the verifier must come from the trusted channel." >&2
     exit 1 ;;
 esac
-python3 "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY"
+LIB_DIR="$(dirname "$self_path")/lib"
+if [ ! -r "$LIB_DIR/os_packages.sh" ]; then
+  echo "FAIL: shared OS-package helper not found at $LIB_DIR/os_packages.sh;" >&2
+  echo "      install it alongside this script on the trusted channel." >&2
+  exit 1
+fi
+# shellcheck source=lib/os_packages.sh
+source "$LIB_DIR/os_packages.sh"
 
+# How to run the trusted verifier. On the documented channel it is installed
+# with `install -m 644` (a Python file), so it is executed via python3; a
+# non-Python executable verifier (e.g. a compiled helper or /bin/sh script) is
+# exec'd directly. A Python file that happens to carry an exec bit still goes
+# through python3: on some staging hosts (macOS Docker Desktop bind mounts)
+# the directory presents the exec bit but is mounted noexec, so exec'ing the
+# file directly fails with rc=126 'bad interpreter' AFTER [ -x ] succeeded.
+# Either way it comes from the trusted path validated above — never from the
+# bundle. $VEXEC is deliberately unquoted at the call sites (it is either
+# empty, or the single word "python3") so the same expression works under the
+# $sudo_ok prefix.
+VEXEC=""
+if [ -x "$VERIFIER" ]; then
+  case "$(head -n 1 "$VERIFIER" 2>/dev/null)" in
+    *"python"*) VEXEC="python3" ;;
+    *) VEXEC="" ;;
+  esac
+else
+  VEXEC="python3"
+fi
+
+# --- privilege is decided ONCE, from identity, never from a path ------------
+# groupadd/useradd, the service state directories and dpkg all require root
+# regardless of where the venv goes; deriving this from the writability of
+# the target's parent used to skip those steps silently on non-root runs.
+# Decided up front so every privileged step below (including staging and
+# re-verification) shares one decision and an unusable sudo fails loudly
+# before any bundle work starts.
 sudo_ok=""
-if [ ! -w "$(dirname "$TARGET")" ] 2>/dev/null; then sudo_ok="sudo"; fi
+if [ "$(id -u)" -ne 0 ]; then
+  # `command -v` reports a PATH match even when the file is not executable,
+  # so the probe must check executability explicitly — a non-executable sudo
+  # (or none at all) must fail loudly here instead of dying mid-install.
+  sudo_bin="$(command -v sudo 2>/dev/null || true)"
+  if [ -z "$sudo_bin" ] || [ ! -x "$sudo_bin" ]; then
+    echo "FAIL: run as root, or install sudo: the installer needs privileged" >&2
+    echo "      steps (service account, state dirs, dpkg) no matter where the venv goes." >&2
+    exit 1
+  fi
+  sudo_ok="sudo"
+fi
+
+$sudo_ok $VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY"
+
+# --- verify-then-use: consume ONLY a private root-owned staging copy --------
+# Verification hashed the tree once, but the bundle is then read for tens of
+# seconds (pip, dpkg -i, the manifest) in a different — privileged — context.
+# Anyone who can write to the bundle path during that window (bundle unpacked
+# in an operator's $HOME, world-writable removable media) can swap a verified
+# .deb or lock after verification and before use, and `dpkg -i` would run the
+# attacker's maintainer scripts as root. Copy the verified bundle into a
+# root-owned, mode-700 staging directory, re-verify THE COPY in the same
+# privileged context that will consume it, and never touch the original again.
+STAGING_BASE="${UDBMCP_STAGING_DIR:-/var/tmp}"  # mktemp -d always creates the dir mode 700
+$sudo_ok mkdir -p "$STAGING_BASE"
+STAGING="$($sudo_ok mktemp -d "$STAGING_BASE/udbmcp-install.XXXXXX")"
+cleanup_staging() { ${sudo_ok:+sudo }rm -rf -- "$STAGING" 2>/dev/null || true; }
+trap cleanup_staging EXIT
+$sudo_ok chmod 700 "$STAGING"
+echo "==> staging a private copy of the verified bundle (closes the verify-then-use race)"
+$sudo_ok cp -a "$BUNDLE"/. "$STAGING/"
+$sudo_ok $VEXEC "$VERIFIER" --bundle "$STAGING" --pubkey "$PUBKEY"
+BUNDLE="$STAGING"
 
 echo "==> checking platform baseline"
 PY=python3.12
 command -v "$PY" >/dev/null 2>&1 || PY=python3
+PY="$(command -v "$PY")"
 "$PY" -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"'
 "$PY" -c 'import ensurepip, venv' || { echo "FAIL: venv/ensurepip not available"; exit 1; }
 
@@ -67,20 +142,35 @@ fi
 if ! id udbmcp >/dev/null 2>&1; then
   $sudo_ok groupadd -r udbmcp 2>/dev/null || $sudo_ok groupadd udbmcp || true
   $sudo_ok useradd -r -g udbmcp -s /usr/sbin/nologin -M udbmcp 2>/dev/null || $sudo_ok useradd -r -g udbmcp udbmcp || true
+  # fail loudly: the systemd unit runs as udbmcp; a silent skip here used to
+  # surface much later as an unrelated dpkg error or a service that cannot start
+  id udbmcp >/dev/null 2>&1 || {
+    echo "FAIL: could not create the udbmcp service account (groupadd/useradd)." >&2
+    echo "      Create it manually and re-run: the service runs as this user." >&2
+    exit 1
+  }
 fi
-$sudo_ok install -d -o udbmcp -g udbmcp /var/lib/universal-db-mcp /var/log/universal-db-mcp 2>/dev/null || true
+$sudo_ok install -d -o udbmcp -g udbmcp /var/lib/universal-db-mcp /var/log/universal-db-mcp || {
+  echo "FAIL: could not create /var/lib/universal-db-mcp and /var/log/universal-db-mcp" >&2
+  echo "      (the service's state and log directories)." >&2
+  exit 1
+}
 
 echo "==> creating virtual environment at $TARGET/venv"
-$sudo_ok mkdir -p "$TARGET"
-[ -w "$TARGET" ] || $sudo_ok chown "$(id -u):$(id -g)" "$TARGET"
-"$PY" -m venv "$TARGET/venv"
+if [ ! -d "$TARGET" ]; then
+  # root-owned 755: the venv is code that root-run tools and the service
+  # execute; it must never be owned (or writable) by the invoking operator.
+  $sudo_ok install -d -m 755 -o root -g root "$TARGET"
+fi
+$sudo_ok "$PY" -m venv "$TARGET/venv"
 
 echo "==> installing application from bundle wheelhouse (no index, hashed)"
-PIP_CONFIG_FILE=/dev/null \
-PIP_DISABLE_PIP_VERSION_CHECK=1 \
-PIP_NO_INDEX=1 \
-PIP_FIND_LINKS="$BUNDLE/wheelhouse" \
-"$TARGET/venv/bin/python" -m pip --isolated --disable-pip-version-check install \
+$sudo_ok env \
+  PIP_CONFIG_FILE=/dev/null \
+  PIP_DISABLE_PIP_VERSION_CHECK=1 \
+  PIP_NO_INDEX=1 \
+  PIP_FIND_LINKS="$BUNDLE/wheelhouse" \
+  "$TARGET/venv/bin/python" -m pip --isolated --disable-pip-version-check install \
   --no-index \
   --no-cache-dir \
   --find-links="$BUNDLE/wheelhouse" \
@@ -89,76 +179,13 @@ PIP_FIND_LINKS="$BUNDLE/wheelhouse" \
   -r "$BUNDLE/requirements/runtime.lock"
 
 # --- OS packages (ODBC driver closure): dpkg only, no apt, no network -------
-OSPKG_DIR="$BUNDLE/os-packages"
-if compgen -G "$OSPKG_DIR/*.deb" >/dev/null; then
-  echo "==> installing OS packages from bundle os-packages/ (dpkg only, no apt, no network)"
-  command -v dpkg >/dev/null 2>&1 || { echo "FAIL: dpkg not available; cannot install bundle OS packages"; exit 1; }
-  export DEBIAN_FRONTEND=noninteractive
-
-  # Install in the manifest-declared dependency order (unixodbc stack before
-  # msodbcsql18, whose postinst runs `odbcinst`). Anything already installed
-  # is skipped, so re-runs and upgrades are idempotent.
-  order="$("$PY" - "$BUNDLE/manifest.json" <<'PYEOF'
-import json, sys
-with open(sys.argv[1]) as fh:
-    m = json.load(fh)
-for entry in (m.get("os_packages") or {}).get("packages", []):
-    print(entry["file"])
-PYEOF
-)"
-  if [ -z "$order" ]; then
-    # Bundles without a manifest os_packages section: fall back to the
-    # documented order for the Microsoft ODBC / unixODBC closure.
-    order="$(cd "$OSPKG_DIR" && ls -1 *.deb \
-      | awk '/msodbcsql18/{print "9 " $0; next} /unixodbc-/{print "4 " $0; next} /libodbc/{print "5 " $0; next} /libkeyutils1|libkrb5support0|libk5crypto3|libkrb5-3|libltdl7/{print "0 " $0; next} {print "3 " $0}' \
-      | sort -k1,1 -k2 | cut -d' ' -f2-)"
-  fi
-
-  while IFS= read -r debfile; do
-    [ -n "$debfile" ] || continue
-    deb="$OSPKG_DIR/$debfile"
-    [ -f "$deb" ] || { echo "FAIL: manifest-listed OS package missing from bundle: $debfile"; exit 1; }
-    pkg="$(dpkg-deb -f "$deb" Package)"
-    if dpkg -s "$pkg" >/dev/null 2>&1; then
-      echo "    already installed, skipping: $pkg"
-      continue
-    fi
-    echo "    dpkg -i: $debfile"
-    # dpkg alone never touches the network; a missing dependency aborts with
-    # dpkg's own dependency error instead of being silently resolved by apt.
-    # The assignments must reach dpkg itself: prefixed onto `sudo` they land in
-    # sudo's own environment, which env_reset strips before exec'ing dpkg, so
-    # msodbcsql18's postinst would never see ACCEPT_EULA and would abort.
-    # `sudo env VAR=... dpkg ...` (and plain `env` when root) sets them in the
-    # child environment dpkg actually runs in.
-    $sudo_ok env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive dpkg -i "$deb" || {
-      echo "FAIL: dpkg -i $debfile failed." >&2
-      echo "      The bundle ships the full dependency closure in $OSPKG_DIR;" >&2
-      echo "      check the ordering/manifest (os_packages.install_order)." >&2
-      echo "      Missing base-OS libraries (e.g. libltdl7) must be provided" >&2
-      echo "      by the administrator; apt is never used here." >&2
-      exit 1
-    }
-  done < <(printf '%s\n' "$order")
-
-  # The msodbcsql18 postinst registers the driver via odbcinst; verify and
-  # register manually from the shipped odbcinst.ini if that did not happen.
-  if command -v odbcinst >/dev/null 2>&1; then
-    if odbcinst -q -d -n "ODBC Driver 18 for SQL Server" >/dev/null 2>&1; then
-      echo "    ODBC driver registered: ODBC Driver 18 for SQL Server"
-    elif [ -f /opt/microsoft/msodbcsql18/etc/odbcinst.ini ]; then
-      echo "    registering ODBC driver from the shipped odbcinst.ini"
-      $sudo_ok odbcinst -i -d -f /opt/microsoft/msodbcsql18/etc/odbcinst.ini
-    fi
-  fi
-else
-  echo "==> no OS packages in bundle os-packages/ (skipping dpkg step)"
-fi
+# Shared, version-aware and idempotent; see lib/os_packages.sh.
+udbmcp_install_os_packages "$BUNDLE" "$PY" "$sudo_ok"
 
 echo "==> smoke check"
-"$TARGET/venv/bin/python" -m universal_db_mcp version
+$sudo_ok "$TARGET/venv/bin/python" -m universal_db_mcp version
 
 echo "==> installed. Next steps:"
-echo "    1. Copy $BUNDLE/config-templates/config.yaml to /etc/universal-db-mcp/config.yaml and edit."
+echo "    1. Copy $ORIG_BUNDLE/config-templates/config.yaml to /etc/universal-db-mcp/config.yaml and edit."
 echo "    2. Run: $TARGET/venv/bin/python -m universal_db_mcp doctor"
 echo "    3. See docs/offline-deployment.md for systemd/service setup."

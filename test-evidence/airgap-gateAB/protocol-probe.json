@@ -23,7 +23,7 @@
     },
     "write_denied": {
       "passed": true,
-      "detail": ""
+      "detail": "Error executing tool db_query: POLICY_VIOLATION: only read statements are permitted here; this statement parsed as Drop"
     },
     "sample": {
       "passed": true,

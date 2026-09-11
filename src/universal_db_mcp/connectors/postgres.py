@@ -305,26 +305,57 @@ class PostgresConnector(DatabaseConnector):
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2]) for r in rows]
 
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
+        # Query the catalog directly with the schema/table as bound parameters:
+        # the previous regclass::text rendering was search_path-dependent
+        # (unqualified names for search_path schemas made ref_schema collapse
+        # into the table name), ignored the schema argument entirely, and never
+        # populated the FK column lists.
         sql = (
-            "SELECT conname, conrelid::regclass::text, confrelid::regclass::text, "
-            "pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f'"
+            "SELECT con.conname, ns.nspname, cl.relname, rns.nspname, rcl.relname, "
+            "a.attname, ra.attname, k.ord "
+            "FROM pg_constraint con "
+            "JOIN pg_class cl ON cl.oid = con.conrelid "
+            "JOIN pg_namespace ns ON ns.oid = cl.relnamespace "
+            "JOIN pg_class rcl ON rcl.oid = con.confrelid "
+            "JOIN pg_namespace rns ON rns.oid = rcl.relnamespace "
+            "CROSS JOIN LATERAL unnest(con.conkey, con.confkey) "
+            "WITH ORDINALITY AS k(att, ratt, ord) "
+            "JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum = k.att "
+            "JOIN pg_attribute ra ON ra.attrelid = rcl.oid AND ra.attnum = k.ratt "
+            "WHERE con.contype = 'f'"
         )
+        params: list[Any] = []
+        if schema:
+            sql += " AND ns.nspname = %s"
+            params.append(schema)
+        if table:
+            sql += " AND cl.relname = %s"
+            params.append(table)
+        sql += " ORDER BY con.conname, k.ord"
         with self._shared_meta_conn() as conn:
-            rows = conn.execute(sql).fetchall()
+            rows = conn.execute(sql, params).fetchall()
+        # Constraint names are unique per (namespace, table) only, so group by
+        # the full constraint identity.
+        grouped: dict[tuple[str, str, str, str, str], KeyInfo] = {}
         out: list[KeyInfo] = []
-        for name, src, dst, _def in rows:
-            src_tbl = str(src).split(".")[-1].strip('"')
-            if table and src_tbl.lower() != table.lower():
-                continue
-            out.append(
-                KeyInfo(
+        for name, src_schema, src_table, ref_schema, ref_table, col, ref_col, _ord in rows:
+            key = (str(name), str(src_schema), str(src_table), str(ref_schema), str(ref_table))
+            info = grouped.get(key)
+            if info is None:
+                info = KeyInfo(
                     kind="foreign_key",
                     name=name,
                     columns=[],
-                    ref_schema=str(dst).split(".")[0].strip('"'),
-                    ref_table=str(dst).split(".")[-1].strip('"'),
+                    ref_schema=ref_schema,
+                    ref_table=ref_table,
+                    ref_columns=[],
+                    source_schema=src_schema,
+                    source_table=src_table,
                 )
-            )
+                grouped[key] = info
+                out.append(info)
+            info.columns.append(col)
+            info.ref_columns.append(ref_col)
         return out
 
     def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:

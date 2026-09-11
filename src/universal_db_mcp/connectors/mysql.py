@@ -30,7 +30,7 @@ from universal_db_mcp.connectors.base import (
     TableSummary,
     ViewInfo,
 )
-from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module
+from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module, translated_driver_errors
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
@@ -219,9 +219,10 @@ class MySQLConnector(DatabaseConnector):
             sql += " WHERE schema_name LIKE %s"
             params.append(f"%{search}%")
         sql += " ORDER BY 1"
-        with self._shared_meta_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            return [r[0] for r in cur.fetchall()]
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, params or None)
+                return [r[0] for r in cur.fetchall()]
 
     def list_tables(self, schema: str | None, kinds: set[str], search: str | None) -> list[TableSummary]:
         types: list[str] = []
@@ -233,7 +234,10 @@ class MySQLConnector(DatabaseConnector):
             return []
         sql = (
             "SELECT table_schema, table_name, table_type, table_rows "
-            "FROM information_schema.tables WHERE table_type IN (" + ", ".join(["%s"] * len(types)) + ")"
+            "FROM information_schema.tables WHERE table_type IN (" + ", ".join(["%s"] * len(types)) + ") "
+            # System schemas are never permitted data: returning them would
+            # turn them into resolver entries under the default config.
+            "AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys')"
         )
         params: list[Any] = list(types)
         if schema:
@@ -243,9 +247,10 @@ class MySQLConnector(DatabaseConnector):
             sql += " AND table_name LIKE %s"
             params.append(f"%{search}%")
         sql += " ORDER BY 1, 2"
-        with self._shared_meta_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, params or None)
+                rows = cur.fetchall()
         return [
             TableSummary(
                 schema=r[0],
@@ -266,9 +271,10 @@ class MySQLConnector(DatabaseConnector):
             "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
             "ORDER BY ordinal_position"
         )
-        with self._shared_meta_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, (schema, table))
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, (schema, table))
+                rows = cur.fetchall()
         return [
             ColumnInfo(
                 schema=schema,
@@ -283,15 +289,19 @@ class MySQLConnector(DatabaseConnector):
         ]
 
     def list_views(self, schema: str | None) -> list[ViewInfo]:
-        sql = "SELECT table_schema, table_name, view_definition FROM information_schema.views"
+        sql = (
+            "SELECT table_schema, table_name, view_definition FROM information_schema.views "
+            "WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')"
+        )
         params: list[Any] = []
         if schema:
-            sql += " WHERE table_schema = %s"
+            sql += " AND table_schema = %s"
             params.append(schema)
         sql += " ORDER BY 1, 2"
-        with self._shared_meta_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, params or None)
+                rows = cur.fetchall()
         return [
             ViewInfo(schema=r[0], name=r[1], kind="view", definition=r[2], definition_state="available") for r in rows
         ]
@@ -308,9 +318,10 @@ class MySQLConnector(DatabaseConnector):
         if schema:
             sql += " AND routine_schema = %s"
             params.append(schema)
-        with self._shared_meta_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, params or None)
+                rows = cur.fetchall()
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2].lower()) for r in rows]
 
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
@@ -326,9 +337,10 @@ class MySQLConnector(DatabaseConnector):
         if table:
             sql += " AND table_name = %s"
             params.append(table)
-        with self._shared_meta_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            rows = cur.fetchall()
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, params or None)
+                rows = cur.fetchall()
         merged: dict[str, KeyInfo] = {}
         for name, tschema, tname, rname, col, rcol in rows:
             k = merged.get(name)
@@ -354,9 +366,10 @@ class MySQLConnector(DatabaseConnector):
             "SELECT table_rows, data_length, index_length, update_time "
             "FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
         )
-        with self._shared_meta_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, (schema, table))
-            row = cur.fetchone()
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, (schema, table))
+                row = cur.fetchone()
         if not row:
             return {"schema": schema, "table": table, "row_estimate": None, "row_estimate_source": "unavailable"}
         return {
@@ -374,16 +387,21 @@ class MySQLConnector(DatabaseConnector):
             return self._execute(spec)
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
-        conn = self._connect()
-        start = time.monotonic()
-        truncated = False
-        truncation_cause = "row limit"
-        rows: list[list[Any]] = []
-        approx_bytes = 0
-        import json
+        with translated_driver_errors():
+            conn = self._connect()
+            start = time.monotonic()
+            truncated = False
+            truncation_cause = "row limit"
+            rows: list[list[Any]] = []
+            approx_bytes = 0
+            conn_closed = False
+            import json
 
-        try:
-            with conn.cursor() as cur:
+            # Not a context manager: on truncation Cursor.close() MUST NOT run
+            # against a live connection (see below), and the explicit close is
+            # easier to make idempotent.
+            cur = conn.cursor()
+            try:
                 # PyMySQL runs ``query % args`` whenever args is not None — an
                 # empty tuple included — so an unparameterised statement with a
                 # literal '%' (LIKE 'a%') would fail client-side. Pass None
@@ -404,25 +422,43 @@ class MySQLConnector(DatabaseConnector):
                             break
                         rows.append(vals)
                     if truncated:
-                        break  # connection is discarded by the caller on the cancel path
-            return QueryOutcome(
-                columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
-                rows=rows,
-                truncated=truncated,
-                rows_seen=len(rows),
-                elapsed_ms=int((time.monotonic() - start) * 1000),
-                warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
-            )
-        finally:
-            conn.close()
+                        # Sever the cursor from the connection BEFORE closing:
+                        # SSCursor.close() would otherwise drain the entire
+                        # remaining streaming result (there is no way to stop
+                        # the server sending it once the cursor stays bound),
+                        # turning a bounded fetch into a full transfer. Closing
+                        # the connection sends COM_QUIT without draining.
+                        cur.connection = None
+                        conn.close()
+                        conn_closed = True
+                        break
+                return QueryOutcome(
+                    columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
+                    rows=rows,
+                    truncated=truncated,
+                    rows_seen=len(rows),
+                    elapsed_ms=int((time.monotonic() - start) * 1000),
+                    warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
+                )
+            finally:
+                try:
+                    cur.close()  # no-op on the truncation path: cursor severed above
+                except Exception:  # noqa: BLE001, S110
+                    pass
+                if not conn_closed:
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001, S110
+                        pass
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
         if analyze:
             raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("EXPLAIN " + sql)  # noqa: S608 - validated upstream
-                return {"raw": [[str(c) for c in row] for row in cur.fetchall()]}
-        finally:
-            conn.close()
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("EXPLAIN " + sql)  # noqa: S608 - validated upstream
+                    return {"raw": [[str(c) for c in row] for row in cur.fetchall()]}
+            finally:
+                conn.close()

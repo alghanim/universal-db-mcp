@@ -97,9 +97,11 @@ if fixture_up postgres postgres:17 \
                -e UDBMCP_TEST_POSTGRES_PASSWORD=udbmcp_ro_pw)
   else
     echo "postgres: themed seed failed"
+    ENV_ARGS+=(-e UDBMCP_TEST_POSTGRES_BLOCKED="themed seed FAILED; fixture endpoint not exported")
   fi
 else
   echo "postgres: blocked"
+  ENV_ARGS+=(-e UDBMCP_TEST_POSTGRES_BLOCKED="fixture unavailable on this staging host (image pull, start or readiness check failed)")
 fi
 
 # --- MySQL (theme: specialty coffee roastery) ---------------------------------
@@ -114,9 +116,11 @@ if fixture_up mysql mysql:9 \
                -e UDBMCP_TEST_MYSQL_PASSWORD=udbmcp_ro_pw)
   else
     echo "mysql: themed seed failed"
+    ENV_ARGS+=(-e UDBMCP_TEST_MYSQL_BLOCKED="themed seed FAILED; fixture endpoint not exported")
   fi
 else
   echo "mysql: blocked"
+  ENV_ARGS+=(-e UDBMCP_TEST_MYSQL_BLOCKED="fixture unavailable on this staging host (image pull, start or readiness check failed)")
 fi
 
 # --- ClickHouse (theme: telecom call data records) ----------------------------
@@ -131,9 +135,11 @@ if fixture_up clickhouse clickhouse/clickhouse-server:latest \
                -e UDBMCP_TEST_CLICKHOUSE_PASSWORD=udbmcp_ro_pw)
   else
     echo "clickhouse: themed seed failed"
+    ENV_ARGS+=(-e UDBMCP_TEST_CLICKHOUSE_BLOCKED="themed seed FAILED; fixture endpoint not exported")
   fi
 else
   echo "clickhouse: blocked"
+  ENV_ARGS+=(-e UDBMCP_TEST_CLICKHOUSE_BLOCKED="fixture unavailable on this staging host (image pull, start or readiness check failed)")
 fi
 
 # --- heavy engines (opt-in: UDBMCP_TEST_ALLOW_HEAVY=1) ------------------------
@@ -152,9 +158,11 @@ if [ "${UDBMCP_TEST_ALLOW_HEAVY:-0}" = "1" ]; then
                  -e UDBMCP_TEST_ORACLE_PASSWORD=Travel_Pass_1)
     else
       echo "oracle: themed seed FAILED"; tail -5 /tmp/oracle_seed.log
+      ENV_ARGS+=(-e UDBMCP_TEST_ORACLE_BLOCKED="themed seed FAILED; fixture endpoint not exported")
     fi
   else
     echo "oracle: blocked"
+    ENV_ARGS+=(-e UDBMCP_TEST_ORACLE_BLOCKED="fixture unavailable on this staging host (image pull, start or readiness check failed)")
   fi
 
   # SQL Server 2022 (theme: hospital clinical records)
@@ -170,9 +178,11 @@ if [ "${UDBMCP_TEST_ALLOW_HEAVY:-0}" = "1" ]; then
                  -e UDBMCP_TEST_MSSQL_PASSWORD=UdbmcpMssql_2022)
     else
       echo "mssql: themed seed FAILED"
+      ENV_ARGS+=(-e UDBMCP_TEST_MSSQL_BLOCKED="themed seed FAILED; fixture endpoint not exported")
     fi
   else
     echo "mssql: blocked"
+    ENV_ARGS+=(-e UDBMCP_TEST_MSSQL_BLOCKED="fixture unavailable on this staging host (image pull, start or readiness check failed)")
   fi
 
   # Db2 Community LUW (theme: ministry of interior civil registry)
@@ -195,17 +205,24 @@ if [ "${UDBMCP_TEST_ALLOW_HEAVY:-0}" = "1" ]; then
                    -e UDBMCP_TEST_DB2_DB=TESTDB -e UDBMCP_TEST_DB2_USER=db2inst1
                    -e UDBMCP_TEST_DB2_PASSWORD=udbmcp_db2_1)
       else
-        echo "db2: BLOCKED - pinned clidriver security init fails under amd64 emulation on this staging host (server verified: started, seeded, local+TCP auth OK via its own clidriver); re-run on a native x86_64 host"
+        reason="pinned ibm_db 3.2.9 clidriver auth failed (SQL30082N rc17) under amd64 emulation on this staging host; server verified: started, seeded, local+TCP auth OK via its own clidriver; re-run on a native x86_64 host"
+        echo "db2: BLOCKED - $reason"
+        ENV_ARGS+=(-e UDBMCP_TEST_DB2_BLOCKED="$reason")
       fi
     else
       echo "db2: themed seed FAILED"; tail -5 /tmp/db2_seed.log
+      ENV_ARGS+=(-e UDBMCP_TEST_DB2_BLOCKED="themed seed FAILED; fixture endpoint not exported")
     fi
   else
     echo "db2: blocked"
+    ENV_ARGS+=(-e UDBMCP_TEST_DB2_BLOCKED="fixture unavailable on this staging host (image pull, start or readiness check failed)")
   fi
 
 else
   echo "oracle/mssql/db2 fixtures: BLOCKED (heavy images; set UDBMCP_TEST_ALLOW_HEAVY=1 to attempt)"
+  ENV_ARGS+=(-e UDBMCP_TEST_ORACLE_BLOCKED="heavy fixture not attempted (set UDBMCP_TEST_ALLOW_HEAVY=1)"
+             -e UDBMCP_TEST_MSSQL_BLOCKED="heavy fixture not attempted (set UDBMCP_TEST_ALLOW_HEAVY=1)"
+             -e UDBMCP_TEST_DB2_BLOCKED="heavy fixture not attempted (set UDBMCP_TEST_ALLOW_HEAVY=1)")
 fi
 
 # Classify a pytest run from its exit code AND its summary line. pytest exits

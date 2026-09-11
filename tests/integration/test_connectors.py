@@ -65,6 +65,21 @@ def conn_from_env(name: str, **cfg: object) -> ResolvedConnection | None:
 BLOCK_REASON = "fixture endpoint not provided (set UDBMCP_TEST_*_HOST); integration not run"
 
 
+def block_reason(name: str) -> str:
+    """The recorded skip reason must state the TRUE cause of a block.
+
+    The Gate C orchestrator exports UDBMCP_TEST_<NAME>_BLOCKED when it stood
+    the fixture up but could not hand it to the client (e.g. the pinned
+    ibm_db clidriver fails its auth probe under emulation, or the themed
+    seed failed) — in those cases the endpoint env is deliberately withheld
+    and a generic 'endpoint not provided' message would misattribute the
+    block in the evidence log."""
+    blocked = os.environ.get(f"UDBMCP_TEST_{name.upper()}_BLOCKED")
+    if blocked:
+        return f"blocked: {blocked}"
+    return BLOCK_REASON
+
+
 # --------------------------------------------------------------------- postgres
 
 
@@ -72,7 +87,7 @@ BLOCK_REASON = "fixture endpoint not provided (set UDBMCP_TEST_*_HOST); integrat
 def postgres_conn() -> object:
     c = conn_from_env("postgres", port=int(os.environ.get("UDBMCP_TEST_POSTGRES_PORT", "5432")))
     if c is None:
-        pytest.skip(BLOCK_REASON)
+        pytest.skip(block_reason("postgres"))
     return c
 
 
@@ -108,7 +123,7 @@ def test_postgres_db_side_permission_denial(postgres_conn) -> None:  # type: ign
 def mysql_conn() -> object:
     c = conn_from_env("mysql", port=int(os.environ.get("UDBMCP_TEST_MYSQL_PORT", "3306")))
     if c is None:
-        pytest.skip(BLOCK_REASON)
+        pytest.skip(block_reason("mysql"))
     return c
 
 
@@ -128,7 +143,7 @@ def test_mysql_roundtrip(mysql_conn) -> None:  # type: ignore[no-untyped-def]
 def clickhouse_conn() -> object:
     c = conn_from_env("clickhouse", port=int(os.environ.get("UDBMCP_TEST_CLICKHOUSE_PORT", "8123")))
     if c is None:
-        pytest.skip(BLOCK_REASON)
+        pytest.skip(block_reason("clickhouse"))
     return c
 
 
@@ -148,7 +163,7 @@ def test_clickhouse_roundtrip(clickhouse_conn) -> None:  # type: ignore[no-untyp
 def oracle_conn() -> object:
     c = conn_from_env("oracle", port=int(os.environ.get("UDBMCP_TEST_ORACLE_PORT", "1521")))
     if c is None:
-        pytest.skip(BLOCK_REASON)
+        pytest.skip(block_reason("oracle"))
     return c
 
 
@@ -168,7 +183,7 @@ def test_oracle_roundtrip(oracle_conn) -> None:  # type: ignore[no-untyped-def]
 def mssql_conn() -> object:
     c = conn_from_env("mssql", port=int(os.environ.get("UDBMCP_TEST_MSSQL_PORT", "1433")))
     if c is None:
-        pytest.skip(BLOCK_REASON)
+        pytest.skip(block_reason("mssql"))
     return c
 
 
@@ -188,7 +203,7 @@ def test_mssql_roundtrip(mssql_conn) -> None:  # type: ignore[no-untyped-def]
 def db2_conn() -> object:
     c = conn_from_env("db2", port=int(os.environ.get("UDBMCP_TEST_DB2_PORT", "50000")))
     if c is None:
-        pytest.skip(BLOCK_REASON)
+        pytest.skip(block_reason("db2"))
     return c
 
 

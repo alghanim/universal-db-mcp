@@ -26,10 +26,14 @@ ENGINE_TYPES = ("sqlite", "db2", "oracle", "mssql", "postgres", "clickhouse", "m
 
 # Built-in sensitive-column heuristics (name-based masking hints). These are
 # useful heuristics, NOT the security boundary; read-only accounts and grants
-# remain mandatory. Administrators extend/override via security.mask_columns.
+# remain mandatory. Administrators extend via security.mask_columns (the
+# built-in patterns always apply and cannot be removed by configuration).
+# Each token is boundary-anchored to identifier characters ([a-z0-9], with '_'
+# treated as a boundary) so short tokens like 'pan' or 'ssn' do not substring-
+# match ordinary identifiers such as company_name, span_ms or issn.
 DEFAULT_SENSITIVE_PATTERNS = [
-    r"(?i)(password|passwd|pwd|secret|token|api_key|apikey|access_key|private_key)",
-    r"(?i)(ssn|social_security|tax_id|national_id|credit_card|card_number|cvv|pan)",
+    r"(?i)(?<![a-z0-9])(password|passwd|pwd|secret|token|api_?key|access_key|private_key)(?![a-z0-9])",
+    r"(?i)(?<![a-z0-9])(ssn|social_security|tax_id|national_id|credit_card|card_number|cvv|pan)(?![a-z0-9])",
 ]
 
 
@@ -71,6 +75,15 @@ class ApplicationConfig(StrictModel):
             )
         return v
 
+    @model_validator(mode="after")
+    def _http_requires_bearer_token(self) -> ApplicationConfig:
+        if self.transport == "http" and not self.http_bearer_token_file:
+            raise ValueError(
+                "application.transport=http requires application.http_bearer_token_file "
+                "(the bearer token is the only authentication on the HTTP listener)"
+            )
+        return self
+
 
 class TlsConfig(StrictModel):
     enabled: bool = False
@@ -81,7 +94,13 @@ class TlsConfig(StrictModel):
 
     @model_validator(mode="after")
     def _verify_needs_ca(self) -> TlsConfig:
-        if self.enabled and self.verify_server and not self.ca_file:
+        if self.enabled and not self.verify_server:
+            raise ValueError(
+                "tls.verify_server=false is not permitted: certificate verification "
+                "cannot be disabled (supply tls.ca_file pointing at the internal "
+                "CA certificate instead)"
+            )
+        if self.enabled and not self.ca_file:
             raise ValueError(
                 "tls.verify_server=true requires tls.ca_file pointing at the "
                 "internal CA certificate; disabling verification is not permitted"
@@ -91,13 +110,18 @@ class TlsConfig(StrictModel):
 
 # Per-engine option allowlist: unknown keys are rejected, values are typed.
 # Anything else an engine needs must be added here deliberately (spec: strict
-# schema everywhere).
+# schema everywhere). Only options actually consumed by a connector are
+# allowlisted — an accepted-but-ignored option (e.g. a TLS control that is a
+# no-op) would mislead operators into believing a setting is enforced.
 _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
     "sqlite": {},
-    "postgres": {"application_name": str},
-    "mysql": {"ssl_mode": str},
-    "clickhouse": {"compress": bool},
+    "postgres": {},
+    "mysql": {},
+    "clickhouse": {},
     "oracle": {"tns_admin": str, "wallet_location": str, "thick_mode": bool},
+    # MssqlConnector reads options.odbc_driver to select the installed ODBC
+    # driver (and doctor matches the exact name); a wrong name fails closed
+    # at connect time naming the installed drivers.
     "mssql": {"odbc_driver": str},
     "db2": {},
 }
@@ -126,6 +150,8 @@ class ConnectionConfig(StrictModel):
                 raise ValueError(f"connections: host is required for type '{self.type}'")
             if not self.database:
                 raise ValueError(f"connections: database is required for type '{self.type}'")
+        if self.type == "sqlite" and not self.database:
+            raise ValueError("connections: database (file path) is required for type 'sqlite'")
         if self.type == "db2" and self.family not in (None, "luw"):
             raise ValueError(
                 "db2 'family' must be 'luw' in this build; z/OS and Db2 for i "
@@ -138,6 +164,18 @@ class ConnectionConfig(StrictModel):
         for key, value in self.options.items():
             if not isinstance(value, allowed[key]):
                 raise ValueError(f"connections: option '{key}' for type '{self.type}' must be {allowed[key].__name__}")
+        if self.type == "oracle":
+            if self.options.get("thick_mode"):
+                raise ValueError(
+                    "oracle thick_mode is not supported in this build; use Thin "
+                    "mode or run a separately reviewed deployment for the Instant Client"
+                )
+            if self.tls.enabled and not self.options.get("wallet_location"):
+                raise ValueError(
+                    "oracle tls.enabled=true requires options.wallet_location "
+                    "(administrator-supplied, outside distributable artifacts); "
+                    "refusing a plaintext connection"
+                )
         return self
 
 
@@ -159,7 +197,7 @@ class SecurityConfig(StrictModel):
     audit_parameter_values: bool = False
     audit_result_rows: bool = False
     allow_explain_analyze: bool = False
-    mask_columns: list[str] = Field(default_factory=DEFAULT_SENSITIVE_PATTERNS.copy)
+    mask_columns: list[str] = Field(default_factory=list)
     mask_action: Literal["mask", "omit"] = "mask"
 
     @field_validator("mask_columns")
@@ -173,6 +211,28 @@ class SecurityConfig(StrictModel):
             except _re.error as exc:
                 raise ValueError(f"invalid mask_columns regex {pattern!r}: {exc}") from exc
         return v
+
+    @model_validator(mode="after")
+    def _merge_mask_columns(self) -> SecurityConfig:
+        """security.mask_columns EXTENDS the built-in sensitive patterns (the
+        documented 'additional patterns' semantics). Without this merge, any
+        configured value would silently drop the default password/ssn/
+        credit-card heuristics, unmasking those columns with no warning."""
+        import re as _re
+
+        merged: list[str] = []
+        for pattern in (*DEFAULT_SENSITIVE_PATTERNS, *self.mask_columns):
+            if pattern not in merged:
+                merged.append(pattern)
+        for pattern in merged:
+            try:
+                _re.compile(pattern)
+            except _re.error as exc:
+                raise ValueError(f"invalid mask_columns regex {pattern!r}: {exc}") from exc
+        if merged != list(self.mask_columns):
+            # frozen model: bypass __setattr__ to store the merged list
+            object.__setattr__(self, "mask_columns", merged)
+        return self
 
     @field_validator("allow_write_operations")
     @classmethod
@@ -207,20 +267,47 @@ class AppConfig(StrictModel):
 
     @model_validator(mode="after")
     def _state_isolated_from_data_sources(self) -> AppConfig:
-        """Writable audit/cache state must be separate files from queried
-        SQLite data sources (spec §5)."""
-        state_paths = [
-            os.path.abspath(p) for p in (self.application.audit_path, self.application.metadata_cache_path) if p
-        ]
+        """Writable audit/cache state (and secret files) must be separate files
+        from each other and from queried SQLite data sources (spec §5).
+
+        Paths are resolved with os.path.realpath so a symlink that points at a
+        data source (or at another state file) cannot bypass the check the way
+        a plain os.path.abspath comparison could."""
+        state: list[tuple[str, str]] = []
+        if self.application.audit_path:
+            state.append(("application.audit_path", os.path.realpath(self.application.audit_path)))
+        if self.application.metadata_cache_path:
+            state.append(
+                ("application.metadata_cache_path", os.path.realpath(self.application.metadata_cache_path))
+            )
+        if self.application.http_bearer_token_file:
+            state.append(
+                ("application.http_bearer_token_file", os.path.realpath(self.application.http_bearer_token_file))
+            )
+        for name, conn in self.connections.items():
+            if conn.password_file:
+                state.append((f"connections.{name}.password_file", os.path.realpath(conn.password_file)))
+
+        seen: dict[str, str] = {}
+        for label, rp in state:
+            other = seen.get(rp)
+            if other is not None:
+                raise ValueError(
+                    f"application state path '{rp}' is shared by '{other}' and "
+                    f"'{label}': audit, metadata-cache and secret files must "
+                    f"each be a separate file"
+                )
+            seen[rp] = label
+
         for name, conn in self.connections.items():
             if conn.type == "sqlite" and conn.database:
-                dbp = os.path.abspath(conn.database)
-                for sp in state_paths:
+                dbp = os.path.realpath(conn.database)
+                for label, sp in state:
                     if sp == dbp:
                         raise ValueError(
-                            f"application state path '{sp}' must be a separate "
-                            f"file from the queried SQLite data source of "
-                            f"connection '{name}'"
+                            f"application state path '{sp}' ('{label}') must be a "
+                            f"separate file from the queried SQLite data source "
+                            f"of connection '{name}'"
                         )
         return self
 

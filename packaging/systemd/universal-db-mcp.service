@@ -7,6 +7,9 @@ Documentation=file:/opt/universal-db-mcp/docs/offline-deployment.md
 Type=simple
 User=udbmcp
 Group=udbmcp
+# Audit trail and metadata cache contain SQL text / schema metadata: create
+# private (0600) files regardless of per-file modes in the code.
+UMask=0077
 Environment=UDBMCP_CONFIG=/etc/universal-db-mcp/config.yaml
 ExecStart=/opt/universal-db-mcp/venv/bin/python -m universal_db_mcp serve
 Restart=on-failure

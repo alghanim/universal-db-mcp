@@ -12,25 +12,37 @@ Cancellation semantics (truthful, per spec §9):
   the caller is the request actually executing against the connector and
   the cancel hook targets its own query.
 - On timeout the connector's ``cancel_current()`` hook fires in a separate
-  thread. For SQLite this is ``interrupt()`` and the worker finishes promptly.
+  thread under a hard budget; a hook that blocks past the budget is
+  abandoned (treated as "not cancelled"), so the timeout path stays bounded.
 - The worker thread itself cannot be killed; if the engine lacks a cancel
   hook (or the hook does not stop the query), the process cannot reclaim that
   worker immediately and the connection is marked poisoned and discarded.
   This residual limitation is reported in tool output and in the driver
   matrix rather than advertised as hard cancellation.
+
+Concurrency accounting (truthful, per spec §9): a worker thread abandoned
+past its deadline keeps its concurrency token until the thread actually
+finishes — the token is returned to the limiter from the event loop as soon
+as the worker's cleanup runs, so ``security.max_concurrent_queries`` bounds
+live driver executions, not merely awaited requests.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
+import weakref
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
 from universal_db_mcp.connectors.base import DatabaseConnector
 from universal_db_mcp.errors import ToolFailure
 from universal_db_mcp.models.responses import ErrorCategory
+
+if TYPE_CHECKING:
+    from anyio.lowlevel import EventLoopToken
 
 _QUEUE_TIMEOUT_FACTOR = 4.0
 _CANCEL_HOOK_BUDGET = 2.0
@@ -39,7 +51,12 @@ _CANCEL_HOOK_BUDGET = 2.0
 class ExecutionService:
     def __init__(self, max_concurrent: int) -> None:
         self._limiter = anyio.CapacityLimiter(max_concurrent)
-        self._poisoned: set[int] = set()
+        # WeakSet: poisoned connectors that were discarded and freed by the
+        # caller leave the set automatically, so a recycled object address
+        # never poisons a healthy replacement connector.
+        self._poisoned: weakref.WeakSet[DatabaseConnector] = weakref.WeakSet()
+        # Guards the poison set, the per-run lease-release flags and worker
+        # handshakes between the event loop and worker threads.
         self._lock = threading.Lock()
         # One gate per connector (created lazily on the event loop; the
         # get/set below never awaits, so it is atomic with respect to the
@@ -62,9 +79,14 @@ class ExecutionService:
                 "cancelled query and was discarded; reconnect or restart",
             )
         queue_budget = max(timeout_seconds * _QUEUE_TIMEOUT_FACTOR, 10.0)
+        # The worker thread runs under this lease (not under a task identity),
+        # so the token can be returned from wherever the worker's lifetime is
+        # observed — see _run_worker.
+        lease = threading.Event()
+        release_token = anyio.lowlevel.current_token()
         acquired = False
         with anyio.move_on_after(queue_budget):
-            await self._limiter.acquire()
+            await self._limiter.acquire_on_behalf_of(lease)
             acquired = True
         if not acquired:
             raise ToolFailure(
@@ -78,6 +100,7 @@ class ExecutionService:
         # timeout can never cancel an unrelated in-flight query via the
         # connector-global cancel hook.
         async with self._gate_for(connector):
+            released = [False]  # exactly-once flag, guarded by self._lock
             try:
                 if self.is_poisoned(connector):
                     # The connector was poisoned by a previous request's
@@ -96,7 +119,10 @@ class ExecutionService:
                         # the worker thread is still running; the thread
                         # itself cannot be killed and is handled by the
                         # cancel hook + poisoning.
-                        return await anyio.to_thread.run_sync(lambda: fn(connector), abandon_on_cancel=True)
+                        return await anyio.to_thread.run_sync(
+                            lambda: self._run_worker(connector, fn, lease, released, release_token),
+                            abandon_on_cancel=True,
+                        )
                 except TimeoutError as exc:
                     # Drivers raise the builtin TimeoutError for their own
                     # connect/read timeouts (socket.timeout aliases it since
@@ -115,7 +141,19 @@ class ExecutionService:
                 await self._handle_timeout(connector, description)
                 raise AssertionError("unreachable") from None  # _handle_timeout always raises
             finally:
-                self._limiter.release()
+                with self._lock:
+                    # Release only when the worker already finished and has
+                    # not claimed the token itself. A worker that is still
+                    # running keeps the token until its cleanup returns it
+                    # from the event loop (below), so abandoned driver calls
+                    # keep counting against max_concurrent_queries.
+                    if not released[0] and lease.is_set():
+                        released[0] = True
+                        do_release = True
+                    else:
+                        do_release = False
+                if do_release:
+                    self._limiter.release_on_behalf_of(lease)
 
     def _gate_for(self, connector: DatabaseConnector) -> anyio.Lock:
         gate = self._connector_gates.get(id(connector))
@@ -124,19 +162,64 @@ class ExecutionService:
             self._connector_gates[id(connector)] = gate
         return gate
 
+    def _run_worker(
+        self,
+        connector: DatabaseConnector,
+        fn: Callable[[DatabaseConnector], Any],
+        lease: threading.Event,
+        released: list[bool],
+        release_token: EventLoopToken,
+    ) -> Any:
+        """Runs on the worker thread. Marks completion and, when the request
+        already gave up on this thread (deadline fired, request cancelled),
+        returns the concurrency token to the limiter via the event loop."""
+        try:
+            return fn(connector)
+        finally:
+            lease.set()
+            self._release_lease_once(lease, released, release_token)
+
+    def _release_lease_once(
+        self,
+        lease: threading.Event,
+        released: list[bool],
+        release_token: EventLoopToken,
+    ) -> None:
+        """Exactly-once lease release, shared between the request path (event
+        loop) and the worker's cleanup."""
+        with self._lock:
+            if released[0]:
+                return  # the other side already released the lease
+            released[0] = True
+        try:
+            anyio.from_thread.run_sync(self._release_lease, lease, token=release_token)
+        except Exception as exc:  # noqa: BLE001 - best effort: loop may be gone
+            print(
+                f"universal-db-mcp: abandoned worker token release failed: {exc}",
+                file=sys.stderr,
+            )
+
+    def _release_lease(self, lease: threading.Event) -> None:
+        """Runs on the event loop (scheduled from a worker thread)."""
+        self._limiter.release_on_behalf_of(lease)
+
     async def _handle_timeout(self, connector: DatabaseConnector, description: str) -> None:
         cancelled = False
         cancel_fn = getattr(connector, "cancel_current", None)
         if callable(cancel_fn):
             try:
                 with anyio.move_on_after(_CANCEL_HOOK_BUDGET):
-                    cancelled = bool(await anyio.to_thread.run_sync(cancel_fn))
+                    # abandon_on_cancel=True so the budget actually bounds the
+                    # wait: a blocking cancel hook (libpq PQcancel, a network
+                    # round-trip) is left running in its thread and the
+                    # budget expiry is treated as "not cancelled".
+                    cancelled = bool(await anyio.to_thread.run_sync(cancel_fn, abandon_on_cancel=True))
             except Exception:  # noqa: BLE001 - cancel is best effort
                 cancelled = False
         # The worker thread cannot be killed. Mark the connection poisoned so
         # it is never reused with uncertain cancellation/transaction state.
         with self._lock:
-            self._poisoned.add(id(connector))
+            self._poisoned.add(connector)
         if cancelled:
             raise ToolFailure(
                 ErrorCategory.TIMEOUT,
@@ -153,4 +236,4 @@ class ExecutionService:
         )
 
     def is_poisoned(self, connector: DatabaseConnector) -> bool:
-        return id(connector) in self._poisoned
+        return connector in self._poisoned

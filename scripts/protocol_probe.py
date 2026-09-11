@@ -13,6 +13,41 @@ import tempfile
 from pathlib import Path
 
 
+def _tool_text(res: object) -> str:
+    """Concatenated text content of a tool result. Error categories such as
+    POLICY_VIOLATION / CONNECTION_ERROR are surfaced as text content, not in
+    structured_content, so denial checks must read here."""
+    return " ".join(
+        c.text  # type: ignore[attr-defined]
+        for c in (getattr(res, "content", None) or [])
+        if getattr(c, "type", "") == "text"
+    )
+
+
+def _denial_is_policy_violation(res: object) -> bool:
+    """A write denial only proves Gate B when the server rejected it as a
+    POLICY_VIOLATION. Any other error (connection failure, INTERNAL_ERROR
+    from a crashed guard, a driver-level OperationalError) must fail the
+    probe: it shows the write was not denied by policy."""
+    return bool(getattr(res, "is_error", False)) and "POLICY_VIOLATION" in _tool_text(res)
+
+
+def _query_rows(res: object) -> list | None:
+    """Rows from a successful db_query result, or None when the result
+    carries no structured content. Returning None (instead of being
+    unreachable) lets the probe record the absence instead of silently
+    skipping the check."""
+    if getattr(res, "is_error", False):
+        return None
+    sc = getattr(res, "structured_content", None)
+    if not sc:
+        return None
+    try:
+        return sc["data"]["rows"]
+    except (KeyError, TypeError, IndexError):
+        return None
+
+
 async def main() -> int:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -73,15 +108,18 @@ connections:
                     {"connection_id": "demo_sqlite", "sql": "SELECT COUNT(*) FROM customers"},
                 )
                 record("query", not res.is_error)
-                if not res.is_error and res.structured_content:
-                    rows = res.structured_content["data"]["rows"]
+                rows = _query_rows(res)
+                if rows is None:
+                    record("query_result_content", False, "no structured_content")
+                else:
                     record("query_result_content", bool(rows), json.dumps(rows))
 
                 res = await session.call_tool(
                     "db_query",
                     {"connection_id": "demo_sqlite", "sql": "DROP TABLE customers"},
                 )
-                record("write_denied", res.is_error)
+                text = _tool_text(res)
+                record("write_denied", _denial_is_policy_violation(res), text[:200])
 
                 res = await session.call_tool(
                     "db_sample_table",

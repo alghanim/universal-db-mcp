@@ -9,8 +9,8 @@
 #
 # Scope:
 #   * --container mode (default): automates the recipe inside a running Db2
-#     container (GSKit ICU shim, keydb + self-signed cert, DBM cfg, instance
-#     restart, certificate extraction, YAML block).
+#     container (GSKit probe + optional ICU shim, keydb + self-signed cert,
+#     DBM cfg, instance restart, certificate extraction, YAML block).
 #   * --host mode: for a native LUW instance the script only PRINTS the exact
 #     commands for the administrator to run on that host; it never opens a
 #     network connection (air-gapped discipline).
@@ -25,8 +25,9 @@
 #     --container db2fixture \
 #     --password '<keydb-password>' \
 #     --ssl-port 50001 \
-#     --icu-source-dir /path/to/icu70-libs \
 #     --cert-out /etc/universal-db-mcp/certs/db2-server.crt \
+#     [--icu-source-dir /path/to/icu70-libs]        # only if the GSKit probe
+#                                                   #   fails on an ICU library
 #     [--client-host 127.0.0.1] [--database SAMPLE] \
 #     [--instance-user db2inst1] [--label udbmcp_self]
 #
@@ -110,15 +111,18 @@ if [ -n "$HOST" ]; then
   echo "Run the following ON ${HOST}, as the instance owner (${INSTANCE_USER})"
   echo "(see docs/db2-tls-setup.md, section 'Native LUW instance'):"
   echo
-  echo "  # 1. Stage unsuffixed ICU libraries. These must be staged by the"
-  echo "  #    administrator (copied from any Ubuntu 22.04-based image's"
-  echo "  #    /usr/lib/x86_64-linux-gnu/, e.g. mcr.microsoft.com/mssql/server:2022-latest);"
-  echo "  #    the air-gapped target NEVER downloads anything:"
-  echo "  mkdir -p \$HOME/udbmcp-icu70"
-  echo "  cp /path/to/staged/libicu{data,i18n,io,uc}.so.70.1 \$HOME/udbmcp-icu70/"
-  echo "  for f in libicudata libicui18n libicuio libicuuc; do"
-  echo "    ln -sf \$HOME/udbmcp-icu70/\${f}.so.70.1 \$HOME/udbmcp-icu70/\${f}.so.70"
-  echo "  done"
+  echo "  # 1. Probe GSKit with only \$HOME/sqllib/lib64/gskit on LD_LIBRARY_PATH."
+  echo "  #    On Db2 11.5.x (GSKit 8) that alone is sufficient — NO ICU shim."
+  echo "  #    Only if the probe fails on an ICU library (observed on the Db2"
+  echo "  #    12.1 image), stage unsuffixed ICU 70 libraries — copied by the"
+  echo "  #    administrator from any Ubuntu 22.04-based image's"
+  echo "  #    /usr/lib/x86_64-linux-gnu/ (e.g."
+  echo "  #    mcr.microsoft.com/mssql/server:2022-latest); the air-gapped target"
+  echo "  #    NEVER downloads anything:"
+  echo "  export LD_LIBRARY_PATH=\"\$HOME/sqllib/lib64/gskit:\${LD_LIBRARY_PATH:-}\""
+  echo "  \$HOME/sqllib/gskit/bin/gsk8capicmd_64 -keydb -create -db \$HOME/.udbmcp-gskit-probe.kdb -pw '<keydb-password>' -stash \\"
+  echo "    && rm -f \$HOME/.udbmcp-gskit-probe.kdb \$HOME/.udbmcp-gskit-probe.sth \\"
+  echo "    || echo \"probe failed: if the error names libicu*.so.70, stage \$HOME/udbmcp-icu70 (libicu{data,i18n,io,uc}.so.70.1 + .so.70 symlinks) and put it FIRST on LD_LIBRARY_PATH — see docs/db2-tls-setup.md\""
   echo
   echo "  # 2. Key database + self-signed cert. Try '-cert -create' first; older"
   echo "  #    GSKit 8 builds that reject it use the legacy '-cert -selfsign' verb"
@@ -142,7 +146,7 @@ if [ -n "$HOST" ]; then
   echo "Client YAML block to paste into the udbmcp config (adjust names/secrets):"
   cat <<EOF
 
-databases:
+connections:
   ${DATABASE_LC}_db2:
     type: db2
     family: luw
@@ -155,7 +159,7 @@ databases:
       enabled: true
       verify_server: true
       ca_file: /etc/universal-db-mcp/certs/db2-server.crt   # = extracted ${CRT_NAME}
-    allowed_schemas: []
+    allowed_schemas: [UDBMCP_RO]               # read-only account's schema — empty list = NO schema restriction
     read_only: true
 EOF
   exit 0
@@ -169,11 +173,17 @@ docker inspect -f '{{.State.Running}}' "$CONTAINER" >/dev/null 2>&1 \
 
 if [ "$VERIFY_ONLY" -eq 0 ]; then
   [ -n "$PASSWORD" ] || die "--password (key database password) is required outside --verify-only"
-  [ -d "$ICU_SOURCE_DIR" ] || die "--icu-source-dir '$ICU_SOURCE_DIR' is not a directory"
-  for lib in libicudata.so.70.1 libicui18n.so.70.1 libicuio.so.70.1 libicuuc.so.70.1; do
-    [ -f "$ICU_SOURCE_DIR/$lib" ] \
-      || die "missing $lib in --icu-source-dir (stage unsuffixed ICU 70 libs from any Ubuntu 22.04-based image first — the target never downloads anything)"
-  done
+  # --icu-source-dir is OPTIONAL: it is only required when the GSKit probe
+  # below fails on an ICU library (observed on the Db2 12.1 image; the Db2
+  # 11.5.9 fixture's GSKit 8 works without any shim). If the administrator
+  # supplies it explicitly, validate it up front.
+  if [ -n "$ICU_SOURCE_DIR" ]; then
+    [ -d "$ICU_SOURCE_DIR" ] || die "--icu-source-dir '$ICU_SOURCE_DIR' is not a directory"
+    for lib in libicudata.so.70.1 libicui18n.so.70.1 libicuio.so.70.1 libicuuc.so.70.1; do
+      [ -f "$ICU_SOURCE_DIR/$lib" ] \
+        || die "missing $lib in --icu-source-dir (stage unsuffixed ICU 70 libs from any Ubuntu 22.04-based image first — the target never downloads anything)"
+    done
+  fi
   CERT_OUT_DIR="$(dirname "$CERT_OUT")"
   [ -w "$CERT_OUT_DIR" ] || [ -d "$CERT_OUT_DIR" ] || die "--cert-out directory '$CERT_OUT_DIR' does not exist"
 fi
@@ -207,40 +217,86 @@ if [ "$VERIFY_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-# ------------------------------------------------------------ 1. ICU shim
-# GSKit in the Db2 image needs UNSUFFIXED ICU .so names; stage a shim dir with
-# versioned symlinks and put it FIRST on LD_LIBRARY_PATH (ahead of
-# $HOME/sqllib/lib64/gskit) for every GSKit invocation below.
+# ------------------------------------------- 1. GSKit probe / optional ICU shim
+# GSKit normally runs with only $HOME/sqllib/lib64/gskit on LD_LIBRARY_PATH
+# (verified on the Db2 11.5.9 fixture: `keydb -create -stash` and
+# `-cert -create` both succeed without any ICU shim). Some builds — observed
+# on the Db2 12.1 image — additionally probe for UNSUFFIXED ICU 70 .so names
+# and need a shim dir FIRST on LD_LIBRARY_PATH. Probe GSKit as-is first and
+# only require/stage the shim when that probe fails on an ICU library.
 ICU_SHIM="udbmcp-icu70"
-info "Staging ICU shim in container at \$HOME/${ICU_SHIM}"
-# docker cp does NOT create missing destination directories, so the shim dir
-# must exist (and belong to the instance owner) before the first copy — on a
-# fresh container $HOME/udbmcp-icu70 is absent and the cp would fail.
-docker exec -u root "$CONTAINER" bash -c "
-  set -e
-  mkdir -p '$INSTANCE_HOME/$ICU_SHIM'
-  chown -R '$INSTANCE_USER' '$INSTANCE_HOME/$ICU_SHIM'
-"
-for lib in libicudata.so.70.1 libicui18n.so.70.1 libicuio.so.70.1 libicuuc.so.70.1; do
-  docker cp "$ICU_SOURCE_DIR/$lib" "$CONTAINER:$INSTANCE_HOME/$ICU_SHIM/$lib.tmp.$$" >/dev/null \
-    || die "docker cp of $lib failed"
-done
-docker exec -u root "$CONTAINER" bash -c "
-  set -e
-  chown -R '$INSTANCE_USER' '$INSTANCE_HOME/$ICU_SHIM'
-"
-docker exec -u "$INSTANCE_USER" "$CONTAINER" bash -lc "
-  set -e
-  cd \$HOME/$ICU_SHIM
-  for lib in libicudata libicui18n libicuio libicuuc; do
-    mv -f \$HOME/$ICU_SHIM/\${lib}.so.70.1.tmp.$$ \${lib}.so.70.1
-    ln -sf \${lib}.so.70.1 \${lib}.so.70
+if [ -n "$ICU_SOURCE_DIR" ]; then
+  # Explicit administrator override: this GSKit build is known to need the
+  # shim (e.g. the Db2 12.1 image), so stage it unconditionally.
+  info "ICU shim requested via --icu-source-dir — staging in container at \$HOME/${ICU_SHIM}"
+  # docker cp does NOT create missing destination directories, so the shim dir
+  # must exist (and belong to the instance owner) before the first copy — on a
+  # fresh container $HOME/udbmcp-icu70 is absent and the cp would fail.
+  docker exec -u root "$CONTAINER" bash -c "
+    set -e
+    mkdir -p '$INSTANCE_HOME/$ICU_SHIM'
+    chown -R '$INSTANCE_USER' '$INSTANCE_HOME/$ICU_SHIM'
+  "
+  for lib in libicudata.so.70.1 libicui18n.so.70.1 libicuio.so.70.1 libicuuc.so.70.1; do
+    docker cp "$ICU_SOURCE_DIR/$lib" "$CONTAINER:$INSTANCE_HOME/$ICU_SHIM/$lib.tmp.$$" >/dev/null \
+      || die "docker cp of $lib failed"
   done
-"
-info "ICU shim staged (libicu{data,i18n,io,uc}.so.70 -> .so.70.1)"
-
-# Helper fragment prepended to every GSKit invocation's environment.
-GSK_ENV="export LD_LIBRARY_PATH=\"\$HOME/${ICU_SHIM}:\$HOME/sqllib/lib64/gskit:\${LD_LIBRARY_PATH:-}\""
+  docker exec -u root "$CONTAINER" bash -c "
+    set -e
+    chown -R '$INSTANCE_USER' '$INSTANCE_HOME/$ICU_SHIM'
+  "
+  docker exec -u "$INSTANCE_USER" "$CONTAINER" bash -lc "
+    set -e
+    cd \$HOME/$ICU_SHIM
+    for lib in libicudata libicui18n libicuio libicuuc; do
+      mv -f \$HOME/$ICU_SHIM/\${lib}.so.70.1.tmp.$$ \${lib}.so.70.1
+      ln -sf \${lib}.so.70.1 \${lib}.so.70
+    done
+  "
+  info "ICU shim staged (libicu{data,i18n,io,uc}.so.70 -> .so.70.1)"
+  # Helper fragment prepended to every GSKit invocation's environment.
+  GSK_ENV="export LD_LIBRARY_PATH=\"\$HOME/${ICU_SHIM}:\$HOME/sqllib/lib64/gskit:\${LD_LIBRARY_PATH:-}\""
+else
+  info "Probing GSKit without an ICU shim (only \$HOME/sqllib/lib64/gskit on LD_LIBRARY_PATH)"
+  # Throwaway keydb -create probe: the same operation the run below needs, so
+  # it proves the real invocations will work. The probe files are removed
+  # again regardless of the outcome.
+  PROBE_OUT="$(docker exec -u "$INSTANCE_USER" \
+    -e GSKCMD="$GSKCMD" \
+    "$CONTAINER" bash -c '
+      export LD_LIBRARY_PATH="$HOME/sqllib/lib64/gskit:${LD_LIBRARY_PATH:-}"
+      PROBE_DB="$HOME/.udbmcp-gskit-probe"
+      rm -f "$PROBE_DB.kdb" "$PROBE_DB.sth" "$PROBE_DB.rdb" "$PROBE_DB.crl"
+      "$GSKCMD" -keydb -create -db "$PROBE_DB.kdb" -pw udbmcp-gskit-probe -stash 2>&1
+      rc=$?
+      rm -f "$PROBE_DB.kdb" "$PROBE_DB.sth" "$PROBE_DB.rdb" "$PROBE_DB.crl"
+      exit $rc
+    ')" && PROBE_RC=0 || PROBE_RC=$?
+  if [ "$PROBE_RC" -eq 0 ]; then
+    info "GSKit probe succeeded — no ICU shim needed (staging skipped)"
+    GSK_ENV='export LD_LIBRARY_PATH="$HOME/sqllib/lib64/gskit:${LD_LIBRARY_PATH:-}"'
+  else
+    case "$PROBE_OUT" in
+      *libicu*)
+        die "GSKit probe failed on an ICU library (exit ${PROBE_RC}):
+$PROBE_OUT
+This GSKit build probes for unsuffixed ICU 70 libraries (observed on the Db2
+12.1 image). Re-run with --icu-source-dir pointing at a staged directory
+containing libicu{data,i18n,io,uc}.so.70.1 (with .so.70 symlinks) — the target
+never downloads anything (see docs/db2-tls-setup.md, 'Prerequisites')."
+        ;;
+      '')
+        die "GSKit probe failed (exit ${PROBE_RC}) with no output — refusing to configure TLS on a broken GSKit (see docs/db2-tls-setup.md, 'Troubleshooting')"
+        ;;
+      *)
+        die "GSKit probe failed (exit ${PROBE_RC}); this is NOT an ICU problem:
+$PROBE_OUT
+Check that \$HOME/sqllib/lib64/gskit exists and see the 'Troubleshooting'
+table in docs/db2-tls-setup.md."
+        ;;
+    esac
+  fi
+fi
 
 # ------------------------------------------------- 2. keydb + self-signed cert
 info "Ensuring key database \$HOME/${KEYDB_NAME} and label '${LABEL}' exist"
@@ -286,7 +342,12 @@ CURRENT_SSL_SVCENAME="$(docker exec -u "$INSTANCE_USER" \
   -e SSL_PORT="$SSL_PORT" -e KDB="$KEYDB_NAME" -e STASH="$STASH_NAME" -e LABEL="$LABEL" \
   "$CONTAINER" bash -c '
     source "$HOME/sqllib/db2profile" >/dev/null 2>&1
-    db2 get dbm cfg 2>/dev/null | awk "/SSL SVCENAME/ {print \$NF}" | tr -d "\""
+    # Db2 prints the parameter as
+    # " SSL service name                         (SSL_SVCENAME) = 50001"
+    # — the literal substring "SSL SVCENAME" never occurs, so the previous
+    # awk pattern never matched and every re-run force-restarted the
+    # instance. Match the parenthesised parameter name instead.
+    db2 get dbm cfg 2>/dev/null | awk -F"= *" "/\\(SSL_SVCENAME\\)/ {print \$2}" | tr -d "\""
   ')" || CURRENT_SSL_SVCENAME=""
 
 CFG_CHANGED=0
@@ -347,7 +408,7 @@ echo "schemas, and secret references to your deployment's policy:      "
 echo "----------------------------------------------------------------"
 cat <<EOF
 
-databases:
+connections:
   ${DATABASE_LC}_db2:
     type: db2
     family: luw
@@ -360,7 +421,7 @@ databases:
       enabled: true
       verify_server: true
       ca_file: ${CERT_OUT}
-    allowed_schemas: []
+    allowed_schemas: [UDBMCP_RO]      # read-only account's schema — empty list = NO schema restriction
     read_only: true
 EOF
 

@@ -8,8 +8,15 @@ status), `docs/offline-deployment.md`, `docs/security.md`.
 
 The pinned `ibm_db` 3.2.9 client (with its bundled clidriver) fails **REMOTE**
 password authentication over plaintext TCP against Db2 LUW with
-`SQL30082N  Security processing failed with reason "17" ("PASSWORD EXPIRED" /
-authentication backend rejected the credential)` on every platform tried
+`SQL30082N  Security processing failed with reason "17"`. Per IBM's
+SQL30082N reason-code table, **reason 17 is UNSUPPORTED FUNCTION**: "the
+security mechanism specified by the client is invalid for this server" — the
+server rejected the security mechanism the client proposed (an
+`AUTHENTICATION` / `SRVCON_AUTH` / `SERVER_ENCRYPT` negotiation mismatch).
+It is **not** a credential problem: reason 1 is PASSWORD EXPIRED, so
+resetting the password cannot change this error. First diagnostic when it
+appears: `db2 get dbm cfg | grep -E 'AUTHENTICATION|SRVCON_AUTH|ALTERNATE_AUTH_ENC'`.
+This occurred on every platform tried
 (emulated amd64 container and native arm64 macOS) and against both Db2 12.1
 and 11.5.9 servers, while the server's own loopback TCP authentication works —
 i.e. the server accepts remote TCP logins; the pinned client's DRDA password
@@ -52,9 +59,18 @@ and keep Db2 recorded as `blocked` in the acceptance evidence.
 
 - Administrator shell access to the machine running the Db2 container (or the
   native LUW host itself), with `docker` on PATH for container mode.
-- **Staged unsuffixed ICU 70 libraries** — see the air-gap note below. You
-  need these four files, from any Ubuntu 22.04-based image (e.g.
-  `mcr.microsoft.com/mssql/server:2022-latest`, at
+- **Staged unsuffixed ICU 70 libraries — only if your GSKit build needs
+  them.** The ICU shim exists for GSKit builds that probe for unsuffixed
+  ICU 70 `.so` names; that was observed on the **Db2 12.1** image. On the
+  project's Db2 **11.5.9** fixture (GSKit 8), GSKit runs with only
+  `$HOME/sqllib/lib64/gskit` on `LD_LIBRARY_PATH` and **no ICU shim**:
+  `-keydb -create ... -stash` and `-cert -create` both succeeded without it.
+  The failure you get with no `LD_LIBRARY_PATH` at all is
+  `libgsk8km_64.so: cannot open shared object file`, which is fixed by
+  putting `$HOME/sqllib/lib64/gskit` first on `LD_LIBRARY_PATH` — it is not
+  an ICU problem. If your GSKit *does* hit an ICU load error (see
+  Troubleshooting), stage these four files, from any Ubuntu 22.04-based
+  image (e.g. `mcr.microsoft.com/mssql/server:2022-latest`, at
   `/usr/lib/x86_64-linux-gnu/`):
   - `libicudata.so.70.1`
   - `libicui18n.so.70.1`
@@ -68,12 +84,12 @@ and keep Db2 recorded as `blocked` in the acceptance evidence.
 
 ### Air-gapped staging note (read before starting)
 
-**The air-gapped target never downloads anything.** The ICU `.so` files must
-be staged by the administrator: extract them on an internet-connected machine
-(`docker create` + `docker cp` from the Ubuntu 22.04-based image, or any
-equivalent offline copy), then move them into the air-gapped environment
-alongside the rest of the udbmcp bundle. Same for the udbmcp script itself.
-Nothing in this runbook performs a fetch.
+**The air-gapped target never downloads anything.** If the ICU shim is needed
+(see Prerequisites), the ICU `.so` files must be staged by the administrator:
+extract them on an internet-connected machine (`docker create` + `docker cp`
+from the Ubuntu 22.04-based image, or any equivalent offline copy), then move
+them into the air-gapped environment alongside the rest of the udbmcp bundle.
+Same for the udbmcp script itself. Nothing in this runbook performs a fetch.
 
 ## Step-by-step: containerized fixture
 
@@ -82,9 +98,10 @@ idempotent (safe to re-run; it reuses an existing keydb/cert and only
 restarts the instance when the configuration actually changed):
 
 ```console
-# 1. Stage the ICU shim inside the container and make it FIRST on
-#    LD_LIBRARY_PATH, ahead of $HOME/sqllib/lib64/gskit. GSKit in the Db2
-#    image needs UNSUFFIXED ICU names:
+# 1. ONLY if the GSKit build needs the ICU shim (see Prerequisites: not
+#    needed on the Db2 11.5.9 / GSKit 8 fixture) — stage it inside the
+#    container and make it FIRST on LD_LIBRARY_PATH, ahead of
+#    $HOME/sqllib/lib64/gskit. Those GSKit builds need UNSUFFIXED ICU names:
 mkdir -p staging-icu70 && cp /path/to/staged/libicu*.so.70.1 staging-icu70/
 
 # 2. Run the script:
@@ -103,10 +120,13 @@ config at the end (shown below). If you prefer to run the steps by hand, this
 is what it does (inside the container, as the instance owner, e.g.
 `db2inst1`):
 
-1. **ICU shim** — copy the four `.so.70.1` files into a shim directory
+1. **ICU shim (only when the GSKit build needs it — see Prerequisites)** —
+   copy the four `.so.70.1` files into a shim directory
    (e.g. `$HOME/udbmcp-icu70`), create versioned symlinks
    `libicu{data,i18n,io,uc}.so.70 -> .so.70.1`, and put that directory FIRST
-   on `LD_LIBRARY_PATH`, followed by `$HOME/sqllib/lib64/gskit`:
+   on `LD_LIBRARY_PATH`, followed by `$HOME/sqllib/lib64/gskit`. On the Db2
+   11.5.9 fixture the shim can be skipped entirely; GSKit then runs with just
+   `$HOME/sqllib/lib64/gskit` on `LD_LIBRARY_PATH`:
    ```bash
    export LD_LIBRARY_PATH="$HOME/udbmcp-icu70:$HOME/sqllib/lib64/gskit:$LD_LIBRARY_PATH"
    ```
@@ -161,13 +181,14 @@ The script never reaches over the network (air-gapped discipline): run it in
 scripts/db2-enable-tls.sh --host db2.internal.example --ssl-port 50001 --database SAMPLE
 ```
 
-The command sequence is identical to the container case (ICU shim under
-`$HOME/udbmcp-icu70`, keydb + cert, `db2set -i <instance> DB2COMM=SSL,TCPIP`,
+The command sequence is identical to the container case (ICU shim — only when
+the GSKit build needs it — under `$HOME/udbmcp-icu70`, keydb + cert,
+`db2set -i <instance> DB2COMM=SSL,TCPIP`,
 `db2 update dbm cfg`, `db2stop force && db2start`, listener check with
 `ss -ltn`, `-cert -extract`), with two differences:
 
-- The ICU source is a directory the administrator staged on that host (never
-  downloaded there).
+- If the ICU shim is needed, its source is a directory the administrator
+  staged on that host (never downloaded there).
 - The extracted `server.crt` must be carried off the host to the MCP target
   by the administrator (secure copy of your choice) — that file is the
   client's `ca_file`.
@@ -193,9 +214,17 @@ connections:
       enabled: true
       verify_server: true
       ca_file: /etc/universal-db-mcp/certs/db2-server.crt
-    allowed_schemas: []
+    allowed_schemas: [UDBMCP_RO]   # the read-only account's schema; see the
+                                   # warning below before ever writing []
     read_only: true
 ```
+
+**Warning — `allowed_schemas: []` is NOT deny-all.** The policy treats an
+empty list as "the administrator did not restrict schemas"
+(`EffectivePolicy.schema_allowed` in `src/universal_db_mcp/security/policy.py`),
+so the agent can list and query every schema the Db2 account has access to.
+Always name the schemas you intend to expose (the script-generated block may
+still print `[]`; replace it before pasting).
 
 The connector appends `SECURITY=SSL` and `SSLServerCertificate=<ca_file>` to
 the connection string when `tls.enabled` is true.
@@ -231,7 +260,8 @@ the SQLSTATE / reason code), not silently left as `not_run`.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `gsk8capicmd_64: error while loading shared libraries: libicuuc.so.70: cannot open shared object file` (or any GSKit launch failure) | GSKit needs unsuffixed ICU libs and the shim dir is missing or not first on `LD_LIBRARY_PATH` | Stage `libicu{data,i18n,io,uc}.so.70.1`, symlink `.so.70 -> .so.70.1`, and export `LD_LIBRARY_PATH="$HOME/udbmcp-icu70:$HOME/sqllib/lib64/gskit:$LD_LIBRARY_PATH"` before every GSKit call. With GSKit 9 the binary is `gsk9certutil_64`; prefer `-cert -create` and fall back to the legacy `-cert -selfsign` on older GSKit 8 builds. |
+| `gsk8capicmd_64: error while loading shared libraries: libgsk8km_64.so: cannot open shared object file` (or any other `libgsk8*.so` load failure) | The GSKit directory is not on `LD_LIBRARY_PATH` at all (not an ICU problem) | `export LD_LIBRARY_PATH="$HOME/sqllib/lib64/gskit:$LD_LIBRARY_PATH"` before every GSKit call. On Db2 11.5.x (GSKit 8) this alone is sufficient — no ICU shim needed. |
+| `gsk8capicmd_64: error while loading shared libraries: libicuuc.so.70: cannot open shared object file` (observed on the Db2 12.1 image's GSKit) | That GSKit build probes for unsuffixed ICU 70 libs and the shim dir is missing or not first on `LD_LIBRARY_PATH` | Stage `libicu{data,i18n,io,uc}.so.70.1`, symlink `.so.70 -> .so.70.1`, and export `LD_LIBRARY_PATH="$HOME/udbmcp-icu70:$HOME/sqllib/lib64/gskit:$LD_LIBRARY_PATH"` before every GSKit call. With GSKit 9 the binary is `gsk9certutil_64`; prefer `-cert -create` and fall back to the legacy `-cert -selfsign` on older GSKit 8 builds. |
 | `db2 get dbm cfg` shows `SSL_SVCENAME` empty (or `SSL_SVR_KEYDB` empty) | TLS was never enabled on this instance | Run `scripts/db2-enable-tls.sh` without `--verify-only` (or the manual step 3), then `db2stop force && db2start`. |
 | `SSL_SVCENAME` is set but nothing listens on that port after `db2start` (`ss -ltn` shows no `:50001`; client gets `SQL30081N` / connection refused) | `DB2COMM` does not include `SSL`, so the instance started without the SSL listener — `db2 update dbm cfg` alone never opens it | `db2set -i db2inst1 DB2COMM=SSL,TCPIP`, then `db2stop force && db2start`; confirm with `db2set -i db2inst1 DB2COMM` and `ss -ltn`. If it still does not listen, read `db2diag -l Severe,Error` for GSKit errors. |
 | Client gets `Connection refused` / `SQL30081N` with the SSL listener up | The client port points at the plaintext `SVCENAME` (typically 50000/50002), not the SSL service port | Set the YAML `port:` to the `SSL_SVCENAME` value (e.g. 50001). `SVCENAME` and `SSL_SVCENAME` are separate settings; both can listen simultaneously. |

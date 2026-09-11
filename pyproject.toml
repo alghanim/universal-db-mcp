@@ -27,7 +27,7 @@ dev = [
 pg = ["psycopg[binary]>=3.2,<4"]
 mysql = ["PyMySQL>=1.1,<2"]
 clickhouse = ["clickhouse-connect>=0.8,<2"]
-oracle = ["oracledb>=2.4,<4"]
+oracle = ["oracledb>=4,<5"]
 mssql = ["pyodbc>=5.1,<6"]
 db2 = ["ibm-db>=3.2,<4"]
 

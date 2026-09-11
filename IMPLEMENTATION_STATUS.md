@@ -57,8 +57,13 @@ confirmed findings: 1×P0, 38×P1, 46×P2. Fixes applied across:
 The full confirmed-finding list (severity-ranked) is archived at
 `docs/review-findings-2026-09-08.json`. Most security- and
 correctness-relevant findings are reflected above; the following
-confirmed finding is explicitly **NOT applied** and remains open in the
-code as of this ledger revision:
+confirmed finding was, at the time of the 2026-09-08 revision,
+explicitly **NOT applied** and disclosed as open. **RESOLVED
+2026-09-11**: `TlsConfig` now rejects `verify_server=false` outright at
+config validation (verified: validation error "tls.verify_server=false
+is not permitted"), so unverified TLS can no longer be configured for
+any engine; the §1c P2 fan-out landed this fix and its regression
+coverage. The original disclosure is kept below for the record:
 
 - **Residual P1 (archive indices 15 and 23): `tls.verify_server=false`
   is still accepted for remote engines, yielding unverified TLS.**
@@ -117,24 +122,77 @@ defects:
   round itself: the A-negative `untrusted_signature` case could pass
   vacuously when every signer failed silently (now aborts exit 2), and
   `verify_bundle.py` printed a non-canonical diagnostic on the
-  OpenSSL-3-only rejection path.
+  OpenSSL-3-only rejection path. A third harness defect — the A-negative
+  `results.json` writer emitting malformed JSON — was reproduced from the
+  committed evidence, fixed (json-module assembly), and the gate re-run
+  green with machine-valid output. Two further packaging regressions
+  were caught by re-running the gates against the final bundle and
+  fixed: the bundle builder omitted `lib/os_packages.sh` from
+  `trusted-tools/` (every install aborted after verification), and the
+  installer's exec-if-executable verifier contract broke on noexec bind
+  mounts (rc=126 after `[ -x ]` succeeded) — python-file verifiers now
+  always run via python3.
+- The full 405-agent review completed (2026-09-11): 92 confirmed
+  findings (1×P0, 8×P1, 52×P2, 31×P3), 40 refuted, 9 critic gaps —
+  archived at `docs/review-findings-2026-09-11.json`. Reconciliation:
+  the P0 and five P1 findings it lists were judged against pre-fix
+  cached verdicts; re-running their repros against the current tree
+  DENIES all of them (CTE-shadowed qualified reference, unqualified
+  resolver bypass, cross-catalog reference — all rejected).
+- **P2 tier (2026-09-11, same day): 49 of 52 confirmed P2 findings
+  fixed** by a reproduce-then-fix fan-out (54 reproduction skeptics, 6
+  file-scoped fixer groups) plus a 6-fixer residual wave for the
+  findings no group owned, including 3 critic-verified gaps. Highlights:
+  parenthesized EXPLAIN options now accepted (ANALYZE/WAL still gated);
+  driver auth-failure usernames redacted (registered-secret registry +
+  keyword backstop); audit/metadata-cache files created 0600 with
+  systemd UMask=0077; baseline image digest-pinned and file-based
+  signing everywhere; driver exceptions wrapped as ConnectorError on
+  every engine; MySQL truncation no longer drains the result set;
+  system schemas excluded from MySQL/Db2 catalogs; ClickHouse nullable
+  inversion fixed and query cancellation implemented via KILL QUERY;
+  postgres FK catalog query rewritten with bound schema/table;
+  bearer-token file permission-checked with CONFIG_ERROR on failure;
+  verify_server=false now rejected at config validation (closing the
+  §1b residual P1 — the disclosure above is now historical, kept for
+  the record); mask_columns merges (never replaces) the built-in
+  patterns with boundary-anchored defaults; oracle thick_mode/TLS
+  wallet validation at config time; state-path overlap checked by
+  realpath; installer dpkg idempotency/staging/privilege fixes;
+  upgrade now installs new os-packages; rollback never deletes the
+  live config; Gate B probe requires POLICY_VIOLATION; the [oracle]
+  extra pin now matches the vendored wheel. The 3 remaining P2s
+  (sql_guard.py #0 verdict reconciliation, evidence-freshness claims
+  resolved by the same-day evidence refresh, and the ledger-pointer
+  item fixed in this revision) are recorded in the archive, not
+  dropped. **31 P3 findings and any residual polish items remain
+  recorded in `docs/review-findings-2026-09-11.json` and are
+  intentionally not claimed as applied.**
 - Gates re-run green 2026-09-11 against the rebuilt, re-signed bundle:
   bundle verification PASSED (91 artifacts, 42 wheels, 11 OS packages),
   Gate A+B PASSED (offline install + no-network protocol probe +
-  restart), Gate A-negative 6/6, Gate C 11 passed / 0 failed / 2
-  skipped with the heavy engines (Oracle, MSSQL) exercised live.
+  restart), Gate A-negative 6/6 with valid machine-readable evidence,
+  Gate C 11 passed / 0 failed / 2 skipped with the heavy engines
+  (Oracle, MSSQL) exercised live.
 
 ## 2. Implemented, NOT verified (code-complete, honest capability state)
 
 - **Oracle connector** (python-oracledb Thin only): full module, catalog
-  queries, cancel hook; every live capability reported `unverified`. No
-  Oracle instance was available. Thick mode deliberately not implemented.
+  queries, cancel hook. Gate C round-trips (health, SELECT, themed
+  travellers data) **passed** against the live Oracle fixture
+  (2026-09-11); the remaining capability surface (catalog batteries,
+  explain, remote cancel) is `unverified`. Thick mode deliberately not
+  implemented.
 - **SQL Server connector** (pyodbc + admin-supplied ODBC Driver 18):
-  full module incl. driver-presence detection; capabilities `unverified`.
+  full module incl. driver-presence detection. Gate C round-trips
+  **passed** against the live HospitalDB fixture (2026-09-11); the
+  remaining capability surface is `unverified`.
 - **IBM Db2 LUW connector** (ibm_db wheel with bundled clidriver):
-  full module; capabilities `unverified`. Import was not exercised on a
-  target (an import alone is not a connectivity test). z/OS and Db2 for i
-  are NOT implemented (config rejects them).
+  full module; live client round-trip `blocked` on this staging host
+  (pinned clidriver cannot authenticate under amd64 emulation; the
+  fixture server itself starts, seeds and TCP-authenticates via its own
+  clidriver). z/OS and Db2 for i are NOT implemented (config rejects
+  them).
 - **Additional metadata paths for pg/mysql/clickhouse** (tables/columns/
   views/routines/FKs/statistics/inference): implemented per documented
   catalog SQL; only the round-trip subset listed in Gate C was exercised.
@@ -198,6 +256,7 @@ bash scripts/test_isolated_integrations.sh  # Gate C (pulls fixtures on staging)
 ```
 
 A release is air-gap ready for the profile `linux-x86_64-ubuntu24.04-cp312`
-with connector set {sqlite, postgres, mysql, clickhouse} per the evidence
-above. Oracle/MSSQL/Db2 remain code-complete-but-unverified until their
-gates run against real instances.
+with connector set {sqlite, postgres, mysql, clickhouse, oracle, mssql} per
+the evidence above (Gate C round-trips passed for all six). The Db2
+connector is code-complete with its live client round-trip `blocked` on
+this staging host (see §3).

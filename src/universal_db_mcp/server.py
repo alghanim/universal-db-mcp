@@ -10,6 +10,8 @@ Stdout is protocol-only (stdio transport); application logs go to stderr.
 from __future__ import annotations
 
 import getpass
+import sqlite3
+import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -122,9 +124,20 @@ class AppContext:
         raise ValueError("internal: guards require a prefetched object set")
 
     async def tables_for(self, policy: EffectivePolicy, connector: DatabaseConnector) -> list[Any]:
-        """Permitted table/view summaries, cached and policy-scoped."""
+        """Permitted table/view summaries, cached and policy-scoped.
+
+        Cache I/O runs off the event loop (a busy/locked SQLite cache file
+        must not freeze every session), and any cache failure is a miss,
+        never a failed tool call."""
         fp = policy_fingerprint(policy)
-        cached = self.cache.get_tables(policy.connection_id, fp)
+        try:
+            cached = await anyio.to_thread.run_sync(self.cache.get_tables, policy.connection_id, fp)
+        except sqlite3.Error as exc:
+            print(
+                f"universal-db-mcp: metadata cache read failed (treated as a miss): {exc}",
+                file=sys.stderr,
+            )
+            cached = None
         if cached is not None:
             return list(cached)
         kinds = {"table", "view", "materialized_view"}
@@ -136,7 +149,13 @@ class AppContext:
             tables = [
                 t for t in tables if policy.schema_allowed(t.schema) or policy.system_schema_allowed(t.schema)
             ]
-        self.cache.put_tables(policy.connection_id, fp, tables)
+        try:
+            await anyio.to_thread.run_sync(self.cache.put_tables, policy.connection_id, fp, tables)
+        except sqlite3.Error as exc:
+            print(
+                f"universal-db-mcp: metadata cache write failed (entry skipped): {exc}",
+                file=sys.stderr,
+            )
         return list(tables)
 
     def record_history(self, record: dict[str, Any]) -> None:
@@ -233,7 +252,10 @@ async def tool_span(
             **redact_value(record),
         }
         if sql is not None and app.cfg.security.audit_sql_text:
-            audit_record["sql_text"] = sql  # only when explicitly enabled
+            # Even when raw SQL text is explicitly enabled by policy it must
+            # pass through the redaction chokepoint: credential-shaped
+            # literals (password=..., api_key=..., driver URLs) are scrubbed.
+            audit_record["sql_text"] = redact_text(sql)
         if outcome == "cancelled":
             # A query may have been in flight when the request was cancelled;
             # the worker thread cannot be interrupted, so the connector's
@@ -825,24 +847,38 @@ def build_server(app: AppContext) -> MCPServer:
                     raise ToolFailure(ErrorCategory.AUTHZ, f"connection '{cid}' is not available to this caller")
             types = set(object_types or ["table", "view", "materialized_view"])
             items: list[tuple[str, str, str, str]] = []
+            warnings: list[str] = []
             for cid in conn_ids:
-                connector, policy = _require_engine(app, cid)
-                if policy.allowed_schemas:
-                    conn_tables = [
-                        t
-                        for t in await app.tables_for(policy, connector)
-                        if t.schema and t.schema.lower() in policy.allowed_schemas
-                    ]
-                else:
-                    conn_tables = await app.tables_for(policy, connector)
+                try:
+                    connector, policy = _require_engine(app, cid)
+                    if policy.allowed_schemas:
+                        conn_tables = [
+                            t
+                            for t in await app.tables_for(policy, connector)
+                            if t.schema and t.schema.lower() in policy.allowed_schemas
+                        ]
+                    else:
+                        conn_tables = await app.tables_for(policy, connector)
+                except (ToolFailure, ConnectorError, DriverUnavailableError) as exc:
+                    # A missing driver, an unreachable engine or a metadata
+                    # timeout on one connection must not abort the
+                    # cross-connection search — unless the caller explicitly
+                    # named exactly that one connection.
+                    if connections is not None and len(conn_ids) == 1:
+                        raise
+                    warnings.append(f"connection '{cid}' skipped: {scrub_exception(exc)}")
+                    continue
                 items.extend((cid, t.schema or "", t.name, t.kind) for t in conn_tables if t.kind in types)
             ranked = rank_search(query, items, cap)
             st["row_count"] = len(ranked)
+            if warnings:
+                st["warnings"].extend(warnings)
             return _envelope(
                 st,
                 None,
                 None,
                 {"matches": ranked, "note": "scores are lexical ranking scores, not probabilities"},
+                warnings=warnings,
             )
 
     register(
@@ -1127,7 +1163,11 @@ async def _resolve_object(
 ) -> tuple[str | None, str]:
     """Authorize + resolve one object reference against policy and metadata.
     Unqualified names resolve only when default-deny finds them in a permitted
-    schema; unknown names are denied, never guessed."""
+    schema; unknown names are denied, never guessed. Both branches return the
+    catalog's canonical (schema, name) spelling whenever the metadata provides
+    a match: connector catalog SQL and sample queries quote identifiers
+    verbatim, so the caller's casing would silently miss on case-sensitive
+    engines (Oracle, Db2, Postgres quoted identifiers)."""
     if schema is None:
         if not policy.default_deny_objects:
             return schema, object_name
@@ -1154,13 +1194,22 @@ async def _resolve_object(
     # default-deny additionally requires the object to exist in metadata
     if policy.default_deny_objects:
         tables = await app.tables_for(policy, connector)
-        if not any(
-            t.name.lower() == object_name.lower() and t.schema and t.schema.lower() == schema.lower() for t in tables
-        ):
+        matches = [
+            t
+            for t in tables
+            if t.name.lower() == object_name.lower() and t.schema and t.schema.lower() == schema.lower()
+        ]
+        if not matches:
             raise ToolFailure(
                 ErrorCategory.AUTHZ,
                 f"object '{schema}.{object_name}' is not a permitted object on connection '{policy.connection_id}'",
             )
+        # Return the catalog's canonical spelling, not the caller's: the
+        # existence check above is case-insensitive but the connector's
+        # catalog queries and quoted identifiers are not.
+        return matches[0].schema, matches[0].name
+    # Policy permits without a metadata check; no catalog match is available
+    # to canonicalize against, so the caller's spelling is used verbatim.
     return schema, object_name
 
 

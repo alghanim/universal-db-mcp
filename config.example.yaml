@@ -38,7 +38,18 @@ security:
   audit_parameter_values: false
   audit_result_rows: false
   allow_explain_analyze: false
-  # mask_columns: additional regex patterns for sensitive column names
+  # mask_columns: EXTRA regex patterns, ADDED to (merged with) the built-in
+  # default list — the built-ins cannot be removed here. Built-in defaults
+  # (case-insensitive, token-boundary anchored so short tokens do not
+  # substring-match ordinary names such as company_name or span_ms):
+  #   (?i)(?<![a-z0-9])(password|passwd|pwd|secret|token|api_?key|access_key|private_key)(?![a-z0-9])
+  #   (?i)(?<![a-z0-9])(ssn|social_security|tax_id|national_id|credit_card|card_number|cvv|pan)(?![a-z0-9])
+  # Example extra pattern:
+  # mask_columns:
+  #   - "(?i)salary"
+  # allowed_schemas (per connection, below): an EMPTY list [] is NOT deny-all.
+  # It imposes no schema restriction — every schema the account can see is
+  # listable and queryable. Always name the schemas to expose.
   mask_action: mask              # mask | omit
 
 connections:

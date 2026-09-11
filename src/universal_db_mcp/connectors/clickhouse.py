@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from typing import Any
 
 from universal_db_mcp.config import ResolvedConnection
@@ -26,7 +27,7 @@ from universal_db_mcp.connectors.base import (
     TableSummary,
     ViewInfo,
 )
-from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module
+from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module, translated_driver_errors
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
@@ -38,7 +39,7 @@ class ClickHouseConnector(DatabaseConnector):
     def __init__(self, connection: ResolvedConnection, policy: EffectivePolicy) -> None:
         super().__init__(connection, policy)
         self._module: Any = None
-        self._cancel_target: Any = None
+        self._cancel_query_id: str | None = None  # query_id of the executing query
         self._exec_lock = threading.Lock()  # serializes queries: cancel slot correctness
         self._pool_lock = threading.Lock()
         self._meta_client: Any = None  # reused metadata client (probe on checkout)
@@ -92,14 +93,33 @@ class ClickHouseConnector(DatabaseConnector):
         return self._module.get_client(**kw)
 
     def cancel_current(self) -> bool:
-        client = self._cancel_target
-        if client is None:
+        """Best-effort server-side cancel via ``KILL QUERY`` on a separate
+        short-lived client.
+
+        clickhouse-connect 1.8.0 exposes no client-side handle (and no
+        ``cancel_query`` method) for an in-flight HTTP request, so ``_execute``
+        pins a generated ``query_id`` on the executing client and the deadline
+        hook kills that exact query out of band. Returns False — cancelling
+        nothing — when no query is executing or the KILL itself fails; it
+        never guesses.
+        """
+        qid = self._cancel_query_id
+        if qid is None:
             return False
         try:
-            client.cancel_query()
-            return True
-        except Exception:  # noqa: BLE001, S110
+            killer = self._connect()
+        except Exception:  # noqa: BLE001 - cancel must never raise
             return False
+        try:
+            killer.command("KILL QUERY WHERE query_id = %(qid)s", parameters={"qid": qid})
+            return True
+        except Exception:  # noqa: BLE001 - best effort; the executor still discards
+            return False
+        finally:
+            try:
+                killer.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
     def capabilities(self) -> CapabilityMatrix:
         return CapabilityMatrix(
@@ -141,7 +161,10 @@ class ClickHouseConnector(DatabaseConnector):
                 ),
             ],
             required_privileges=["SELECT on permitted databases/tables (read-only profile)"],
-            unverified_items=["cancel_query over native transport", "TLS verify with internal CA"],
+            unverified_items=[
+                "KILL QUERY cancellation by query_id over native transport",
+                "TLS verify with internal CA",
+            ],
         )
 
     def health_check(self) -> HealthInfo:
@@ -164,8 +187,9 @@ class ClickHouseConnector(DatabaseConnector):
             sql += " WHERE name ILIKE %(s)s"
             params["s"] = f"%{search}%"
         sql += " ORDER BY name"
-        client = self._shared_meta_client()
-        return [r[0] for r in client.query(sql, parameters=params).result_rows]
+        with translated_driver_errors():
+            client = self._shared_meta_client()
+            return [r[0] for r in client.query(sql, parameters=params).result_rows]
 
     def list_tables(self, schema: str | None, kinds: set[str], search: str | None) -> list[TableSummary]:
         conds = ["database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')"]
@@ -181,8 +205,9 @@ class ClickHouseConnector(DatabaseConnector):
             + " AND ".join(conds)
             + " ORDER BY database, name"
         )
-        client = self._shared_meta_client()
-        rows = client.query(sql, parameters=params).result_rows
+        with translated_driver_errors():
+            client = self._shared_meta_client()
+            rows = client.query(sql, parameters=params).result_rows
         out = []
         for db, name, eng, total in rows:
             kind = "view" if str(eng).lower().startswith("view") else "table"
@@ -200,20 +225,24 @@ class ClickHouseConnector(DatabaseConnector):
         return out
 
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
-        client = self._shared_meta_client()
-        rows = client.query(
-            "SELECT name, type, is_in_primary_key, comment "
-            "FROM system.columns WHERE database = %(db)s AND table = %(t)s "
-            "ORDER BY position",
-            parameters={"db": schema or self.connection.config.database, "t": table},
-        ).result_rows
+        with translated_driver_errors():
+            client = self._shared_meta_client()
+            rows = client.query(
+                "SELECT name, type, is_in_primary_key, comment "
+                "FROM system.columns WHERE database = %(db)s AND table = %(t)s "
+                "ORDER BY position",
+                parameters={"db": schema or self.connection.config.database, "t": table},
+            ).result_rows
         return [
             ColumnInfo(
                 schema=schema,
                 table=table,
                 name=r[0],
                 data_type=r[1],
-                nullable=not str(r[1]).startswith("Nullable") and "nothing" not in str(r[1]).lower(),
+                # ClickHouse marks nullable columns as Nullable(T) (and
+                # Nullable(Nothing) for the untyped NULL); everything else is
+                # NOT NULL. The previous negation reported exactly the inverse.
+                nullable=str(r[1]).startswith("Nullable("),
                 comment=r[3] or None,
                 ordinal=i,
             )
@@ -234,12 +263,13 @@ class ClickHouseConnector(DatabaseConnector):
         return []  # ClickHouse does not enforce FKs; report empty, not guessed
 
     def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:
-        client = self._shared_meta_client()
-        rows = client.query(
-            "SELECT total_rows, formatReadableSize(total_bytes) FROM system.tables "
-            "WHERE database = %(db)s AND name = %(t)s",
-            parameters={"db": schema or "", "t": table},
-        ).result_rows
+        with translated_driver_errors():
+            client = self._shared_meta_client()
+            rows = client.query(
+                "SELECT total_rows, formatReadableSize(total_bytes) FROM system.tables "
+                "WHERE database = %(db)s AND name = %(t)s",
+                parameters={"db": schema or "", "t": table},
+            ).result_rows
         if not rows:
             return {"schema": schema, "table": table, "row_estimate": None, "row_estimate_source": "unavailable"}
         return {
@@ -255,46 +285,62 @@ class ClickHouseConnector(DatabaseConnector):
             return self._execute(spec)
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
-        client = self._connect()
-        self._cancel_target = client
-        start = time.monotonic()
-        truncated = False
-        truncation_cause = "row limit"
-        rows: list[list[Any]] = []
-        approx_bytes = 0
-        import json
+        with translated_driver_errors():
+            client = self._connect()
+            # Pin a per-query query_id on the executing client:
+            # clickhouse-connect shares this params dict by reference into
+            # every HTTP request, and _execute runs one query per dedicated
+            # client under _exec_lock, so cancel_current() can KILL exactly
+            # this query. If the driver surface ever changes, cancellation
+            # becomes unavailable — reported truthfully as False — rather
+            # than guessed.
+            qid = str(uuid.uuid4())
+            try:
+                client.params["query_id"] = qid
+            except AttributeError:
+                qid = None  # type: ignore[assignment]
+                self._cancel_query_id = None
+            else:
+                self._cancel_query_id = qid
+            start = time.monotonic()
+            truncated = False
+            truncation_cause = "row limit"
+            rows: list[list[Any]] = []
+            approx_bytes = 0
+            import json
 
-        try:
-            result = client.query(spec.sql, parameters=spec.parameters or None)
-            cols = [(n, "unknown") for n in result.column_names]
-            labels: list[str] = []
-            for raw in result.result_rows:
-                vals, lab, _ = cell_truncated_json(raw, spec.max_cell_bytes)
-                if not labels:
-                    labels = lab
-                approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
-                if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
-                    truncated = True
-                    truncation_cause = "row limit" if len(rows) >= spec.max_rows else "byte limit"
-                    break
-                rows.append(vals)
-            return QueryOutcome(
-                columns=[(c[0], t) for c, t in zip(cols, labels or ["unknown"] * len(cols), strict=True)],
-                rows=rows,
-                truncated=truncated,
-                rows_seen=len(rows),
-                elapsed_ms=int((time.monotonic() - start) * 1000),
-                warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
-            )
-        finally:
-            self._cancel_target = None
-            client.close()
+            try:
+                result = client.query(spec.sql, parameters=spec.parameters or None)
+                cols = [(n, "unknown") for n in result.column_names]
+                labels: list[str] = []
+                for raw in result.result_rows:
+                    vals, lab, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                    if not labels:
+                        labels = lab
+                    approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
+                    if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
+                        truncated = True
+                        truncation_cause = "row limit" if len(rows) >= spec.max_rows else "byte limit"
+                        break
+                    rows.append(vals)
+                return QueryOutcome(
+                    columns=[(c[0], t) for c, t in zip(cols, labels or ["unknown"] * len(cols), strict=True)],
+                    rows=rows,
+                    truncated=truncated,
+                    rows_seen=len(rows),
+                    elapsed_ms=int((time.monotonic() - start) * 1000),
+                    warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
+                )
+            finally:
+                self._cancel_query_id = None
+                client.close()
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
         if analyze:
             raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
-        client = self._connect()
-        try:
-            return {"raw": client.query("EXPLAIN " + sql).result_rows}  # noqa: S608 - validated upstream
-        finally:
-            client.close()
+        with translated_driver_errors():
+            client = self._connect()
+            try:
+                return {"raw": client.query("EXPLAIN " + sql).result_rows}  # noqa: S608 - validated upstream
+            finally:
+                client.close()
