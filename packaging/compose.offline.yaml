@@ -1,0 +1,47 @@
+# Offline container deployment. Rules enforced here (spec §11 Stage B):
+# - pull_policy: never — an absent image fails locally, no registry contact
+# - no build: directive — images arrive prebuilt via docker load
+# - read-only root filesystem; explicit writable volumes for audit/cache only
+# - no docker socket mounted; no public networks
+services:
+  universal-db-mcp:
+    image: udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312
+    pull_policy: never
+    container_name: universal-db-mcp
+    user: udbmcp
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - /etc/universal-db-mcp/config.yaml:/etc/universal-db-mcp/config.yaml:ro
+      - /etc/universal-db-mcp/certs:/etc/universal-db-mcp/certs:ro
+      - /run/secrets:/run/secrets:ro
+      - audit-data:/var/log/universal-db-mcp
+      - cache-data:/var/lib/universal-db-mcp
+    networks:
+      - db-internal
+    ports:
+      - "127.0.0.1:8765:8765"   # authenticated Streamable HTTP behind an
+                                # internal reverse proxy; never exposed publicly
+    command: ["serve", "--transport", "http"]
+    # HTTP mode REQUIRES application.http_bearer_token_file in the mounted
+    # config AND /run/secrets/udbmcp_http_token (mode 600) to exist; the
+    # server exits with CONFIG_ERROR otherwise (fail-fast, by design).
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 2).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  db-internal:
+    # Attach to the administrator-managed internal network only.
+    external: true
+    name: udbmcp-internal
+
+volumes:
+  audit-data:
+  cache-data:

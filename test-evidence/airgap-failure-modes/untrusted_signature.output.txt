@@ -1,0 +1,9 @@
+integrity: 91 artifacts checked, full coverage verified
+FAIL: signature verification FAILED (untrusted or corrupted bundle); openssl rejected Ed25519 verification and no cryptography fallback is installed: 
+runtime.lock: 42 pinned requirements checked against wheelhouse
+NOTE: administrator-supplied prerequisites (not distributable):
+  - db2_connect_license: Db2 Connect client licensing if connecting to z/OS or i
+os-packages: 11/11 declared .deb artifacts hash-checked
+
+bundle verification FAILED; do not install
+rc=1

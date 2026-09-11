@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "universal-db-mcp"
+version = "0.1.0"
+description = "Universal Database MCP Server - air-gapped deployment ready"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "Platform Engineering" }]
+dependencies = [
+    "mcp>=2.2.0,<3",
+    "PyYAML>=6.0.2,<7",
+    "sqlglot>=30,<31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9",
+    "ruff>=0.16",
+    "mypy>=2.3",
+    "types-PyYAML",
+    "build>=1.2",
+]
+pg = ["psycopg[binary]>=3.2,<4"]
+mysql = ["PyMySQL>=1.1,<2"]
+clickhouse = ["clickhouse-connect>=0.8,<2"]
+oracle = ["oracledb>=2.4,<4"]
+mssql = ["pyodbc>=5.1,<6"]
+db2 = ["ibm-db>=3.2,<4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/universal_db_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: Gate C real-driver integration tests (env-gated fixtures)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S608"]
+"src/universal_db_mcp/connectors/*" = ["S608"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "ASYNC"]
+ignore = ["S101"]  # assert in tests
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"

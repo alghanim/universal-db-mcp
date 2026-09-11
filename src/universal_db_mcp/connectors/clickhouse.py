@@ -1,0 +1,300 @@
+"""ClickHouse connector (clickhouse-connect).
+
+Implemented against the documented HTTP-native client APIs; live behaviors
+marked ``unverified`` until Gate C proves them. TLS via explicit CA. Query
+settings are never sent (no relaxations of engine-side limits), and the
+server-side result limit is pinned to the policy ceiling so a runaway result
+cannot exhaust client memory.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any
+
+from universal_db_mcp.config import ResolvedConnection
+from universal_db_mcp.connectors.base import (
+    ColumnInfo,
+    DatabaseConnector,
+    HealthInfo,
+    KeyInfo,
+    QueryOutcome,
+    QuerySpec,
+    RoutineInfo,
+    SynonymInfo,
+    TableSummary,
+    ViewInfo,
+)
+from universal_db_mcp.connectors.driver_helpers import cell_truncated_json, open_module
+from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
+from universal_db_mcp.security.policy import EffectivePolicy
+from universal_db_mcp.security.redact import scrub_exception
+
+
+class ClickHouseConnector(DatabaseConnector):
+    engine = "clickhouse"
+
+    def __init__(self, connection: ResolvedConnection, policy: EffectivePolicy) -> None:
+        super().__init__(connection, policy)
+        self._module: Any = None
+        self._cancel_target: Any = None
+        self._exec_lock = threading.Lock()  # serializes queries: cancel slot correctness
+        self._pool_lock = threading.Lock()
+        self._meta_client: Any = None  # reused metadata client (probe on checkout)
+
+    def _shared_meta_client(self) -> Any:
+        """Lock-guarded reusable metadata client with probe-on-checkout
+        (spec §7 connection pooling; one client per connector)."""
+        with self._pool_lock:
+            if self._meta_client is not None:
+                try:
+                    self._meta_client.query("SELECT 1")
+                    return self._meta_client
+                except Exception:  # noqa: BLE001, S110 - stale client, rebuild
+                    try:
+                        self._meta_client.close()
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                    self._meta_client = None
+            self._meta_client = self._connect()
+            return self._meta_client
+
+    def _connect(self) -> Any:
+        self._module = open_module(
+            "clickhouse_connect",
+            "clickhouse-connect (wheel from the bundle wheelhouse)",
+        )
+        cfg = self.connection.config
+        kw: dict[str, Any] = {
+            "host": cfg.host,
+            "port": cfg.port or (8443 if cfg.tls.enabled else 8123),
+            "database": cfg.database,
+            "connect_timeout": int(cfg.connect_timeout_seconds),
+            # Bound the server-side response to the policy ceiling: legal
+            # requests are clamped to hard_max_rows before reaching here, so
+            # this never truncates a permitted query but does stop a runaway
+            # result from exhausting client memory.
+            "query_limit": self.policy.hard_max_rows,
+        }
+        if self.connection.username:
+            kw["username"] = self.connection.username.value
+        if self.connection.password:
+            kw["password"] = self.connection.password.value
+        if cfg.tls.enabled:
+            kw["secure"] = True
+            kw["verify"] = bool(cfg.tls.verify_server)
+            kw["ca_cert"] = cfg.tls.ca_file
+            if cfg.tls.client_cert_file:
+                kw["client_cert"] = cfg.tls.client_cert_file
+            if cfg.tls.client_key_file:
+                kw["client_cert_key"] = cfg.tls.client_key_file
+        return self._module.get_client(**kw)
+
+    def cancel_current(self) -> bool:
+        client = self._cancel_target
+        if client is None:
+            return False
+        try:
+            client.cancel_query()
+            return True
+        except Exception:  # noqa: BLE001, S110
+            return False
+
+    def capabilities(self) -> CapabilityMatrix:
+        return CapabilityMatrix(
+            engine="clickhouse",
+            engine_family="clickhouse",
+            driver="clickhouse-connect",
+            capabilities={
+                Cap.CONNECT: CapabilityState.UNVERIFIED,
+                Cap.HEALTH: CapabilityState.UNVERIFIED,
+                Cap.LIST_SCHEMAS: CapabilityState.UNVERIFIED,
+                Cap.LIST_TABLES: CapabilityState.UNVERIFIED,
+                Cap.GET_TABLE: CapabilityState.UNVERIFIED,
+                Cap.LIST_COLUMNS: CapabilityState.UNVERIFIED,
+                Cap.LIST_VIEWS: CapabilityState.UNVERIFIED,
+                Cap.LIST_SYNONYMS: CapabilityState.UNSUPPORTED,
+                Cap.LIST_ROUTINES: CapabilityState.UNSUPPORTED,
+                Cap.RELATIONSHIPS: CapabilityState.UNVERIFIED,
+                Cap.STATISTICS: CapabilityState.UNVERIFIED,
+                Cap.QUERY: CapabilityState.UNVERIFIED,
+                Cap.PARAMETERS: CapabilityState.UNVERIFIED,
+                Cap.CANCEL: CapabilityState.UNVERIFIED,
+                Cap.SERVER_SIDE_CANCEL: CapabilityState.UNVERIFIED,
+                Cap.EXPLAIN: CapabilityState.UNVERIFIED,
+                Cap.EXPLAIN_ANALYZE: CapabilityState.UNSUPPORTED,
+                Cap.SAMPLE: CapabilityState.UNVERIFIED,
+                Cap.TLS: CapabilityState.UNVERIFIED,
+            },
+            limitations=[
+                Limitation(scope="explain", detail="EXPLAIN ANALYZE executes and is policy-disabled."),
+                Limitation(
+                    scope="metadata",
+                    detail="ClickHouse dictionaries/projections are not surfaced in v1.",
+                ),
+                Limitation(
+                    scope="column_types",
+                    detail="Column type labels are derived from the first returned row "
+                    "when the driver does not expose per-column types on streaming "
+                    "results; treat them as hints, not guarantees.",
+                ),
+            ],
+            required_privileges=["SELECT on permitted databases/tables (read-only profile)"],
+            unverified_items=["cancel_query over native transport", "TLS verify with internal CA"],
+        )
+
+    def health_check(self) -> HealthInfo:
+        start = time.monotonic()
+        try:
+            client = self._connect()
+            row = client.query("SELECT version()").result_rows
+            return HealthInfo(
+                healthy=True,
+                server_version=str(row[0][0]) if row else None,
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001, S110
+            return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
+
+    def list_schemas(self, catalog: str | None, search: str | None) -> list[str]:
+        sql = "SELECT name FROM system.databases"
+        params: dict[str, Any] = {}
+        if search:
+            sql += " WHERE name ILIKE %(s)s"
+            params["s"] = f"%{search}%"
+        sql += " ORDER BY name"
+        client = self._shared_meta_client()
+        return [r[0] for r in client.query(sql, parameters=params).result_rows]
+
+    def list_tables(self, schema: str | None, kinds: set[str], search: str | None) -> list[TableSummary]:
+        conds = ["database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')"]
+        params: dict[str, Any] = {}
+        if schema:
+            conds.append("database = %(db)s")
+            params["db"] = schema
+        if search:
+            conds.append("name ILIKE %(s)s")
+            params["s"] = f"%{search}%"
+        sql = (
+            "SELECT database, name, engine, total_rows FROM system.tables WHERE "
+            + " AND ".join(conds)
+            + " ORDER BY database, name"
+        )
+        client = self._shared_meta_client()
+        rows = client.query(sql, parameters=params).result_rows
+        out = []
+        for db, name, eng, total in rows:
+            kind = "view" if str(eng).lower().startswith("view") else "table"
+            if kind not in kinds:
+                continue
+            out.append(
+                TableSummary(
+                    schema=db,
+                    name=name,
+                    kind=kind,
+                    row_estimate=int(total) if total is not None else None,
+                    row_estimate_source="catalog_estimate(system.tables.total_rows)" if total is not None else None,
+                )
+            )
+        return out
+
+    def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
+        client = self._shared_meta_client()
+        rows = client.query(
+            "SELECT name, type, is_in_primary_key, comment "
+            "FROM system.columns WHERE database = %(db)s AND table = %(t)s "
+            "ORDER BY position",
+            parameters={"db": schema or self.connection.config.database, "t": table},
+        ).result_rows
+        return [
+            ColumnInfo(
+                schema=schema,
+                table=table,
+                name=r[0],
+                data_type=r[1],
+                nullable=not str(r[1]).startswith("Nullable") and "nothing" not in str(r[1]).lower(),
+                comment=r[3] or None,
+                ordinal=i,
+            )
+            for i, r in enumerate(rows)
+        ]
+
+    def list_views(self, schema: str | None) -> list[ViewInfo]:
+        tables = self.list_tables(schema, {"view"}, None)
+        return [ViewInfo(schema=t.schema, name=t.name, kind="view", definition_state="not_supported") for t in tables]
+
+    def list_synonyms(self, schema: str | None) -> list[SynonymInfo]:
+        return []
+
+    def list_routines(self, schema: str | None) -> list[RoutineInfo]:
+        return []  # user-defined functions exist but are not surfaced in v1
+
+    def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
+        return []  # ClickHouse does not enforce FKs; report empty, not guessed
+
+    def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:
+        client = self._shared_meta_client()
+        rows = client.query(
+            "SELECT total_rows, formatReadableSize(total_bytes) FROM system.tables "
+            "WHERE database = %(db)s AND name = %(t)s",
+            parameters={"db": schema or "", "t": table},
+        ).result_rows
+        if not rows:
+            return {"schema": schema, "table": table, "row_estimate": None, "row_estimate_source": "unavailable"}
+        return {
+            "schema": schema,
+            "table": table,
+            "row_estimate": int(rows[0][0]) if rows[0][0] is not None else None,
+            "row_estimate_source": "catalog_estimate(system.tables)",
+            "total_bytes": rows[0][1],
+        }
+
+    def execute_query(self, spec: QuerySpec) -> QueryOutcome:
+        with self._exec_lock:
+            return self._execute(spec)
+
+    def _execute(self, spec: QuerySpec) -> QueryOutcome:
+        client = self._connect()
+        self._cancel_target = client
+        start = time.monotonic()
+        truncated = False
+        truncation_cause = "row limit"
+        rows: list[list[Any]] = []
+        approx_bytes = 0
+        import json
+
+        try:
+            result = client.query(spec.sql, parameters=spec.parameters or None)
+            cols = [(n, "unknown") for n in result.column_names]
+            labels: list[str] = []
+            for raw in result.result_rows:
+                vals, lab, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                if not labels:
+                    labels = lab
+                approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
+                if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
+                    truncated = True
+                    truncation_cause = "row limit" if len(rows) >= spec.max_rows else "byte limit"
+                    break
+                rows.append(vals)
+            return QueryOutcome(
+                columns=[(c[0], t) for c, t in zip(cols, labels or ["unknown"] * len(cols), strict=True)],
+                rows=rows,
+                truncated=truncated,
+                rows_seen=len(rows),
+                elapsed_ms=int((time.monotonic() - start) * 1000),
+                warnings=[f"result truncated by {truncation_cause}"] if truncated else [],
+            )
+        finally:
+            self._cancel_target = None
+            client.close()
+
+    def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
+        if analyze:
+            raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
+        client = self._connect()
+        try:
+            return {"raw": client.query("EXPLAIN " + sql).result_rows}  # noqa: S608 - validated upstream
+        finally:
+            client.close()

@@ -1,0 +1,81 @@
+# Example configuration for universal-db-mcp.
+# Copy to /etc/universal-db-mcp/config.yaml and edit for your deployment.
+# All addresses/paths here are examples, not real infrastructure.
+#
+# Schema rules: unknown fields are rejected; secrets are referenced, never
+# inlined (username_env / password_env / password_file).
+
+application:
+  airgapped: true
+  transport: stdio            # stdio | http
+  metadata_cache_path: /var/lib/universal-db-mcp/metadata.sqlite
+  audit_path: /var/log/universal-db-mcp/audit.jsonl
+  audit_max_bytes: 52428800   # rotate at 50 MiB
+  audit_max_backups: 5
+  audit_fail_closed: true     # refuse operations if the audit write fails
+  telemetry_enabled: false    # must remain false; this build has no telemetry
+  # HTTP transport only (stdio ignores these):
+  http_host: "127.0.0.1"      # restrictive default; put an internal reverse
+                              # proxy in front for shared deployments
+  http_port: 8765
+  # http_bearer_token_file: /run/secrets/udbmcp_http_token
+
+security:
+  read_only: true
+  allow_write_operations: false   # cannot be true in v1
+  default_max_rows: 1000
+  hard_max_rows: 10000
+  max_response_bytes: 1048576
+  max_cell_bytes: 8192
+  default_query_timeout_seconds: 30
+  hard_query_timeout_seconds: 60
+  max_concurrent_queries: 4
+  require_remote_tls: true
+  default_deny_objects: true
+  allowed_system_schemas: [information_schema]
+  sample_limit: 20
+  audit_sql_text: false
+  audit_parameter_values: false
+  audit_result_rows: false
+  allow_explain_analyze: false
+  # mask_columns: additional regex patterns for sensitive column names
+  mask_action: mask              # mask | omit
+
+connections:
+  # Always-available local reference (works with the demo fixture):
+  demo_sqlite:
+    type: sqlite
+    database: /var/lib/universal-db-mcp/demo/finlink_demo.db
+    read_only: true
+
+  # IBM Db2 (LUW) example — requires ibm-db wheel from the bundle wheelhouse
+  # and Db2 Connect / client licensing as an administrator prerequisite:
+  # finance_db2:
+  #   type: db2
+  #   family: luw
+  #   host: db2.internal.example
+  #   port: 50001
+  #   database: FINANCE
+  #   username_env: FINANCE_DB2_USER
+  #   password_file: /run/secrets/finance_db2_password
+  #   tls:
+  #     enabled: true
+  #     verify_server: true
+  #     ca_file: /etc/universal-db-mcp/certs/internal-ca.pem
+  #   allowed_schemas: [REPORTING]
+  #   read_only: true
+
+  # PostgreSQL example:
+  # analytics_pg:
+  #   type: postgres
+  #   host: pg.internal.example
+  #   port: 5432
+  #   database: analytics
+  #   username_env: ANALYTICS_PG_USER
+  #   password_file: /run/secrets/analytics_pg_password
+  #   tls:
+  #     enabled: true
+  #     verify_server: true
+  #     ca_file: /etc/universal-db-mcp/certs/internal-ca.pem
+  #   allowed_schemas: [public]
+  #   read_only: true

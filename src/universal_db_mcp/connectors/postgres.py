@@ -1,0 +1,454 @@
+"""PostgreSQL connector (psycopg 3, binary wheel).
+
+Integration status: implemented against psycopg 3 documented APIs; marked
+``unverified`` in capabilities until a real instance proves each item (Gate
+C). TLS uses the explicit CA file; verification is never disabled.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
+from universal_db_mcp.config import ResolvedConnection
+from universal_db_mcp.connectors.base import (
+    ColumnInfo,
+    ConnectorError,
+    DatabaseConnector,
+    HealthInfo,
+    KeyInfo,
+    QueryOutcome,
+    QuerySpec,
+    RoutineInfo,
+    SynonymInfo,
+    TableSummary,
+    ViewInfo,
+)
+from universal_db_mcp.connectors.driver_helpers import (
+    cell_truncated_json,
+    open_module,
+)
+from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
+from universal_db_mcp.security.policy import EffectivePolicy
+from universal_db_mcp.security.redact import scrub_exception
+
+
+class PostgresConnector(DatabaseConnector):
+    engine = "postgres"
+
+    def __init__(self, connection: ResolvedConnection, policy: EffectivePolicy) -> None:
+        super().__init__(connection, policy)
+        self._module: Any = None
+        self._cancel_target: Any = None
+        self._exec_lock = threading.Lock()  # serializes queries: cancel slot correctness
+        self._exec_state_lock = threading.Lock()  # guards _exec_waiters
+        self._exec_waiters = 0  # requests queued on _exec_lock, not yet executing
+        self._pool_lock = threading.Lock()
+        self._meta_conn: Any = None  # reused metadata connection (probe on checkout)
+
+    @contextmanager
+    def _shared_meta_conn(self) -> Iterator[Any]:
+        """Reusable metadata connection with probe-on-checkout (spec §7
+        connection pooling; bounded to one connection per connector).
+
+        A psycopg connection must never be used as a context manager here:
+        ``Connection.__exit__`` *closes* the connection, which would defeat
+        pooling. The pool lock is held for the whole ``with`` block — checkout
+        probe, execute and fetch — mirroring how ``_exec_lock`` serializes
+        queries, so two concurrent metadata callers can never share (and one
+        close) the same connection. If the block raises, the connection is
+        discarded (closed and dropped, fail closed) rather than reused in an
+        uncertain state; the next caller transparently reconnects.
+        """
+        with self._pool_lock:
+            if self._meta_conn is not None:
+                try:
+                    self._meta_conn.execute("SELECT 1")
+                except Exception:  # noqa: BLE001 - stale connection, rebuild
+                    self._discard_meta_conn()
+            if self._meta_conn is None:
+                conn = self._connect()
+                conn.autocommit = True
+                self._meta_conn = conn
+            try:
+                yield self._meta_conn
+            except BaseException:
+                self._discard_meta_conn()
+                raise
+            finally:
+                try:
+                    self._meta_conn.rollback()  # release any implicit transaction state
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
+    def _discard_meta_conn(self) -> None:
+        """Close and forget the shared metadata connection (caller holds
+        ``_pool_lock``). Close errors are irrelevant: the object is dropped."""
+        conn, self._meta_conn = self._meta_conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+    def _connect(self) -> Any:
+        self._module = open_module(
+            "psycopg",
+            "psycopg[binary] (manylinux cp312 wheel from the bundle wheelhouse)",
+        )
+        cfg = self.connection.config
+        kw: dict[str, Any] = {
+            "host": cfg.host,
+            "port": cfg.port or 5432,
+            "dbname": cfg.database,
+            "connect_timeout": int(cfg.connect_timeout_seconds),
+        }
+        if self.connection.username:
+            kw["user"] = self.connection.username.value
+        if self.connection.password:
+            kw["password"] = self.connection.password.value
+        if cfg.tls.enabled:
+            kw["sslmode"] = "verify-full" if cfg.tls.verify_server else "require"
+            kw["sslrootcert"] = cfg.tls.ca_file
+            if cfg.tls.client_cert_file:
+                kw["sslcert"] = cfg.tls.client_cert_file
+            if cfg.tls.client_key_file:
+                kw["sslkey"] = cfg.tls.client_key_file
+        return self._module.connect(**kw)
+
+    def cancel_current(self) -> bool:
+        """Request-scoped best-effort cancel of the executing query.
+
+        The executor's deadline hook calls this from a separate thread with no
+        request identity, so the only safe discriminator is execution state:
+        if another request is still queued on ``_exec_lock``, the deadline that
+        fired belongs to the *queued* request, and cancelling the registered
+        target would kill an unrelated in-flight query. In that case the hook
+        refuses (fail closed): the cancel is lost, but the executor still
+        discards the timed-out request's connection and poisons the connector.
+        """
+        with self._exec_state_lock:
+            if self._exec_waiters > 0:
+                return False
+        target = self._cancel_target
+        if target is not None:
+            try:
+                target.cancel()  # psycopg: server-side cancel via a separate path
+                return True
+            except Exception:  # noqa: BLE001, S110
+                return False
+        return False
+
+    def capabilities(self) -> CapabilityMatrix:
+        return CapabilityMatrix(
+            engine="postgres",
+            engine_family="postgresql",
+            driver="psycopg 3 (binary)",
+            capabilities={
+                Cap.CONNECT: CapabilityState.UNVERIFIED,
+                Cap.HEALTH: CapabilityState.UNVERIFIED,
+                Cap.LIST_SCHEMAS: CapabilityState.UNVERIFIED,
+                Cap.LIST_TABLES: CapabilityState.UNVERIFIED,
+                Cap.GET_TABLE: CapabilityState.UNVERIFIED,
+                Cap.LIST_COLUMNS: CapabilityState.UNVERIFIED,
+                Cap.LIST_VIEWS: CapabilityState.UNVERIFIED,
+                Cap.LIST_SYNONYMS: CapabilityState.UNSUPPORTED,
+                Cap.LIST_ROUTINES: CapabilityState.UNVERIFIED,
+                Cap.RELATIONSHIPS: CapabilityState.UNVERIFIED,
+                Cap.STATISTICS: CapabilityState.UNVERIFIED,
+                Cap.QUERY: CapabilityState.UNVERIFIED,
+                Cap.PARAMETERS: CapabilityState.UNVERIFIED,
+                Cap.CANCEL: CapabilityState.UNVERIFIED,
+                Cap.SERVER_SIDE_CANCEL: CapabilityState.UNVERIFIED,
+                Cap.EXPLAIN: CapabilityState.UNVERIFIED,
+                Cap.EXPLAIN_ANALYZE: CapabilityState.UNSUPPORTED,
+                Cap.SAMPLE: CapabilityState.UNVERIFIED,
+                Cap.TLS: CapabilityState.UNVERIFIED,
+            },
+            limitations=[
+                Limitation(scope="explain", detail="EXPLAIN ANALYZE executes and is policy-disabled."),
+                Limitation(
+                    scope="cancel",
+                    detail="psycopg cancel() requests server-side cancellation; the "
+                    "executor still discards the connection after a deadline. "
+                    "Cancel is skipped while another request is queued, so a "
+                    "queued request's deadline can never cancel a running query.",
+                ),
+            ],
+            required_privileges=[
+                "CONNECT on the database",
+                "USAGE on allowed schemas",
+                "SELECT on permitted tables/views",
+                "read access to catalog views for metadata (pg_catalog)",
+            ],
+            unverified_items=[
+                "live TLS verify-full against internal CA",
+                "server-side cancel under load",
+                "row estimates via pg_class.reltuples freshness",
+            ],
+        )
+
+    def health_check(self) -> HealthInfo:
+        start = time.monotonic()
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT version()").fetchone()
+            return HealthInfo(
+                healthy=True,
+                server_version=(row[0] if row else "")[:40],
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001, S110
+            return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
+
+    def list_schemas(self, catalog: str | None, search: str | None) -> list[str]:
+        sql = "SELECT schema_name FROM information_schema.schemata"
+        params: list[Any] = []
+        if search:
+            sql += " WHERE schema_name ILIKE %s"
+            params.append(f"%{search}%")
+        sql += " ORDER BY 1"
+        with self._shared_meta_conn() as conn:
+            return [r[0] for r in conn.execute(sql, params).fetchall()]
+
+    def list_tables(self, schema: str | None, kinds: set[str], search: str | None) -> list[TableSummary]:
+        types: list[str] = []
+        if "table" in kinds:
+            types.append("r")
+        if "view" in kinds:
+            types.append("v")
+        if "materialized_view" in kinds:
+            types.append("m")
+        if "foreign_table" in kinds:
+            types.append("f")
+        if not types:
+            return []
+        sql = (
+            "SELECT n.nspname, c.relname, c.relkind, GREATEST(c.reltuples, 0)::bigint "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relkind = ANY(%s) AND n.nspname NOT IN "
+            "('pg_toast','pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%%'"
+        )
+        params: list[Any] = [types]
+        if schema:
+            sql += " AND n.nspname = %s"
+            params.append(schema)
+        if search:
+            sql += " AND c.relname ILIKE %s"
+            params.append(f"%{search}%")
+        kind_map = {"r": "table", "v": "view", "m": "materialized_view", "f": "foreign_table"}
+        with self._shared_meta_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            TableSummary(
+                schema=r[0],
+                name=r[1],
+                kind=kind_map.get(r[2], r[2]),
+                row_estimate=int(r[3]) if r[3] else None,
+                row_estimate_source="catalog_estimate(pg_class.reltuples)" if r[3] else None,
+            )
+            for r in rows
+        ]
+
+    def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
+        schema = schema or "public"
+        sql = (
+            "SELECT column_name, data_type, is_nullable, column_default, ordinal_position "
+            "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+            "ORDER BY ordinal_position"
+        )
+        with self._shared_meta_conn() as conn:
+            rows = conn.execute(sql, (schema, table)).fetchall()
+        return [
+            ColumnInfo(
+                schema=schema,
+                table=table,
+                name=r[0],
+                data_type=r[1],
+                nullable=r[2] == "YES",
+                default=r[3],
+                ordinal=r[4],
+            )
+            for r in rows
+        ]
+
+    def list_views(self, schema: str | None) -> list[ViewInfo]:
+        sql = (
+            "SELECT schemaname, viewname, definition FROM pg_views"
+            + (" WHERE schemaname = %s" if schema else "")
+            + " ORDER BY 1, 2"
+        )
+        params: tuple[Any, ...] = (schema,) if schema else ()
+        with self._shared_meta_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            ViewInfo(schema=r[0], name=r[1], kind="view", definition=r[2], definition_state="available") for r in rows
+        ]
+
+    def list_synonyms(self, schema: str | None) -> list[SynonymInfo]:
+        return []  # PostgreSQL has no synonyms.
+
+    def list_routines(self, schema: str | None) -> list[RoutineInfo]:
+        sql = (
+            "SELECT n.nspname, p.proname, CASE WHEN p.prokind = 'p' THEN 'procedure' ELSE 'function' END "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname NOT IN ('pg_catalog','information_schema')"
+            + (" AND n.nspname = %s" if schema else "")
+            + " ORDER BY 1, 2"
+        )
+        params: tuple[Any, ...] = (schema,) if schema else ()
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [RoutineInfo(schema=r[0], name=r[1], kind=r[2]) for r in rows]
+
+    def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
+        sql = (
+            "SELECT conname, conrelid::regclass::text, confrelid::regclass::text, "
+            "pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f'"
+        )
+        with self._shared_meta_conn() as conn:
+            rows = conn.execute(sql).fetchall()
+        out: list[KeyInfo] = []
+        for name, src, dst, _def in rows:
+            src_tbl = str(src).split(".")[-1].strip('"')
+            if table and src_tbl.lower() != table.lower():
+                continue
+            out.append(
+                KeyInfo(
+                    kind="foreign_key",
+                    name=name,
+                    columns=[],
+                    ref_schema=str(dst).split(".")[0].strip('"'),
+                    ref_table=str(dst).split(".")[-1].strip('"'),
+                )
+            )
+        return out
+
+    def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:
+        schema = schema or "public"
+        with self._shared_meta_conn() as conn:
+            row = conn.execute(
+                "SELECT c.reltuples::bigint, s.n_live_tup, s.last_analyze "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid "
+                "WHERE n.nspname = %s AND c.relname = %s",
+                (schema, table),
+            ).fetchone()
+        if not row:
+            return {"schema": schema, "table": table, "row_estimate": None, "row_estimate_source": "unavailable"}
+        return {
+            "schema": schema,
+            "table": table,
+            "row_estimate": int(row[0]) if row[0] is not None else None,
+            "row_estimate_source": "catalog_estimate(pg_class.reltuples / pg_stat_user_tables)",
+            "last_analyze": str(row[2]) if row[2] else None,
+            "note": "estimates; freshness depends on the last ANALYZE",
+        }
+
+    # Common PostgreSQL type OIDs -> stable labels (driver-derived, not
+    # data-derived).
+    _PG_OID_TYPES = {
+        16: "boolean",
+        17: "blob",
+        20: "bigint",
+        21: "integer",
+        23: "integer",
+        25: "text",
+        700: "real",
+        701: "real",
+        1700: "decimal",
+        1082: "date",
+        1083: "time",
+        1114: "datetime",
+        1184: "datetime",
+        2950: "text",
+        114: "text",
+        3802: "text",
+        1043: "text",
+        1042: "text",
+        18: "text",
+    }
+
+    def execute_query(self, spec: QuerySpec) -> QueryOutcome:
+        with self._exec_state_lock:
+            self._exec_waiters += 1
+        try:
+            self._exec_lock.acquire()
+        finally:
+            # The request is no longer queued once it holds the lock: from
+            # here on a firing deadline belongs to THIS request, so it must
+            # not suppress cancellation any more.
+            with self._exec_state_lock:
+                self._exec_waiters -= 1
+        try:
+            return self._execute(spec)
+        finally:
+            self._exec_lock.release()
+
+    def _execute(self, spec: QuerySpec) -> QueryOutcome:
+        start = time.monotonic()
+        truncated = False
+        rows: list[list[Any]] = []
+        approx_bytes = 0
+        import json
+
+        try:
+            conn = self._connect()
+            self._cancel_target = conn
+        except Exception as exc:
+            raise ConnectorError(scrub_exception(exc)) from exc
+        try:
+            # Server-side (named) cursor: rows stream from the engine and the
+            # row/byte ceilings stop the transfer early instead of after the
+            # full result has been buffered client-side.
+            with conn.cursor(name="udbmcp_query") as cur:
+                args: Any = tuple(spec.parameters) if isinstance(spec.parameters, (list, tuple)) else spec.parameters
+                cur.execute(spec.sql, args)
+                cols = [(d[0], self._PG_OID_TYPES.get(d.type_code, "unknown")) for d in (cur.description or [])]
+                col_labels = [c[1] for c in cols]
+                while True:
+                    batch = cur.fetchmany(200)
+                    if not batch:
+                        break
+                    for raw in batch:
+                        vals, labels, _ = cell_truncated_json(raw, spec.max_cell_bytes)
+                        if not col_labels:
+                            col_labels = labels
+                        approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
+                        if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
+                            truncated = True
+                            break
+                        rows.append(vals)
+                    if truncated:
+                        try:
+                            conn.cancel()  # stop server-side work
+                        except Exception:  # noqa: BLE001, S110
+                            pass
+                        break
+            return QueryOutcome(
+                columns=[(c[0], t) for c, t in zip(cols, col_labels or ["unknown"] * len(cols), strict=True)],
+                rows=rows,
+                truncated=truncated,
+                rows_seen=len(rows),
+                elapsed_ms=int((time.monotonic() - start) * 1000),
+                warnings=["result truncated by limits"] if truncated else [],
+            )
+        except Exception as exc:
+            raise ConnectorError(scrub_exception(exc)) from exc
+        finally:
+            self._cancel_target = None
+            try:
+                conn.rollback()  # release the cursor's read transaction
+            except Exception:  # noqa: BLE001, S110
+                pass
+            conn.close()
+
+    def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
+        if analyze:
+            raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
+        with self._connect() as conn:
+            rows = conn.execute("EXPLAIN " + sql).fetchall()
+        return {"raw": "\n".join(r[0] for r in rows)}

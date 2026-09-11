@@ -1,0 +1,66 @@
+{
+  "healthy": true,
+  "checks": [
+    {
+      "check": "python-version",
+      "status": "ok",
+      "detail": "running CPython 3.12.3 matches the linux-x86_64-ubuntu24.04-cp312 profile"
+    },
+    {
+      "check": "platform",
+      "status": "ok",
+      "detail": "Linux 6.12.76-linuxkit x86_64 (bundle profile is linux-x86_64 glibc; other platforms are different profiles)"
+    },
+    {
+      "check": "application-wheel",
+      "status": "ok",
+      "detail": "universal_db_mcp 0.1.0 importable"
+    },
+    {
+      "check": "dep-mcp",
+      "status": "ok",
+      "detail": "importable"
+    },
+    {
+      "check": "dep-yaml",
+      "status": "ok",
+      "detail": "importable"
+    },
+    {
+      "check": "dep-sqlglot",
+      "status": "ok",
+      "detail": "importable"
+    },
+    {
+      "check": "config",
+      "status": "ok",
+      "detail": "loaded '/tmp/demo/config.yaml': 1 connection(s)"
+    },
+    {
+      "check": "connection-demo_sqlite-secrets",
+      "status": "ok",
+      "detail": "secret references resolvable"
+    },
+    {
+      "check": "connection-demo_sqlite-file",
+      "status": "ok",
+      "detail": "data file '/tmp/finlink_demo.db' readable"
+    },
+    {
+      "check": "connection-demo_sqlite-driver",
+      "status": "ok",
+      "detail": "engine 'sqlite' needs no driver wheel"
+    },
+    {
+      "check": "audit-path",
+      "status": "ok",
+      "detail": "'/tmp/audit.jsonl' writable"
+    },
+    {
+      "check": "metadata-cache-path",
+      "status": "ok",
+      "detail": "'/tmp/metadata-cache.sqlite' writable"
+    }
+  ],
+  "fatal_count": 0
+}

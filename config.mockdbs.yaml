@@ -1,0 +1,96 @@
+# DEMO configuration: connects the MCP server to the themed mock-database
+# fixtures started by scripts/fixtures/start_mock_dbs.sh. Everything runs on
+# host loopback with plaintext database sessions.
+#
+# DEMO-ONLY DEVIATION: security.require_remote_tls is false here because the
+# mock fixtures terminate on loopback with self-signed/no TLS. A production
+# config MUST keep require_remote_tls: true (the server refuses plaintext
+# remote connections otherwise) and per-connection tls.ca_file pins.
+
+application:
+  airgapped: true
+  transport: stdio
+  metadata_cache_path: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/metadata.sqlite
+  audit_path: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/audit.jsonl
+  audit_max_bytes: 52428800
+  audit_max_backups: 5
+  audit_fail_closed: true
+  telemetry_enabled: false
+  # For the HTTP deployment mode (agent connects over authenticated HTTP):
+  # transport: http
+  http_host: "127.0.0.1"
+  http_port: 8765
+  # http_bearer_token_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/http.token
+
+security:
+  read_only: true
+  allow_write_operations: false
+  default_max_rows: 1000
+  hard_max_rows: 10000
+  max_response_bytes: 1048576
+  max_cell_bytes: 8192
+  default_query_timeout_seconds: 30
+  hard_query_timeout_seconds: 60
+  max_concurrent_queries: 4
+  require_remote_tls: false      # DEMO ONLY - see header
+  default_deny_objects: true
+  allowed_system_schemas: [information_schema]
+  sample_limit: 20
+  allow_explain_analyze: false
+  mask_action: mask
+
+connections:
+  mock_pg:
+    type: postgres
+    host: 127.0.0.1
+    port: 5433
+    database: postgres
+    username_env: UDBMCP_DEMO_PG_USER
+    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/pg.pw
+    read_only: true
+
+  mock_mysql:
+    type: mysql
+    host: 127.0.0.1
+    port: 3307
+    database: testdb
+    username_env: UDBMCP_DEMO_MYSQL_USER
+    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/mysql.pw
+    read_only: true
+
+  mock_clickhouse:
+    type: clickhouse
+    host: 127.0.0.1
+    port: 8124
+    database: default
+    username_env: UDBMCP_DEMO_CH_USER
+    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/clickhouse.pw
+    read_only: true
+
+  mock_oracle:
+    type: oracle
+    host: 127.0.0.1
+    port: 1522
+    database: FREEPDB1
+    username_env: UDBMCP_DEMO_ORA_USER
+    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/oracle.pw
+    read_only: true
+
+  mock_mssql:
+    type: mssql
+    host: 127.0.0.1
+    port: 1434
+    database: HospitalDB
+    username_env: UDBMCP_DEMO_MSSQL_USER
+    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/mssql.pw
+    read_only: true
+
+  mock_db2:
+    type: db2
+    family: luw
+    host: 127.0.0.1
+    port: 50002
+    database: TESTDB
+    username_env: UDBMCP_DEMO_DB2_USER
+    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/db2.pw
+    read_only: true

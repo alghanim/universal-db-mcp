@@ -1,0 +1,34 @@
+{
+  "probe": "protocol_lifecycle",
+  "checks": {
+    "initialize": {
+      "passed": true,
+      "detail": "universal-db-mcp"
+    },
+    "tools_listed": {
+      "passed": true,
+      "detail": "20 tools"
+    },
+    "list_connections": {
+      "passed": true,
+      "detail": ""
+    },
+    "query": {
+      "passed": true,
+      "detail": ""
+    },
+    "query_result_content": {
+      "passed": true,
+      "detail": "[[10]]"
+    },
+    "write_denied": {
+      "passed": true,
+      "detail": ""
+    },
+    "sample": {
+      "passed": true,
+      "detail": ""
+    }
+  },
+  "status": "passed"
+}

@@ -1,0 +1,15 @@
+# Runtime dependencies (target: linux-x86_64, glibc, CPython 3.12).
+# The offline bundle builder resolves this to a fully pinned, hashed
+# runtime.lock. Do not install from this file in production.
+mcp==2.2.0
+PyYAML==6.0.3
+sqlglot==30.18.0
+
+# Connector wheels (lazy-imported; missing wheels must be declared in the
+# bundle manifest rather than skipped silently):
+psycopg[binary]==3.3.5
+PyMySQL==1.2.0
+clickhouse-connect==1.8.0
+oracledb==4.0.2
+pyodbc==5.3.0
+ibm-db==3.2.9  # tested wheel in the bundle wheelhouse

@@ -1,0 +1,29 @@
+[Unit]
+Description=Universal Database MCP Server (read-only, air-gapped)
+After=network.target
+Documentation=file:/opt/universal-db-mcp/docs/offline-deployment.md
+
+[Service]
+Type=simple
+User=udbmcp
+Group=udbmcp
+Environment=UDBMCP_CONFIG=/etc/universal-db-mcp/config.yaml
+ExecStart=/opt/universal-db-mcp/venv/bin/python -m universal_db_mcp serve
+Restart=on-failure
+RestartSec=5
+
+# Hardening: read-only FS except explicit writable state; no privileges.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/universal-db-mcp /var/log/universal-db-mcp
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

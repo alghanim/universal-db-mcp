@@ -1,0 +1,11 @@
+{
+  "gate": "C-isolated-integrations",
+  "network": "docker --internal network; fixtures AND test client attached; no external route",
+  "heavy_engines": "1",
+  "exit": 0,
+  "status": "passed",
+  "passed": 11,
+  "failed": 0,
+  "skipped": 2,
+  "errors": 0
+}

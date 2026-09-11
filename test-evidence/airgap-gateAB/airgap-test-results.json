@@ -1,0 +1,13 @@
+{
+  "profile": "linux-x86_64-ubuntu24.04-cp312",
+  "network": "none (docker --network none)",
+  "platform_caveat": "amd64 userland under Docker Desktop emulation on the staging host; wheels and installer are genuine x86_64 artifacts",
+  "started": "2026-09-11T18:25:48Z",
+  "bundle_verification": "passed",
+  "installation": "passed",
+  "doctor": "passed",
+  "protocol_probe": "passed",
+  "restart": "passed",
+  "finished": "2026-09-11T18:26:04Z",
+  "status": "passed"
+}

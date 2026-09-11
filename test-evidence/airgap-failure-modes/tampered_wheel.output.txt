@@ -1,0 +1,11 @@
+FAIL: tampered artifact: wheelhouse/sqlglot-30.18.0-py3-none-any.whl (sha256 mismatch)
+integrity: 91 artifacts checked, full coverage verified
+signature: verified against provided public key
+FAIL: wheel missing from wheelhouse: sqlglot==30.18.0
+runtime.lock: 42 pinned requirements checked against wheelhouse
+NOTE: administrator-supplied prerequisites (not distributable):
+  - db2_connect_license: Db2 Connect client licensing if connecting to z/OS or i
+os-packages: 11/11 declared .deb artifacts hash-checked
+
+bundle verification FAILED; do not install
+rc=1
