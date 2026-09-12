@@ -368,15 +368,34 @@ UDBMCP_RELEASE_PUBKEY="$PUBKEY" \
 # the deb-shipped canonical unit only if absent or already identical, and
 # NEVER clobber an admin-modified unit on upgrade — point at the canonical
 # copy instead.
+SHIPPED_UNIT_RECORD=/var/lib/universal-db-mcp/.shipped-unit.sha256
 if [ ! -e "$UNIT_DST" ]; then
   echo "==> installing systemd unit to $UNIT_DST"
   install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 elif cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   echo "==> $UNIT_DST already matches the deb-shipped unit (no change)"
+elif [ -f "$SHIPPED_UNIT_RECORD" ] \
+     && [ "$(sha256sum "$UNIT_DST" | awk '{print $1}')" = "$(awk '{print $1}' "$SHIPPED_UNIT_RECORD")" ]; then
+  # The deployed unit is byte-identical to what a PREVIOUS release of this
+  # package shipped (the record is written on every successful deploy below),
+  # so it is ours, not an admin modification: deploy the updated unit.
+  # Without this, a fixed unit would never reach upgraded systems — the
+  # matches-or-absent rule alone would keep the old (e.g. stdio) unit forever
+  # on exactly the fleets that need the fix.
+  echo "==> $UNIT_DST matches the previously-shipped unit (hash record); deploying the updated unit"
+  install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 else
   echo "WARNING: $UNIT_DST exists and differs from the deb-shipped unit;" >&2
   echo "         keeping the admin-controlled unit untouched. Canonical copy:" >&2
   echo "         $UNIT_SRC (review with: diff $UNIT_SRC $UNIT_DST)" >&2
+fi
+# Record (or refresh) the hash of the DEPLOYED unit so the next upgrade can
+# tell our own previous copy from an admin modification. Written only when the
+# deployed unit is exactly what this release ships; an admin-modified unit
+# leaves the record pointing at the last unit WE deployed.
+mkdir -p /var/lib/universal-db-mcp
+if cmp -s "$UNIT_SRC" "$UNIT_DST"; then
+  sha256sum "$UNIT_DST" | awk '{print $1}' > "$SHIPPED_UNIT_RECORD"
 fi
 
 systemctl daemon-reload 2>/dev/null || \
@@ -392,6 +411,33 @@ else
   echo "==> $CONFIG already present: leaving the admin's config untouched"
 fi
 
+# --- HTTP bearer token for the systemd daemon --------------------------------
+# The unit runs `serve --transport http` (a systemd daemon has no stdin
+# client, so the config's default stdio transport would read EOF and exit 0);
+# the bearer token is the only authentication on the listener. Provision a
+# fresh token ONLY if absent (never clobber the admin's), owned by the
+# service account, mode 0600 — the server's secret-file permission rule
+# rejects any group/other access bit. The token value is never printed.
+TOKEN_FILE="$CONFIG_DIR/http-token"
+# -s (non-empty), not -f: a zero-length leftover (e.g. a previous install was
+# killed between file creation and token append) must be REGENERATED, not
+# preserved — the server refuses an empty token file, so keeping it would
+# leave a sticky broken state misdescribed as an admin-owned token.
+if [ -s "$TOKEN_FILE" ]; then
+  echo "==> $TOKEN_FILE already present: left untouched (never clobber)"
+else
+  [ ! -e "$TOKEN_FILE" ] || echo "==> $TOKEN_FILE is empty; regenerating it"
+  install -m 0600 -o udbmcp -g udbmcp /dev/null "$TOKEN_FILE" || {
+    echo "FAIL: could not create the HTTP bearer token file at $TOKEN_FILE" >&2
+    exit 1
+  }
+  python3 -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" || {
+    echo "FAIL: could not generate the HTTP bearer token (python secrets)" >&2
+    exit 1
+  }
+  echo "==> generated $TOKEN_FILE (0600 udbmcp:udbmcp)"
+fi
+
 # Record success BEFORE `enable --now`: the postinst-installed guard drop-in
 # (ExecStartPre) refuses to start the service while the status file says
 # anything but 'success', so the start triggered by enable must already see
@@ -400,6 +446,12 @@ fi
 # which rewrites the status to 'failed'. The only step after this write is
 # the enable call below, which is best-effort by design (container-safe) and
 # never fails the worker.
+# An upgrade may have replaced the deployed unit (previously-shipped hash
+# match above): a RUNNING service must be restarted to pick it up — `enable
+# --now` alone is a no-op on an already-active unit. Stopped services are
+# unaffected (try-restart on an inactive unit does nothing).
+systemctl try-restart universal-db-mcp.service 2>/dev/null || true
+
 echo success > "$STATUS"
 
 if systemctl enable --now universal-db-mcp.service 2>/dev/null; then
@@ -483,15 +535,34 @@ if [ ! -f "$UNIT_SRC" ]; then
   echo "FAIL: systemd unit not found (deb payload and bundle both lack it)." >&2
   exit 1
 fi
+SHIPPED_UNIT_RECORD=/var/lib/universal-db-mcp/.shipped-unit.sha256
 if [ ! -e "$UNIT_DST" ]; then
   echo "==> installing systemd unit to $UNIT_DST"
   install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 elif cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   echo "==> $UNIT_DST already matches the deb-shipped unit (no change)"
+elif [ -f "$SHIPPED_UNIT_RECORD" ] \
+     && [ "$(sha256sum "$UNIT_DST" | awk '{print $1}')" = "$(awk '{print $1}' "$SHIPPED_UNIT_RECORD")" ]; then
+  # The deployed unit is byte-identical to what a PREVIOUS release of this
+  # package shipped (the record is written on every successful deploy below),
+  # so it is ours, not an admin modification: deploy the updated unit.
+  # Without this, a fixed unit would never reach upgraded systems — the
+  # matches-or-absent rule alone would keep the old (e.g. stdio) unit forever
+  # on exactly the fleets that need the fix.
+  echo "==> $UNIT_DST matches the previously-shipped unit (hash record); deploying the updated unit"
+  install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 else
   echo "WARNING: $UNIT_DST exists and differs from the deb-shipped unit;" >&2
   echo "         keeping the admin-controlled unit untouched. Canonical copy:" >&2
   echo "         $UNIT_SRC (review with: diff $UNIT_SRC $UNIT_DST)" >&2
+fi
+# Record (or refresh) the hash of the DEPLOYED unit so the next upgrade can
+# tell our own previous copy from an admin modification. Written only when the
+# deployed unit is exactly what this release ships; an admin-modified unit
+# leaves the record pointing at the last unit WE deployed.
+mkdir -p /var/lib/universal-db-mcp
+if cmp -s "$UNIT_SRC" "$UNIT_DST"; then
+  sha256sum "$UNIT_DST" | awk '{print $1}' > "$SHIPPED_UNIT_RECORD"
 fi
 
 # --- step 6 (before enable --now): install config ONLY if absent ------------
@@ -516,6 +587,33 @@ else
   echo "==> $CONFIG already present: leaving the admin's config untouched"
 fi
 
+# --- step 6b: HTTP bearer token for the systemd daemon -----------------------
+# The unit runs `serve --transport http` (a systemd daemon has no stdin
+# client, so the config's default stdio transport would read EOF and exit 0);
+# the bearer token is the only authentication on the listener. Provision a
+# fresh token ONLY if absent (never clobber the admin's), owned by the
+# service account, mode 0600 — the server's secret-file permission rule
+# rejects any group/other access bit. The token value is never printed.
+TOKEN_FILE="$CONFIG_DIR/http-token"
+# -s (non-empty), not -f: a zero-length leftover (e.g. a previous install was
+# killed between file creation and token append) must be REGENERATED, not
+# preserved — the server refuses an empty token file, so keeping it would
+# leave a sticky broken state misdescribed as an admin-owned token.
+if [ -s "$TOKEN_FILE" ]; then
+  echo "==> $TOKEN_FILE already present: left untouched (never clobber)"
+else
+  [ ! -e "$TOKEN_FILE" ] || echo "==> $TOKEN_FILE is empty; regenerating it"
+  install -m 0600 -o udbmcp -g udbmcp /dev/null "$TOKEN_FILE" || {
+    echo "FAIL: could not create the HTTP bearer token file at $TOKEN_FILE" >&2
+    exit 1
+  }
+  python3 -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" || {
+    echo "FAIL: could not generate the HTTP bearer token (python secrets)" >&2
+    exit 1
+  }
+  echo "==> generated $TOKEN_FILE (0600 udbmcp:udbmcp)"
+fi
+
 # --- step 7: reload systemd (guarded) ---------------------------------------
 # Container installs often have systemctl but no PID-1 systemd ("System has
 # not been booted with systemd"); that must not fail the package configure
@@ -523,6 +621,11 @@ fi
 # below on hosts that do run systemd.
 systemctl daemon-reload 2>/dev/null || \
   echo "==> systemctl daemon-reload unavailable (no running systemd?) — skipping"
+# An upgrade may have replaced the deployed unit (previously-shipped hash
+# match in step 5): a RUNNING service must be restarted to pick it up —
+# `enable --now` alone is a no-op on an already-active unit. try-restart on
+# an inactive (or containerless) system does nothing.
+systemctl try-restart universal-db-mcp.service 2>/dev/null || true
 
 # --- step 8: enable + start the service (guarded, container-safe) -----------
 # On a normal host this enables and starts the service. In a container

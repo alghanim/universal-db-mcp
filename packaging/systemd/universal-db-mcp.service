@@ -11,7 +11,15 @@ Group=udbmcp
 # private (0600) files regardless of per-file modes in the code.
 UMask=0077
 Environment=UDBMCP_CONFIG=/etc/universal-db-mcp/config.yaml
-ExecStart=/opt/universal-db-mcp/venv/bin/python -m universal_db_mcp serve
+# Bearer-token PATH for HTTP mode (the token itself stays in the file created
+# 0600 by postinst). An explicit config value would win; this env fallback
+# keeps the config shareable with per-harness stdio spawns.
+Environment=UDBMCP_HTTP_BEARER_TOKEN_FILE=/etc/universal-db-mcp/http-token
+# A daemon under systemd has no client on stdin, so the default config
+# transport (stdio) would read EOF and exit 0 immediately. The system service
+# is the shared authenticated HTTP daemon; per-harness agents keep spawning
+# their own stdio servers.
+ExecStart=/opt/universal-db-mcp/venv/bin/python -m universal_db_mcp serve --transport http
 Restart=on-failure
 RestartSec=5
 

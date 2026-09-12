@@ -236,7 +236,10 @@ def test_binpath_embedding_round_trips(
 ) -> None:
     """The binPath value is itself quoted (interpreter path inside); it must
     come back as one token (the value token following 'binPath=')."""
-    binpath = '"C:\\Program Files\\UniversalDB MCP\\venv\\Scripts\\python.exe" -m universal_db_mcp serve'
+    binpath = (
+        '"C:\\Program Files\\UniversalDB MCP\\venv\\Scripts\\python.exe"'
+        " -m universal_db_mcp serve --transport http"
+    )
     line = 'create udbmcp binPath= "' + escape(binpath, escape_patterns) + '" start= auto'
     argv = clapargvw_parse(line)
     assert argv == ["create", "udbmcp", "binPath=", binpath, "start=", "auto"]

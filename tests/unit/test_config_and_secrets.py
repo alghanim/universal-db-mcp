@@ -112,3 +112,70 @@ def test_db2_family_restriction(tmp_path: Path) -> None:
     p.write_text("connections:\n  d:\n    type: db2\n    family: zos\n    host: h\n    database: x\n")
     with pytest.raises(ConfigError, match="luw"):
         load_config(p)
+
+
+# ------------------------------------------------------------- service env override
+# The systemd unit / launchd plist run `serve --transport http` (a daemon has
+# no stdin client) while sharing the config with per-harness stdio spawns, so
+# the bearer-token PATH must be able to arrive from the service environment
+# (UDBMCP_HTTP_BEARER_TOKEN_FILE) instead of the shared config file. The token
+# VALUE itself is never carried in an environment variable.
+
+
+def test_bearer_token_path_from_service_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = tmp_path / "c.yaml"
+    p.write_text("application:\n  transport: stdio\n")
+    monkeypatch.setenv("UDBMCP_HTTP_BEARER_TOKEN_FILE", "/etc/universal-db-mcp/http-token")
+    cfg = load_config(p)
+    assert cfg.application.http_bearer_token_file == "/etc/universal-db-mcp/http-token"
+
+
+def test_bearer_token_env_satisfies_http_transport_requirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "c.yaml"
+    p.write_text("application:\n  transport: http\n")
+    monkeypatch.setenv("UDBMCP_HTTP_BEARER_TOKEN_FILE", "/etc/universal-db-mcp/http-token")
+    cfg = load_config(p)  # must NOT raise: the env fallback provides the path
+    assert cfg.application.transport == "http"
+
+
+def test_explicit_config_token_path_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "c.yaml"
+    p.write_text(
+        "application:\n  transport: http\n"
+        "  http_bearer_token_file: /admin/chosen/token\n"
+    )
+    monkeypatch.setenv("UDBMCP_HTTP_BEARER_TOKEN_FILE", "/etc/universal-db-mcp/http-token")
+    cfg = load_config(p)
+    assert cfg.application.http_bearer_token_file == "/admin/chosen/token"
+
+
+def test_bearer_token_env_injected_when_application_section_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "c.yaml"
+    p.write_text("security:\n  read_only: true\n")
+    monkeypatch.setenv("UDBMCP_HTTP_BEARER_TOKEN_FILE", "/run/tok")
+    cfg = load_config(p)
+    assert cfg.application.http_bearer_token_file == "/run/tok"
+
+
+def test_no_env_no_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = tmp_path / "c.yaml"
+    p.write_text("application:\n  transport: stdio\n")
+    monkeypatch.delenv("UDBMCP_HTTP_BEARER_TOKEN_FILE", raising=False)
+    cfg = load_config(p)
+    assert cfg.application.http_bearer_token_file is None
+
+
+def test_http_transport_without_any_token_path_still_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "c.yaml"
+    p.write_text("application:\n  transport: http\n")
+    monkeypatch.delenv("UDBMCP_HTTP_BEARER_TOKEN_FILE", raising=False)
+    with pytest.raises(ConfigError, match="http_bearer_token_file"):
+        load_config(p)

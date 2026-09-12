@@ -118,6 +118,29 @@ sudo systemctl daemon-reload && sudo systemctl enable --now universal-db-mcp
 The unit runs as the dedicated `udbmcp` account with a hardened sandbox
 (read-only FS, explicit writable paths, no privileges).
 
+The daemon runs in **HTTP mode** (`serve --transport http`): a service-manager
+daemon has no client on stdin, so the config template's `stdio` default would
+read EOF and exit 0 immediately. The listener's only authentication is a
+bearer token; the unit points at `/etc/universal-db-mcp/http-token` via
+`UDBMCP_HTTP_BEARER_TOKEN_FILE`, which the package postinst provisions (0600,
+owned `udbmcp`) when absent. A manual unit-only install must create it the
+same way:
+
+```bash
+sudo install -d -o root -g root -m 755 /etc/universal-db-mcp
+if [ ! -s /etc/universal-db-mcp/http-token ]; then
+  # only-if-absent/empty: never clobber an existing token
+  sudo install -o udbmcp -g udbmcp -m 600 /dev/null /etc/universal-db-mcp/http-token
+  python3 -c 'import secrets; print(secrets.token_hex(32))' \
+    | sudo tee -a /etc/universal-db-mcp/http-token >/dev/null
+fi
+```
+
+An explicit `application.http_bearer_token_file` in the config always wins
+over the unit's env fallback. Per-harness agent spawns keep using stdio and
+are unaffected (the override only supplies the token PATH; the token value is
+never carried in an environment variable).
+
 ## Container mode
 
 Before starting, two prerequisites the bundle does **not** satisfy on its own:
@@ -307,19 +330,25 @@ Verify the driver registration with the 64-bit ODBC Administrator
 The MSI registers the service itself: the deferred `RegisterServiceCA`
 action runs `service.ps1`, which creates an auto-start service named
 `udbmcp` running
-`"<venv>\Scripts\python.exe" -m universal_db_mcp serve` (account LocalSystem
+`"<venv>\Scripts\python.exe" -m universal_db_mcp serve --transport http`
+(account LocalSystem
 by default; override with the public `UDBMCP_SERVICE_ACCOUNT` property on
 the `msiexec` command line or the machine-scope `UDBMCP_SERVICE_ACCOUNT`
 environment value — values containing quotes or line breaks are rejected,
 fail closed) with failure recovery mirroring the systemd unit
 (`Restart=on-failure`: restart after 60000 ms, counter reset after 86400 s)
-and `UDBMCP_CONFIG` injected via the service's `Environment` registry
-value. `start= auto` registers the service for automatic start; the admin
+and `UDBMCP_CONFIG` + `UDBMCP_HTTP_BEARER_TOKEN_FILE` injected via the
+service's `Environment` registry value. A daemon under the SCM has no stdin
+client, so HTTP transport is forced (the config's `stdio` default would exit
+0 immediately); the HTTP listener's only authentication is a bearer token
+that the action provisions at `<config dir>\http-token` (only if absent or
+empty, never clobbered, value never printed). `start= auto` registers the
+service for automatic start; the admin
 (or the gate script) starts it once the configuration is in place. For
 inspection and manual recovery, the equivalent commands:
 
 ```bat
-sc.exe create udbmcp binPath= "\"C:\Program Files\UniversalDB MCP\venv\Scripts\python.exe\" -m universal_db_mcp serve" start= auto
+sc.exe create udbmcp binPath= "\"C:\Program Files\UniversalDB MCP\venv\Scripts\python.exe\" -m universal_db_mcp serve --transport http" start= auto
 sc.exe failure udbmcp reset= 86400 actions= restart/60000/restart/60000//0
 sc.exe config udbmcp env= "UDBMCP_CONFIG=C:\ProgramData\UniversalDB MCP\config.yaml"
 sc.exe query udbmcp
@@ -713,12 +742,19 @@ What `postinstall` does, in order:
    absent** (seeded from the bundle's `config-templates/config.yaml`,
    root-owned, group `_udbmcp`, mode 640). An admin-provisioned config is
    never overwritten.
-6. **State/log dirs**: `/var/lib/universal-db-mcp` and
+6. **HTTP bearer token**: `/etc/universal-db-mcp/http-token` is generated
+   **only if absent** (mode 0600, owned `_udbmcp`) — the launchd daemon runs
+   `serve --transport http` (a daemon has no stdin client; the config's
+   `stdio` default would exit 0 immediately under launchd), and this token is
+   the only authentication on the listener. The value is never printed or
+   logged. An explicit `application.http_bearer_token_file` in the config
+   would win over the unit's env fallback.
+7. **State/log dirs**: `/var/lib/universal-db-mcp` and
    `/var/log/universal-db-mcp` created 0750, owned `_udbmcp:_udbmcp`.
-7. **Manifest** published next to the venv
+8. **Manifest** published next to the venv
    (`/usr/local/universal-db-mcp/manifest.json`) so `doctor` reports the real
    installed profile instead of guessing from the platform.
-8. **launchd**: if `launchctl print system/com.udbmcp.server` shows the
+9. **launchd**: if `launchctl print system/com.udbmcp.server` shows the
    daemon already bootstrapped (upgrade), `launchctl bootout
    system/com.udbmcp.server` unloads it — a bootout failure is fatal — then
    `launchctl bootstrap system

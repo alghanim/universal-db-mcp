@@ -349,8 +349,10 @@ def test_launchd_plist_program_arguments_run_the_verified_venv() -> None:
     assert args[0].startswith(f"{PAYLOAD_PREFIX}/venv/bin/python"), (
         f"must run the installed venv python under {PAYLOAD_PREFIX}, got {args[0]}"
     )
-    assert args[-3:] == ["-m", "universal_db_mcp", "serve"], (
-        f"program arguments must end with '-m universal_db_mcp serve', got {args}"
+    assert args[-5:] == ["-m", "universal_db_mcp", "serve", "--transport", "http"], (
+        "program arguments must end with '-m universal_db_mcp serve --transport http' "
+        "(a daemon under launchd has no stdin client; stdio would exit 0 immediately), "
+        f"got {args}"
     )
 
 
@@ -429,11 +431,15 @@ def test_launchd_plist_mirrors_systemd_unit_values() -> None:
     )
     assert f"Environment=UDBMCP_CONFIG={CONFIG_PATH}" in unit_text
 
-    m = re.search(r"^ExecStart=(\S+) -m universal_db_mcp serve$", unit_text, re.MULTILINE)
-    assert m, "systemd ExecStart must be '<venv python> -m universal_db_mcp serve'"
+    m = re.search(r"^ExecStart=(\S+) -m universal_db_mcp serve --transport http$", unit_text, re.MULTILINE)
+    assert m, "systemd ExecStart must be '<venv python> -m universal_db_mcp serve --transport http'"
     args = data["ProgramArguments"]
     assert isinstance(args, list)
-    assert args[-2:] == ["universal_db_mcp", "serve"], "launchd and systemd must run the same module entrypoint"
+    assert args[-4:-2] == ["universal_db_mcp", "serve"], "launchd and systemd must run the same module entrypoint"
+    assert args[-2:] == ["--transport", "http"], "launchd and systemd must force the same transport"
+    # both sides must point the server at the bearer-token PATH the same way
+    assert "Environment=UDBMCP_HTTP_BEARER_TOKEN_FILE=" in unit_text
+    assert data["EnvironmentVariables"].get("UDBMCP_HTTP_BEARER_TOKEN_FILE")
     assert "Restart=on-failure" in unit_text
 
 

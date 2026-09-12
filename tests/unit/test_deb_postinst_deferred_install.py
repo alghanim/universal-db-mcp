@@ -288,6 +288,12 @@ def _deferred_sandbox_postinst(tmp_path: Path) -> Path:
         line = line.replace("systemctl ", "sbx-systemctl ")
         line = line.replace("flock -n", "sbx-flock -n")
         line = line.replace("setsid --fork", "sbx-setsid --fork")
+        # The unit-hash record lives under /var/lib on a real target (root,
+        # coreutils guaranteed); in the sandbox it must land in tmp_path.
+        line = line.replace(
+            "mkdir -p /var/lib/universal-db-mcp",
+            f"mkdir -p {tmp_path / 'var_lib_universal_db_mcp'}",
+        )
         line = re.sub(r"-o root -g root ", "", line)
         line = re.sub(r"-o udbmcp -g udbmcp ", "", line)
         rewritten.append(line)
@@ -308,6 +314,10 @@ def _make_shims(tmp_path: Path) -> None:
         "#!/bin/sh\n" f'printf "%s\\n" "$*" >> "{calls}"\n' "exit 1\n", encoding="utf-8"
     )
     (shim / "sbx-flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    # coreutils' sha256sum exists on the deb target (Essential) but not on the
+    # macOS test host: shim it onto shasum(1) so the unit-hash record path is
+    # exercised on both.
+    (shim / "sha256sum").write_text('#!/bin/sh\nexec shasum -a 256 "$@"\n', encoding="utf-8")
     (shim / "sbx-setsid").write_text(
         "#!/bin/sh\n" '[ "$1" = "--fork" ] && shift\n' '"$@" </dev/null >/dev/null 2>&1 &\n' "exit 0\n",
         encoding="utf-8",

@@ -243,6 +243,29 @@ else
   echo "    $CONFIG already present — left untouched (never clobber)"
 fi
 
+# --- step 5b: HTTP bearer token for the launchd daemon -----------------------
+# The daemon runs `serve --transport http` (launchd gives a daemon no stdin
+# client, so the config's default stdio transport would read EOF and exit 0);
+# the bearer token is the only authentication on the listener. Provision a
+# fresh token ONLY if absent (never clobber the admin's), owned by the
+# service account, mode 0600 — the server's secret-file permission rule
+# rejects any group/other access bit. The token value is never printed.
+TOKEN_FILE="$CONFIG_DIR/http-token"
+# -s (non-empty), not -f: a zero-length leftover (e.g. a previous install was
+# killed between file creation and token append) must be REGENERATED, not
+# preserved — the server refuses an empty token file, so keeping it would
+# leave a sticky broken state misdescribed as an admin-owned token.
+if [ -s "$TOKEN_FILE" ]; then
+  echo "    $TOKEN_FILE already present — left untouched (never clobber)"
+else
+  [ ! -e "$TOKEN_FILE" ] || echo "    $TOKEN_FILE is empty; regenerating it"
+  install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /dev/null "$TOKEN_FILE" \
+    || fail "could not create the HTTP bearer token file at $TOKEN_FILE"
+  "$PY" -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" \
+    || fail "could not generate the HTTP bearer token (python secrets)"
+  echo "    generated $TOKEN_FILE (0600 $SERVICE_USER:$SERVICE_GROUP)"
+fi
+
 # --- step 6: state and log directories, owned by the service account ---------
 echo "==> postinstall: provisioning state and log directories"
 # 0750: audit trail and metadata cache contain SQL text / schema metadata;

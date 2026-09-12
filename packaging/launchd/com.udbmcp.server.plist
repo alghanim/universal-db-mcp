@@ -62,12 +62,23 @@
 		<string>-m</string>
 		<string>universal_db_mcp</string>
 		<string>serve</string>
+		<!-- A daemon under launchd has no client on stdin, so the default
+		     config transport (stdio) would read EOF and exit 0 immediately.
+		     The system service is the shared authenticated HTTP daemon;
+		     per-harness agents keep spawning their own stdio servers. -->
+		<string>--transport</string>
+		<string>http</string>
 	</array>
 
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>UDBMCP_CONFIG</key>
 		<string>/etc/universal-db-mcp/config.yaml</string>
+		<!-- Bearer-token PATH (the token itself stays in the file, created
+		     0600 by postinstall). An explicit config value would win; this
+		     env fallback keeps the config shareable with stdio spawns. -->
+		<key>UDBMCP_HTTP_BEARER_TOKEN_FILE</key>
+		<string>/etc/universal-db-mcp/http-token</string>
 	</dict>
 
 	<!-- Mirrors systemd User=udbmcp (macOS service account created by

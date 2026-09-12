@@ -388,6 +388,30 @@ def _format_validation_errors(exc: ValidationError) -> str:
     return "; ".join(parts)
 
 
+def _apply_http_token_env_override(raw: dict[str, object]) -> dict[str, object]:
+    """Allow the HTTP bearer-token PATH to come from the service environment.
+
+    A service-manager deployment (systemd unit, launchd plist, container
+    compose) forces ``--transport http`` on the command line while sharing the
+    SAME config file with per-harness stdio spawns, so the config template
+    keeps ``transport: stdio`` and cannot hard-code the token path. The unit
+    sets ``UDBMCP_HTTP_BEARER_TOKEN_FILE`` and the provisioner creates that
+    file; an explicit ``application.http_bearer_token_file`` in the config
+    always wins. This is a PATH override only — the token itself is never
+    carried in an environment variable.
+    """
+    env_path = os.environ.get("UDBMCP_HTTP_BEARER_TOKEN_FILE")
+    if not env_path:
+        return raw
+    app = raw.get("application")
+    if app is None:
+        app = {}
+        raw["application"] = app
+    if isinstance(app, dict) and not app.get("http_bearer_token_file"):
+        app["http_bearer_token_file"] = env_path
+    return raw
+
+
 def load_config(path: str | Path) -> AppConfig:
     p = Path(path)
     try:
@@ -400,6 +424,7 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigError(f"invalid YAML in '{p}': {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError(f"config '{p}' must be a mapping at the top level")
+    raw = _apply_http_token_env_override(raw)
     try:
         return AppConfig.model_validate(raw)
     except ValidationError as exc:

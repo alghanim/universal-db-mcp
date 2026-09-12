@@ -16,6 +16,13 @@ from urllib.parse import quote
 from universal_db_mcp.config import AppConfig, ResolvedConnection, load_config
 from universal_db_mcp.connectors import registry
 
+# The bearer-token PATH the package postinstalls provision for the systemd /
+# launchd daemon (which forces --transport http on the command line and
+# receives this path via UDBMCP_HTTP_BEARER_TOKEN_FILE — an env var an admin
+# shell does not have). doctor validates it whenever the file exists, even if
+# THIS config says stdio. Module-level so tests can point it at a tmp file.
+SERVICE_TOKEN_PATH = Path("/etc/universal-db-mcp/http-token")
+
 CHECKS: list[dict[str, Any]] = []
 
 MSSQL_ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
@@ -359,8 +366,20 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
         # HTTP deployment: the bearer token file is the only authentication on
         # the listener; verify it exists, is a non-empty regular file and is
         # not group/world readable.
-        if cfg.application.transport == "http":
+        # ALSO validate the SYSTEM SERVICE's token when this config says
+        # stdio: the systemd/launchd daemon forces --transport http on the
+        # command line and receives the token path from
+        # UDBMCP_HTTP_BEARER_TOKEN_FILE (an env var an admin shell does not
+        # have), so gating solely on cfg.application.transport would never
+        # reach these checks on a real package deployment. The conventional
+        # provisioned path (/etc/universal-db-mcp/http-token, written by the
+        # package postinstalls) is therefore validated whenever it exists.
+        _service_token = SERVICE_TOKEN_PATH
+        _service_token_exists = _service_token.is_file()
+        if cfg.application.transport == "http" or _service_token_exists:
             token_path = cfg.application.http_bearer_token_file
+            if not token_path and _service_token_exists:
+                token_path = str(_service_token)
             if not token_path:
                 results.append(
                     _check(

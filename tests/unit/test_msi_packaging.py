@@ -803,6 +803,10 @@ def test_service_registers_via_sc_exe_with_autostart() -> None:
     assert re.search(r"start=\s*auto", code), "the service must be created with start= auto"
     assert "binPath=" in code, "the service must point at the custom-action-created venv interpreter (binPath=)"
     assert "-m universal_db_mcp serve" in code, "binPath must run the verified venv module entrypoint"
+    assert "serve --transport http" in code, (
+        "the SCM daemon has no stdin client: it must force HTTP transport "
+        "(stdio would read EOF and exit 0; failure recovery only fires on nonzero exit)"
+    )
 
 
 def test_service_configures_failure_recovery() -> None:
