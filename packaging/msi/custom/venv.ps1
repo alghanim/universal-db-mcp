@@ -36,8 +36,12 @@
 #     UDBMCP_BUNDLE_DIR  signed bundle directory (contains wheelhouse/,
 #                        requirements/runtime.lock)
 #     UDBMCP_VENV_DIR    virtual environment to create
-#     UDBMCP_PYTHON      explicit CPython 3.12 python.exe (otherwise found via
-#                        the PEP 514 registry or the py launcher)
+#     UDBMCP_PYTHON      explicit CPython 3.12 python.exe (otherwise resolved
+#                        from the PER-MACHINE PEP 514 registry value,
+#                        HKLM\SOFTWARE\Python\PythonCore\3.12\InstallPath --
+#                        never the HKCU hive or the py launcher, which a
+#                        local non-admin can point at their own interpreter;
+#                        see Find-Cpython312 below)
 #
 # Logging: this script has no UI; every message is a structured console write
 # (stdout for progress, stderr for failures) that msiexec captures verbatim
@@ -108,9 +112,19 @@ function Invoke-Native {
 }
 
 function Find-Cpython312 {
-    # Locate a CPython 3.12 interpreter. Order: explicit override, PEP 514
-    # registry (python.org install; HKLM per-machine preferred, HKCU
-    # fallback), py launcher. Returns $null if nothing suitable is found.
+    # Locate the machine's PER-MACHINE CPython 3.12 interpreter. Order:
+    # explicit override, then the PEP 514 registry -- HKLM ONLY. Returns $null
+    # if nothing suitable is found (the caller fails closed).
+    #
+    # The HKCU hive and the py launcher are deliberately NOT consulted. Both
+    # resolve to a per-user installation that a local NON-ADMIN can register
+    # (Python's own preference order is per-user over per-machine), and this
+    # script runs deferred with Impersonate=no (LocalSystem): a venv built
+    # with attacker-controlled python would make the service interpreter
+    # attacker-controlled. The udbmcp.wxs LaunchCondition enforces the same
+    # HKLM hive (Installed OR CPYTHON312), so an HKCU-only machine fails
+    # closed here with the per-machine bootstrap diagnostic instead of
+    # silently building on a per-user interpreter.
     if ($PythonExe) {
         if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
             Fail "UDBMCP_PYTHON override is set but the interpreter does not exist: $PythonExe"
@@ -118,9 +132,8 @@ function Find-Cpython312 {
         return $PythonExe
     }
 
-    foreach ($hive in 'HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath',
-                      'HKCU:\SOFTWARE\Python\PythonCore\3.12\InstallPath') {
-        if (-not (Test-Path -LiteralPath $hive)) { continue }
+    $hive = 'HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath'
+    if (Test-Path -LiteralPath $hive) {
         $props = Get-ItemProperty -LiteralPath $hive
         # PEP 514: ExecutablePath when present, else the key's default value
         # (the install directory) + python.exe.
@@ -131,26 +144,6 @@ function Find-Cpython312 {
         }
         if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
             return $candidate
-        }
-    }
-
-    $launcher = Get-Command -Name 'py.exe' -ErrorAction SilentlyContinue
-    if ($launcher) {
-        # py.exe prints its "no Python 3.12 found" diagnostic on stderr -- the
-        # exact case this fallback handles -- and Windows PowerShell 5.1 turns
-        # that stderr into error records that a 'Stop' preference escalates
-        # into a terminating NativeCommandError before the exit-code check
-        # below (same hazard Invoke-Native guards against). Relax the
-        # preference for this one invocation and decide solely on
-        # $LASTEXITCODE: a missing 3.12 is the graceful not-found return, not
-        # a crash.
-        $previousEap = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        $found = & $launcher.Source -3.12 -c 'import sys; print(sys.executable)' 2>$null
-        $launcherExit = $LASTEXITCODE
-        $ErrorActionPreference = $previousEap
-        if ($launcherExit -eq 0 -and $found -and (Test-Path -LiteralPath $found.Trim() -PathType Leaf)) {
-            return $found.Trim()
         }
     }
     return $null
@@ -293,7 +286,8 @@ catch {
     # $ErrorActionPreference = 'Stop' turns any cmdlet failure into a
     # terminating error; route it through the same structured FAIL channel.
     # Native-command stderr can no longer land here: every native invocation
-    # above (Invoke-Native, the py-launcher probe, the pip install) relaxes
+    # above (Invoke-Native for the interpreter check and venv create, the pip
+    # install) relaxes
     # the preference for its own scope and decides solely on $LASTEXITCODE,
     # while the exit-code checks keep failing closed on every nonzero result.
     Fail ("unexpected error: " + $_.Exception.Message)

@@ -138,8 +138,8 @@ def test_deb_scan_function_does_not_match_the_root_directory(tmp_path: Path) -> 
     fn = _extract_shell_function(BUILD_DEB, "find_pubkey_material")
 
     def run_scan(root: Path) -> str:
-        proc = subprocess.run(
-            ["bash", "-c", f"{fn}\nfind_pubkey_material \"$1\"", "bash", str(root)],
+        proc = subprocess.run(  # noqa: S603 - fixed args, local test helper
+            ["/bin/bash", "-c", f"{fn}\nfind_pubkey_material \"$1\"", "/bin/bash", str(root)],
             capture_output=True, text=True, timeout=60,
         )
         assert proc.returncode == 0, proc.stderr

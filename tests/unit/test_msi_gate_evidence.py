@@ -173,17 +173,17 @@ def test_stderr_redirected_native_invocations_are_guarded() -> None:
             continue  # the helper's own `& $Block` dispatch runs relaxed
         if not re.search(r"(?<![>&\w])&(?=\s)", ln):
             continue
-        if not re.search(r"2>&1|2>\s", ln):
+        if not re.search(r"2>&1|2>\s|2>\$null", ln):
             continue  # unredirected native stderr is not escalated (console)
         assert "Invoke-Native {" in ln, (
             f"stderr-redirected native invocation without an EAP relaxation "
             f"guard (PS 5.1 escalates it to a terminating error): {ln}"
         )
         guarded += 1
-    assert guarded >= 8, (
-        "expected at least: py-launcher probe, trusted verifier, three "
-        "sc.exe calls, create_demo, doctor, probe, verify.ps1 tamper run "
-        f"to be present and guarded; found {guarded}"
+    assert guarded >= 9, (
+        "expected at least: trusted verifier, three sc.exe calls, create_demo, "
+        "doctor, probe, verify.ps1 tamper run, verify.ps1 per-user-interpreter "
+        f"refusal run to be present and guarded; found {guarded}"
     )
 
 

@@ -319,6 +319,16 @@ def test_build_msi_happy_path_produces_msi_and_heat_equivalent_fragment(
     assert "-define" in args and "CustomActionScriptsDir=" in args, (
         "wix build must receive -define CustomActionScriptsDir for the deferred actions"
     )
+    # step 4 of the script: the SIGNED manifest release is substituted into
+    # the .wxs preprocessor variables. If -define ProductVersion is dropped
+    # or broken, udbmcp.wxs silently falls back to its <?ifndef> default
+    # (0.1.0) and still compiles — corrupting MajorUpgrade/upgrade detection
+    # while every other gate stays green.
+    assert "ProductVersion=1.2.3" in args, (
+        "wix build must receive -define ProductVersion=<signed manifest release> "
+        "(1.2.3 here); the wxs <?ifndef ProductVersion> fallback would otherwise "
+        "ship 0.1.0 and break MajorUpgrade"
+    )
     staged = env["capture"] / "custom"
     assert staged.is_dir(), "the custom action scripts were not staged for the compile"
     for name in CUSTOM_ACTION_SCRIPTS:
@@ -365,6 +375,13 @@ def test_build_msi_fails_closed(
     work = tmp_path_factory.mktemp("msi-neg")
     bundle = work / "bundle"
     shutil.copytree(env["bundle"], bundle, symlinks=True)
+    # build_msi.sh resolves the trusted verifier OUTSIDE the bundle (sibling
+    # trusted-tools/ or $UDBMCP_TRUST_DIR) and dies BEFORE staging when it is
+    # absent. Copy the sibling so the payload mutations below actually reach
+    # the gates they pin (the staged-payload pubkey scan and the harvester's
+    # non-regular-file check) instead of failing earlier on the verifier
+    # lookup — otherwise these two fail-closed gates would be untested.
+    shutil.copytree(env["root"] / "trusted-tools", work / "trusted-tools")
     pubkey = work / "release.pub.pem"
     pubkey.write_bytes(env["pubkey"].read_bytes())
 
@@ -385,6 +402,18 @@ def test_build_msi_fails_closed(
     assert proc.returncode != 0, f"build_msi.sh must fail closed ({reason}); it exited 0:\n{proc.stdout}"
     assert "FAIL" in out, f"the refusal must carry a diagnostic ({reason}), got:\n{out}"
     assert list(out_dir.glob("*.msi")) == [], f"no MSI may be produced ({reason})"
+    # pin the SPECIFIC gate each payload mutation must reach: with the trusted
+    # verifier present, an earlier/other refusal would mean the gate under
+    # test was bypassed or reordered and the test would pass for the wrong
+    # reason (mutation-proven vacuous-pass failure mode).
+    expected_gate = {
+        "pubkey-in-payload": "public key material found in staged msi payload",
+        "symlink-in-payload": "non-regular file in staged payload",
+    }
+    if mutate in expected_gate:
+        assert expected_gate[mutate] in out, (
+            f"the build must fail at the gate this mutation targets ({reason}), got:\n{out}"
+        )
 
 
 def test_build_msi_fails_closed_when_wix_build_fails(
@@ -620,7 +649,21 @@ def test_wxs_never_references_release_key_material() -> None:
         el.get("ExeCommand") for el in _iter_local(_wxs_root(), "CustomAction")
         if el.get("Id") == "VerifyBundleCA"
     )
-    assert "pubkey" not in verify_cmd.lower() and "trust" not in verify_cmd.lower(), (
-        "the verify action's command line carries only the bundle path; trust material is "
-        "resolved at runtime from the admin-installed machine scope"
+    assert "pubkey" not in verify_cmd.lower(), (
+        "the verify action's command line must not reference a public key; the "
+        "release pubkey is resolved at runtime from machine scope "
+        "(UDBMCP_RELEASE_PUBKEY), never from the package authoring"
+    )
+    # The trust DIRECTORY, by contrast, IS pinned in the command line —
+    # deliberately (P1 fix): TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust
+    # forces the gate to run the trusted verifier from the admin-write-only
+    # Program Files tree instead of verify.ps1's fallback default under
+    # C:\ProgramData, whose default ACLs let a NON-ADMIN process pre-create
+    # (and thereby own) the trust directory and swap the verifier that this
+    # LocalSystem action then executes. This pins a location, not key
+    # material — no key path or key bytes pass through the authoring.
+    assert "TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust" in verify_cmd, (
+        "the verify action must pin TRUST_DIR to the ACL-protected Program "
+        "Files trust location; leaving it to verify.ps1's C:\\ProgramData "
+        "fallback reopens the non-admin trust-dir squatting bypass"
     )

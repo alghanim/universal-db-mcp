@@ -222,9 +222,42 @@ def test_uninstall_fails_closed_on_other_errors(sources: dict[str, str]) -> None
     assert re.search(r"\bexit\s+1\b", text)
 
 
-def test_uninstall_retains_machine_config(sources: dict[str, str]) -> None:
+def test_uninstall_states_machine_config_is_not_retained(sources: dict[str, str]) -> None:
+    """The MSI uninstall transaction DOES delete ProgramData\\...\\config.yaml
+    (ConfigYamlComponent has NeverOverwrite but no Permanent, so RemoveFiles
+    removes it right after this action). The script must never claim the
+    config is retained: an admin relying on such a log line would skip the
+    documented backup (docs/offline-deployment.md: uninstall section) and
+    lose hand-edited config. The .deb comparison is the opposite: postrm
+    keeps the conffile on remove."""
     text = sources["uninstall.ps1"]
     assert not re.search(r"Remove-Item[^\n]*config\.yaml", text), (
-        "uninstall must not delete the admin's config (conffile retention)"
+        "uninstall.ps1 itself must not delete the config (the MSI RemoveFiles "
+        "standard action does that; the script stays out of it)"
     )
-    assert "retained" in text, "the retention decision must be stated in the script, not implicit"
+    assert "NOT retained" in text, (
+        "the script must state explicitly that the machine-wide config is NOT "
+        "retained at uninstall, so admins back it up before uninstalling"
+    )
+    assert "retained by design" not in text, (
+        "the false retention assurance must not come back"
+    )
+
+
+def test_uninstall_validates_service_name_before_tool_invocation(sources: dict[str, str]) -> None:
+    """$ServiceName is embedded unquoted in sc.exe command lines and inside a
+    quoted reg.exe key path, so both quote styles and whitespace must be
+    rejected before the first tool invocation (same guard as service.ps1)."""
+    code = code_lines(sources["uninstall.ps1"])
+    guard_line = next(
+        (line for line in code.splitlines() if "$ServiceName -match" in line), None
+    )
+    assert guard_line, "uninstall.ps1 does not validate the service name"
+    assert "\\s" in guard_line, "whitespace in the service name must be rejected"
+    assert '"' in guard_line, "double quotes in the service name must be rejected"
+    assert "'" in guard_line, "single quotes in the service name must be rejected"
+    # The guard must run before the first tool invocation (the
+    # Test-ServiceExists call that triggers the first sc.exe query).
+    assert code.index("$ServiceName -match") < code.index("Test-ServiceExists -Name"), (
+        "the service name guard must run before the first sc.exe invocation"
+    )

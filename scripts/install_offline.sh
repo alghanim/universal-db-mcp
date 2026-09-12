@@ -48,9 +48,38 @@ if [ ! -f "$VERIFIER" ]; then
   echo "FAIL: trusted verifier not found at $VERIFIER (set UDBMCP_VERIFIER or install the trusted tools)." >&2
   exit 1
 fi
-case "$(cd "$(dirname "$VERIFIER")" && pwd -P)" in
+# A zero-length verifier is not a verifier: python3 on an empty script exits 0
+# without ever running argparse, so a truncated trusted-channel copy would
+# 'verify' vacuously and the unverified bundle would be installed. The .pkg
+# preinstall ([ ! -s ]) and the deb preinst/postinst guard this same case;
+# fail closed here too.
+if [ ! -s "$VERIFIER" ]; then
+  echo "FAIL: trusted verifier at $VERIFIER is empty; refusing to proceed." >&2
+  echo "      python3 on an empty script exits 0 without verifying anything, so" >&2
+  echo "      a truncated trusted-channel copy must abort the install. Re-install" >&2
+  echo "      the real verifier from the trusted channel:" >&2
+  echo "        sudo install -m 644 <trusted-channel>/verify_bundle.py $TRUST_DIR/" >&2
+  exit 1
+fi
+verifier_real="$(cd "$(dirname "$VERIFIER")" && pwd -P)/$(basename "$VERIFIER")"
+case "$verifier_real" in
   "$bundle_real"/*)
     echo "FAIL: UDBMCP_VERIFIER points inside the bundle; the verifier must come from the trusted channel." >&2
+    exit 1 ;;
+esac
+# Same rule for the release public key: a tampered bundle ships its own key
+# (and a re-signed SHA256SUMS/SIGNATURE), so a key read from inside the bundle
+# authenticates nothing — verification would PASSED against attacker material.
+# Like the verifier, the key is distributed out-of-band on the trusted channel.
+# The RESOLVED FILE PATH is compared (not just its directory): a key sitting
+# directly in the bundle root has dirname == $bundle_real, which would slip
+# past a "$bundle_real"/* match on the directory alone.
+pubkey_dir="$(cd "$(dirname "$PUBKEY")" 2>/dev/null && pwd -P)" || pubkey_dir=""
+case "$pubkey_dir/$(basename "$PUBKEY")" in
+  "$bundle_real"/*)
+    echo "FAIL: UDBMCP_RELEASE_PUBKEY ($PUBKEY) is inside the bundle; refusing to verify with a pubkey shipped inside the bundle." >&2
+    echo "      Install the key outside the bundle from the trusted channel" >&2
+    echo "      (e.g. sudo install -m 644 <trusted-channel>/release.pub.pem $TRUST_DIR/)." >&2
     exit 1 ;;
 esac
 LIB_DIR="$(dirname "$self_path")/lib"
@@ -104,7 +133,33 @@ if [ "$(id -u)" -ne 0 ]; then
   sudo_ok="sudo"
 fi
 
-$sudo_ok $VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY"
+# --- verifier PROOF gate -----------------------------------------------------
+# Exit code alone is not proof of verification: python3 on an empty, truncated
+# or no-op verifier exits 0 vacuously, and a verifier that exits 0 without
+# certifying proves nothing. Success requires exit 0 AND the verifier's
+# literal 'bundle verification PASSED' AND no 'FAIL:' diagnostic — the same
+# rule packaging/msi/custom/verify.ps1 enforces. Output is echoed through so
+# the admin sees the canonical diagnostics either way.
+verify_with_proof() {
+  # $1: the bundle directory to verify
+  local vout vrc=0
+  vout="$(mktemp "${TMPDIR:-/tmp}/udbmcp-verify.XXXXXX")"
+  $sudo_ok $VEXEC "$VERIFIER" --bundle "$1" --pubkey "$PUBKEY" >"$vout" 2>&1 || vrc=$?
+  cat "$vout"
+  if [ "$vrc" -ne 0 ]; then
+    echo "FAIL: trusted verifier exited $vrc; the bundle is untrusted: installation ABORTED." >&2
+    rm -f "$vout"
+    exit 1
+  fi
+  if grep -q '^FAIL:' "$vout" || ! grep -q 'bundle verification PASSED' "$vout"; then
+    echo "FAIL: trusted verifier exited 0 but did not print 'bundle verification PASSED' (or printed a FAIL line); without explicit proof of verification the bundle is treated as untrusted: installation ABORTED." >&2
+    rm -f "$vout"
+    exit 1
+  fi
+  rm -f "$vout"
+}
+
+verify_with_proof "$BUNDLE"
 
 # --- verify-then-use: consume ONLY a private root-owned staging copy --------
 # Verification hashed the tree once, but the bundle is then read for tens of
@@ -123,7 +178,7 @@ trap cleanup_staging EXIT
 $sudo_ok chmod 700 "$STAGING"
 echo "==> staging a private copy of the verified bundle (closes the verify-then-use race)"
 $sudo_ok cp -a "$BUNDLE"/. "$STAGING/"
-$sudo_ok $VEXEC "$VERIFIER" --bundle "$STAGING" --pubkey "$PUBKEY"
+verify_with_proof "$STAGING"
 BUNDLE="$STAGING"
 
 echo "==> checking platform baseline"

@@ -15,14 +15,25 @@ P1 (root cause lives in scripts/lib/os_packages.sh, reached via the deb's
    tripwire can never misfire inside it.
 
 P3: build_deb.sh staged the systemd unit into the dpkg payload at
-   etc/systemd/system/ (dpkg-owned, silently overwritten on upgrade) and the
-   default config as a dpkg conffile (root:root 0644, making postinst's
-   only-if-absent seeding unreachable). Both are postinst-installed OUTSIDE
-   dpkg management now; build_deb.sh must never stage them again.
+   etc/systemd/system/ (dpkg-owned, silently overwritten on upgrade). The
+   unit is installed by postinst OUTSIDE dpkg management now (the deb ships
+   the canonical copy under usr/share/universal-db-mcp/systemd/); build_deb.sh
+   must never stage the unit under /etc again. The default config, by
+   contrast, IS staged at etc/universal-db-mcp/config.yaml as a dpkg
+   conffile (plan Phase 4, registered via packaging/deb/conffiles): dpkg owns
+   it, preserves admin edits across upgrades, and postinst's only-if-absent
+   seeding stays as the documented fallback for a conffile an admin deleted
+   before an upgrade — it is not dead code. See
+   tests/unit/test_deb_conffiles_gate.py, the authoritative suite for the
+   conffile staging and its fail-loud gate.
 
-P2 (build side): the deb's self-bootstrap needs profiles.py in the
-   trusted-tools payload (verify_bundle.py imports it from its own directory);
-   build_deb.sh must fail closed at build time if it is missing.
+P2 (build side): the deb's trusted-tools payload must be COMPLETE
+   (profiles.py next to verify_bundle.py, lib/os_packages.sh next to
+   install_offline.sh). Since the no-self-bootstrap fix the deb-shipped copy
+   is INERT reference material — postinst never bootstraps the trust dir from
+   the package payload — but the copy that ships next to the bundle on the
+   trusted channel must still be usable by the admin, so build_deb.sh fails
+   closed at build time if it is missing either file.
 
 Trust invariants under test (never broken):
   1. verify-before-execute: build_deb.sh still verifies the source bundle via
@@ -73,19 +84,25 @@ def test_build_deb_passes_bash_syntax_check() -> None:
     _bash_n(_BUILD_DEB)
 
 
-def test_build_deb_does_not_stage_unit_or_config_into_dpkg_payload() -> None:
-    """P3: the systemd unit and the default config are installed by postinst
-    OUTSIDE dpkg management (/etc/systemd/system is admin-controlled; the
-    config is seeded only-if-absent, owner udbmcp:udbmcp 0640). Staging either
-    under etc/ would make dpkg own them and silently clobber admin edits on
-    upgrade (unit) or make the seeding dead code (config)."""
+def test_build_deb_does_not_stage_unit_into_dpkg_payload() -> None:
+    """P3: the systemd unit is installed by postinst OUTSIDE dpkg management
+    (/etc/systemd/system is admin-controlled; a dpkg-owned unit would be
+    silently clobbered on upgrade). build_deb.sh stages the deb-shipped
+    canonical copy under usr/share/universal-db-mcp/systemd/ only — never
+    under /etc. The default config, unlike the unit, IS deliberately staged
+    under etc/ as a dpkg conffile (plan Phase 4); that staging and its
+    fail-loud gate are covered authoritatively by
+    tests/unit/test_deb_conffiles_gate.py — here only the unit is locked
+    out of dpkg's /etc paths."""
     code = _noncomment(_read(_BUILD_DEB))
     assert "etc/systemd/system/universal-db-mcp.service" not in code
-    assert "etc/universal-db-mcp/config.yaml" not in code
-    assert '"$DEBROOT/etc' not in code, "nothing should be staged under /etc anymore"
     # The canonical copies postinst consumes must still be staged.
     assert 'cp "$UNIT_SRC" "$PKG_SHARE/systemd/universal-db-mcp.service"' in code
     assert 'CONFIG_TEMPLATE="$BUNDLE/config-templates/config.yaml"' in code
+    # The conffile staging is intentional (not a regression): assert the
+    # exact string the conffiles-gate suite requires, so the two suites can
+    # never disagree about the config's dpkg ownership again.
+    assert 'install -m 0644 "$CONFIG_TEMPLATE" "$DEBROOT/etc/universal-db-mcp/config.yaml"' in code
 
 
 def test_build_deb_requires_complete_trusted_tools_including_profiles() -> None:

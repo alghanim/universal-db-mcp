@@ -12,7 +12,7 @@ Status ledger: `IMPLEMENTATION_STATUS.md`. Machine-readable evidence:
 | D: egress observation | process-level observation of DNS/connect attempts incl. blocked ones | `scripts/observe_egress.sh` | harness provided; requires strace-capable Linux host for a full run |
 | E: query/authz security | the spec §14-E battery | `pytest tests/unit tests/integration` + fixture-based denial tests | unit/integration portions passed; DB-side permission denial covered in Gate C fixtures |
 | F: client/model end-to-end | pinned Claude Code + internal gateway + GLM, egress blocked | manual, org-specific | not_run (requires organization's client/gateway) |
-| G: upgrade/rollback | local-bundle upgrade, interruption, rollback, state preservation | `scripts/upgrade_offline.sh` / `rollback_offline.sh` | scripts provided; exercise on target and record evidence before release |
+| G: upgrade/rollback | local-bundle upgrade, interruption, rollback, state preservation | `scripts/upgrade_offline.sh` / `rollback_offline.sh` | upgrade + rollback passed in a `docker --network none` container (2026-09-12T11:22:01Z, 23/23 checks; evidence: `out/package-evidence/upgrade/`, machine-readable `results.json`); `not_run`: systemd stop/start (no systemd as PID 1 in the container — exercise on a systemd target before release) and the deliberate-interruption sub-case |
 
 ## Gate C manual procedure (heavy engines)
 

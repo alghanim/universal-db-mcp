@@ -5,7 +5,9 @@ Runs on the air-gapped target with no network. Checks:
 - manifest present and parses; profile matches this machine
 - every file matches SHA256SUMS (integrity)
 - SIGNATURE verifies against an independently distributed Ed25519 public key
-  (authenticity; pass --pubkey to enforce)
+  (authenticity; --pubkey is REQUIRED — without it the verdict is always
+  FAILED, because integrity alone proves nothing against an attacker who can
+  rewrite SHA256SUMS)
 - wheelhouse satisfies runtime.lock: every pinned requirement has a wheel
   with the exact recorded hash
 - declared os_packages (.deb closure) exist and match the manifest hashes,
@@ -71,8 +73,13 @@ def main() -> int:
     if not manifest_p.exists():
         fail(f"manifest.json missing in {bundle}")
         return 1
-    manifest = json.loads(manifest_p.read_text())
-    profile = manifest["profile"]
+    try:
+        manifest = json.loads(manifest_p.read_text())
+        profile = manifest["profile"]
+    except (ValueError, KeyError, TypeError) as exc:
+        fail(f"manifest.json is unreadable or not a valid manifest ({exc}); "
+             "re-copy the bundle from your trusted channel and re-run")
+        return 1
 
     # profile compatibility: registry lookup (scripts/profiles.py) replaces the
     # previously hardcoded 'linux-x86_64' branch. Known profiles are checked
@@ -127,22 +134,30 @@ def main() -> int:
                 fail(f"tampered artifact: {rel} (sha256 mismatch)")
             checked += 1
         # every file on disk must be accounted for: an unlisted file (planted
-        # or left by a partial regeneration) is a failure
+        # or left by a partial regeneration) is a failure. Exempt: checksum
+        # listings named SHA256SUMS (the trusted build tool writes a per-image
+        # images/SHA256SUMS next to the tars; these listings are inert — only
+        # the root one is ever the verification basis) and the bundle-root
+        # SIGNATURE. A file merely NAMED "SIGNATURE" in a subdirectory is NOT
+        # exempt and must be covered like any other payload.
+        root = bundle.resolve()
         for f in bundle.rglob("*"):
-            if f.is_file() and f.name not in ("SHA256SUMS", "SIGNATURE") and f.resolve() not in listed:
-                fail(f"file present in bundle but NOT covered by SHA256SUMS: {f.relative_to(bundle)}")
+            if not f.is_file() or f.resolve() in listed:
+                continue
+            if f.name == "SHA256SUMS" or f.resolve() == root / "SIGNATURE":
+                continue
+            fail(f"file present in bundle but NOT covered by SHA256SUMS: {f.relative_to(bundle)}")
         print(f"integrity: {checked} artifacts checked, full coverage verified")
 
     # authenticity
     sig = bundle / "SIGNATURE"
-    if not args.pubkey and sig.exists():
-        # A signed bundle MUST be verifiable: refusing to proceed without the
-        # key prevents 'verify without authenticity' becoming the norm.
-        fail("bundle is signed but no --pubkey was provided; obtain the release "
-             "public key through your trusted channel and verify before installing")
     if args.pubkey:
         if not sig.exists():
             fail("SIGNATURE missing but a public key was provided for verification")
+        elif not sums.exists():
+            # already reported above ("SHA256SUMS missing"); there is no
+            # signed data left to verify against
+            pass
         else:
             data = (bundle / "SHA256SUMS").read_bytes()
             # OpenSSL 3.0's pkeyutl -rawin cannot read a non-seekable stdin
@@ -183,7 +198,19 @@ def main() -> int:
             else:
                 print("signature: verified against provided public key")
     else:
-        print("signature: NOT verified (no --pubkey given); authenticity unproven")
+        # Fail closed, unconditionally: integrity alone proves nothing, since
+        # an attacker who can touch the bundle can also regenerate unsigned
+        # SHA256SUMS (and delete SIGNATURE). Without --pubkey this verifier
+        # must never certify the bundle — no PASSED verdict, exit nonzero.
+        if sig.exists():
+            # A signed bundle MUST be verifiable: refusing to proceed without
+            # the key prevents 'verify without authenticity' becoming the norm.
+            fail("bundle is signed but no --pubkey was provided; obtain the release "
+                 "public key through your trusted channel and verify before installing")
+        else:
+            print("signature: NOT verified (no --pubkey given); authenticity unproven")
+        fail("authenticity NOT verified: obtain the release public key through "
+             "your trusted channel and re-run with --pubkey before installing")
 
     # wheelhouse satisfies runtime.lock
     lock = bundle / "requirements" / "runtime.lock"
@@ -229,36 +256,42 @@ def main() -> int:
 
     # os-packages: every declared .deb must exist with the manifest hash, and
     # every .deb shipped on disk must be declared (nothing extra, nothing
-    # swapped after signing).
+    # swapped after signing). Enforced even when the manifest declares no
+    # packages: os_packages.sh falls back to running every .deb found in
+    # os-packages/, so an undeclared .deb must never slip through a manifest
+    # with an empty os_packages section.
     os_packages = manifest.get("os_packages") or {}
     entries = os_packages.get("packages") if isinstance(os_packages, dict) else None
+    entries = list(entries) if entries else []
+    osp_dir = bundle / "os-packages"
+    declared_files: set[Path] = set()
+    declared_names: set[str] = set()
+    ok_count = 0
+    for entry in entries:
+        fname = str(entry.get("file", ""))
+        rel = str(entry.get("path") or f"os-packages/{fname}")
+        f = bundle / rel
+        declared_files.add(f.resolve())
+        declared_names.add(str(entry.get("package", "")))
+        if not fname or not f.exists():
+            fail(f"os package declared in manifest but missing from bundle: {rel}")
+            continue
+        actual = hashlib.sha256(f.read_bytes()).hexdigest()
+        if actual != entry.get("sha256"):
+            fail(f"tampered os package: {rel} (manifest sha256 mismatch)")
+            continue
+        ok_count += 1
+    if osp_dir.exists():
+        for f in sorted(osp_dir.glob("*.deb")):
+            if f.resolve() not in declared_files:
+                fail(f".deb present in os-packages but not declared in manifest.json: {f.name}")
+    print(f"os-packages: {ok_count}/{len(entries)} declared .deb artifacts hash-checked")
     if entries:
-        osp_dir = bundle / "os-packages"
-        declared_files: set[Path] = set()
-        declared_names: set[str] = set()
-        ok_count = 0
-        for entry in entries:
-            fname = str(entry.get("file", ""))
-            rel = str(entry.get("path") or f"os-packages/{fname}")
-            f = bundle / rel
-            declared_files.add(f.resolve())
-            declared_names.add(str(entry.get("package", "")))
-            if not fname or not f.exists():
-                fail(f"os package declared in manifest but missing from bundle: {rel}")
-                continue
-            actual = hashlib.sha256(f.read_bytes()).hexdigest()
-            if actual != entry.get("sha256"):
-                fail(f"tampered os package: {rel} (manifest sha256 mismatch)")
-                continue
-            ok_count += 1
-        if osp_dir.exists():
-            for f in sorted(osp_dir.glob("*.deb")):
-                if f.resolve() not in declared_files:
-                    fail(f".deb present in os-packages but not declared in manifest.json: {f.name}")
-        print(f"os-packages: {ok_count}/{len(entries)} declared .deb artifacts hash-checked")
         # dependency closure sanity: msodbcsql18 cannot be configured without
         # the unixODBC stack, and a selected mssql connector without the driver
         # deb means the shipped closure is incomplete (not admin-supplied).
+        # (Only meaningful when the manifest declares deb packages at all:
+        # macOS/Windows bundles legitimately ship none.)
         if "msodbcsql18" in declared_names and "unixodbc" not in declared_names:
             fail("os_packages closure incomplete: msodbcsql18 requires unixodbc")
         if "mssql" in manifest.get("selected_connectors", []) and "msodbcsql18" not in declared_names:

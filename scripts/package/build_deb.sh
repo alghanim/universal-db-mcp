@@ -16,9 +16,15 @@
 #                          builder sentinel "unknown" FAILS the build — see
 #                          the provenance guard below)
 #        DEBIAN/{preinst,postinst,prerm,postrm}
-#                        — copied executable from packaging/deb/. conffiles is
-#                          DELIBERATELY ABSENT (deviation from the plan listed
-#                          above, enforced by the fail-loud gate below).
+#                        — copied executable from packaging/deb/.
+#        DEBIAN/conffiles — rendered from packaging/deb/conffiles (REQUIRED;
+#                          fail-loud gate below): registers
+#                          /etc/universal-db-mcp/config.yaml as a dpkg
+#                          conffile. The config file itself is ALSO staged
+#                          into the payload at etc/universal-db-mcp/
+#                          config.yaml — dpkg treats a conffile entry whose
+#                          file is missing from the payload as "deleted by
+#                          the packager".
 #        usr/share/universal-db-mcp/bundle/        — the entire signed bundle
 #        usr/share/universal-db-mcp/trusted-tools/ — INERT reference copy of
 #                          the trusted verifier/installer (postinst NEVER
@@ -30,16 +36,22 @@
 #                          the unit stays a non-dpkg-managed, admin-controlled
 #                          path — see packaging/deb/postinst step 3)
 #
-#      Deliberately NOT in the payload (neither is a dpkg path; see the
-#      staging code below for why):
+#      Deliberately NOT in the payload (not a dpkg path; see the staging
+#      code below for why):
 #        the systemd unit under /etc — installing it via dpkg would make the
 #                          unit dpkg-owned, so admin edits would be silently
 #                          lost on upgrade; postinst installs the deb-shipped
 #                          canonical copy to /etc/systemd/system instead.
-#        the default config under /etc — a dpkg conffile would land root:root
-#                          0644 and make postinst's "install config ONLY if
-#                          absent" seeding (owner udbmcp:udbmcp, mode 0640)
-#                          unreachable; postinst seeds it instead.
+#      The default config IS in the payload at etc/universal-db-mcp/
+#      config.yaml as a dpkg conffile (registered via packaging/deb/conffiles,
+#      plan Phase 4): dpkg owns the file, preserves admin edits across
+#      upgrades (prompting only on a conflict), keeps it on remove and
+#      deletes it on purge. postinst's only-if-absent seeding stays as the
+#      fallback for a config an admin deleted before an upgrade — it never
+#      overwrites an existing file. NOTE: --root-owner-group forces the
+#      unpacked conffile to root:root (the staged 0644 mode is preserved);
+#      postinst's udbmcp:udbmcp 0640 seeding therefore only applies to the
+#      fallback path.
 #   3. Builds the .deb INSIDE the baseline container (the staging host may be
 #      macOS, which has no trustworthy dpkg-deb environment):
 #        docker run --rm -v <staged root>:/debroot <baseline image> \
@@ -73,7 +85,7 @@ die() {
 }
 
 usage() {
-    sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 sha256_of() {
@@ -213,7 +225,10 @@ esac
 case "$SOURCE_REV" in
     unknown|UNKNOWN|Unknown)
         die "manifest source_rev is the builder sentinel 'unknown' (scripts/prepare_offline_bundle.py ran without --source-rev) — the bundle carries no source revision; refusing to emit version '$RELEASE~$SOURCE_REV'. Rebuild the bundle with a real --source-rev (see docs/offline-build.md step 2) and re-sign it." ;;
-    *[!A-Za-z0-9.+-~]*)
+    # NOTE: '~' and '-' are placed LAST in the bracket so '-' cannot be
+    # parsed as a glob range ('+-~' would mean chars 0x2B..0x7E and let
+    # '/', ':' etc. through). Hyphen-at-end is a literal in POSIX patterns.
+    *[!A-Za-z0-9.+~-]*)
         die "manifest source_rev contains characters invalid in a dpkg version: '$SOURCE_REV' — refusing to build a package around a malformed revision" ;;
 esac
 
@@ -236,17 +251,28 @@ echo "==> version:   $DEB_VERSION (from signed manifest)"
 
 # The trusted tools are distributed by prepare_offline_bundle.py as a
 # SIBLING of the bundle directory on the same trusted channel
-# (<staging-out>/trusted-tools/). Fall back to an in-bundle copy only for
-# layouts that ship it there. If neither exists, fail closed: verifying with
-# the bundle's own installers/ copies proves nothing (reference copies).
+# (<staging-out>/trusted-tools/), or via an explicit UDBMCP_TRUST_DIR
+# override. An IN-BUNDLE copy is NEVER used as the verifier: a tampered
+# bundle would ship a verifier that prints PASSED (the self-verification
+# bypass this check exists to prevent — commit security review flagged
+# exactly this fallback on 2026-09-12). If no out-of-bundle copy exists,
+# fail closed: verifying with the bundle's own copies proves nothing.
 TRUSTED=""
-for cand in "$BUNDLE/../trusted-tools" "$BUNDLE/trusted-tools"; do
-    if [ -f "$cand/verify_bundle.py" ]; then
-        TRUSTED="$(cd "$cand" && pwd -P)"
-        break
-    fi
+for cand in "${UDBMCP_TRUST_DIR:-}" "$BUNDLE/../trusted-tools"; do
+    [ -n "$cand" ] || continue
+    [ -f "$cand/verify_bundle.py" ] || continue
+    cand_real="$(cd "$cand" && pwd -P)"
+    bundle_real="$(cd "$BUNDLE" && pwd -P)"
+    case "$cand_real" in
+        # exact match too: if the bundle dir itself is named "trusted-tools",
+        # "$BUNDLE/../trusted-tools" resolves TO the bundle, and trusting it
+        # would let a tampered bundle verify itself.
+        "$bundle_real"|"$bundle_real"/*) continue ;;  # in-bundle copy: never trusted
+    esac
+    TRUSTED="$cand_real"
+    break
 done
-[ -n "$TRUSTED" ] || die "trusted-tools/ (with verify_bundle.py) not found next to the bundle — cannot verify from the trusted channel"
+[ -n "$TRUSTED" ] || die "no trusted verifier found OUTSIDE the bundle (expected $BUNDLE/../trusted-tools or \$UDBMCP_TRUST_DIR) — an in-bundle verifier is never trusted; bootstrap the trust channel first"
 
 # The deb stages this copy as INERT reference material at
 # /usr/share/universal-db-mcp/trusted-tools/: postinst NEVER bootstraps or
@@ -307,11 +333,12 @@ cleanup() { rm -rf "$DEBROOT"; }
 trap cleanup EXIT INT TERM
 
 PKG_SHARE="$DEBROOT/usr/share/universal-db-mcp"
-# No etc/ directories are staged: the systemd unit and the default config are
-# both installed by postinst OUTSIDE dpkg management (see above), so dpkg
-# never owns either /etc path.
+# Exactly ONE /etc path is staged: the default config conffile (below), which
+# dpkg owns via DEBIAN/conffiles. The systemd unit is still installed by
+# postinst OUTSIDE dpkg management (see above), so dpkg never owns the unit
+# path.
 mkdir -p "$PKG_SHARE/bundle" "$PKG_SHARE/trusted-tools" "$PKG_SHARE/systemd" \
-         "$DEBROOT/DEBIAN"
+         "$DEBROOT/etc/universal-db-mcp" "$DEBROOT/DEBIAN"
 
 # Payload: the ENTIRE signed bundle, byte-for-byte (cp -a preserves modes so
 # the postinst verification sees exactly what was signed).
@@ -335,17 +362,16 @@ UNIT_SRC="$PROJECT_ROOT/packaging/systemd/universal-db-mcp.service"
 cp "$UNIT_SRC" "$PKG_SHARE/systemd/universal-db-mcp.service"
 chmod 0644 "$PKG_SHARE/systemd/universal-db-mcp.service"
 
-# Default config: deliberately NOT staged as a dpkg conffile. A staged
-# conffile would (a) land root:root 0644 (ownership is forced by
-# --root-owner-group) instead of the documented owner udbmcp:udbmcp mode 0640,
-# and (b) make postinst's "install config ONLY if absent" seeding unreachable,
-# because dpkg would always place the file at unpack time. Instead the config
-# is seeded by postinst from the verified bundle's config-templates/ copy
-# (checked to exist below), only when the /etc config path is absent — admin
-# edits are never overwritten on upgrade, the file survives
-# remove, and postrm deletes it on purge.
+# Default config: staged as a dpkg conffile from the verified bundle's
+# config-templates/ copy (checked to exist below) and registered via
+# packaging/deb/conffiles in the gate below. Mode 0644 is preserved by
+# dpkg-deb (--root-owner-group forces only the ownership to root:root), so
+# the udbmcp service account can read the config; postinst's
+# only-if-absent seeding remains as the fallback for a conffile an admin
+# deleted before an upgrade and never overwrites an existing file.
 CONFIG_TEMPLATE="$BUNDLE/config-templates/config.yaml"
 [ -f "$CONFIG_TEMPLATE" ] || die "default config template missing from bundle: $CONFIG_TEMPLATE"
+install -m 0644 "$CONFIG_TEMPLATE" "$DEBROOT/etc/universal-db-mcp/config.yaml"
 
 # Maintainer scripts from packaging/deb/ — copied executable, as dpkg
 # requires. Missing files fail the build loudly: a .deb whose postinst cannot
@@ -358,54 +384,48 @@ for script in preinst postinst prerm postrm; do
     chmod 0755 "$DEBROOT/DEBIAN/$script"
 done
 # --- conffiles gate (fail-loud) ---------------------------------------------
-# The plan listed packaging/deb/conffiles as a Phase 4 input, but this package
-# DELIBERATELY registers no dpkg conffile (rationale above; also documented in
-# packaging/deb/postrm and docs/offline-deployment.md): the default config is
-# seeded by postinst only-if-absent as udbmcp:udbmcp 0640, which a forced
-# root:root 0644 conffile would make unreachable. A deviation this
-# load-bearing must not degrade to a build-time NOTE, so both directions fail
-# loud:
-#   1. conffiles PRESENT: every path entry must point at a file that is
-#      actually in the staged payload. Nothing under /etc is staged (both /etc
-#      artifacts are postinst-installed outside dpkg management), so
-#      re-registering the seeded /etc config path here aborts the build
-#      instead of shipping a conffile dpkg would treat as deleted by the
-#      packager.
-#   2. conffiles ABSENT (the required state): the compensating controls are
-#      verified below — postinst must still seed the config only-if-absent,
-#      and postrm must still delete it on purge while keeping it on remove.
-#      A package that neither registers a conffile nor compensates for it
-#      must never be produced.
+# packaging/deb/conffiles is a REQUIRED plan Phase 4 input: it registers
+# /etc/universal-db-mcp/config.yaml as a dpkg conffile (the file is staged
+# above at etc/universal-db-mcp/config.yaml). Both failure directions abort
+# the build — a soft NOTE must never be possible:
+#   1. conffiles ABSENT: abort. A package whose default config is silently
+#      unregistered loses the dpkg conffile semantics the package documents
+#      (dpkg ownership, `dpkg -V` verification, admin-edit prompts on
+#      upgrade, keep-on-remove / delete-on-purge).
+#   2. conffiles PRESENT: every path entry must point at a file that is
+#      actually in the staged payload — dpkg would treat a payload-foreign
+#      entry as a conffile deleted by the packager.
 CONFFILES_SRC="$MAINT_DIR/conffiles"
-if [ -f "$CONFFILES_SRC" ]; then
-    # dpkg-deb does NOT strip comments from conffiles — only absolute
-    # pathnames may remain, so drop comment/blank lines while staging.
-    grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$CONFFILES_SRC" \
-        > "$DEBROOT/DEBIAN/conffiles" \
-        || true
-    [ -s "$DEBROOT/DEBIAN/conffiles" ] || die "conffiles template contains no path entries after comment stripping ($CONFFILES_SRC)"
-    chmod 0644 "$DEBROOT/DEBIAN/conffiles"
-    while IFS= read -r _conffile_path; do
-        [ -n "$_conffile_path" ] || continue
-        [ -e "$DEBROOT$_conffile_path" ] \
-            || die "conffiles entry '$_conffile_path' is NOT in the staged deb payload ($CONFFILES_SRC): dpkg would treat it as a conffile deleted by the packager. Stage the file or drop the entry."
-    done < "$DEBROOT/DEBIAN/conffiles"
-fi
+[ -f "$CONFFILES_SRC" ] \
+    || die "conffiles template missing: $CONFFILES_SRC (required plan Phase 4 input; it must register /etc/universal-db-mcp/config.yaml as a dpkg conffile)"
+# dpkg-deb does NOT strip comments from conffiles — only absolute
+# pathnames may remain, so drop comment/blank lines while staging.
+grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$CONFFILES_SRC" \
+    > "$DEBROOT/DEBIAN/conffiles" \
+    || true
+[ -s "$DEBROOT/DEBIAN/conffiles" ] || die "conffiles template contains no path entries after comment stripping ($CONFFILES_SRC)"
+chmod 0644 "$DEBROOT/DEBIAN/conffiles"
+while IFS= read -r _conffile_path; do
+    [ -n "$_conffile_path" ] || continue
+    [ -e "$DEBROOT$_conffile_path" ] \
+        || die "conffiles entry '$_conffile_path' is NOT in the staged deb payload ($CONFFILES_SRC): dpkg would treat it as a conffile deleted by the packager. Stage the file or drop the entry."
+done < "$DEBROOT/DEBIAN/conffiles"
 
-# Compensating controls for the no-conffile design. These run UNCONDITIONALLY
-# (they hold regardless of whether a conffiles template is ever reintroduced):
-# with no conffile registered, postinst's only-if-absent seeding is the ONLY
-# mechanism installing the default config, and postrm's purge branch is the
-# ONLY mechanism removing it — losing either silently breaks the remove/purge
-# semantics the package documents.
+# postinst/postrm config-semantics guards. These run UNCONDITIONALLY: with the
+# config registered as a conffile, dpkg places it at unpack, so postinst's
+# only-if-absent seeding is the FALLBACK for a conffile an admin deleted
+# before an upgrade — it must stay only-if-absent (never overwrite
+# dpkg-owned/admin-edited content) and keep sourcing the verified bundle's
+# config-templates/ copy. postrm must keep deleting the config on purge and
+# documenting the keep-on-remove retention.
 grep -qF 'if [ ! -e "$CONFIG" ]; then' "$DEBROOT/DEBIAN/postinst" \
-    || die "packaging/deb/postinst lost the only-if-absent config seeding: with no dpkg conffile registered it is the ONLY mechanism installing the default config — refusing to build"
+    || die "packaging/deb/postinst lost the only-if-absent config seeding: it is the fallback that restores a conffile an admin deleted before an upgrade — refusing to build"
 grep -qF '"$BUNDLE/config-templates/config.yaml"' "$DEBROOT/DEBIAN/postinst" \
     || die "packaging/deb/postinst no longer seeds the config from the verified bundle payload (config-templates/) — refusing to build"
 grep -qF 'rm -f "$CONFIG_FILE"' "$DEBROOT/DEBIAN/postrm" \
-    || die "packaging/deb/postrm no longer deletes the seeded config on purge: with no dpkg conffile registered, purge would leave it behind forever — refusing to build"
+    || die "packaging/deb/postrm no longer deletes the config on purge: dpkg removes conffiles on purge and postrm must stay consistent (belt and braces for the seeded fallback copy) — refusing to build"
 grep -qF 'are retained' "$DEBROOT/DEBIAN/postrm" \
-    || die "packaging/deb/postrm no longer documents conffile retention on remove (seeded config and installer artifacts must be kept on remove, deleted on purge) — refusing to build"
+    || die "packaging/deb/postrm no longer documents conffile retention on remove (the config and installer artifacts must be kept on remove, deleted on purge) — refusing to build"
 # --- end conffiles gate ------------------------------------------------------
 
 # --- trust gate (fail-loud): postinst must NEVER self-bootstrap the trust dir
@@ -484,11 +504,21 @@ chmod 0644 "$CONTROL"
 # and fail closed. NOTE: find_pubkey_material places -type f \( ... \) AFTER
 # its path arguments, so no -print/-quit may be passed through (it would land
 # before the expression and match the root directory itself, like BSD/GNU
-# find's left-to-right evaluation); the plain pipe mirrors build_msi.sh.
-if find_pubkey_material "$DEBROOT" | grep -q .; then
-    find_pubkey_material "$DEBROOT"
+# find's left-to-right evaluation); hits are CAPTURED, not piped to grep -q,
+# so a large hit list cannot SIGPIPE find under pipefail (see below).
+# NOTE: build_msi.sh/build_pkg.sh use the old piped form — apply the same
+# capture fix there for consistency.
+# CAPTURE the hits instead of `... | grep -q .`: under `set -o pipefail`,
+# grep -q exits after its first match and a large hit list would SIGPIPE
+# find (rc=141), making the pipeline non-zero and silently taking the
+# "no keys" branch — i.e. the build would PROCEED with key material staged.
+_key_hits="$(find_pubkey_material "$DEBROOT" || true)"
+if [ -n "$_key_hits" ]; then
+    printf '%s\n' "$_key_hits"
+    unset _key_hits
     die "public key material found in staged deb root — the release pubkey is never shipped inside a package"
 fi
+unset _key_hits
 
 echo "==> staged deb root at $DEBROOT"
 

@@ -16,12 +16,21 @@ provisioning — exactly the failure class postinstall exists to prevent.
 These tests therefore EXECUTE postinstall in a sandbox, the same
 extract-and-rewrite technique the deb tests use:
 
-- hardcoded path constants (PREFIX, CONFIG_DIR, STATE_DIR, LOG_DIR, PLIST) are
-  sed-rewritten into ``tmp_path`` (PREFIX has no env override — the trust
-  inputs do: ``UDBMCP_TRUST_DIR``/``UDBMCP_VERIFIER``/``UDBMCP_RELEASE_PUBKEY``);
+- hardcoded path constants (PREFIX, CONFIG_DIR, STATE_DIR, LOG_DIR, PLIST and
+  the two CPython 3.12 candidate paths) are sed-rewritten into ``tmp_path``
+  (PREFIX has no env override — the trust inputs do:
+  ``UDBMCP_TRUST_DIR``/``UDBMCP_VERIFIER``/``UDBMCP_RELEASE_PUBKEY``);
 - the trusted verifier is a stub under tmp_path (outside the bundle);
 - ``dscl``/``launchctl`` are PATH shims that only log, so the real system
-  directory services and launchd are never touched.
+  directory services and launchd are never touched. postinstall re-prepends
+  the system dirs to PATH internally (its launchd-PATH workaround), which
+  would shadow the inherited shims — that re-assignment is rewritten to
+  ``PATH="$PATH"`` too, so the shim dir inherited at the front of PATH
+  genuinely intercepts dscl/launchctl;
+- the CPython 3.12 candidates point at a ``python312-sandbox`` shim: postinstall
+  selects the interpreter BEFORE running the verifier (never a PATH search), so
+  the sandbox must supply the preinstall-validated candidate; it passes the
+  `-c` prerequisite probes and executes the verifier stub via the host python3.
 
 Invariant 1 (nothing executes payload before the trusted-channel verifier
 passes) and invariant 2 (pubkey never sourced from the bundle) are asserted
@@ -66,6 +75,25 @@ _PATH_REWRITES = [
     (r'^STATE_DIR="/var/lib/universal-db-mcp"$', 'STATE_DIR="{state}"'),
     (r'^LOG_DIR="/var/log/universal-db-mcp"$', 'LOG_DIR="{log}"'),
     (r'^PLIST="/Library/LaunchDaemons/com\.udbmcp\.server\.plist"$', 'PLIST="{plist}"'),
+    # The interpreter candidates are absolute paths with no env override: point
+    # both at the sandbox py shim — postinstall selects the interpreter (the
+    # preinstall-approved candidate) BEFORE executing the verifier, so the
+    # sandbox must supply one regardless of what the host has installed.
+    (
+        r'^FRAMEWORK_PY="/Library/Frameworks/Python\.framework/Versions/3\.12/bin/python3"$',
+        'FRAMEWORK_PY="{pyshim}"',
+    ),
+    (r'^USR_LOCAL_PY="/usr/local/bin/python3"$', 'USR_LOCAL_PY="{pyshim}"'),
+    # postinstall re-prepends the system dirs to PATH (its launchd-minimal-PATH
+    # workaround), which would put the REAL /usr/bin/dscl and /bin/launchctl
+    # ahead of the sandbox shim dir inherited via env["PATH"] — leaving the
+    # `_shim_invocations(...) == []` guards vacuous and the real directory
+    # service reachable by a verify-branch mutant. Drop the prepend so the
+    # inherited PATH (shim dir first) stays in effect inside the sandbox copy.
+    (
+        r'^PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"$',
+        'PATH="$PATH"',
+    ),
 ]
 
 
@@ -87,6 +115,7 @@ def _sandbox_postinstall(tmp_path: Path, *, verifier: str | None = None, pubkey:
         "state": str(tmp_path / "state"),
         "log": str(tmp_path / "log"),
         "plist": str(tmp_path / "com.udbmcp.server.plist"),
+        "pyshim": str(tmp_path / "shim-bin" / "python312-sandbox"),
     }
     for pattern, replacement in _PATH_REWRITES:
         new_text, n = re.subn(pattern, replacement.format(**dirs), text, flags=re.MULTILINE)
@@ -133,7 +162,12 @@ def _pubkey_stub(tmp_path: Path, *, name: str = "release.pub.pem") -> Path:
 
 
 def _shim_bin(tmp_path: Path) -> Path:
-    """PATH shims for dscl/launchctl: log invocations, never touch the system."""
+    """PATH shims for dscl/launchctl (log invocations, never touch the system)
+    and for the preinstall-validated CPython 3.12 candidate: the py shim passes
+    the `-c` prerequisite probes and executes the trusted verifier stub by
+    delegating to the host python3 (resolved beyond the shim dir — the shim is
+    named python312-sandbox, so `python3` cannot re-enter it). It does NOT log
+    into shims.log, which the tests below pin to dscl/launchctl only."""
     log = tmp_path / "shims.log"
     bin_dir = tmp_path / "shim-bin"
     bin_dir.mkdir(exist_ok=True)
@@ -147,6 +181,16 @@ def _shim_bin(tmp_path: Path) -> Path:
             encoding="utf-8",
         )
         shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+    pyshim = bin_dir / "python312-sandbox"
+    pyshim.write_text(
+        "#!/bin/sh\n"
+        "# rewritten preinstall-approved candidate: `-c` probes pass; anything\n"
+        "# else is the trusted verifier stub executing under this interpreter.\n"
+        'if [ "$1" = "-c" ]; then exit 0; fi\n'
+        'exec python3 "$@"\n',
+        encoding="utf-8",
+    )
+    pyshim.chmod(pyshim.stat().st_mode | stat.S_IXUSR)
     return bin_dir
 
 

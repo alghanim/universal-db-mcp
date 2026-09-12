@@ -27,7 +27,10 @@ _DEPLOY_DOC = _PROJECT / "docs" / "offline-deployment.md"
 
 # The complete set of trusted-channel files an admin must install into
 # /usr/local/lib/udbmcp-trust for postinst's verify+install to be able to run
-# at all (matches scripts/prepare_offline_bundle.py trusted-tools/ export).
+# at all. This is a subset of scripts/prepare_offline_bundle.py's
+# trusted-tools/ export, which additionally ships upgrade_offline.sh and
+# rollback_offline.sh; the .deb bootstrap path never invokes those two, so
+# they are not required here.
 _REQUIRED_TRUST_FILES = (
     "verify_bundle.py",
     "profiles.py",
@@ -67,22 +70,53 @@ def test_preinst_still_fails_closed_and_keeps_original_two_prerequisites() -> No
     assert "exit 1" in text
 
 
+def _doc_bash_blocks(text: str) -> list[str]:
+    return re.findall(r"```bash\n(.*?)```", text, flags=re.DOTALL)
+
+
 def test_offline_deployment_doc_mirrors_complete_file_set() -> None:
     """The runbook's generic 'Trust bootstrap' block and the .deb Step 1 block
     must name every required trusted-channel file. (The .pkg section has its
     own bootstrap block, owned by the pkg artifact — not asserted here.)"""
     doc = _DEPLOY_DOC.read_text(encoding="utf-8")
-    blocks = re.findall(r"```bash\n(.*?)```", doc, flags=re.DOTALL)
-    # Only blocks that bootstrap the trust dir (create it) count; other blocks
-    # merely invoke the installer/verifier from it.
-    bootstrap_blocks = [
-        b for b in blocks if "install -d -m 755 /usr/local/lib/udbmcp-trust" in b
-    ]
-    complete = [
-        b for b in bootstrap_blocks
-        if all(f"/{name}" in b for name in _REQUIRED_TRUST_FILES)
-    ]
-    assert len(complete) >= 2, (
-        "expected the generic Trust bootstrap and the .deb Step 1 block to "
-        f"install all of {_REQUIRED_TRUST_FILES}; complete blocks: {len(complete)}"
+
+    def _bootstrap_blocks_between(start: str, end: str) -> list[str]:
+        # Only blocks that bootstrap the trust dir (create it) count; other
+        # blocks merely invoke the installer/verifier from it.
+        section = doc[doc.index(start):doc.index(end)]
+        return [
+            b for b in _doc_bash_blocks(section)
+            if "install -d -m 755 /usr/local/lib/udbmcp-trust" in b
+        ]
+
+    # Bind each owned block by its enclosing section, not by a bare count over
+    # the whole document: a regression in ONE block (e.g. dropping the
+    # profiles.py line from the .deb Step 1 block) must fail this test even
+    # though the other blocks are still complete.
+    sections = (
+        (
+            "generic Trust bootstrap",
+            _bootstrap_blocks_between(
+                "## Trust bootstrap (before install)", "## Native mode install"
+            ),
+        ),
+        (
+            ".deb Step 1",
+            _bootstrap_blocks_between(
+                "## Install on Ubuntu via .deb", "## Install on macOS via .pkg"
+            ),
+        ),
     )
+    for label, blocks in sections:
+        assert len(blocks) == 1, (
+            f"expected exactly one trust-bootstrap bash block in the {label} "
+            f"section of docs/offline-deployment.md, found {len(blocks)}"
+        )
+        missing = [
+            name for name in _REQUIRED_TRUST_FILES if f"/{name}" not in blocks[0]
+        ]
+        assert not missing, (
+            f"the {label} bootstrap block in docs/offline-deployment.md does "
+            f"not install {missing}; an admin following it verbatim fails "
+            "later inside postinst"
+        )

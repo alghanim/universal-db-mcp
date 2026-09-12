@@ -80,6 +80,33 @@ verifier obtained outside the package/bundle supply chain."
     echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
     exit 1
 fi
+# A zero-length verifier is not a verifier: python3 on an empty script exits
+# 0 without ever running argparse, so a truncated trusted-channel copy would
+# 'pass' readability and then verify nothing (mirrors the -s guard in
+# packaging/deb/postinst).
+if [ ! -s "$VERIFIER" ]; then
+    fail "trusted verifier at $VERIFIER exists but is EMPTY — python3 exits 0 on an empty script, so a truncated trusted-channel copy would 'verify' vacuously and must abort the install exactly like a missing one."
+    bootstrap_verifier
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
+
+# A zero-length verifier is not a verifier: python3 on an empty script exits 0
+# without ever running argparse, so a truncated trusted-channel copy would
+# 'pass' the postinst verification vacuously and the unverified payload would
+# be installed and the service enabled — the exact vacuous-pass attack the
+# .pkg preinstall ([ ! -s ]) and the msi custom action ('bundle verification
+# PASSED' proof) guard. Treat an empty copy exactly like a missing one.
+if [ ! -s "$VERIFIER" ]; then
+    fail "trusted verifier at $VERIFIER exists but is EMPTY.
+
+python3 exits 0 on an empty script without verifying anything, so a
+truncated trusted-channel copy would defeat the verify-then-execute
+boundary. The package refuses to install against it."
+    bootstrap_verifier
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
 
 # --- prerequisite 2: the release public key ---------------------------------
 # Never shipped inside this package (or any artifact of the release): the

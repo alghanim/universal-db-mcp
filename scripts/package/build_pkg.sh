@@ -169,7 +169,7 @@ PUBKEY_FPR="$(openssl pkey -pubin -in "$PUBKEY" -outform DER 2>/dev/null | shasu
 log "    pubkey fingerprint (sha256 of DER): ${PUBKEY_FPR:-unavailable}"
 log "    signing identity: ${SIGN_IDENTITY:-<none — package will be UNSIGNED>}"
 
-WORK="$(mktemp -d "$TMPDIR/udbmcp-pkg.XXXXXX")" || fail "mktemp failed"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/udbmcp-pkg.XXXXXX")" || fail "mktemp failed"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 log "    workdir: $WORK"
@@ -198,9 +198,9 @@ fi
 
 # Invariant 2: the release pubkey must never ship inside a package.
 log "==> scanning staged payload for key material (fail closed)"
-if find "$ROOT" -type f \( -name '*.pem' -o -name '*.pub' -o -name '*pubkey*' \) -print -quit | grep -q .; then
-  find "$ROOT" -type f \( -name '*.pem' -o -name '*.pub' -o -name '*pubkey*' \) >>"$LOG_FILE"
-  fail "public-key material found in staged payload; the release pubkey is distributed out-of-band and must never be packaged"
+if find "$ROOT" -type f \( -name '*.pem' -o -name '*.pub' -o -name '*pubkey*' -o -name '*.key' \) -print -quit | grep -q .; then
+  find "$ROOT" -type f \( -name '*.pem' -o -name '*.pub' -o -name '*pubkey*' -o -name '*.key' \) >>"$LOG_FILE"
+  fail "key material found in staged payload; the release pubkey is distributed out-of-band and must never be packaged"
 fi
 log "    no key material in payload"
 

@@ -11,6 +11,7 @@ import stat
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from universal_db_mcp.config import AppConfig, ResolvedConnection, load_config
 from universal_db_mcp.connectors import registry
@@ -38,10 +39,14 @@ def _bundle_profile() -> str:
     else:
         # scripts/install_offline.sh installs the verified bundle's
         # manifest.json at $TARGET/manifest.json, i.e. one level above the
-        # venv that contains this interpreter.
-        candidate = Path(sys.executable).resolve().parent.parent / "manifest.json"
-        if candidate.is_file():
-            manifest_path = candidate
+        # venv that contains this interpreter. Derive the venv root from
+        # sys.prefix: real venvs symlink bin/python to the base interpreter,
+        # so Path(sys.executable).resolve() would land in the base
+        # interpreter's own directory, unrelated to the install target.
+        if Path(sys.prefix) != Path(sys.base_prefix):
+            candidate = Path(sys.prefix).parent / "manifest.json"
+            if candidate.is_file():
+                manifest_path = candidate
     if manifest_path is not None and manifest_path.is_file():
         try:
             profile = json.loads(manifest_path.read_text(encoding="utf-8")).get("profile")
@@ -318,7 +323,13 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                     import sqlite3
 
                     try:
-                        cache_conn = sqlite3.connect(f"file:{fp}?mode=rw", uri=True)
+                        # Percent-encode the path: a raw '?' or '#' in the
+                        # configured path would be parsed as URI query/
+                        # fragment, probing a DIFFERENT file than the one
+                        # configured (fail-open on this fatal gate).
+                        cache_conn = sqlite3.connect(
+                            f"file:{quote(str(fp), safe='/\\')}?mode=rw", uri=True
+                        )
                         try:
                             cache_conn.execute("PRAGMA schema_version")
                         finally:

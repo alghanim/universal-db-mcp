@@ -42,6 +42,16 @@
 #      installed with NO admin trust dir and NO pubkey: the postinst run
 #      directly (the dpkg --configure path, which bypasses preinst) must
 #      refuse to self-bootstrap, and dpkg -i must abort (preinst).
+#   6. NEGATIVE case 3, its own container, against a TRUNCATED trusted
+#      verifier: the admin bootstrap installs verify_bundle.py from the
+#      trusted channel and then truncates it to ZERO bytes. python3 on an
+#      empty script exits 0 without ever running argparse (vacuous pass), so
+#      exit-code-only trust would install the unverified payload and enable
+#      the service. The deb must fail closed twice: the unpacked postinst run
+#      directly must abort at the trust-dir completeness gate (zero-length is
+#      treated like missing), and dpkg -i must abort at the preinst's
+#      non-empty check — with NO 'bundle verification PASSED' anywhere, no
+#      venv and no enabled service.
 #
 # Every check result is recorded; any failure fails the gate closed and the
 # evidence JSON is still written. Machine-readable evidence lands in
@@ -470,10 +480,13 @@ else
 fi
 
 # Trust invariant (2): the release pubkey is NEVER shipped inside the package.
-LEAKS="$(find /tmp/inspect -type f \( -name '*.pem' -o -name '*.pub' -o -name '*.key' -o -name 'release.pub*' \) 2>/dev/null | tr '\n' ' ')"
+# Name patterns mirror build_deb.sh's find_pubkey_material (plus *.key) so the
+# scan stays equally strict on the UDBMCP_DEB pre-built-package path, which
+# bypasses the builder's staged-root scan.
+LEAKS="$(find /tmp/inspect -type f \( -name '*.pem' -o -name '*.pub' -o -name '*.key' -o -name 'release.pub*' -o -name '*pubkey*' \) 2>/dev/null | tr '\n' ' ')"
 TEXT_LEAKS="$(grep -rIl -- 'BEGIN PUBLIC KEY\|BEGIN PRIVATE KEY' /tmp/inspect 2>/dev/null | head -3 | tr '\n' ' ')"
 if [ -z "$LEAKS" ] && [ -z "$TEXT_LEAKS" ]; then
-  rec no_keys_in_package passed "no .pem/.pub/.key files and no PEM blocks anywhere in the package payload"
+  rec no_keys_in_package passed "no .pem/.pub/.key/*pubkey*/release.pub* files and no PEM blocks anywhere in the package payload"
 else
   rec no_keys_in_package failed "key material found in package payload: files=[$LEAKS] pem-text=[$TEXT_LEAKS]"
 fi
@@ -493,13 +506,17 @@ fi
 # --- admin trust bootstrap (equivalent of docs/offline-deployment.md) --------
 # The trusted tools come from the mounted trusted channel (/trust), NEVER from
 # the package being verified. dpkg's preinst requires exactly these paths.
-install -d -m 755 /usr/local/lib/udbmcp-trust/lib /etc/universal-db-mcp/keys
-install -m 644 /trust/verify_bundle.py /usr/local/lib/udbmcp-trust/
-install -m 644 /trust/profiles.py /usr/local/lib/udbmcp-trust/
-install -m 755 /trust/install_offline.sh /usr/local/lib/udbmcp-trust/
-install -m 644 /trust/os_packages.sh /usr/local/lib/udbmcp-trust/lib/
-install -m 644 /pubkey.pem /etc/universal-db-mcp/keys/release.pub.pem
-rec trust_bootstrap passed "trusted verifier + installer + lib + release pubkey installed at the documented admin paths (from the trusted channel, not the package)"
+if install -d -m 755 /usr/local/lib/udbmcp-trust/lib /etc/universal-db-mcp/keys \
+   && install -m 644 /trust/verify_bundle.py /usr/local/lib/udbmcp-trust/ \
+   && install -m 644 /trust/profiles.py /usr/local/lib/udbmcp-trust/ \
+   && install -m 755 /trust/install_offline.sh /usr/local/lib/udbmcp-trust/ \
+   && install -m 644 /trust/os_packages.sh /usr/local/lib/udbmcp-trust/lib/ \
+   && install -m 644 /pubkey.pem /etc/universal-db-mcp/keys/release.pub.pem; then
+  rec trust_bootstrap passed "trusted verifier + installer + lib + release pubkey installed at the documented admin paths (from the trusted channel, not the package)"
+else
+  rec trust_bootstrap failed "admin trust bootstrap failed (rc=$?): the trusted channel (/trust/*, /pubkey.pem) is incomplete or the mounts are broken; dpkg's preinst requires the verifier + pubkey at the documented admin paths"
+  exit 1
+fi
 
 # --- dpkg -i -----------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
@@ -803,7 +820,106 @@ echo "[deb-gate-negative2] finished, FAILED=$FAILED"
 exit "$FAILED"
 NEGATIVE2_EOF
 
-# ------------------------------------------------------------- positive case
+cat > "$WORK/negative3.sh" <<'NEGATIVE3_EOF'
+#!/bin/bash
+# Negative case 3 — TRUNCATED (zero-length) trusted verifier.
+#
+# python3 on an empty script exits 0 without ever running argparse: a
+# trusted-channel copy of verify_bundle.py truncated to 0 bytes would make
+# every exit-code-only verifier invocation 'pass' vacuously, and the
+# unverified payload would be installed and universal-db-mcp.service enabled.
+# The .pkg preinstall guards this exact case with [ ! -s ]; the deb must be
+# at least as strict: the preinst refuses an empty verifier outright and the
+# postinst's trust-dir completeness gate treats zero-length like missing.
+set -uo pipefail
+EV=/evidence
+TSV="$EV/negative3-checks.tsv"
+: > "$TSV"
+FAILED=0
+DEB=/pkg/universal-db-mcp.deb
+TRUST_DIR=/usr/local/lib/udbmcp-trust
+
+rec() { # name status detail
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$TSV"
+  echo "[deb-gate-negative3] [$2] $1: $3"
+  # 'recorded' is informational evidence (either outcome is acceptable), not a
+  # failure; only a non-passed CHECK fails the case.
+  [ "$2" = "passed" ] || [ "$2" = "recorded" ] || FAILED=1
+}
+
+# --- admin trust bootstrap, with the verifier TRUNCATED to zero bytes --------
+if install -d -m 755 "$TRUST_DIR/lib" /etc/universal-db-mcp/keys \
+   && install -m 644 /trust/verify_bundle.py "$TRUST_DIR/" \
+   && install -m 644 /trust/profiles.py "$TRUST_DIR/" \
+   && install -m 755 /trust/install_offline.sh "$TRUST_DIR/" \
+   && install -m 644 /trust/os_packages.sh "$TRUST_DIR/lib/" \
+   && install -m 644 /pubkey.pem /etc/universal-db-mcp/keys/release.pub.pem \
+   && : > "$TRUST_DIR/verify_bundle.py"; then
+  rec truncated_bootstrap passed "admin bootstrap installed from the trusted channel, then verify_bundle.py truncated to 0 bytes (the damaged-copy scenario)"
+else
+  rec truncated_bootstrap failed "admin trust bootstrap failed (rc=$?)"
+  exit 1
+fi
+[ -s "$TRUST_DIR/verify_bundle.py" ] && { rec truncated_bootstrap failed "verifier not actually empty"; exit 1; } || true
+
+# --- document the vacuous pass the fix guards against ------------------------
+# Empirical baseline: python3 on the empty verifier exits 0 against garbage
+# arguments. If this ever changes (python3 refusing empty scripts), the -s
+# gates below become redundant — which is fine, but the evidence should say so.
+if python3 "$TRUST_DIR/verify_bundle.py" --bundle /nonexistent --pubkey /nonexistent >/dev/null 2>&1; then
+  rec vacuous_pass_baseline recorded "confirmed: python3 on the zero-length verifier exits 0 without checking anything (why exit-code-only trust fails closed is required)"
+else
+  rec vacuous_pass_baseline recorded "python3 no longer exits 0 on an empty script; the -s gates remain as defense in depth"
+fi
+
+# --- the unpacked postinst must refuse the zero-length verifier --------------
+# Run DIRECTLY (dpkg --configure path, bypasses preinst): the trust-dir
+# completeness gate must treat zero-length like missing (fail closed).
+rm -rf /tmp/tamper3
+mkdir -p /tmp/tamper3  # dpkg-deb -R creates the leaf dir but not its parents
+if ! dpkg-deb -R "$DEB" /tmp/tamper3/tree > /tmp/tamper3-extract.log 2>&1; then
+  rec tamper3_setup failed "dpkg-deb -R failed: $(tail -c 300 /tmp/tamper3-extract.log | tr '\n' ' ')"
+  exit 1
+fi
+export DEBIAN_FRONTEND=noninteractive
+PLOG=/tmp/postinst-empty-verifier.log
+if DPKG_MAINTSCRIPT_PACKAGE=universal-db-mcp \
+    bash /tmp/tamper3/tree/DEBIAN/postinst configure > "$PLOG" 2>&1; then
+  PRC=0
+else
+  PRC=$?
+fi
+cp "$PLOG" "$EV/postinst-empty-verifier.log"
+if [ "$PRC" -ne 0 ] \
+    && grep -q "trusted tool missing from the admin trust dir" "$PLOG" \
+    && grep -q "zero-length" "$PLOG"; then
+  rec postinst_refuses_empty_verifier passed "postinst exited rc=$PRC with the zero-length trusted-tool diagnostic (fail closed at configure time)"
+else
+  rec postinst_refuses_empty_verifier failed "expected nonzero rc + zero-length diagnostic; got rc=$PRC: $(tail -c 300 "$PLOG" | tr '\n' ' ')"
+fi
+if grep -q "bundle verification PASSED" "$PLOG"; then
+  rec no_vacuous_pass_postinst failed "a PASSED verdict appeared despite the empty verifier"
+else
+  rec no_vacuous_pass_postinst passed "no 'bundle verification PASSED' anywhere in the postinst run"
+fi
+
+# --- dpkg -i must abort at the preinst ---------------------------------------
+dpkg -i --force-depends "$DEB" > /tmp/dpkg-empty.log 2>&1
+rc=$?
+cp /tmp/dpkg-empty.log "$EV/dpkg-empty.log"
+if [ "$rc" -ne 0 ] \
+    && grep -q "exists but is EMPTY" /tmp/dpkg-empty.log \
+    && ! grep -q "bundle verification PASSED" /tmp/dpkg-empty.log \
+    && [ ! -e /opt/universal-db-mcp/venv ] \
+    && [ ! -e /etc/systemd/system/universal-db-mcp.service ]; then
+  rec empty_verifier_dpkg_install_fails passed "dpkg -i FAILED (rc=$rc) at the preinst's non-empty check: no venv, no unit, no service enabled, no PASSED verdict (fail closed)"
+else
+  rec empty_verifier_dpkg_install_fails failed "expected nonzero rc + 'exists but is EMPTY' preinst diagnostic, no venv/unit/PASSED; got rc=$rc: $(tail -c 300 /tmp/dpkg-empty.log | tr '\n' ' ')"
+fi
+
+echo "[deb-gate-negative3] finished, FAILED=$FAILED"
+exit "$FAILED"
+NEGATIVE3_EOF
 echo "==> POSITIVE case: install + doctor + protocol probe (network: NONE, platform: linux/amd64)"
 set +e
 docker run --rm --network none --platform linux/amd64 \
@@ -857,6 +973,28 @@ NEG2_RC=$?
 set -e
 merge_container_checks "$EVIDENCE_DIR/negative2-checks.tsv" "$NEG2_RC" "negative2"
 mv "$EVIDENCE_DIR/negative2-checks.tsv" "$LOG_DIR/negative2-checks.tsv" 2>/dev/null || true
+
+# --------------------------------------------- negative case 3 (empty verifier)
+# The trust mounts ARE needed here: the bootstrap succeeds and only the
+# verifier copy is truncated afterwards — the failure must come from the
+# deb's zero-length guards, not from missing prerequisites.
+echo "==> NEGATIVE case 3: zero-length trusted verifier must fail closed (preinst + postinst)"
+set +e
+docker run --rm --network none --platform linux/amd64 \
+  -v "$DEB":"$CONTAINER_DEB":ro \
+  -v "$PUBKEY":/pubkey.pem:ro \
+  -v "$PROJECT/scripts/verify_bundle.py":/trust/verify_bundle.py:ro \
+  -v "$PROJECT/scripts/profiles.py":/trust/profiles.py:ro \
+  -v "$PROJECT/scripts/install_offline.sh":/trust/install_offline.sh:ro \
+  -v "$PROJECT/scripts/lib/os_packages.sh":/trust/os_packages.sh:ro \
+  -v "$EVIDENCE_DIR":/evidence \
+  -v "$WORK/negative3.sh":/gate/negative3.sh:ro \
+  "$IMAGE" \
+  bash /gate/negative3.sh > "$LOG_DIR/negative3-container.log" 2>&1
+NEG3_RC=$?
+set -e
+merge_container_checks "$EVIDENCE_DIR/negative3-checks.tsv" "$NEG3_RC" "negative3"
+mv "$EVIDENCE_DIR/negative3-checks.tsv" "$LOG_DIR/negative3-checks.tsv" 2>/dev/null || true
 
 # --------------------------------------------------------------------- summary
 if [ "$FAILED" -eq 0 ]; then

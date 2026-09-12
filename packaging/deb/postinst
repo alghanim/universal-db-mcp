@@ -42,6 +42,31 @@
 #      failure nothing unverified is executed or enabled.
 # Bundles WITHOUT os-packages keep the fully synchronous flow below.
 #
+# MASKED-FAILURE SURFACE (deferred mode + dpkg): dpkg marks the package
+# installed ('ii') as soon as this postinst exits 0, but the real install
+# still runs detached — if the worker later fails, dpkg state cannot be
+# corrected retroactively (dpkg has already exited; no safe mechanism exists
+# for a detached process to downgrade a completed 'ii', and dpkg's database
+# is not designed for out-of-band mutation). The failure is therefore
+# surfaced where it operationally binds:
+#   - the worker writes 'failed' to the status file and the install log,
+#     and never installs the unit or enables the service on failure;
+#   - BEFORE spawning the worker, this postinst installs a systemd drop-in
+#     guard (/etc/systemd/system/universal-db-mcp.service.d/
+#     deferred-install-guard.conf) whose ExecStartPre refuses to start the
+#     service unless the status file says 'success' — fail closed on every
+#     other state ('deferred', 'running', 'failed', garbage); a missing
+#     status file means nothing was deferred (synchronous installs complete
+#     inside postinst) and the start is allowed. `systemctl start` /
+#     `enable --now` / a reboot cannot bring up a service against a
+#     half-installed payload; the diagnostic points at the log and the
+#     `dpkg --configure` re-run.
+# The guard is installed synchronously (a failure aborts the configure step)
+# so even a worker that dies before writing anything leaves the service
+# gated. The drop-in lives under /etc/systemd/system (admin-controlled,
+# like the unit this package installs there) and persists on remove/purge
+# exactly like that unit.
+#
 # set -e: ANY verification or pre-flight failure exits nonzero, which makes
 # dpkg abort the configure step (fail closed, never partially trusted).
 set -e
@@ -56,6 +81,8 @@ CONFIG_DIR=/etc/universal-db-mcp
 CONFIG="$CONFIG_DIR/config.yaml"
 LOG=/var/log/universal-db-mcp-install.log
 STATUS=/var/log/universal-db-mcp-install.status
+UNIT_DROPIN_DIR=/etc/systemd/system/universal-db-mcp.service.d
+UNIT_DROPIN="$UNIT_DROPIN_DIR/deferred-install-guard.conf"
 
 # --- step 1: the ADMIN trust dir must already be complete (fail closed) ------
 # The package NEVER bootstraps /usr/local/lib/udbmcp-trust from its own
@@ -77,8 +104,14 @@ for f in "$TRUST_DIR/verify_bundle.py" \
          "$TRUST_DIR/profiles.py" \
          "$TRUST_DIR/install_offline.sh" \
          "$TRUST_DIR/lib/os_packages.sh"; do
-  if [ ! -f "$f" ]; then
-    echo "FAIL: trusted tool missing from the admin trust dir: $f" >&2
+  # -s (non-empty), not just -f: python3 on a ZERO-LENGTH verifier exits 0
+  # vacuously (argparse never runs) and bash on an empty installer 'succeeds'
+  # without installing anything — a truncated trusted-channel copy must abort
+  # here exactly like a missing one (mirrors packaging/pkg/preinstall).
+  if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+    echo "FAIL: trusted tool missing from the admin trust dir (or present but zero-length): $f" >&2
+    echo "      A zero-length verifier makes 'python3 verify_bundle.py' exit 0" >&2
+    echo "      without checking anything: that is a vacuous pass, not trust." >&2
     echo "      The package NEVER bootstraps $TRUST_DIR from its own payload:" >&2
     echo "      the deb-shipped trusted-tools/ copy rides on the same channel" >&2
     echo "      as the payload it would verify, so a tampered package would" >&2
@@ -112,16 +145,24 @@ fi
 # os-packages/*.deb in the payload => the installer needs dpkg => the install
 # cannot run inside the dpkg-held critical section (see WHY above) and is
 # deferred to the worker. Otherwise the original synchronous flow runs.
-if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
 
-  # ---- deferred mode: verify now, install after dpkg releases the locks ----
-  echo "==> bundle ships OS packages: the dpkg-dependent install runs after dpkg exits"
-  echo "==> verifying the unpacked payload via the trusted verifier (fail closed, at configure time)"
+# --- trusted-verifier PROOF gate (both install modes) -------------------------
+# Exit code alone is NOT proof of verification: python3 on an empty, truncated
+# or no-op verifier script exits 0 without ever running argparse, so a damaged
+# trusted-channel copy would 'pass' vacuously and the unverified payload would
+# be installed and enabled. Mirror packaging/msi/custom/verify.ps1: success
+# requires exit 0 AND the verifier's literal 'bundle verification PASSED' AND
+# no 'FAIL:' diagnostic. All output is forwarded verbatim so the admin sees
+# the canonical diagnostics. Used on BOTH paths: the deferred branch verifies
+# synchronously here, and the synchronous path pre-verifies before handing to
+# install_offline.sh (whose own copy in the admin trust dir may be an older
+# revision without its own proof gate — the deb must fail closed regardless).
+verify_payload_with_proof() {
+  local VEXEC="" vout vrc=0
   # Same verifier-execution rule as install_offline.sh: a 644 Python verifier
   # runs via python3; an executable non-Python verifier is exec'd directly.
   # $VEXEC is deliberately unquoted at the call site (it is either empty, or
   # the single word "python3").
-  VEXEC=""
   if [ -x "$TRUST_DIR/verify_bundle.py" ]; then
     case "$(head -n 1 "$TRUST_DIR/verify_bundle.py" 2>/dev/null)" in
       *"python"*) VEXEC="python3" ;;
@@ -129,7 +170,31 @@ if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
   else
     VEXEC="python3"
   fi
-  $VEXEC "$TRUST_DIR/verify_bundle.py" --bundle "$BUNDLE" --pubkey "$PUBKEY"
+  vout="$(mktemp "${TMPDIR:-/tmp}/udbmcp-postinst-verify.XXXXXX")"
+  $VEXEC "$TRUST_DIR/verify_bundle.py" --bundle "$BUNDLE" --pubkey "$PUBKEY" >"$vout" 2>&1 || vrc=$?
+  cat "$vout"
+  if [ "$vrc" -ne 0 ]; then
+    echo "FAIL: trusted verifier exited $vrc; the unpacked payload is UNTRUSTED: configure ABORTED (fail closed)." >&2
+    rm -f "$vout"
+    exit 1
+  fi
+  if grep -q '^FAIL:' "$vout" || ! grep -q 'bundle verification PASSED' "$vout"; then
+    echo "FAIL: trusted verifier exited 0 but did not certify the payload (no 'bundle verification PASSED' line, or a FAIL diagnostic): exit code alone is not proof. The payload is UNTRUSTED: configure ABORTED (fail closed)." >&2
+    rm -f "$vout"
+    exit 1
+  fi
+  rm -f "$vout"
+}
+
+if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
+
+  # ---- deferred mode: verify now, install after dpkg releases the locks ----
+  echo "==> bundle ships OS packages: the dpkg-dependent install runs after dpkg exits"
+  echo "==> verifying the unpacked payload via the trusted verifier (fail closed, at configure time)"
+  # Runs the verifier via the proof gate above: a nonzero exit, a FAIL line or
+  # a missing 'bundle verification PASSED' all abort the configure step — an
+  # empty/truncated verifier that exits 0 vacuously proves nothing.
+  verify_payload_with_proof
 
   # Pre-flight everything the worker will need, while a failure can still
   # abort the configure step (fail closed — not discovered in the background).
@@ -144,6 +209,37 @@ if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
     echo "FAIL: $BUNDLE/config-templates/config.yaml missing from the deb payload." >&2
     exit 1
   fi
+
+  # Install the deferred-install guard BEFORE spawning the worker (see the
+  # MASKED-FAILURE SURFACE note above): from this moment on, the service can
+  # only start once the worker has recorded success. Installing it here —
+  # synchronously, inside the configure step — means even a worker that dies
+  # before writing anything leaves the service gated (fail closed). The
+  # unquoted heredoc expands $STATUS/$LOG so the guard references the exact
+  # paths this postinst uses; the guard text itself contains no other shell
+  # expansions. systemd tokenizes the single-quoted sh -c payload, so the
+  # ;/|| inside it are inert to the unit parser.
+  install -d -m 755 -o root -g root "$UNIT_DROPIN_DIR"
+  umask 022
+  cat > "$UNIT_DROPIN" <<DROPIN_EOF
+# Installed by the universal-db-mcp deb postinst (deferred-install mode).
+# dpkg marks the package installed as soon as postinst exits 0, while the
+# real install (venv, wheelhouse, bundle OS packages) still runs in the
+# detached root worker; if that worker fails, dpkg state cannot be corrected
+# retroactively. This guard closes that masked-failure surface: the service
+# refuses to start unless the deferred install recorded success. Fail closed
+# on every non-success state ('deferred', 'running', 'failed', garbage); a
+# missing status file means nothing was deferred (the synchronous install
+# completed inside postinst) and the start is allowed. Lives under
+# /etc/systemd/system (admin-controlled, like the unit itself) and persists
+# on remove/purge exactly like that unit.
+[Service]
+ExecStartPre=/bin/sh -ec 'if [ -f "$STATUS" ]; then grep -qx success "$STATUS" || { echo "universal-db-mcp: deferred install not complete (status file: $STATUS, log: $LOG); refusing to start. Check the log, then re-run: sudo dpkg --configure universal-db-mcp" >&2; exit 1; }; fi'
+DROPIN_EOF
+  chmod 644 "$UNIT_DROPIN"
+  systemctl daemon-reload 2>/dev/null || \
+    echo "==> systemctl daemon-reload unavailable (no running systemd?) — skipping"
+  echo "==> deferred-install guard installed at $UNIT_DROPIN (service refuses to start until the deferred install records success)"
 
   # Single flight: never spawn a second worker while one is still running
   # (e.g. postinst re-run by `dpkg --configure -a` during a long install).
@@ -296,6 +392,16 @@ else
   echo "==> $CONFIG already present: leaving the admin's config untouched"
 fi
 
+# Record success BEFORE `enable --now`: the postinst-installed guard drop-in
+# (ExecStartPre) refuses to start the service while the status file says
+# anything but 'success', so the start triggered by enable must already see
+# 'success' here. Everything that can fail the worker (installer, unit,
+# config) ran above under set -eu — any failure there goes through on_exit,
+# which rewrites the status to 'failed'. The only step after this write is
+# the enable call below, which is best-effort by design (container-safe) and
+# never fails the worker.
+echo success > "$STATUS"
+
 if systemctl enable --now universal-db-mcp.service 2>/dev/null; then
   echo "==> universal-db-mcp.service enabled and started"
 else
@@ -305,7 +411,6 @@ else
   echo "           systemctl enable --now universal-db-mcp" >&2
 fi
 
-echo success > "$STATUS"
 echo "==> deferred deb install complete (install at $TARGET, config: $CONFIG)"
 WORKER_EOF
   chmod 700 "$WORKER_SCRIPT"
@@ -352,6 +457,12 @@ fi
 # never reaches a nested dpkg -i, so the synchronous install cannot
 # deadlock against the outer dpkg.)
 echo "==> verifying and installing the bundle payload via $TRUST_DIR/install_offline.sh"
+# Pre-verify with the proof gate BEFORE the installer runs (fail closed even
+# if the admin trust dir holds an older installer revision that still trusts
+# the exit code alone): the installer then re-verifies with its own staging
+# copy, as before. An empty/truncated/no-op verifier that exits 0 vacuously
+# can no longer get unverified payload installed and the service enabled.
+verify_payload_with_proof
 # Explicit `bash`: the deb-shipped copy is installed 644 in the bundle layout
 # and the trust-dir copy carries the exec bit; invoking via bash makes the
 # call independent of how the bootstrap above (or the admin) installed it.
@@ -385,9 +496,16 @@ fi
 
 # --- step 6 (before enable --now): install config ONLY if absent ------------
 # Done before the service is started so the first start already sees a config
-# at the path the unit exports (UDBMCP_CONFIG). NEVER overwrite: the config is
-# seeded by postinst (not a dpkg conffile), so an admin's edited config
-# survives every upgrade; postrm deletes it on purge, keeps it on remove.
+# at the path the unit exports (UDBMCP_CONFIG). The default config IS a dpkg
+# conffile (registered in DEBIAN/conffiles; build_deb.sh stages it 0644
+# root:root), so dpkg places it at unpack time and this branch normally does
+# not run. This only-if-absent seeding is the FALLBACK that restores the
+# conffile if an admin deleted it before an upgrade — hence it must NEVER
+# overwrite: an existing config is dpkg-owned/admin-edited content. Conffile
+# semantics apply: dpkg preserves admin edits on upgrade (prompting only when
+# an admin-modified config conflicts with a changed shipped default) and keeps
+# the file on remove; postrm deletes it on purge (belt and braces for this
+# seeded fallback copy).
 if [ ! -e "$CONFIG" ]; then
   echo "==> installing default config to $CONFIG (only because it is absent)"
   # 0755 root:root dir: the udbmcp service account (User=udbmcp in the unit)
@@ -419,5 +537,12 @@ else
   echo "         installed; start it later with:" >&2
   echo "           systemctl enable --now universal-db-mcp" >&2
 fi
+
+# A previous deferred install may have left a status file ('deferred',
+# 'running', or 'failed') and, with it, the deferred-install guard drop-in.
+# This synchronous install just completed in this privileged context, so no
+# deferred install is outstanding: drop the stale status file so the guard
+# (absent status file => allow) cannot block service starts on stale state.
+rm -f -- "$STATUS" 2>/dev/null || true
 
 echo "==> postinst complete: install at $TARGET (config: $CONFIG)"

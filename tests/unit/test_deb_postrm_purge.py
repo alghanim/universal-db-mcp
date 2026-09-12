@@ -3,12 +3,12 @@
 Two verified defects are locked out here:
 
 1. install_offline.sh publishes /opt/universal-db-mcp/manifest.json next to
-   the venv (scripts/install_offline.sh:195). That file is NOT dpkg-owned, so
+   the venv (scripts/install_offline.sh:211). That file is NOT dpkg-owned, so
    postrm must remove it on `purge` — otherwise the guarded parent `rmdir`
    always fails silently and a stale manifest.json survives `dpkg -P`.
 2. install_offline.sh never writes inside the installed bundle tree: it stages
    into a private `mktemp -d` directory under /var/tmp removed by an EXIT trap
-   (scripts/install_offline.sh:118-121), and dpkg deletes the dpkg-owned
+   (scripts/install_offline.sh:134-138), and dpkg deletes the dpkg-owned
    bundle tree before postrm purge runs. postrm must therefore carry no dead
    bundle-tree rm -rf and must not claim the installer writes into the bundle.
 
@@ -49,8 +49,9 @@ def _sandbox_postrm(tmp_path: Path) -> Path:
     text = _read_postrm()
     text = text.replace("/opt/universal-db-mcp", str(tmp_path / "opt" / "universal-db-mcp"))
     text = text.replace("/usr/share/universal-db-mcp", str(tmp_path / "usr" / "share" / "universal-db-mcp"))
-    # The seeded config (postinst-only, not a dpkg conffile) lives under /etc:
-    # rewrite it too so the sandbox purge can never touch the real host /etc.
+    # The config (a dpkg conffile, also seeded only-if-absent by postinst)
+    # lives under /etc: rewrite it too so the sandbox purge can never touch
+    # the real host /etc.
     text = text.replace("/etc/universal-db-mcp", str(tmp_path / "etc" / "universal-db-mcp"))
     script = tmp_path / "postrm.sh"
     script.write_text(text, encoding="utf-8")
@@ -131,8 +132,9 @@ def test_postrm_purge_removes_venv_manifest_and_empty_parents(tmp_path: Path) ->
 
 @_POSIX
 def test_postrm_purge_deletes_seeded_config_but_keeps_admin_pubkey(tmp_path: Path) -> None:
-    """The config is seeded by postinst (NOT a dpkg conffile), so dpkg no
-    longer deletes it on purge — postrm must. The admin's keys/ directory
+    """The config is a dpkg conffile (deleted on purge by dpkg itself) and is
+    also seeded only-if-absent by postinst — postrm's purge deletion of it is
+    belt and braces for that seeded fallback copy. The admin's keys/ directory
     (out-of-band release public key) must survive a purge untouched."""
     script = _sandbox_postrm(tmp_path)
     etc = tmp_path / "etc" / "universal-db-mcp"

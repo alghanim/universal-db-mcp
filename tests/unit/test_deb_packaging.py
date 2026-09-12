@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import os
 import re
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -72,23 +71,31 @@ def test_control_documents_verify_before_execute_and_never_ships_pubkey() -> Non
 # ------------------------------------------------------------------- conffiles
 
 
-def test_config_is_not_a_dpkg_conffile() -> None:
-    """/etc/universal-db-mcp/config.yaml must NOT ship as a dpkg conffile.
+def test_config_is_a_dpkg_conffile_registered_and_payload_backed() -> None:
+    """/etc/universal-db-mcp/config.yaml IS a dpkg conffile (plan Phase 4).
 
-    A conffile would land root:root 0644 (--root-owner-group) and make
-    postinst's "install config ONLY if absent" seeding (owner udbmcp:udbmcp,
-    mode 0640) unreachable. The config is seeded by postinst instead, so no
-    conffiles template may register it (the template file is gone entirely;
-    if one is ever reintroduced it must not list the config path)."""
+    dpkg places it at unpack time, preserves admin edits on upgrade, keeps
+    it on `remove` and deletes it on `purge`. build_deb.sh REQUIRES the
+    conffiles template via its fail-loud gate and stages the config into the
+    payload from the verified bundle's config-templates/ copy (mode 0644 so
+    the udbmcp service account can read it). postinst's only-if-absent
+    seeding stays as the fallback for a conffile an admin deleted before an
+    upgrade (asserted by test_postinst_config_installed_only_if_absent; the
+    build gate itself is exercised end-to-end by tests/unit/
+    test_deb_conffiles_gate.py). The systemd unit, by contrast, is
+    deliberately NOT dpkg-managed: it must never be staged at
+    etc/systemd/system in the payload, so admin edits to the unit survive
+    upgrades (postinst installs it to /etc/systemd/system instead)."""
     conffiles = _deb_dir() / "conffiles"
-    if conffiles.exists():
-        entries = [line for line in conffiles.read_text(encoding="utf-8").splitlines()
-                   if line.strip() and not line.lstrip().startswith("#")]
-        assert entries == [], "unexpected dpkg conffiles entries; /etc/universal-db-mcp/config.yaml must not be one"
-    # And build_deb.sh must not stage the config (or the unit) into the
-    # dpkg payload at /etc.
+    assert conffiles.exists(), "packaging/deb/conffiles is a required plan Phase 4 input"
+    entries = [line.strip() for line in conffiles.read_text(encoding="utf-8").splitlines()
+               if line.strip() and not line.lstrip().startswith("#")]
+    assert entries == ["/etc/universal-db-mcp/config.yaml"], f"unexpected dpkg conffiles entries: {entries}"
+    # build_deb.sh must stage the config conffile into the payload (a
+    # conffile entry without a backing file is "deleted by the packager").
     build = (Path(__file__).resolve().parents[2] / "scripts" / "package" / "build_deb.sh").read_text(encoding="utf-8")
-    assert "etc/universal-db-mcp/config.yaml" not in build
+    assert 'install -m 0644 "$CONFIG_TEMPLATE" "$DEBROOT/etc/universal-db-mcp/config.yaml"' in build
+    # The systemd unit is NOT staged at etc/systemd/system on purpose.
     assert "etc/systemd/system/universal-db-mcp.service" not in build
 
 

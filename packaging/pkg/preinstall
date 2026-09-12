@@ -34,7 +34,28 @@ if [ ! -f "$VERIFIER" ]; then
   echo "" >&2
   echo "  sudo install -d -m 755 $TRUST_DIR" >&2
   echo "  sudo install -m 644 <trusted-channel>/verify_bundle.py $TRUST_DIR/" >&2
+  echo "  sudo install -m 644 <trusted-channel>/profiles.py $TRUST_DIR/" >&2
   echo "  sudo install -m 755 <trusted-channel>/install_offline.sh $TRUST_DIR/" >&2
+  echo "  sudo install -d -m 755 $TRUST_DIR/lib" >&2
+  echo "  sudo install -m 644 <trusted-channel>/lib/os_packages.sh $TRUST_DIR/lib/" >&2
+  echo "" >&2
+  echo "(verify_bundle.py imports profiles.py from its own directory and" >&2
+  echo "install_offline.sh sources lib/os_packages.sh relative to its own" >&2
+  echo "location, so profiles.py and lib/ are part of the bootstrap too.)" >&2
+  echo "" >&2
+  echo "then re-run this installer." >&2
+  exit 1
+fi
+
+# A zero-length verifier would make the postinstall verification step exit 0
+# vacuously (python3 on an empty script succeeds), silently defeating the
+# verify-then-execute boundary. Treat it exactly like a missing key file:
+# a truncated trusted-channel copy must abort the install here.
+if [ ! -s "$VERIFIER" ]; then
+  echo "FAIL: trusted verifier at $VERIFIER is empty; refusing to proceed." >&2
+  echo "      Re-install the real verifier from the trusted channel:" >&2
+  echo "" >&2
+  echo "  sudo install -m 644 <trusted-channel>/verify_bundle.py $TRUST_DIR/" >&2
   echo "" >&2
   echo "then re-run this installer." >&2
   exit 1

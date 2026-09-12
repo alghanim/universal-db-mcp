@@ -152,9 +152,13 @@ def _ps_code_text(path: Path) -> str:
 
 def _invocation_lines(lines: list[str]) -> list[str]:
     """PowerShell lines that invoke an external command via the call operator
-    (`& ...`). Cmdlets (Test-Path, Join-Path, Get-Command, ...) are NOT
-    external processes and are excluded."""
-    return [ln for ln in lines if re.match(r"\s*&\s", ln)]
+    (`& ...`), in EITHER form: line-initial (`& cmd ...`) or as the right-hand
+    side of an assignment (`$x = & cmd ...`) — both execute the command, so a
+    trust gate must see both (search-anchored, like the bundle-dir-as-command
+    gate in test_verify_bundle_dir_is_only_ever_an_argument_never_a_command).
+    Cmdlets (Test-Path, Join-Path, Get-Command, ...) are NOT external processes
+    and are excluded."""
+    return [ln for ln in lines if re.search(r"(?<!\w)&\s", ln)]
 
 
 # --------------------------------------------------------------------------
@@ -188,6 +192,25 @@ def test_wxs_has_major_upgrade_with_downgrade_block() -> None:
     assert major[0].get("DowngradeErrorMessage"), "MajorUpgrade must block downgrades with a message"
 
 
+def test_wxs_installfolder_is_under_the_64bit_program_files_root() -> None:
+    """The whole install tree (INSTALLFOLDER, and with it BundleDir/ScriptsDir)
+    must live under the 64-bit Program Files root
+    (<StandardDirectory Id="ProgramFiles64Folder">) — the x64 payload and the
+    default paths the action scripts derive ($env:ProgramFiles\\UniversalDB MCP)
+    depend on it. A producer regression relocating the tree under a 32-bit or
+    per-user root must fail here."""
+    root = _wxs_root()
+    holders = [
+        el for el in _iter_local(root, "StandardDirectory")
+        if any(d.get("Id") == "INSTALLFOLDER" for d in _iter_local(el, "Directory"))
+    ]
+    assert len(holders) == 1, f"INSTALLFOLDER must be authored under exactly one standard directory, got {len(holders)}"
+    assert holders[0].get("Id") == "ProgramFiles64Folder", (
+        f"INSTALLFOLDER must be a child of StandardDirectory Id='ProgramFiles64Folder' "
+        f"(the 64-bit Program Files root), got {holders[0].get('Id')!r}"
+    )
+
+
 def test_wxs_launch_condition_requires_permachine_cpython312() -> None:
     """Prerequisite gate: a per-machine python.org CPython 3.12 (PEP 514,
     HKLM\\SOFTWARE\\Python\\PythonCore\\3.12\\InstallPath), read from the
@@ -213,9 +236,12 @@ def test_wxs_launch_condition_requires_permachine_cpython312() -> None:
     assert prop_id, "the RegistrySearch must feed a Property"
     launches = _iter_local(root, "Launch")
     assert launches, "the CPython 3.12 prerequisite must be enforced by a Launch element (WiX v4 spelling)"
-    cond_text = " ".join(c.get("Condition") or "" for c in launches)
-    assert prop_id in cond_text, f"Launch must reference the RegistrySearch property {prop_id}"
-    assert "Installed" in cond_text, "Launch must keep 'Installed OR ...' so uninstall/repair still work"
+    conditions = [c.get("Condition") or "" for c in launches]
+    assert any(prop_id in cond and "Installed" in cond for cond in conditions), (
+        f"ONE Launch condition must hold BOTH the RegistrySearch property {prop_id} AND 'Installed' "
+        f"(uninstall/repair must keep working); splitting them into separate Launch elements would "
+        f"block fresh installs, got conditions: {conditions!r}"
+    )
 
 
 def test_wxs_config_component_under_programdata_is_never_overwrite() -> None:
@@ -499,9 +525,15 @@ def test_build_msi_defines_custom_action_scripts_dir_and_stages_every_action_scr
     assert 'CustomActionScriptsDir=$CUSTOM_STAGE' in code, (
         "build_msi.sh must pass -define CustomActionScriptsDir=<staged custom scripts> to wix build"
     )
-    assert re.search(r"for ps1 in ((?:verify|venv|doctor|service|uninstall)\.ps1[;\s]+){5}", code), (
+    staged = re.search(r"for ps1 in ((?:verify|venv|doctor|service|uninstall)\.ps1[;\s]+){5}", code)
+    assert staged, (
         "build_msi.sh must stage ALL five custom action scripts (verify/venv/doctor/service/uninstall) — "
         "a missing one is a packaging bug: fail closed"
+    )
+    staged_names = set(re.findall(r"(verify|venv|doctor|service|uninstall)\.ps1", staged.group(0)))
+    assert staged_names == {"verify", "venv", "doctor", "service", "uninstall"}, (
+        f"the five staged scripts must be DISTINCT (got {sorted(staged_names)}): "
+        "repeating one name must not substitute for a missing action script"
     )
     assert 'find_pubkey_material "$CUSTOM_STAGE"' in code, (
         "the staged custom action scripts must get the same pubkey-material scan as the payload"
@@ -594,14 +626,31 @@ def test_verify_runs_trusted_verifier_from_outside_the_bundle_with_pubkey() -> N
 
 
 def test_verify_first_process_invocation_is_the_trusted_verifier() -> None:
-    """Nothing external is executed before the verifier: the FIRST call-operator
-    invocation in the script is the verifier run itself (python outside the
-    bundle running verify_bundle.py against --bundle with --pubkey)."""
+    """Nothing external is executed before the verifier EXCEPT the pinned
+    interpreter's own version probe: verify.ps1 resolves the per-machine
+    CPython 3.12 exclusively from the admin-only HKLM PEP 514 hive (never
+    py.exe/PATH/HKCU -- a local non-admin can register a per-user interpreter)
+    and proves it is 3.12 before executing the trusted verifier with it. The
+    probe is an inline -c version check on that admin-owned interpreter whose
+    exit code is the ONLY decision input -- no bundle-derived path or content
+    is involved. The first invocation touching bundle/trust material must
+    still be the verifier run itself."""
     invocations = _invocation_lines(_verify_lines())
     assert invocations, "verify.ps1 must invoke the trusted verifier"
     first = invocations[0]
-    assert "$Verifier" in first, f"the first external invocation must be the trusted verifier, got: {first}"
-    assert "--bundle" in first and "--pubkey" in first, f"verifier invocation lacks its arguments: {first}"
+    verifier_run = [ln for ln in invocations if "$Verifier" in ln]
+    assert verifier_run, "verify.ps1 must run the trusted verifier"
+    assert "--bundle" in verifier_run[0] and "--pubkey" in verifier_run[0], (
+        f"verifier invocation lacks its arguments: {verifier_run[0]}")
+    if "$Verifier" not in first:
+        assert re.search(
+            r"&\s*\$pyExe\s+-c\s+'import sys; sys\.exit\(0 if sys\.version_info\[:2\] == \(3, 12\) else 1\)'",
+            first,
+        ), (f"the only invocation allowed before the trusted verifier is the "
+            f"HKLM-pinned interpreter's cp312 version probe, got: {first}")
+        for subject in ("$BundleDir", "$TrustDir", "$PubKey", "$Verifier"):
+            assert subject not in first, (
+                f"the pre-verifier version probe must not touch {subject}: {first}")
 
 
 def test_verify_bundle_dir_is_only_ever_an_argument_never_a_command() -> None:
@@ -611,9 +660,14 @@ def test_verify_bundle_dir_is_only_ever_an_argument_never_a_command() -> None:
     for ln in _verify_lines():
         if "$BundleDir" in ln and re.search(r"(?<!\w)&\s*\$BundleDir", ln):
             pytest.fail(f"the bundle directory is used as a COMMAND (payload execution): {ln}")
-        # no invocation whose command expression resolves inside the bundle
+        # no invocation whose command expression resolves inside the bundle;
+        # the ONE permitted exception is the cp312 version probe of the
+        # HKLM-pinned per-machine interpreter (inline -c check, no bundle- or
+        # trust-derived content on the command line)
         if re.search(r"&\s*\$pyExe", ln) and "$Verifier" not in ln:
-            pytest.fail(f"an interpreter is invoked for something other than the trusted verifier: {ln}")
+            assert "sys.version_info" in ln and "$BundleDir" not in ln, (
+                f"an interpreter is invoked for something other than the trusted "
+                f"verifier or the pinned interpreter's version probe: {ln}")
 
 
 def test_verify_containment_guards_reject_in_bundle_trust_material() -> None:

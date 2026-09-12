@@ -26,8 +26,11 @@
 #     reboot); failing the uninstall for that would strand the files.
 #   * Any other sc.exe/reg.exe failure exits nonzero (fail closed).
 #   * The machine-wide config at ProgramData\UniversalDB MCP\config.yaml is
-#     deliberately NOT touched (retention semantics, mirrors the .deb
-#     conffile behavior on remove).
+#     NOT retained at uninstall: the config component's NeverOverwrite
+#     protects it at install/repair time only, and the MSI RemoveFiles
+#     standard action (which runs immediately after this one) deletes it in
+#     the same transaction. Back it up before uninstalling. This differs
+#     from the .deb, whose postrm keeps the config on remove.
 #
 # Parameters may also be supplied via environment variables for manual runs:
 #   UDBMCP_SERVICE_NAME
@@ -101,6 +104,13 @@ try {
     if (-not $ServiceName) { $ServiceName = $env:UDBMCP_SERVICE_NAME }
     if (-not $ServiceName) { $ServiceName = 'udbmcp' }
 
+    # The name is embedded unquoted in sc.exe command lines and inside a
+    # quoted reg.exe key path, so both quote styles and whitespace are
+    # rejected here (same guard as service.ps1; fail closed).
+    if ($ServiceName -match '[\s"'']') {
+        Fail "service name must not contain whitespace or quotes"
+    }
+
     if (-not (Test-ServiceExists -Name $ServiceName)) {
         Write-Output ("==> service '" + $ServiceName + "' not present: nothing to stop or delete")
     }
@@ -170,7 +180,7 @@ try {
         Write-Output ("==> no UDBMCP_CONFIG value under " + $envKey + " (nothing to clean)")
     }
 
-    Write-Output ("==> uninstall custom action complete (machine-wide config under ProgramData is retained by design)")
+    Write-Output ("==> uninstall custom action complete (machine-wide config.yaml under ProgramData is NOT retained: RemoveFiles deletes it in this transaction; back it up before uninstalling)")
     exit 0
 }
 catch {

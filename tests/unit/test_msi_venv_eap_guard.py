@@ -4,9 +4,8 @@ packaging/msi/custom/venv.ps1 runs under msiexec with redirected handles,
 where Windows PowerShell 5.1 turns ANY native-command stderr output into
 error records that a ``$ErrorActionPreference = 'Stop'`` preference escalates
 into a spurious terminating NativeCommandError. Left unguarded, that dead-
-coded the graceful diagnostics (e.g. the py-launcher "CPython 3.12 not found"
-fallback, whose ``2>$null`` stderr redirect IS the case it handles) and made
-any pip warning abort an otherwise-successful install through the catch block.
+coded graceful diagnostics and made any pip warning abort an
+otherwise-successful install through the catch block.
 
 The fix (mirroring the sibling actions verify.ps1 and doctor.ps1, which
 document the guard as mandatory): relax the preference around every native
@@ -101,10 +100,10 @@ def test_every_native_invocation_is_guarded() -> None:
                 f"(PS 5.1 escalates redirected stderr to a terminating error): {ln}"
             )
             guarded_invocations += 1
-    assert guarded_invocations >= 3, (
-        "expected at least the py-launcher probe, the pip install and the "
-        "Invoke-Native helper invocation (which guards the interpreter check "
-        "and venv create) to be present and guarded"
+    assert guarded_invocations >= 2, (
+        "expected at least the Invoke-Native helper invocation (which guards "
+        "the interpreter version check and the venv create) and the pip "
+        "install to be present and guarded"
     )
     assert relaxed == 0, "every relaxation must be restored before the script ends"
 
@@ -113,7 +112,7 @@ def test_exit_decisions_use_captured_exit_codes() -> None:
     """The fail-closed decisions must test the captured exit-code variables,
     not a $LASTEXITCODE that a later native invocation could clobber."""
     code = "\n".join(_code_lines(_require_script()))
-    for var in ("$launcherExit", "$verExit", "$venvExit", "$pipExit"):
+    for var in ("$verExit", "$venvExit", "$pipExit"):
         assert f"if ({var} -ne 0" in code or f"if ({var} -eq 0" in code, (
             f"{var} must be captured and checked as the sole decision input"
         )

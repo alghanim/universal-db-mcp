@@ -13,6 +13,12 @@
 #      SHA256SUMS + SIGNATURE + wheelhouse (+ manifest, installer, runtime.lock);
 #   4. run the TRUSTED verify_bundle.py --pubkey against the payload bundle
 #      (payload == signed bundle; the payload's own verifier is NEVER executed);
+#   4b. TAMPER NEGATIVE: flip one byte in a wheel inside a COPY of the payload
+#      bundle and refresh its SHA256SUMS line (so the integrity layer passes
+#      and the rejection must come from the SIGNATURE), then run the trusted
+#      verifier against the tampered copy and require a nonzero exit with the
+#      canonical "signature verification FAILED" diagnostic (the pkg
+#      counterpart of the deb gate's repacked-deb tamper case);
 #   5. assert NO public/private key material ships inside the package
 #      (the release pubkey is distributed out-of-band, never packaged);
 #   6. plutil -lint + value checks on the payload launchd plist
@@ -165,12 +171,16 @@ fi
 
 if [ -n "$BUNDLE" ]; then
   # Reuse path: a bundle without a matching pubkey cannot be authenticity
-  # checked, so refuse (fail closed) rather than packaging an unverified payload.
-  if [ -z "$PUBKEY" ] && [ -f "$BOOTSTRAP_KEYS/release-pubkey.pem" ]; then
-    PUBKEY="$BOOTSTRAP_KEYS/release-pubkey.pem"
-  fi
+  # checked, so refuse (fail closed) rather than packaging an unverified
+  # payload. The trust anchor MUST come from a trusted channel
+  # (UDBMCP_PUBKEY): out/pkg-bootstrap/release-pubkey.pem is NOT adopted as
+  # a fallback because it lives in the same user-writable output tree as the
+  # bundle itself (a prior run also persists the matching ephemeral private
+  # key there), so bundle and trust anchor would be co-located and both
+  # attacker-controllable with out/ write access. This mirrors the Linux
+  # gate (scripts/test_airgap.sh), which also requires the pubkey explicitly.
   if [ -z "$PUBKEY" ]; then
-    record bundle_source failed "reusing bundle $BUNDLE but no public key available; set UDBMCP_PUBKEY (trusted channel) or remove the bundle to force an ephemeral-key rebuild"
+    record bundle_source failed "reusing bundle $BUNDLE but no trusted public key provided; set UDBMCP_PUBKEY (trusted channel; out/pkg-bootstrap/release-pubkey.pem is NOT trusted — it shares the bundle's output tree) or remove the bundle to force an ephemeral-key rebuild"
     exit 1
   fi
   record bundle_source passed "reusing existing bundle: $BUNDLE"
@@ -329,6 +339,65 @@ if [ -z "$LEAKS" ]; then
 else
   record no_keys_in_payload failed "key material found in payload: $LEAKS"
   exit 1
+fi
+
+# ----------------------------------------------- tamper negative (fail closed)
+# The pkg counterpart of the deb gate's repacked-deb tamper case: prove the
+# trusted verifier REJECTS a tampered payload instead of waving it through.
+# A COPY of the expanded payload bundle is tampered (the on-disk payload and
+# the built package are never modified): one byte flipped inside a wheelhouse
+# wheel and that wheel's SHA256SUMS line refreshed, exactly like an attacker
+# who can repack a package — so the integrity layer passes and the rejection
+# must come from the SIGNATURE layer (the canonical diagnostic). The trusted
+# repo verifier runs against the tampered copy and MUST exit nonzero with
+# "signature verification FAILED"; anything else fails the gate.
+TAMPER_ROOT="$WORK/tamper"
+TAMPERED_BUNDLE="$TAMPER_ROOT/$(basename "$PBUNDLE")"
+TAMPER_LOG="$LOG_DIR/tampered_payload_rejected.log"
+mkdir -p "$TAMPER_ROOT"
+if cp -R "$PBUNDLE" "$TAMPERED_BUNDLE"; then
+  record tamper_copy passed "payload bundle copied to a scratch tamper tree (originals untouched)"
+else
+  record tamper_copy failed "copying the payload bundle for the tamper case failed"
+  exit 1
+fi
+WHEEL="$(ls "$TAMPERED_BUNDLE"/wheelhouse/sqlglot-*.whl 2>/dev/null | head -1 || true)"
+[ -n "$WHEEL" ] || WHEEL="$(find "$TAMPERED_BUNDLE/wheelhouse" -name '*.whl' -type f | sort | head -1)"
+if [ -n "$WHEEL" ]; then
+  "$PY" - "$WHEEL" <<'PY' >> "$TAMPER_LOG" 2>&1
+import hashlib
+import sys
+from pathlib import Path
+
+wheel = Path(sys.argv[1])
+data = bytearray(wheel.read_bytes())
+data[min(200, len(data) - 1)] = data[min(200, len(data) - 1)] ^ 0xFF  # flip one bit inside the wheel payload
+wheel.write_bytes(bytes(data))
+# Refresh the wheel's SHA256SUMS line so the tamper survives the integrity
+# check and must be caught by the SIGNATURE check (the canonical diagnostic).
+sums = wheel.parent.parent / "SHA256SUMS"
+rel = "wheelhouse/" + wheel.name
+lines = []
+for line in sums.read_text().splitlines():
+    digest, _, path = line.partition("  ")
+    if path == rel:
+        line = hashlib.sha256(wheel.read_bytes()).hexdigest() + "  " + rel
+    lines.append(line)
+sums.write_text("\n".join(lines) + "\n")
+print(f"tampered {rel}: one byte flipped, SHA256SUMS line refreshed")
+PY
+  record wheel_tampered passed "$(basename "$WHEEL") byte-flipped inside the COPY; its SHA256SUMS line refreshed so the rejection must come from the SIGNATURE (log: ${TAMPER_LOG#$PROJECT/})"
+else
+  record wheel_tampered failed "no wheel found in the tampered wheelhouse copy"
+  exit 1
+fi
+TAMPER_RC=0
+TAMPER_OUT="$("$PY" "$TRUSTED_VERIFIER" --bundle "$TAMPERED_BUNDLE" --pubkey "$PUBKEY" 2>&1)" || TAMPER_RC=$?
+printf '%s\n' "$TAMPER_OUT" >> "$TAMPER_LOG"
+if [ "$TAMPER_RC" -ne 0 ] && printf '%s\n' "$TAMPER_OUT" | grep -q "signature verification FAILED"; then
+  record tampered_payload_rejected passed "trusted verifier rejected the tampered payload COPY (rc=$TAMPER_RC) with the canonical 'signature verification FAILED' diagnostic (log: ${TAMPER_LOG#$PROJECT/})"
+else
+  record tampered_payload_rejected failed "expected nonzero rc + 'signature verification FAILED' for the tampered payload, got rc=$TAMPER_RC: $(printf '%s' "$TAMPER_OUT" | tail -c 300 | tr '\n' ' ')"
 fi
 
 # -------------------------------------------------------------- install scripts

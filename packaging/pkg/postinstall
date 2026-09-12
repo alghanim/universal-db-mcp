@@ -43,10 +43,12 @@ TRUST_DIR="${UDBMCP_TRUST_DIR:-/usr/local/lib/udbmcp-trust}"
 VERIFIER="${UDBMCP_VERIFIER:-$TRUST_DIR/verify_bundle.py}"
 PUBKEY="${UDBMCP_RELEASE_PUBKEY:-$CONFIG_DIR/keys/release.pub.pem}"
 
-# launchd runs pkg scripts with a minimal PATH that may exclude /usr/local/bin,
-# where a staging-host python3.12 typically lives. Extend it for the
-# interpreter lookup only; everything we execute afterwards is referenced by
-# absolute path (the venv) or is an OS binary.
+# launchd runs pkg scripts with a minimal PATH that may exclude /usr/local/bin.
+# Extend it so the OS tools below (dscl, install, launchctl) resolve on that
+# minimal PATH; the interpreter and everything else we execute is referenced by
+# absolute path — never a PATH search (see step 1: a PATH-searched python3
+# could resolve to a Homebrew or per-user interpreter that is writable by
+# someone other than root, yet it would be executed as root here).
 PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
@@ -73,19 +75,41 @@ echo "==> postinstall: verifying unpacked payload with the trusted verifier"
 [ -f "$VERIFIER" ] || fail "trusted verifier not found at $VERIFIER; install the trusted tools (see docs/offline-deployment.md, 'Trust bootstrap')"
 
 # The verifier must not come from the bundle it verifies (see header comment).
+# The pattern also refuses the bundle root itself ("$bundle_real" alone): a
+# verifier/pubkey placed DIRECTLY at the payload root makes dirname resolve to
+# exactly the bundle path, which "$bundle_real"/* alone would let through.
 bundle_real="$(cd "$BUNDLE" && pwd -P)"
 case "$(cd "$(dirname "$VERIFIER")" && pwd -P)" in
-  "$bundle_real"/*)
+  "$bundle_real"|"$bundle_real"/*)
     fail "refusing to verify with a verifier inside the bundle; install the trusted tools at $TRUST_DIR" ;;
 esac
 case "$(cd "$(dirname "$PUBKEY")" && pwd -P)" in
-  "$bundle_real"/*)
+  "$bundle_real"|"$bundle_real"/*)
     fail "refusing to verify with a pubkey shipped inside the bundle; install it at $PUBKEY from the trusted channel" ;;
 esac
 
-# Execute the verifier via python3 (it is installed with install -m 644 on the
-# documented channel); mirrors install_offline.sh's VEXEC handling.
-VEXEC="python3"
+# The verifier executes as root, so it must run under an interpreter preinstall
+# already validated — never a PATH search: `python3` could resolve to a
+# Homebrew or per-user interpreter that preinstall never checked and that is
+# writable by someone other than root, yet it would be executed as root here
+# BEFORE the payload is verified. Select EXACTLY the candidates preinstall
+# approved; the same interpreter is reused to build the venv in step 3.
+FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+USR_LOCAL_PY="/usr/local/bin/python3"
+PY=""
+for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY"; do
+  if [ -x "$candidate" ] && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
+    PY="$candidate"
+    break
+  fi
+done
+[ -n "$PY" ] || fail "CPython 3.12 (all-users install) not found at $FRAMEWORK_PY or $USR_LOCAL_PY (the exact paths preinstall validated); install the python.org 3.12 framework installer and re-run"
+
+# Execute the verifier under the validated interpreter (it is installed with
+# install -m 644 on the documented channel); VEXEC is pinned to the absolute
+# candidate path — the same contract as install_offline.sh's VEXEC handling
+# without its PATH search.
+VEXEC="$PY"
 $VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" || {
   fail "bundle verification FAILED — the payload may be tampered or corrupt; nothing will be installed or executed"
 }
@@ -142,22 +166,9 @@ dscl . -read "/Users/$SERVICE_USER" >/dev/null 2>&1 || {
 # --- step 3: build the venv from the bundle wheelhouse (no index, hashed) ----
 echo "==> postinstall: creating virtual environment at $VENV"
 
-# Interpreter is an admin-provisioned staging-host prerequisite (same trust
-# position as libc6/python3 on the .deb). Re-validate EXACTLY the candidates
-# preinstall approved — never a PATH search: `command -v python3.12` could
-# resolve to a Homebrew or per-user interpreter that preinstall never checked
-# and that is writable by someone other than root, yet it would be executed
-# as root here and remain the target of the venv's python symlink.
-FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
-USR_LOCAL_PY="/usr/local/bin/python3"
-PY=""
-for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY"; do
-  if [ -x "$candidate" ] && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
-    PY="$candidate"
-    break
-  fi
-done
-[ -n "$PY" ] || fail "CPython 3.12 (all-users install) not found at $FRAMEWORK_PY or $USR_LOCAL_PY (the exact paths preinstall validated); install the python.org 3.12 framework installer and re-run"
+# $PY was selected before step 1 from exactly the preinstall-approved
+# candidates (never a PATH search) and is the interpreter the verifier ran
+# under; re-assert the minor version as defense in depth.
 "$PY" -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"' || {
   fail "CPython 3.12.x is required (the wheelhouse is built for cp312)"
 }
@@ -168,7 +179,24 @@ if [ ! -d "$PREFIX" ]; then
   # execute; it must never be owned or writable by anyone else.
   install -d -m 755 -o root -g wheel "$PREFIX"
 fi
-"$PY" -m venv "$VENV" || fail "could not create the virtual environment at $VENV"
+
+# --copies: the venv python must be a REAL COPY of the base interpreter, not a
+# symlink to it. doctor derives the installed profile from
+# Path(sys.executable).resolve().parent.parent / "manifest.json" (published in
+# step 7); with a symlinked venv python, resolve() escapes the venv to the
+# base framework and doctor never finds the manifest.
+#
+# Upgrade guard for venvs created by earlier builds with symlinks: venv's
+# copier is shutil.copyfile, which writes THROUGH an existing destination
+# symlink — copying over the stale links would overwrite the base framework's
+# python binary itself. Remove stale symlinks first; venv recreates each name
+# as a copy immediately after.
+for stale in "$VENV/bin/python" "$VENV/bin/python3" "$VENV/bin/python3."*; do
+  if [ -L "$stale" ]; then
+    rm -f "$stale"
+  fi
+done
+"$PY" -m venv --copies "$VENV" || fail "could not create the virtual environment at $VENV"
 
 echo "==> postinstall: installing application from bundle wheelhouse (no index, hashed)"
 # Hostile-env neutralization (mirrors scripts/install_offline.sh): a curated
@@ -221,8 +249,10 @@ install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$LOG_DIR
 
 # --- step 7: publish manifest.json next to the venv (doctor hook) ------------
 # doctor derives the installed profile from this file instead of guessing from
-# the running platform. Guarded: a bundle without a manifest must not fail the
-# install — doctor falls back to an honest platform description.
+# the running platform (it looks at Path(sys.executable).resolve().parent.parent,
+# which lands on $PREFIX only because step 3 built the venv with --copies).
+# Guarded: a bundle without a manifest must not fail the install — doctor
+# falls back to an honest platform description.
 if [ -f "$BUNDLE/manifest.json" ]; then
   install -m 644 -o root -g wheel "$BUNDLE/manifest.json" "$PREFIX/manifest.json"
 fi

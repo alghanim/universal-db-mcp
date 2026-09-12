@@ -200,14 +200,19 @@ without them.
 The verifier must NOT come from inside the bundle it verifies: a tampered
 bundle would ship a verifier that prints PASSED. Install the trusted tools
 and the release public key from the same trusted channel that delivered the
-MSI, at paths OUTSIDE the bundle, in machine scope (run the verifier from an
-elevated prompt so it sees machine environment only):
+MSI, at paths OUTSIDE the bundle. The trust directory MUST be
+`C:\Program Files\udbmcp-trust`: the MSI's deferred verify custom action
+resolves exactly that path (WiX `ProgramFiles64Folder`) via CustomActionData
+and does NOT read a `UDBMCP_TRUST_DIR` environment override. `C:\Program
+Files` is admin-write-only, so a non-admin process cannot pre-create (and
+thereby own) the verifier that LocalSystem executes — the analogue of the
+root-owned `/usr/local/lib/udbmcp-trust` on Linux/macOS:
 
 ```powershell
 # 1. trusted verifier + its profile registry (plain copies; run via python.exe)
-New-Item -ItemType Directory -Force "$env:ProgramData\udbmcp-trust\lib"
-Copy-Item <trusted-channel>\verify_bundle.py "$env:ProgramData\udbmcp-trust\"
-Copy-Item <trusted-channel>\profiles.py      "$env:ProgramData\udbmcp-trust\"
+New-Item -ItemType Directory -Force "C:\Program Files\udbmcp-trust\lib"
+Copy-Item <trusted-channel>\verify_bundle.py "C:\Program Files\udbmcp-trust\"
+Copy-Item <trusted-channel>\profiles.py      "C:\Program Files\udbmcp-trust\"
 
 # 2. release public key (distributed out-of-band by the release administrator)
 New-Item -ItemType Directory -Force "$env:ProgramData\universal-db-mcp\keys"
@@ -218,9 +223,11 @@ Copy-Item <trusted-path>\udbmcp-release.pub.pem `
 setx /M UDBMCP_RELEASE_PUBKEY "C:\ProgramData\universal-db-mcp\keys\udbmcp-release.pub.pem"
 ```
 
-Optional overrides (machine scope, `setx /M`): `UDBMCP_TRUST_DIR` (default
-`C:\ProgramData\udbmcp-trust`) and `UDBMCP_PYTHON` (explicit interpreter for
-the verifier).
+Optional override (machine scope, `setx /M`): `UDBMCP_PYTHON` (explicit
+interpreter for the verifier). The trust directory itself is NOT
+env-overridable for the MSI: the installer pins it to
+`C:\Program Files\udbmcp-trust` via CustomActionData, so the trusted tools
+must be provisioned at that exact path before `msiexec` runs.
 
 The verifier fails closed — exits nonzero with a diagnostic — if any of
 these are missing, if the trust directory, the public key, or the Python
@@ -378,7 +385,7 @@ host: current WiX (v4.0.5, 5.0.2 and 6.0.2 all tested) rejects every
 `BundleValidator.GetCanonicalRelativePath` does
 `Path.GetFullPath("C:\" + name)` and requires the result to start with
 `C:\`, which no Unix `GetFullPath` can ever produce (ShortName-only
-directories are rejected too). The 16 WIX0389 errors are the ONLY remaining
+directories are rejected too). The 15 WIX0389 errors are the ONLY remaining
 failures — the same authoring compiles past all first-party errors — so
 this is a WiX-on-Unix toolchain limitation, not an authoring defect. MSI
 compilation therefore requires a **Windows** staging host with the same
@@ -533,13 +540,18 @@ What postinst does, in order:
    only if absent or identical to the deb-shipped copy — an admin-modified
    unit is never overwritten (the unit is not a dpkg path; the deb-shipped
    canonical copy stays at `/usr/share/universal-db-mcp/systemd/`).
-4. **Config**: `/etc/universal-db-mcp/config.yaml` is installed **only if
-   absent** (seeded from the bundle's `config-templates/config.yaml`,
-   owner `udbmcp:udbmcp`, mode 640) — BEFORE the service is enabled, so the
-   first start already sees the seeded config. An admin-provisioned config
-   is never overwritten. The config is deliberately NOT a dpkg conffile: a
-   conffile would land root:root 0644 and make the only-if-absent seeding
-   unreachable.
+4. **Config**: `/etc/universal-db-mcp/config.yaml` ships as a **dpkg
+   conffile** (registered in the package's `conffiles`, staged 0644
+   root:root from the verified bundle's `config-templates/config.yaml`):
+   dpkg places it at unpack time — BEFORE the service is enabled, so the
+   first start already sees it. `postinst` keeps an only-if-absent seeding
+   from that same verified bundle copy as a **fallback** that restores the
+   config if an admin deleted it before an upgrade (that fallback copy is
+   seeded `udbmcp:udbmcp` 0640 so the service account can read it); it never
+   overwrites an existing file, so an admin-provisioned config is never
+   clobbered. Because the config is a conffile, dpkg preserves admin edits
+   on upgrade and prompts only when an admin-modified config conflicts with
+   a changed shipped default.
 5. **Enable**: `systemctl daemon-reload`, then `systemctl enable --now`. The
    enable call is guarded: in a container without systemd as PID 1 the package
    install still succeeds and prints
@@ -574,11 +586,11 @@ connection error.
 
 ### Upgrade, remove, purge
 
-| Action | Service | `/etc/universal-db-mcp/config.yaml` (seeded by postinst, not a conffile) | venv `/opt/universal-db-mcp/venv` | Audit/state `/var/lib`, `/var/log/universal-db-mcp` |
+| Action | Service | `/etc/universal-db-mcp/config.yaml` (dpkg conffile; postinst seeds only if absent) | venv `/opt/universal-db-mcp/venv` | Audit/state `/var/lib`, `/var/log/universal-db-mcp` |
 |---|---|---|---|---|
-| `dpkg -i` (upgrade) | stopped by `prerm`, then re-enabled and started by `postinst` (`enable --now`) | kept; your edits survive (the package only ever seeds it when absent) | rebuilt against the new bundle | kept |
+| `dpkg -i` (upgrade) | stopped by `prerm`, then re-enabled and started by `postinst` (`enable --now`) | kept (conffile semantics: your edits survive; dpkg prompts only if your modified config conflicts with a changed shipped default) | rebuilt against the new bundle | kept |
 | `dpkg -r` (remove) | stopped and disabled | **kept** | kept (fast reinstall / rollback) | kept |
-| `dpkg -P` (purge) | **not stopped** — `prerm` acts only on `remove`/`upgrade`/`deconfigure`/`failed-upgrade`; the `purge` action falls into its catch-all, which only prints a warning. Stop it manually first (`systemctl stop universal-db-mcp`) if it is running | **deleted** (by `postrm`, since dpkg does not own the seeded file; `/etc/universal-db-mcp/keys/` with the release public key is never touched) | deleted, plus installer staging leftovers under `/usr/share/universal-db-mcp/bundle` | **kept** — the audit trail must outlive the package; delete explicitly if you really want it gone |
+| `dpkg -P` (purge) | **not stopped** — `prerm` acts only on `remove`/`upgrade`/`deconfigure`/`failed-upgrade`; the `purge` action falls into its catch-all, which only prints a warning. Stop it manually first (`systemctl stop universal-db-mcp`) if it is running | **deleted** (dpkg removes conffiles on purge; `postrm` also removes the postinst-seeded fallback copy — belt and braces; `/etc/universal-db-mcp/keys/` with the release public key is never touched) | deleted, plus installer staging leftovers under `/usr/share/universal-db-mcp/bundle` | **kept** — the audit trail must outlive the package; delete explicitly if you really want it gone |
 
 Notes:
 
@@ -776,8 +788,22 @@ Ed25519 bundle verification above.
 The build-environment gate (`scripts/package/test_package_pkg.sh`) proved on
 a real macOS host: payload = the signed bundle (trusted verifier run against
 the expanded package payload), plist contents, prerequisite checks, and the
-native unit suite. The **full `sudo installer` run was NOT performed in the
-build environment** — `installer_run` is recorded `not_run` in the evidence
-at `out/package-evidence/pkg/`. Run the optional full install
+native unit suite — plus, in the latest recorded run
+(`out/package-evidence/pkg/results.json`), an executed
+tamper negative: a byte-flipped wheel inside a repacked COPY of the `.pkg` is
+rejected by the trusted verifier with the canonical FAIL diagnostic
+(`tamper_copy` / `wheel_tampered` / `tampered_payload_rejected` all passed).
+That file records a complete green gate: status `passed`, all 23 checks
+green, including the native unit suite and all three tamper checks. (The
+file is overwritten by every gate run, so check it directly for the
+`generated_at` timestamp of the run it currently describes.) History: an
+earlier same-day run (2026-09-12T10:47:30Z) recorded all 20 checks green;
+a later run (2026-09-12T11:17:20Z) recorded 22/23, failing only the
+unit-suite check in a transient race with concurrent edits to the tree
+(the two affected tests pass on re-run); the owed full re-run of the
+23-check gate has since been recorded green, closing that gap. The **full `sudo installer` run
+was NOT performed in the build environment** — `installer_run` is recorded
+`not_run` in the evidence at `out/package-evidence/pkg/`. Run the optional
+full install
 (`UDBMCP_PKG_INSTALL=1 scripts/package/test_package_pkg.sh`) on a
 sacrificial macOS host before fleet rollout.

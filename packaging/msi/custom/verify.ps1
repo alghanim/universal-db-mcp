@@ -10,10 +10,12 @@
 #
 #   1. NOTHING in the installed bundle is executed before the ADMIN-INSTALLED
 #      trusted verify_bundle.py --pubkey run has passed. This action runs the
-#      verifier from the trust directory (C:\ProgramData\udbmcp-trust by
-#      default) -- a path OUTSIDE the bundle, populated by the admin from the
-#      same trusted channel that delivered the MSI. The bundle is only ever
-#      READ (manifest, SHA256SUMS, wheel hashes) by that verifier, never run.
+#      verifier from the trust directory the MSI pins via CustomActionData
+#      (C:\Program Files\udbmcp-trust -- the admin-write-only Program Files
+#      tree, so a non-admin process cannot pre-create it) -- a path OUTSIDE
+#      the bundle, populated by the admin from the same trusted channel that
+#      delivered the MSI. The bundle is only ever READ (manifest, SHA256SUMS,
+#      wheel hashes) by that verifier, never run.
 #   2. The release public key is NEVER shipped inside the MSI (or any release
 #      artifact). The admin distributes it out-of-band and points
 #      UDBMCP_RELEASE_PUBKEY (machine scope) at it; without it this action
@@ -37,29 +39,35 @@
 #   Pass parameters via CustomActionData as semicolon-separated KEY=VALUE:
 #
 #     BUNDLE_DIR=C:\Program Files\UniversalDB MCP\bundle   (required)
-#     TRUST_DIR=C:\ProgramData\udbmcp-trust                (optional override)
+#     TRUST_DIR=C:\Program Files\udbmcp-trust  (ALWAYS passed by the wxs as
+#         [ProgramFiles64Folder]udbmcp-trust -- the admin-write-only Program
+#         Files tree, the analogue of the deb/pkg root-owned
+#         /usr/local/lib/udbmcp-trust; never left to the fallback below)
 #     PUBKEY=C:\ProgramData\universal-db-mcp\keys\udbmcp-release.pub.pem (optional override)
 #     PYTHON=C:\Program Files\Python312\python.exe         (optional override)
 #
-#   Values may contain spaces but not ';'. Any key may be omitted and falls
-#   back to the machine-scope environment variables below (set by the admin
-#   with setx /M BEFORE running msiexec -- a deferred action runs as
-#   LocalSystem and sees machine env only):
+#   Values may contain spaces but not ';'. TRUST_DIR is always passed by the
+#   wxs, so the machine-scope UDBMCP_TRUST_DIR below is a fallback for
+#   STANDALONE/manual runs of this script only (e.g. the delivered gate's
+#   tamper negative) -- it is NEVER read during an MSI install. The other
+#   keys may be omitted and fall back to the machine-scope environment
+#   variables below (set by the admin with setx /M BEFORE running msiexec --
+#   a deferred action runs as LocalSystem and sees machine env only):
 #
-#     UDBMCP_TRUST_DIR        (default C:\ProgramData\udbmcp-trust)
+#     UDBMCP_TRUST_DIR        (standalone-only fallback; default C:\ProgramData\udbmcp-trust)
 #     UDBMCP_RELEASE_PUBKEY   (required, directly or via PUBKEY in CustomActionData)
 #     UDBMCP_PYTHON           (optional interpreter override)
 #
-# TRUST BOOTSTRAP (admin, machine scope, from the trusted channel that
+# TRUST BOOTSTRAP (admin, elevated prompt, from the trusted channel that
 # delivered this MSI -- see docs/offline-deployment.md, 'Trust bootstrap'):
 #
 #     setx /M UDBMCP_RELEASE_PUBKEY "C:\ProgramData\universal-db-mcp\keys\udbmcp-release.pub.pem"
 #     New-Item -ItemType Directory -Force "$env:ProgramData\universal-db-mcp\keys"
 #     Copy-Item <trusted-path>\udbmcp-release.pub.pem `
 #         "$env:ProgramData\universal-db-mcp\keys\udbmcp-release.pub.pem"
-#     New-Item -ItemType Directory -Force "$env:ProgramData\udbmcp-trust\lib"
-#     Copy-Item <trusted-channel>\verify_bundle.py "$env:ProgramData\udbmcp-trust\"
-#     Copy-Item <trusted-channel>\profiles.py      "$env:ProgramData\udbmcp-trust\"
+#     New-Item -ItemType Directory -Force 'C:\Program Files\udbmcp-trust\lib'
+#     Copy-Item <trusted-channel>\verify_bundle.py 'C:\Program Files\udbmcp-trust\'
+#     Copy-Item <trusted-channel>\profiles.py      'C:\Program Files\udbmcp-trust\'
 #
 # The verifier checks Ed25519 signatures via openssl.exe (e.g. from Git for
 # Windows on PATH) or, failing that, the `cryptography` package importable by
@@ -161,7 +169,7 @@ try {
     # A tampered bundle ships a verifier that prints PASSED: never accept a
     # trust directory (verifier, profiles registry) located inside the bundle.
     if (Test-InsideDir $TrustDir $BundleDir) {
-        Fail "trust directory ($TrustDir) is inside the installed bundle ($BundleDir); a verifier from the payload proves nothing. Install the trusted tools outside the bundle, e.g. C:\ProgramData\udbmcp-trust (set UDBMCP_TRUST_DIR machine-wide if you use a custom path)."
+        Fail "trust directory ($TrustDir) is inside the installed bundle ($BundleDir); a verifier from the payload proves nothing. Install the trusted tools outside the bundle at the path the MSI pins via CustomActionData: C:\Program Files\udbmcp-trust."
     }
 
     # --- prerequisite 1: the trusted verifier + its profiles registry -------
@@ -170,7 +178,7 @@ try {
     if (-not (Test-Path -LiteralPath $Verifier -PathType Leaf)) {
         Write-Log "trusted verifier not found at $Verifier."
         Write-Log "The MSI refuses to install without it: nothing in this package may run payload that has not passed verification by an admin-installed trusted verifier obtained outside the package/bundle supply chain."
-        Write-Log "Bootstrap it from the same trusted channel that delivered this MSI (machine scope):"
+        Write-Log "Bootstrap it from the same trusted channel that delivered this MSI (the MSI reads TRUST_DIR from CustomActionData, so provision exactly the path below):"
         Write-Log "    New-Item -ItemType Directory -Force '$TrustDir\lib'"
         Write-Log "    Copy-Item <trusted-channel>\verify_bundle.py '$TrustDir\'"
         Write-Log "    Copy-Item <trusted-channel>\profiles.py      '$TrustDir\'"
@@ -213,10 +221,19 @@ try {
         Fail "release public key ($PubKey) is inside the installed bundle ($BundleDir); a key shipped with the payload authenticates nothing. Install the key outside the bundle (set UDBMCP_RELEASE_PUBKEY machine-wide)."
     }
 
-    # --- prerequisite 3: a python interpreter OUTSIDE the bundle --------------
+    # --- prerequisite 3: the PER-MACHINE python interpreter -------------------
     # The bundle's own python (venv/python.exe) may not run anything yet --
     # including the verifier. The wxs LaunchCondition guarantees a per-machine
-    # python.org CPython 3.12; resolve it explicitly, never via the bundle.
+    # python.org CPython 3.12 (HKLM\SOFTWARE\Python\PythonCore\3.12, PEP 514);
+    # resolution is pinned to EXACTLY that registry value and never via py.exe
+    # or PATH: py.exe prefers a per-user (HKCU) installation over the
+    # per-machine one, and a local non-admin can register one. Python startup
+    # auto-executes user site-packages (.pth files), so an unpinned resolver
+    # would let a non-admin run arbitrary code HERE, as LocalSystem, BEFORE the
+    # bundle is verified -- the verify-before-execute gate itself would be
+    # attacker-controlled. The LaunchCondition only proves a per-machine 3.12
+    # EXISTS; this block pins execution to that same hive, and an HKCU-only
+    # machine fails closed with the bootstrap diagnostic below.
     $pyExe = $null
     $pyArgs = @()
     $candidate = $data['PYTHON']
@@ -228,20 +245,24 @@ try {
         $pyExe = $candidate
     }
     if (-not $pyExe) {
-        # python.org per-machine installs put the launcher in the Windows dir.
-        $pyLauncher = Join-Path $env:SystemRoot 'py.exe'
-        if (Test-Path -LiteralPath $pyLauncher -PathType Leaf) {
-            $pyExe = $pyLauncher
-            $pyArgs = @('-3.12')
-        } elseif (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Python312\python.exe') -PathType Leaf) {
-            $pyExe = Join-Path $env:ProgramFiles 'Python312\python.exe'
-        } else {
-            $cmd = Get-Command -Name 'python.exe' -ErrorAction SilentlyContinue
-            if ($cmd) { $pyExe = $cmd.Source }
+        $pyHive = 'HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath'
+        if (Test-Path -LiteralPath $pyHive) {
+            $pyProps = Get-ItemProperty -LiteralPath $pyHive
+            # PEP 514: ExecutablePath when present, else the key's default
+            # value (the install directory) + python.exe.
+            $regCandidate = $pyProps.ExecutablePath
+            if (-not $regCandidate) {
+                $pyInstallPath = $pyProps.'(default)'
+                if ($pyInstallPath) { $regCandidate = Join-Path $pyInstallPath 'python.exe' }
+            }
+            if ($regCandidate -and (Test-Path -LiteralPath $regCandidate -PathType Leaf)) {
+                $pyExe = $regCandidate
+            }
         }
     }
     if (-not $pyExe) {
-        Write-Log "no python interpreter found for the trusted verifier (looked for $env:SystemRoot\py.exe, $env:ProgramFiles\Python312\python.exe, python.exe on PATH)."
+        Write-Log "no PER-MACHINE CPython 3.12 found (HKLM\SOFTWARE\Python\PythonCore\3.12\InstallPath)."
+        Write-Log "A per-user (HKCU) interpreter is deliberately NOT accepted: py.exe would prefer it and a local non-admin can register one, so executing it here -- as LocalSystem, before the bundle is verified -- would run attacker-controlled code."
         Write-Log "Install python.org CPython 3.12 per-machine (the MSI launch condition requires it), or pass PYTHON in CustomActionData / set UDBMCP_PYTHON machine-wide."
         Fail "no python interpreter available to run the trusted verifier; installation ABORTED (fail closed)."
     }
@@ -249,6 +270,26 @@ try {
     # yet, but refuse a misconfigured path regardless).
     if (Test-InsideDir $pyExe $BundleDir) {
         Fail "python interpreter ($pyExe) is inside the installed bundle; bundle payload (including its python) may not execute before verification passes."
+    }
+    # Prove the registry-resolved interpreter is really CPython 3.12 BEFORE the
+    # trusted verifier is executed with it: a stale/wrong HKLM registration
+    # must fail closed with a clear diagnostic, not crash inside the verifier
+    # (the admin-provided PYTHON/UDBMCP_PYTHON override above is a deliberate
+    # administrator decision and is not second-guessed here). EAP is relaxed
+    # around the native invocation for the same Windows PowerShell 5.1
+    # stderr-escalation reason documented at the verifier run below.
+    if (-not $candidate) {
+        $prevProbeEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $pyExe -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 1> $null 2> $null
+            $pyProbeExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevProbeEap
+        }
+        if ($pyProbeExit -ne 0) {
+            Fail "the per-machine interpreter registered at HKLM\SOFTWARE\Python\PythonCore\3.12 ($pyExe) is not CPython 3.12.x (the wheelhouse is built for cp312); installation ABORTED (fail closed)."
+        }
     }
 
     Write-Log "  bundle:   $BundleDir"

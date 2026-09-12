@@ -41,8 +41,9 @@ case "$self_path" in
     echo "      then run: sudo bash $TRUST_DIR/install_offline.sh <bundle-dir>" >&2
     exit 1 ;;
 esac
-if [ ! -f "$VERIFIER" ]; then
-  echo "FAIL: trusted verifier not found at $VERIFIER (set UDBMCP_VERIFIER or install the trusted tools)." >&2
+if [ ! -f "$VERIFIER" ] || [ ! -s "$VERIFIER" ]; then
+  echo "FAIL: trusted verifier not found (or zero-length) at $VERIFIER (set UDBMCP_VERIFIER or install the trusted tools)." >&2
+  echo "      A zero-length verifier would 'verify' vacuously: python3 on an empty script exits 0." >&2
   exit 1
 fi
 case "$(cd "$(dirname "$VERIFIER")" && pwd -P)" in
@@ -138,8 +139,15 @@ udbmcp_install_os_packages "$NEW_BUNDLE" "$PY" "$sudo_ok"
 
 echo "==> building new venv alongside current (atomic switch on success)"
 "$PY" -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"'
-NEWVENV="$TARGET/venv.new-$(date -u +%Y%m%dT%H%M%SZ)"
 $sudo_ok mkdir -p "$TARGET"
+# Re-run hygiene: an earlier attempt aborted between venv creation and the
+# doctor check (pip failure, smoke-check failure, kill) leaves a full
+# venv.new-* tree behind — hundreds of MB of dead weight under /opt per
+# attempt, and a later upgrade can die on ENOSPC mid-pip. Discard stale ones
+# before building the new one. Concurrent upgrades are not supported (both
+# would contest the same venv), so anything matching here is debris.
+$sudo_ok rm -rf "$TARGET"/venv.new-* 2>/dev/null || true
+NEWVENV="$TARGET/venv.new-$(date -u +%Y%m%dT%H%M%SZ)"
 $sudo_ok "$PY" -m venv "$NEWVENV"
 $sudo_ok env PIP_CONFIG_FILE=/dev/null PIP_DISABLE_PIP_VERSION_CHECK=1 \
   PIP_NO_INDEX=1 PIP_FIND_LINKS="$NEW_BUNDLE/wheelhouse" \
@@ -175,17 +183,42 @@ $sudo_ok mv "$NEWVENV" "$TARGET/venv"
 
 echo "==> validating effective installation"
 # doctor resolves the config as args.config or $UDBMCP_CONFIG and fails closed
-# with "no config path" when neither is set; pass it explicitly so a healthy
-# upgrade is not rolled back by its own validation.
-if ! "$TARGET/venv/bin/python" -m universal_db_mcp doctor \
-  --config "${UDBMCP_CONFIG:-/etc/universal-db-mcp/config.yaml}"; then
-  echo "FAIL: doctor failed after switch; rolling back automatically" >&2
-  $sudo_ok rm -rf "$TARGET/venv.failed"; $sudo_ok mv "$TARGET/venv" "$TARGET/venv.failed"
-  if [ -d "$TARGET/venv.previous" ]; then $sudo_ok mv "$TARGET/venv.previous" "$TARGET/venv"; fi
-  exit 1
+# with "no config path" — or "config file not found" — when neither resolves
+# to an existing file; pass it explicitly so a healthy upgrade is not rolled
+# back by its own validation. Mirror the pre-switch guard too: on a
+# config-less installation (no /etc/universal-db-mcp/config.yaml yet, no
+# UDBMCP_CONFIG) the default path does not exist and would turn a valid
+# upgrade into an automatic rollback, so only run the config-aware doctor
+# when a config actually resolves.
+if [ -n "${UDBMCP_CONFIG:-}" ] || [ -f /etc/universal-db-mcp/config.yaml ]; then
+  if ! "$TARGET/venv/bin/python" -m universal_db_mcp doctor \
+    --config "${UDBMCP_CONFIG:-/etc/universal-db-mcp/config.yaml}"; then
+    echo "FAIL: doctor failed after switch; rolling back automatically" >&2
+    $sudo_ok rm -rf "$TARGET/venv.failed"; $sudo_ok mv "$TARGET/venv" "$TARGET/venv.failed"
+    if [ -d "$TARGET/venv.previous" ]; then $sudo_ok mv "$TARGET/venv.previous" "$TARGET/venv"; fi
+    # The unit was stopped for the switch: leave the rolled-back installation
+    # running again instead of exiting with the service down and no hint.
+    if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl start universal-db-mcp || true; fi
+    echo "FAIL: previous release restored and service restarted; see the doctor output above." >&2
+    exit 1
+  fi
+else
+  echo "==> no config file present; skipping config-aware doctor validation"
 fi
+
+# Publish the re-verified staging copy's manifest next to the venv, mirroring
+# install_offline.sh, so `doctor` (and fleet audits) report the profile of the
+# bundle that is actually installed instead of the previous release's. It is
+# written only AFTER validation succeeds and the switch is final: on the
+# auto-rollback path the existing manifest keeps describing the restored venv.
+# $NEW_BUNDLE is the re-verified private staging copy here, so what is
+# published is exactly what was verified.
+if [ -f "$NEW_BUNDLE/manifest.json" ]; then
+  $sudo_ok install -m 644 -o root -g root "$NEW_BUNDLE/manifest.json" "$TARGET/manifest.json"
+fi
+
 if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl start universal-db-mcp || true; fi
 
-echo "==> upgraded. Rollback if needed:"
+echo "==> upgraded from $ORIG_BUNDLE. Rollback if needed:"
 echo "    rollback_offline.sh $TARGET"
-echo "Interrupted mid-way? Re-run: the .new-* venv is discarded and rebuilt."
+echo "Interrupted mid-way? Re-run: stale .new-* venvs are discarded and the build restarts."

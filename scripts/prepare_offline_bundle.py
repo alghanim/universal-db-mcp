@@ -161,6 +161,79 @@ def require_complete_wheelhouse(missing: list[str], profile_name: str, allow_mis
         )
 
 
+def check_os_package_closure(
+    connectors: list[str],
+    os_packages: list[dict[str, object]],
+    profile: Profile,
+    signing_key: str | None,
+) -> bool:
+    """Fail loud (signed) or warn loudly (unsigned) on an incomplete .deb closure.
+
+    Mirrors BOTH scripts/verify_bundle.py closure rules for declared os_packages:
+
+    1. Any bundle declaring msodbcsql18 must also declare the unixODBC stack
+       (unixodbc): msodbcsql18's postinst invokes `odbcinst`, so the driver
+       cannot be configured without it. The verifier refuses such a bundle
+       unconditionally — there is no administrator_supplied fallback once the
+       driver .deb is shipped — so a signed build fails here rather than
+       producing a release that could never pass verification in the air gap,
+       and an unsigned build proceeds only with a loud warning.
+    2. When mssql is selected on a profile that stages an OS-package closure,
+       the staged directory must actually contain msodbcsql18: the verifier
+       refuses any bundle whose manifest selects mssql without msodbcsql18
+       among the declared os_packages. A signed build therefore fails here —
+       the mirror of check_signing_conflict's "a signed release can never ship
+       a knowingly incomplete wheelhouse". Unsigned builds keep the documented
+       administrator_supplied fallback, but loudly, never silently.
+
+    Returns True when the vendored closure includes the mssql ODBC driver.
+    """
+    names = {str(e["package"]) for e in os_packages}
+    driver_vendored = "msodbcsql18" in names
+    # Rule 1 — applies whenever .debs are declared at all, exactly like the
+    # verifier (which only exempts rule 2 for the entirely-absent case).
+    if driver_vendored and "unixodbc" not in names:
+        msg = (
+            f"staged OS-package closure for profile '{profile.name}' declares "
+            "msodbcsql18 without the unixODBC stack (unixodbc): the driver's "
+            "postinst invokes `odbcinst`, so scripts/verify_bundle.py refuses "
+            "any bundle that declares msodbcsql18 without unixodbc. "
+        )
+        if signing_key:
+            raise SystemExit(
+                msg + "A signed release can never ship a knowingly incomplete "
+                "OS-package closure: stage the full closure (see "
+                "BUILD_UNIVERSAL_DB_MCP_AIRGAPPED.md), or build without the signing key."
+            )
+        print("WARNING: " + msg + "The bundle will fail scripts/verify_bundle.py "
+              "on the target; stage the unixODBC stack .debs before release.",
+              file=sys.stderr)
+    if "mssql" not in connectors or not profile.os_packages_staging:
+        return driver_vendored
+    if driver_vendored:
+        return True
+    state = (
+        f"missing entirely (no .debs found in {profile.os_packages_staging}/)"
+        if not os_packages
+        else "incomplete (msodbcsql18 is not among the staged .debs)"
+    )
+    msg = (
+        f"staged OS-package closure for profile '{profile.name}' is {state}: "
+        "the MSSQL connector would be demoted to administrator_supplied in "
+        "manifest.json, and scripts/verify_bundle.py refuses a bundle that "
+        "selects mssql without msodbcsql18 among the declared os_packages. "
+    )
+    if signing_key:
+        raise SystemExit(
+            msg + "A signed release can never ship a knowingly incomplete "
+            "OS-package closure: stage the full closure (see "
+            "BUILD_UNIVERSAL_DB_MCP_AIRGAPPED.md), or build without the signing key."
+        )
+    print("WARNING: " + msg + "The bundle will declare the Microsoft ODBC "
+          "driver administrator_supplied.", file=sys.stderr)
+    return False
+
+
 def pip_download_command(profile: Profile, pkgs: list[str], wheelhouse: Path, constraints: Path) -> list[str]:
     """Build the pip download command for the profile's target interpreter.
 
@@ -181,19 +254,86 @@ def pip_download_command(profile: Profile, pkgs: list[str], wheelhouse: Path, co
     return cmd
 
 
+def connectors_arg(value: str) -> str:
+    """Validate and normalize the --connectors argument at the argparse boundary.
+
+    Unknown or padded values ('trino', ' postgres') must fail as a clean
+    argparse error (exit code 2), not as a raw KeyError deep inside the build.
+    """
+    names = [c.strip() for c in value.split(",") if c.strip()]
+    unknown = sorted({c for c in names if c not in CONNECTOR_WHEELS})
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown connector(s): {', '.join(unknown)} "
+            f"(valid choices: {', '.join(sorted(CONNECTOR_WHEELS))})"
+        )
+    if not names:
+        raise argparse.ArgumentTypeError(
+            "no connectors selected ('core' is always included regardless)"
+        )
+    return ",".join(names)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", default="linux-x86_64-ubuntu24.04-cp312", choices=sorted(PROFILES),
                     help="target profile (see scripts/profiles.py)")
     ap.add_argument("--out", required=True, help="bundle output directory")
     ap.add_argument("--connectors", default="core,postgres,mysql,clickhouse,oracle,mssql,db2",
+                    type=connectors_arg,
                     help="comma list; 'core' is always included")
     ap.add_argument("--allow-missing-connectors", action="store_true",
                     help="record missing connector wheels in the manifest and continue "
                          "instead of failing; refused together with --signing-key")
     ap.add_argument("--signing-key", default=None, help="PEM file with an Ed25519 private key (staging only)")
-    ap.add_argument("--source-rev", default=os.environ.get("UDBMCP_SOURCE_REV", "unknown"))
+    ap.add_argument("--source-rev", default=os.environ.get("UDBMCP_SOURCE_REV") or None,
+                    help="source revision recorded in manifest.json. Default: git HEAD of "
+                         "this repository (UDBMCP_SOURCE_REV as an environment override); "
+                         "falls back to the sentinel 'unknown' with a WARNING when git is "
+                         "unavailable, the tree is not a repository, or no commit exists — "
+                         "package versions derived from 'unknown' cannot be tied to a "
+                         "source revision.")
     return ap
+
+
+def detect_git_rev(repo: Path = PROJECT) -> str | None:
+    """Return the git HEAD revision of the repository containing *repo*, or
+    None when git is unavailable, the path is not inside a git work tree, or
+    HEAD is unborn (no commits yet). Never raises."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout.strip() or None
+
+
+def resolve_source_rev(explicit: str | None) -> str:
+    """Resolve the manifest source_rev.
+
+    Order: an explicit --source-rev / UDBMCP_SOURCE_REV wins, then the
+    automatically captured git HEAD. When the revision cannot be determined,
+    fall back to the 'unknown' sentinel LOUDLY (stderr WARNING) so a bundle
+    without provenance never passes unnoticed — never silently.
+    """
+    if explicit:
+        return explicit
+    rev = detect_git_rev()
+    if rev:
+        return rev
+    print(
+        "WARNING: could not determine the source revision automatically (git "
+        "unavailable, not a git repository, or no commits yet); manifest "
+        "source_rev will be the sentinel 'unknown'. Package versions derived "
+        "from it cannot be tied to any source revision — pass --source-rev "
+        "or set UDBMCP_SOURCE_REV to record one.",
+        file=sys.stderr,
+    )
+    return "unknown"
 
 
 def stage_os_packages(out: Path, staging: Path) -> list[dict[str, object]]:
@@ -218,6 +358,22 @@ def stage_os_packages(out: Path, staging: Path) -> list[dict[str, object]]:
             if line.strip():
                 digest, _, fname = line.partition("  ")
                 staged[fname.strip()] = digest
+
+    # Fail loud on a declared-but-absent staged .deb: SHA256SUMS is copied
+    # verbatim into the bundle below, so silently dropping the file would
+    # ship a bundle whose os-packages/SHA256SUMS declares a .deb it does not
+    # contain — a signed release that could never pass verification.
+    missing_staged = sorted(
+        name for name in staged
+        if name.endswith(".deb") and not (staging / name).is_file()
+    )
+    if missing_staged:
+        raise SystemExit(
+            "staged OS-package closure is incomplete: staging SHA256SUMS "
+            f"declares {missing_staged} but the file(s) are absent from "
+            f"{staging}. Re-stage the missing .deb(s) (or regenerate the "
+            "staging SHA256SUMS) before building."
+        )
 
     entries: list[dict[str, object]] = []
     for deb in debs:
@@ -253,6 +409,15 @@ def stage_os_packages(out: Path, staging: Path) -> list[dict[str, object]]:
 def main() -> None:
     args = build_arg_parser().parse_args()
     check_signing_conflict(args.signing_key, args.allow_missing_connectors)
+    source_rev = resolve_source_rev(args.source_rev)
+    if args.signing_key and source_rev == "unknown":
+        print(
+            "WARNING: signing a bundle whose manifest source_rev is the sentinel "
+            "'unknown': the signature attests the payload bytes but ties them to "
+            "no source revision. Pass --source-rev (or UDBMCP_SOURCE_REV) to "
+            "record one.",
+            file=sys.stderr,
+        )
     profile = get_profile(args.profile)
 
     connectors = ["core"] + [c for c in args.connectors.split(",") if c != "core"]
@@ -268,8 +433,7 @@ def main() -> None:
 
     # 1. application wheel -----------------------------------------------------
     with tempfile.TemporaryDirectory() as td:
-        sh([str(Path(sys.executable).parent / "python"), "-m", "build", "--wheel",
-            "--outdir", td, str(PROJECT)])
+        sh([sys.executable, "-m", "build", "--wheel", "--outdir", td, str(PROJECT)])
         app_wheels = list(Path(td).glob("*.whl"))
         assert len(app_wheels) == 1, app_wheels
         app_wheel_name = app_wheels[0].name
@@ -406,7 +570,10 @@ def main() -> None:
     os_packages: list[dict[str, object]] = []
     if "mssql" in connectors and profile.os_packages_staging:
         os_packages = stage_os_packages(out, PROJECT / profile.os_packages_staging)
-    if os_packages:
+    mssql_driver_vendored = check_os_package_closure(
+        connectors, os_packages, profile, args.signing_key,
+    )
+    if mssql_driver_vendored and os_packages:
         (out / "os-packages" / "README.md").write_text(
             "# OS packages\n\nThis bundle ships a pre-staged, hash-pinned OS package "
             "closure for the MSSQL connector (unixODBC stack + Microsoft ODBC Driver 18 "
@@ -433,14 +600,14 @@ def main() -> None:
     admin_supplied: dict[str, str] = {}
     if "db2" in connectors:
         admin_supplied["db2_connect_license"] = "Db2 Connect client licensing if connecting to z/OS or i"
-    if "mssql" in connectors and not os_packages:
+    if "mssql" in connectors and not mssql_driver_vendored:
         admin_supplied["mssql_odbc_driver"] = (
             f"Microsoft ODBC Driver 18 for SQL Server ({profile.odbc_driver_package}) + EULA acceptance"
         )
     manifest = {
         "release": "0.1.0",
         "profile": args.profile,
-        "source_rev": args.source_rev,
+        "source_rev": source_rev,
         "created": datetime.datetime.now(datetime.UTC).isoformat(),
         "build_tools": {
             "python": platform.python_version(),
@@ -479,6 +646,7 @@ def main() -> None:
         sign_sha256sums(out, args.signing_key)
 
     print(f"\nbundle ready: {out}")
+    print(f"source_rev: {source_rev}")
     print(f"wheels: {len(wheelhouse)}  missing connector artifacts: {missing or 'none'}")
     if os_packages:
         print(f"os packages: {len(os_packages)} vendored into os-packages/ (hash-pinned in manifest)")

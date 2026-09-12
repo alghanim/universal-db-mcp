@@ -371,10 +371,14 @@ def test_p0_installer_refuses_to_run_from_inside_bundle(tmp_path) -> None:  # ty
     bundle being verified (a tampered bundle would verify itself otherwise)."""
     import shutil
     import subprocess
+    from pathlib import Path
 
+    repo_root = Path(__file__).resolve().parents[2]
     bundle = tmp_path / "bundle"
     (bundle / "installers").mkdir(parents=True)
-    shutil.copy("scripts/install_offline.sh", bundle / "installers" / "install_offline.sh")
+    shutil.copy(
+        repo_root / "scripts" / "install_offline.sh", bundle / "installers" / "install_offline.sh"
+    )
     r = subprocess.run(  # noqa: S603
         ["/bin/bash", str(bundle / "installers" / "install_offline.sh"), str(bundle)],
         env={"PATH": "/usr/bin:/bin", "UDBMCP_RELEASE_PUBKEY": str(tmp_path / "k.pem")},
@@ -1478,6 +1482,7 @@ def test_airgap_bootstrap_signs_bundle_and_exports_matching_pubkey(tmp_path) -> 
     _assert_container_verifies_with(pub_file, _docker_run_args(docker_log), bundle)
 
 
+@_WIN32_ONLY
 def test_airgap_bootstrap_uses_release_key_when_provided(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """When UDBMCP_RELEASE_KEY is set the bootstrap must sign with THAT key (no
     ephemeral key generated) and export its matching public key."""
@@ -1516,6 +1521,7 @@ def test_airgap_bootstrap_uses_release_key_when_provided(tmp_path) -> None:  # t
     _assert_container_verifies_with(pub_file, _docker_run_args(docker_log), bundle)
 
 
+@_WIN32_ONLY
 def test_airgap_prebuilt_bundle_path_keeps_pubkey_env_injection(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The prebuilt-bundle path must be unchanged: no bootstrap key material is
     created, and the container still receives UDBMCP_RELEASE_PUBKEY so an
@@ -1587,6 +1593,7 @@ def _run_gate_c_classify(rc: int, log_text: str, tmp_path):  # type: ignore[no-u
     }
 
 
+@_WIN32_ONLY
 def test_gate_c_all_fixtures_blocked_is_recorded_blocked_not_passed(tmp_path) -> None:
     """Regression: with every UDBMCP_TEST_*_HOST unset, all 13 connector
     tests skip and pytest exits 0 — the gate must record status=blocked and
@@ -1603,6 +1610,7 @@ def test_gate_c_all_fixtures_blocked_is_recorded_blocked_not_passed(tmp_path) ->
     assert out["test_failed"] == 0
 
 
+@_WIN32_ONLY
 def test_gate_c_real_pass_requires_at_least_one_passed_test(tmp_path) -> None:
     out = _run_gate_c_classify(
         0,
@@ -1615,6 +1623,7 @@ def test_gate_c_real_pass_requires_at_least_one_passed_test(tmp_path) -> None:
     assert out["skipped"] == 8
 
 
+@_WIN32_ONLY
 def test_gate_c_nonzero_pytest_exit_is_failed(tmp_path) -> None:
     out = _run_gate_c_classify(
         1,
@@ -1627,6 +1636,7 @@ def test_gate_c_nonzero_pytest_exit_is_failed(tmp_path) -> None:
     assert out["test_failed"] == 1
 
 
+@_WIN32_ONLY
 def test_gate_c_no_tests_ran_fails_closed(tmp_path) -> None:
     """pytest exit 0 with 'no tests ran' (e.g. collection produced nothing)
     must not be recorded as a pass."""
@@ -1636,6 +1646,7 @@ def test_gate_c_no_tests_ran_fails_closed(tmp_path) -> None:
     assert out["passed"] == 0
 
 
+@_WIN32_ONLY
 def test_gate_c_summary_failures_with_exit_zero_fail_closed(tmp_path) -> None:
     """Defensive: if the summary reports failures/errors while pytest exited
     0 anyway, the gate must not call it a pass."""
@@ -1940,6 +1951,7 @@ def _run_db2_tls_script(tmp_path, gsk8_reject):  # type: ignore[no-untyped-def]
     return proc, home, root / "docker.log", root / "gskit.log"
 
 
+@_WIN32_ONLY
 def test_db2_tls_script_end_to_end_gsk8_rejects_selfsign(tmp_path) -> None:
     """Mirror of the reproduced fixture: GSKit 8 that rejects -cert -selfsign.
     The run must succeed via -cert -create, stage the ICU shim on a fresh
@@ -1968,6 +1980,7 @@ def test_db2_tls_script_end_to_end_gsk8_rejects_selfsign(tmp_path) -> None:
     assert mkdir_idx < cp_idx, "\n".join(log_lines)
 
 
+@_WIN32_ONLY
 def test_db2_tls_script_end_to_end_falls_back_to_selfsign(tmp_path) -> None:
     """A GSKit 8 build that rejects `-cert -create` must still succeed via the
     `-cert -selfsign` fallback instead of aborting."""
@@ -2194,6 +2207,7 @@ def test_gate_a_fail_fast_cases_require_expected_diagnostics_and_pubkey() -> Non
         )
 
 
+@_WIN32_ONLY
 def test_gate_a_untrusted_signature_case_fails_closed_when_signing_fails() -> None:
     """The untrusted_signature tamper case must never run vacuously: if every
     signer (docker openssl, host openssl, python cryptography) fails and the
@@ -2423,7 +2437,9 @@ def test_installer_dpkg_env_reaches_dpkg_through_sudo() -> None:
     import tempfile
     from pathlib import Path
 
-    script = open("scripts/lib/os_packages.sh", encoding="utf-8").read()
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "lib" / "os_packages.sh"
+    ).read_text(encoding="utf-8")
 
     # The broken pattern must be gone: a variable assignment applied as a
     # prefix to the privileged wrapper itself.
@@ -2689,6 +2705,7 @@ def _run_baseline_script(bundle, shim_dir, env_extra):
     )
 
 
+@_WIN32_ONLY
 def test_prepare_baseline_script_passes_bash_syntax_check() -> None:
     import subprocess
 
@@ -2698,6 +2715,7 @@ def test_prepare_baseline_script_passes_bash_syntax_check() -> None:
     assert proc.returncode == 0, proc.stderr
 
 
+@_WIN32_ONLY
 def test_prepare_baseline_script_fails_closed_when_bundle_signed_and_no_key(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """Signed bundle + no UDBMCP_RELEASE_KEY must exit non-zero and leave the
     bundle byte-identical (no stale SIGNATURE over refreshed SHA256SUMS)."""
@@ -2815,6 +2833,7 @@ def test_audit_rotation_single_threaded_unchanged(tmp_path):  # type: ignore[no-
     assert "audit.jsonl.4" not in names
     # most recent record lives in the live file
     assert path.read_text(encoding="utf-8").strip().endswith('"n":4}')
+@_WIN32_ONLY
 def test_prepare_baseline_script_resigns_signed_bundle_with_key(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """With UDBMCP_RELEASE_KEY set, the refreshed SHA256SUMS must cover every
     bundle file (including the exported image tar) and SIGNATURE must verify
@@ -2864,6 +2883,7 @@ def test_prepare_baseline_script_resigns_signed_bundle_with_key(tmp_path) -> Non
     )
 
 
+@_WIN32_ONLY
 def test_prepare_baseline_script_unsigned_bundle_without_key_stays_unsigned(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A bundle that was never signed may still be refreshed without a key
     (exit 0, no SIGNATURE created) — the fail-closed guard applies only to
@@ -3844,19 +3864,35 @@ def test_doctor_reports_installed_bundle_profile(tmp_path, monkeypatch) -> None:
     assert "linux-x86_64-ubuntu24.04-cp312" not in json.dumps(report)
 
     # venv-relative discovery: the installer publishes the bundle manifest at
-    # $TARGET/manifest.json, i.e. one level above <venv>/bin/python
+    # $TARGET/manifest.json, i.e. one level ABOVE the venv root (see
+    # scripts/install_offline.sh and packaging/pkg/postinstall). Discovery must
+    # derive the venv root from sys.prefix so it survives the bin/python ->
+    # base-interpreter symlink every real venv uses, and must NOT pick up a
+    # stray manifest.json inside the venv (the off-by-one regression guard).
     monkeypatch.delenv("UDBMCP_BUNDLE_MANIFEST")
-    venv_bin = tmp_path / "venv" / "bin"
+    venv_root = tmp_path / "venv"
+    venv_bin = venv_root / "bin"
     venv_bin.mkdir(parents=True)
-    (tmp_path / "venv" / "manifest.json").write_text(json.dumps({"profile": "windows-x86_64-cp312"}))
-    monkeypatch.setattr(sys, "executable", str(venv_bin / "python.exe"))
+    (tmp_path / "manifest.json").write_text(json.dumps({"profile": "windows-x86_64-cp312"}))
+    (venv_root / "manifest.json").write_text(json.dumps({"profile": "decoy-inside-venv"}))
+    # emulate a real venv: bin/python symlinks to the base interpreter, whose
+    # directory is unrelated to the install target
+    base_py = tmp_path / "base" / "python3.12"
+    base_py.parent.mkdir(parents=True)
+    base_py.write_text("#!/bin/sh\n")
+    (venv_bin / "python").symlink_to(base_py)
+    monkeypatch.setattr(sys, "prefix", str(venv_root))
+    monkeypatch.setattr(sys, "base_prefix", str(base_py.parent.parent))
+    monkeypatch.setattr(sys, "executable", str(venv_bin / "python"))
     report = run_doctor(str(cfg))
-    assert "windows-x86_64-cp312" in str(_doctor_checks(report, "platform")[0]["detail"])
+    platform_detail = str(_doctor_checks(report, "platform")[0]["detail"])
+    assert "windows-x86_64-cp312" in platform_detail, platform_detail
+    assert "decoy-inside-venv" not in platform_detail, platform_detail
     assert "linux-x86_64-ubuntu24.04-cp312" not in json.dumps(report)
 
     # honest fallback (no manifest anywhere): describe the running platform,
     # never claim a profile the doctor did not verify
-    (tmp_path / "venv" / "manifest.json").unlink()
+    (tmp_path / "manifest.json").unlink()
     report = run_doctor(str(cfg))
     fallback = str(_doctor_checks(report, "platform")[0]["detail"])
     assert f"{platform.system()}/{platform.machine()}" in fallback, fallback
@@ -4249,6 +4285,7 @@ def test_p2_gate_c_orchestrator_exports_block_reason_env() -> None:
 
 # ------------------------------------------------- P2 fixer regressions (db2-enable-tls.sh idempotency)
 
+@_WIN32_ONLY
 def test_p2_db2_tls_svcename_pipeline_extracts_real_dbm_cfg_value(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """Db2 prints ' SSL service name   (SSL_SVCENAME) = 50001'; the old awk
     pattern matched the literal substring 'SSL SVCENAME', which never occurs,
@@ -4318,6 +4355,7 @@ def test_p2_start_mock_dbs_arithmetic_variables_are_assigned() -> None:
         "scripts/db2-enable-tls.sh",
     ],
 )
+@_WIN32_ONLY
 def test_p2_owned_scripts_pass_bash_syntax_check(script: str) -> None:
     import subprocess
     from pathlib import Path
@@ -4752,6 +4790,7 @@ def _bash_n(path) -> None:  # type: ignore[no-untyped-def]
     "name",
     ["install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh", "lib/os_packages.sh"],
 )
+@_WIN32_ONLY
 def test_offline_scripts_pass_bash_syntax_check(name: str) -> None:
     _bash_n(_offline_script(name))
 
@@ -4818,6 +4857,9 @@ def _install_sandbox(tmp_path, *, verifier_fails_second: bool = False):  # type:
         'echo "$2" >> "$UDBMCP_TEST_VERIFIER_LOG"\n'
         'count=$(wc -l < "$UDBMCP_TEST_VERIFIER_LOG")\n'
         'if [ "$fail_second" = "1" ] && [ "$count" -ge 2 ]; then exit 1; fi\n'
+        # install_offline.sh requires the verifier's explicit proof, not just
+        # exit 0 (same rule as packaging/msi/custom/verify.ps1).
+        'echo "bundle verification PASSED"\n'
         "exit 0\n".replace("$fail_second", fail_second),
     )
 
@@ -4845,6 +4887,7 @@ def _install_sandbox(tmp_path, *, verifier_fails_second: bool = False):  # type:
     return proc, vlog, bundle, target
 
 
+@_WIN32_ONLY
 def test_install_offline_consumes_only_private_reverified_staging_copy(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """verify_bundle.py hashed the tree once and the script then pip-installed
     and dpkg -i'ed straight from $BUNDLE — a verify-then-use race that let any
@@ -4863,6 +4906,7 @@ def test_install_offline_consumes_only_private_reverified_staging_copy(tmp_path)
     assert leftovers == [], f"staging copy leaked: {leftovers}"
 
 
+@_WIN32_ONLY
 def test_install_offline_aborts_when_staged_copy_fails_reverification(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """If the staged copy no longer verifies, nothing may be consumed from it:
     the run must abort before creating a venv (fail closed)."""
@@ -4873,6 +4917,7 @@ def test_install_offline_aborts_when_staged_copy_fails_reverification(tmp_path) 
     assert not (target / "venv").exists(), "staged copy that fails verification must not be installed from"
 
 
+@_WIN32_ONLY
 def test_install_offline_without_root_or_sudo_fails_loudly(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A non-root run without a usable sudo must refuse instead of silently
     skipping the privileged steps (a non-executable `sudo` on PATH makes
@@ -5001,6 +5046,7 @@ def _os_packages_sandbox(tmp_path, pre_status: str, post_status: str = "installe
     return proc, installs, proc.stdout + proc.stderr
 
 
+@_WIN32_ONLY
 def test_os_packages_exact_version_installed_is_skipped(tmp_path) -> None:  # type: ignore[no-untyped-def]
     proc, installs, out = _os_packages_sandbox(tmp_path, pre_status="installed 1.0.0")
     assert proc.returncode == 0, out
@@ -5008,6 +5054,7 @@ def test_os_packages_exact_version_installed_is_skipped(tmp_path) -> None:  # ty
     assert "already installed at required version, skipping" in out
 
 
+@_WIN32_ONLY
 def test_os_packages_older_installed_version_is_upgraded(tmp_path) -> None:  # type: ignore[no-untyped-def]
     proc, installs, out = _os_packages_sandbox(tmp_path, pre_status="installed 0.9.0")
     assert proc.returncode == 0, out
@@ -5015,6 +5062,7 @@ def test_os_packages_older_installed_version_is_upgraded(tmp_path) -> None:  # t
     assert "upgrading fakepkg: 0.9.0 -> 1.0.0" in out
 
 
+@_WIN32_ONLY
 def test_os_packages_newer_installed_version_is_never_downgraded(tmp_path) -> None:  # type: ignore[no-untyped-def]
     proc, installs, out = _os_packages_sandbox(tmp_path, pre_status="installed 2.0.0")
     assert proc.returncode == 0, out
@@ -5022,6 +5070,7 @@ def test_os_packages_newer_installed_version_is_never_downgraded(tmp_path) -> No
     assert "NEWER than bundled" in out
 
 
+@_WIN32_ONLY
 def test_os_packages_removed_but_not_purged_is_reinstalled(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """`dpkg -s` (the old check) returns success for 'deinstall ok
     config-files' and every other non-'ii' state; the helper must reinstall."""
@@ -5031,12 +5080,14 @@ def test_os_packages_removed_but_not_purged_is_reinstalled(tmp_path) -> None:  #
     assert "not 'installed'; (re)installing" in out
 
 
+@_WIN32_ONLY
 def test_os_packages_unknown_package_is_installed(tmp_path) -> None:  # type: ignore[no-untyped-def]
     proc, installs, out = _os_packages_sandbox(tmp_path, pre_status="")
     assert proc.returncode == 0, out
     assert len(installs) == 1
 
 
+@_WIN32_ONLY
 def test_os_packages_fails_loudly_when_dpkg_leaves_non_installed_state(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """dpkg -i can 'succeed' while the package ends up half-configured (failed
     postinst); the old script never re-checked. The helper must fail closed."""
@@ -5071,6 +5122,23 @@ def test_upgrade_offline_closes_verify_then_use_and_switch_windows() -> None:
     assert "[ ! -d \"$TARGET/venv\" ]" in text, "restore must fire only when no venv exists"
 
 
+def _record_rollback_manifest(target):  # type: ignore[no-untyped-def]
+    """Record <target>/venv.previous.sha256 exactly the way upgrade_offline.sh
+    does at demotion time (relative paths, LC_ALL=C byte order, sha256sum
+    ``<hash>  <path>`` lines), so rollback_offline.sh's verify-then-use gate
+    accepts the sandbox tree the way it would accept a real demoted venv."""
+    import hashlib
+
+    tree = target / "venv.previous"
+    rels = sorted(
+        "./" + p.relative_to(tree).as_posix()
+        for p in tree.rglob("*")
+        if p.is_file() and not p.is_symlink()
+    )
+    lines = [f"{hashlib.sha256((tree / r[2:]).read_bytes()).hexdigest()}  {r}\n" for r in rels]
+    (target / "venv.previous.sha256").write_text("".join(lines), encoding="utf-8")
+
+
 def _rollback_sandbox(tmp_path):  # type: ignore[no-untyped-def]
     """Sandbox the REAL rollback_offline.sh: a venv stub python whose doctor
     honors UDBMCP_DOCTOR_RC, and UDBMCP_CONFIG_DIR / UDBMCP_STATE_DIR pointed
@@ -5101,6 +5169,7 @@ def _rollback_sandbox(tmp_path):  # type: ignore[no-untyped-def]
     return run, root / "etc"
 
 
+@_WIN32_ONLY
 def test_rollback_offline_restores_venv_previous_without_current_venv(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """An upgrade killed between upgrade_offline.sh's two renames leaves NO
     current venv; under set -e the old script aborted on `mv venv` before
@@ -5112,6 +5181,7 @@ def test_rollback_offline_restores_venv_previous_without_current_venv(tmp_path) 
         '#!/bin/sh\ncase "$*" in *doctor*) exit 0;; esac\n', encoding="utf-8"
     )
     (target / "venv.previous" / "bin" / "python").chmod(0o755)
+    _record_rollback_manifest(target)
 
     proc = run(str(target), str(tmp_path / "backups"))
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -5120,6 +5190,7 @@ def test_rollback_offline_restores_venv_previous_without_current_venv(tmp_path) 
     assert not (target / "venv.previous").exists()
 
 
+@_WIN32_ONLY
 def test_rollback_offline_normal_swap_still_keeps_failed_venv(tmp_path) -> None:  # type: ignore[no-untyped-def]
     run, _ = _rollback_sandbox(tmp_path)
     target = tmp_path / "rb" / "t"
@@ -5128,6 +5199,7 @@ def test_rollback_offline_normal_swap_still_keeps_failed_venv(tmp_path) -> None:
         p = target / v / "bin" / "python"
         p.write_text('#!/bin/sh\nexit 0\n', encoding="utf-8")
         p.chmod(0o755)
+    _record_rollback_manifest(target)
 
     proc = run(str(target), str(tmp_path / "backups"))
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -5137,6 +5209,7 @@ def test_rollback_offline_normal_swap_still_keeps_failed_venv(tmp_path) -> None:
     assert "failed venv kept" in proc.stdout
 
 
+@_WIN32_ONLY
 def test_rollback_offline_config_restore_is_opt_in_and_preserves_live_config(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The rollback used to rm -rf the LIVE configuration and replace it with a
     possibly weeks-old backup, destroying post-upgrade edits, while claiming
@@ -5591,6 +5664,7 @@ def _verifier_contract_sandbox(tmp_path, verifier_body: str, executable: bool): 
     return proc, bundles
 
 
+@_WIN32_ONLY
 def test_install_offline_verifies_via_python3_for_a_644_verifier(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The documented trusted-channel install is `install -m 644
     verify_bundle.py`; a non-executable verifier must still be run (via
@@ -5601,7 +5675,8 @@ def test_install_offline_verifies_via_python3_for_a_644_verifier(tmp_path) -> No
         # a 644 verifier is a PYTHON file, exactly like the real verify_bundle.py
         "import os, sys\n"
         'with open(os.environ["UDBMCP_TEST_VERIFIER_LOG"], "a") as fh:\n'
-        '    fh.write(sys.argv[2] + "\\n")\n',
+        '    fh.write(sys.argv[2] + "\\n")\n'
+        'print("bundle verification PASSED")\n',
         executable=False,
     )
     assert len(bundles) >= 2, f"644 verifier must still verify twice:\n{proc.stdout}{proc.stderr}"
@@ -5609,18 +5684,23 @@ def test_install_offline_verifies_via_python3_for_a_644_verifier(tmp_path) -> No
     assert "/udbmcp-install." in bundles[1], bundles
 
 
+@_WIN32_ONLY
 def test_install_offline_execs_an_executable_verifier_directly(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A verifier installed with its own exec bit (e.g. a shebang script) must
     be exec'd directly, not handed to python3 as a script argument — and again
     it must verify both the original bundle and the private staging copy."""
     proc, bundles = _verifier_contract_sandbox(
-        tmp_path, '#!/bin/sh\necho "$2" >> "$UDBMCP_TEST_VERIFIER_LOG"\nexit 0\n', executable=True
+        tmp_path,
+        '#!/bin/sh\necho "$2" >> "$UDBMCP_TEST_VERIFIER_LOG"\n'
+        'echo "bundle verification PASSED"\nexit 0\n',
+        executable=True,
     )
     assert len(bundles) >= 2, f"executable verifier must verify twice:\n{proc.stdout}{proc.stderr}"
     assert bundles[0] == str(tmp_path / "bundle"), bundles
     assert "/udbmcp-install." in bundles[1], bundles
 
 
+@_WIN32_ONLY
 def test_install_offline_runs_python_file_verifiers_via_python3_even_when_executable(tmp_path) -> None:  # type: ignore[unused-ignore]
     """A verifier that is BOTH executable and a Python file must go through
     python3, never direct exec: on noexec bind mounts (macOS Docker Desktop)
@@ -5631,7 +5711,8 @@ def test_install_offline_runs_python_file_verifiers_via_python3_even_when_execut
         "#!/usr/bin/env python3\n"
         "import os, sys\n"
         'with open(os.environ["UDBMCP_TEST_VERIFIER_LOG"], "a") as fh:\n'
-        '    fh.write(sys.argv[2] + "\\n")\n',
+        '    fh.write(sys.argv[2] + "\\n")\n'
+        'print("bundle verification PASSED")\n',
         executable=True,
     )
     assert len(bundles) >= 2, f"python-file verifier must verify twice:\n{proc.stdout}{proc.stderr}"
@@ -5639,6 +5720,7 @@ def test_install_offline_runs_python_file_verifiers_via_python3_even_when_execut
     assert "/udbmcp-install." in bundles[1], bundles
 
 
+@_WIN32_ONLY
 def test_upgrade_offline_uses_the_same_verifier_invocation_contract() -> None:
     """upgrade_offline.sh re-verifies the staged copy too; it must use the same
     exec-if-executable / python3-otherwise rule, not a hardcoded python3 that
@@ -5981,6 +6063,7 @@ def test_prepare_baseline_script_pins_base_image_and_signs_via_in_out_files() ->
     assert "unable to determine file size for oneshot operation" in text
 
 
+@_WIN32_ONLY
 def test_prepare_baseline_script_records_pinned_base_image_in_manifest(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A digest-pinned UDBMCP_BASE_IMAGE is used verbatim and recorded in the
     bundle manifest (and build log), so the signed baseline is traceable."""
@@ -5999,6 +6082,7 @@ def test_prepare_baseline_script_records_pinned_base_image_in_manifest(tmp_path)
     assert manifest["image_identity"]["baseline_image"] == "udbmcp-baseline:ubuntu24.04-cp312"
 
 
+@_WIN32_ONLY
 def test_prepare_baseline_script_fails_closed_on_base_digest_change(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A rebuild whose base image resolves to a different digest than the one
     recorded in the bundle manifest must fail closed BEFORE mutating the
@@ -6027,6 +6111,7 @@ def test_prepare_baseline_script_fails_closed_on_base_digest_change(tmp_path) ->
     assert (bundle / "manifest.json").read_bytes() == manifest_with_old_digest
 
 
+@_WIN32_ONLY
 def test_prepare_baseline_script_allows_base_digest_change_only_with_opt_in(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """UDBMCP_ALLOW_FLOATING_BASE=1 is the explicit opt-in that permits a
     rebuild from a different base digest; the new digest is then recorded."""
@@ -6050,6 +6135,7 @@ def test_prepare_baseline_script_allows_base_digest_change_only_with_opt_in(tmp_
     assert manifest["image_identity"]["base_image_digest"] == new_digest
 
 
+@_WIN32_ONLY
 def test_prepare_baseline_script_fails_closed_when_previously_pinned_and_digest_unresolvable(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """If the bundle was built from a pinned digest but this host cannot
     resolve any digest for the base image (e.g. a locally-built, never-pushed
@@ -6090,6 +6176,7 @@ def test_final_db2_tls_script_heredocs_emit_strict_schema_config() -> None:
     assert "empty list = NO schema restriction" in text
 
 
+@_WIN32_ONLY
 def test_final_db2_tls_host_mode_yaml_block_parses_against_strict_schema(tmp_path) -> None:  # type: ignore[no-untyped-def]
     import subprocess
 
@@ -6302,6 +6389,7 @@ def _run_db2_tls_script_without_icu(tmp_path, gskit_probe_behavior):  # type: ig
     return proc, home, root / "docker.log", root / "gskit.log", cert_out
 
 
+@_WIN32_ONLY
 def test_final_db2_tls_script_runs_without_icu_source_dir_on_gskit8(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """GSKit 8 (Db2 11.5.9 fixture) works with only $HOME/sqllib/lib64/gskit on
     LD_LIBRARY_PATH: a run with NO --icu-source-dir must succeed end to end,
@@ -6323,6 +6411,7 @@ def test_final_db2_tls_script_runs_without_icu_source_dir_on_gskit8(tmp_path) ->
     assert "no ICU shim needed" in proc.stdout
 
 
+@_WIN32_ONLY
 def test_final_db2_tls_script_fails_closed_on_icu_probe_failure_without_icu_dir(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """If the probe fails on an ICU library (Db2 12.1-style GSKit) and no
     --icu-source-dir was given, the script must abort BEFORE configuring
@@ -6337,6 +6426,7 @@ def test_final_db2_tls_script_fails_closed_on_icu_probe_failure_without_icu_dir(
     assert not (home / "server.kdb").exists(), "must fail closed before creating the real keydb"
 
 
+@_WIN32_ONLY
 def test_final_db2_tls_script_fails_closed_on_non_icu_probe_failure(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A probe failure that is NOT an ICU problem (e.g. libgsk8km_64.so missing
     from LD_LIBRARY_PATH) must abort too — never fall through to configuring

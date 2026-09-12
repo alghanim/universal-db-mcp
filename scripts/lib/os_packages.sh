@@ -104,7 +104,9 @@ udbmcp_install_os_packages() {
     echo "==> dpkg maintainer-script context with dpkg locks held: OS-package installation DEFERRED"
     echo "    (a nested 'dpkg -i' could never succeed against the outer dpkg's locks)."
     echo "    PENDING marker: $_defer_marker — install the bundle OS packages"
-    echo "    once dpkg is idle, e.g.: dpkg -i $ospkg_dir/*.deb (no apt, no network)."
+    echo "    once dpkg is idle by re-running the original installer with the"
+    echo "    ORIGINAL bundle path (this staging copy is removed on exit),"
+    echo "    e.g.: install_offline.sh <bundle-dir>  (dpkg only, no apt, no network)."
     return 0
   fi
 
@@ -137,14 +139,21 @@ for entry in (m.get("os_packages") or {}).get("packages", []):
 PYEOF
 )"
   if [ -z "$order" ]; then
-    # Bundles without a manifest os_packages section: fall back to the
-    # documented order for the Microsoft ODBC / unixODBC closure.
+    # Bundles without a manifest os_packages section: fall back to the same
+    # tiers as the builder's OS_PACKAGE_INSTALL_ORDER (prepare_offline_bundle.py):
+    # krb5/libltdl libs, then unixodbc-common + libodbc2/libodbcinst2, then the
+    # unixodbc/odbcinst CLI packages that depend on those libs, and finally
+    # msodbcsql18 (whose postinst runs `odbcinst`). Filename anchors use `_`
+    # after the package name because that is dpkg's name_version separator.
     order="$(_udbmcp_rootrun ls -1 "$ospkg_dir" 2>/dev/null \
       | awk '/\.deb$/ {
-          if (/msodbcsql18/) print "9 " $0
-          else if (/unixodbc-/) print "4 " $0
-          else if (/libodbc/) print "5 " $0
-          else if (/libkeyutils1|libkrb5support0|libk5crypto3|libkrb5-3|libltdl7/) print "0 " $0
+          if (/^libkeyutils1_|^libkrb5support0_|^libk5crypto3_|^libkrb5-3_|^libltdl7_/) print "0 " $0
+          else if (/^unixodbc-common_/) print "4 " $0
+          else if (/^libodbc2_/) print "5 " $0
+          else if (/^libodbcinst2_/) print "6 " $0
+          else if (/^unixodbc_/) print "7 " $0
+          else if (/^odbcinst_/) print "8 " $0
+          else if (/^msodbcsql18_/) print "9 " $0
           else print "3 " $0
         }' \
       | sort -k1,1 -k2 | cut -d' ' -f2-)"

@@ -148,6 +148,37 @@ def test_verify_action_invokes_the_shipped_verify_ps1_with_customactiondata():
     assert "BUNDLE_DIR=[INSTALLFOLDER]bundle" in cmd
 
 
+def test_verify_action_pins_trust_dir_to_an_acl_protected_location():
+    # Trust invariant: the gate must not resolve the trusted verifier from a
+    # location a NON-ADMIN local process can pre-create. C:\ProgramData's
+    # default ACLs give Authenticated Users create-folder/append-data on the
+    # root and CREATOR OWNER Full Control on directories they create, so a
+    # squatted C:\ProgramData\udbmcp-trust would let an attacker delete and
+    # replace the admin-copied verifier that this action (Impersonate="no":
+    # LocalSystem) then executes — LocalSystem code execution and a forged
+    # "bundle verification PASSED" proof. The wxs therefore passes TRUST_DIR
+    # explicitly into the admin-write-only Program Files tree, the analogue
+    # of the deb/pkg bootstrap's root-owned
+    # `install -d -m 755 /usr/local/lib/udbmcp-trust`. CustomActionData takes
+    # precedence over the machine-scope UDBMCP_TRUST_DIR override in
+    # verify.ps1, so this pins the effective path, not just a fallback.
+    root = wxs_root()
+    ca = find_one(root, "CustomAction", Id="VerifyBundleCA")
+    cmd = ca.get("ExeCommand") or ""
+    assert "TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust" in cmd, (
+        "VerifyBundleCA must pass TRUST_DIR pointing into the admin-write-only "
+        "Program Files tree; falling back to verify.ps1's C:\\ProgramData "
+        "default lets a non-admin squat the trust directory and replace the "
+        "verifier the gate executes as LocalSystem"
+    )
+    # The authored CustomActionData must never root the trust dir (or any
+    # other trust input) in world-squattable ProgramData.
+    custom_action_data = cmd.split("-CustomActionData", 1)[1]
+    assert "ProgramData" not in custom_action_data, (
+        f"CustomActionData must not place trust material under C:\\ProgramData: {custom_action_data!r}"
+    )
+
+
 def test_customactiondata_flag_matches_the_verify_ps1_param_name():
     # Cross-file consistency: the wxs passes "-CustomActionData ..." and
     # verify.ps1's param block binds exactly that name (a rename on either

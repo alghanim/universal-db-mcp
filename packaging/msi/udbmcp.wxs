@@ -9,8 +9,12 @@
       verify_bundle.py custom action has re-verified the installed tree with
       the admin-distributed release public key (see plan Phase 5).
     * The release public key is NEVER embedded in this package. The admin
-      provisions it out-of-band into C:\ProgramData\udbmcp-trust\ before
-      running the MSI; verification fails closed if it is absent.
+      provisions it out-of-band, together with the trusted verifier, into the
+      trust directory BEFORE running the MSI; verification fails closed if it
+      is absent. That trust directory is passed to verify.ps1 EXPLICITLY as
+      TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust (see VerifyBundleCA): it
+      must live where only administrators can create/write, never in a
+      world-squattable location such as C:\ProgramData.
     * The venv build custom action MUST run pip in no-index mode with
       require-hashes and PIP_CONFIG_FILE neutralized
       (see packaging/msi/custom/*.ps1).
@@ -205,10 +209,11 @@
 
         VerifyBundleCA           AFTER InstallFiles. Runs verify.ps1: the
                                  ADMIN-installed trusted verify_bundle.py with
-                                 the admin pubkey (from
-                                 C:\ProgramData\udbmcp-trust, OUTSIDE the
-                                 bundle; the release public key is NEVER
-                                 shipped in this package — the admin
+                                 the admin pubkey (from the trust directory
+                                 passed explicitly below as
+                                 TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust,
+                                 OUTSIDE the bundle; the release public key is
+                                 NEVER shipped in this package — the admin
                                  distributes it out-of-band and the action
                                  reads it from machine scope) re-verifies the
                                  installed bundle. NO payload may execute
@@ -272,10 +277,32 @@
         Property="POWERSHELLEXE"
         Value="[System64Folder]WindowsPowerShell\v1.0\powershell.exe" />
 
+    <!--
+      TRUST_DIR is passed EXPLICITLY here — never left to verify.ps1's
+      fallback default (C:\ProgramData\udbmcp-trust). C:\ProgramData's
+      default ACL grants Authenticated Users create-folder/append-data on the
+      root and CREATOR OWNER Full Control on directories they create, so a
+      NON-ADMIN local process could pre-create (and therefore own) the trust
+      directory before the admin bootstrap; the admin's copied verifier would
+      then live in attacker-writable space (deletable/replaceable via the
+      parent dir's Delete permission) and this action — Impersonate="no",
+      i.e. LocalSystem — would execute attacker-controlled Python that can
+      exit 0 and print "bundle verification PASSED", defeating the
+      verify-before-execute gate entirely. C:\Program Files grants write
+      access to administrators only, so a trust directory provisioned there
+      cannot be squatted: the exact analogue of the .deb/.pkg bootstrap's
+      root-owned `install -d -m 755 /usr/local/lib/udbmcp-trust`
+      (packaging/deb, packaging/pkg). The path is deliberately FIXED and
+      takes precedence over the machine-scope UDBMCP_TRUST_DIR environment
+      override (verify.ps1 reads CustomActionData first): a trust anchor path
+      is part of the package's trust model, not a runtime knob. Admins who
+      provision elsewhere get a fail-closed diagnostic naming this exact
+      path — never a silently weaker gate.
+    -->
     <CustomAction
         Id="VerifyBundleCA"
         Property="POWERSHELLEXE"
-        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\verify.ps1&quot; -CustomActionData &quot;BUNDLE_DIR=[INSTALLFOLDER]bundle&quot;"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\verify.ps1&quot; -CustomActionData &quot;BUNDLE_DIR=[INSTALLFOLDER]bundle;TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust&quot;"
         Execute="deferred"
         Impersonate="no"
         Return="check" />

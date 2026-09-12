@@ -5,7 +5,7 @@ docs/acceptance-tests.md). Everything else is labeled truthfully.
 
 | Engine | Driver (pinned) | Native components | TLS | Cancel | Explain | Integration status |
 | --- | --- | --- | --- | --- | --- | --- |
-| SQLite | stdlib `sqlite3` (CPython 3.12) | none | n/a | `interrupt()` (hard) | EXPLAIN / EXPLAIN QUERY PLAN (non-executing) | **passed** — Gate A/B container runs |
+| SQLite | stdlib `sqlite3` (CPython 3.12) | none | n/a | `interrupt()` (hard) | EXPLAIN / EXPLAIN QUERY PLAN (non-executing) | **passed** — Gate A/B container runs; other capabilities unverified (cancel/explain columns are code-level claims, not recorded in the Gate A/B evidence) |
 | PostgreSQL | psycopg 3.3.5 `[binary]` | libpq bundled in wheel | verify-full w/ CA | `connection.cancel()` | EXPLAIN (no ANALYZE) | **passed** (Gate C run: roundtrip, db-side permission denial, themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | MySQL/MariaDB | PyMySQL 1.2.0 | none (pure Python) | TLS w/ CA (`ssl` dict) | none (documented) | EXPLAIN (no ANALYZE) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | ClickHouse | clickhouse-connect 1.8.0 | lz4 + zstd are hard dependencies (in wheelhouse); driver-default lz4 write compression (no `compress` kwarg passed) | HTTPS + CA | `KILL QUERY` by pinned `query_id` (client has no `cancel_query`) | EXPLAIN | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |

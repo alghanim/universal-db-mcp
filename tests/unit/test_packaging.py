@@ -8,6 +8,7 @@ wheelhouse rule must behave exactly as specified.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -115,6 +116,120 @@ def test_allow_missing_connectors_refused_with_signing_key() -> None:
 def test_allow_missing_connectors_permitted_without_signing_key() -> None:
     pob.check_signing_conflict(None, allow_missing=True)
     pob.check_signing_conflict("udbmcp-release.pem", allow_missing=False)
+
+
+# --- --connectors validation at the argparse boundary ---
+
+
+def test_connectors_arg_rejects_unknown_connector_cleanly() -> None:
+    parser = pob.build_arg_parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["--out", "out/x", "--connectors", "core,trino"])
+    assert exc.value.code == 2  # clean argparse error, never a raw KeyError
+    with pytest.raises(SystemExit) as exc2:
+        parser.parse_args(["--out", "out/x", "--connectors", ""])
+    assert exc2.value.code == 2
+
+
+def test_connectors_arg_strips_whitespace_and_keeps_valid_names() -> None:
+    parser = pob.build_arg_parser()
+    # previously ' postgres' hit CONNECTOR_WHEELS[c] as ' postgres' -> KeyError
+    ns = parser.parse_args(["--out", "out/x", "--connectors", " core , mssql "])
+    assert ns.connectors == "core,mssql"
+    ns = parser.parse_args(["--out", "out/x"])
+    assert ns.connectors == "core,postgres,mysql,clickhouse,oracle,mssql,db2"
+
+
+# --- OS-package closure: fail loud on incomplete staged .debs ---
+
+
+def test_stage_os_packages_fails_when_sums_declares_absent_deb(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "msodbcsql18_18.4.1.1-1_amd64.deb").write_bytes(b"payload")
+    digest = hashlib.sha256(b"payload").hexdigest()
+    (staging / "SHA256SUMS").write_text(
+        f"{digest}  msodbcsql18_18.4.1.1-1_amd64.deb\n"
+        f"{hashlib.sha256(b'x').hexdigest()}  unixodbc_2.3.12-1_amd64.deb\n"
+    )
+    out = tmp_path / "bundle"
+    out.mkdir()
+    with pytest.raises(SystemExit, match="incomplete"):
+        pob.stage_os_packages(out, staging)
+    # nothing was copied: the bundle must not declare files it does not ship
+    assert not (out / "os-packages" / "SHA256SUMS").exists()
+
+
+def test_os_package_closure_refused_with_signing_key_when_incomplete() -> None:
+    prof = PROFILES[LINUX]
+    for closure in ([], [{"package": "unixodbc"}]):  # absent, and present-but-no-driver
+        with pytest.raises(SystemExit) as exc:
+            pob.check_os_package_closure(["core", "mssql"], closure, prof, "key.pem")
+        assert "OS-package closure" in str(exc.value)
+        assert "signed" in str(exc.value)
+
+
+def test_os_package_closure_warns_loudly_without_signing_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    prof = PROFILES[LINUX]
+    for closure in ([], [{"package": "unixodbc"}]):
+        assert pob.check_os_package_closure(["core", "mssql"], closure, prof, None) is False
+        err = capsys.readouterr().err
+        assert "WARNING" in err
+        assert "administrator_supplied" in err
+
+
+def test_os_package_closure_passes_when_msodbcsql18_is_vendored() -> None:
+    prof = PROFILES[LINUX]
+    assert pob.check_os_package_closure(
+        ["core", "mssql"], [{"package": "unixodbc"}, {"package": "msodbcsql18"}], prof, "key.pem",
+    ) is True
+    # native profiles stage no OS packages: mssql stays administrator_supplied
+    assert pob.check_os_package_closure(["core", "mssql"], [], PROFILES[MACOS], "key.pem") is False
+
+
+def test_os_package_closure_refuses_msodbcsql18_without_unixodbc_for_signed_build() -> None:
+    # Mirror of verify_bundle.py's second closure rule: any bundle declaring
+    # msodbcsql18 without unixodbc is refused unconditionally, so a signed
+    # build must fail here instead of producing an unverifiable release.
+    prof = PROFILES[LINUX]
+    for connectors in (["core", "mssql"], ["core"]):  # rule fires regardless of selection
+        with pytest.raises(SystemExit) as exc:
+            pob.check_os_package_closure(
+                connectors, [{"package": "msodbcsql18", "file": "msodbcsql18.deb"}], prof, "key.pem",
+            )
+        assert "unixodbc" in str(exc.value)
+        assert "signed" in str(exc.value)
+
+
+def test_os_package_closure_warns_when_msodbcsql18_lacks_unixodbc_unsigned(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Unsigned builds keep building (no signed-release guarantee to protect),
+    # but never silently: the bundle would fail verification on the target.
+    prof = PROFILES[LINUX]
+    assert pob.check_os_package_closure(
+        ["core", "mssql"], [{"package": "msodbcsql18", "file": "msodbcsql18.deb"}], prof, None,
+    ) is True
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "unixodbc" in err
+
+
+def test_os_package_closure_unixodbc_without_driver_still_fine(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Rule 1 only fires when the driver is declared; a unixODBC-only staging
+    # dir keeps the existing mssql-demotion semantics (admin-supplied driver),
+    # so no rule-1 message and only the usual rule-2 unsigned warning.
+    prof = PROFILES[LINUX]
+    assert pob.check_os_package_closure(
+        ["core", "mssql"], [{"package": "unixodbc", "file": "unixodbc.deb"}], prof, None,
+    ) is False
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "declares msodbcsql18 without" not in err
 
 
 # --- pip download command: repeated --platform flags ---

@@ -31,11 +31,14 @@
 # reinstall is fast and so that a rollback to an older package version keeps a
 # working installation; they are destroyed by the next `purge`.
 #
-# CONFIG (/etc/universal-db-mcp/config.yaml): NOT a dpkg conffile — it is
-# seeded by postinst from the verified bundle's config-templates/ copy, only
-# if absent, so admin edits survive every upgrade untouched. Because dpkg
-# therefore does not own the file, it would survive `purge` forever unless
-# this script removes it: on `purge` the config is deleted (the /keys
+# CONFIG (/etc/universal-db-mcp/config.yaml): a dpkg conffile (registered in
+# DEBIAN/conffiles and staged by build_deb.sh), so dpkg itself keeps it on
+# `remove` and deletes it on `purge`. postinst additionally seeds it
+# only-if-absent from the verified bundle's config-templates/ copy as a
+# fallback for a conffile an admin deleted before an upgrade. On `purge` the
+# config is deleted here as belt and braces: after dpkg's own conffile
+# deletion the `rm -f` is a harmless no-op, but it guarantees the
+# postinst-seeded fallback copy can never survive a purge (the /keys
 # subdirectory with the admin-held release public key is NEVER touched); on
 # `remove` it is kept, mirroring standard conffile retention semantics.
 #

@@ -1,0 +1,15 @@
+# dpkg conffiles for the universal-db-mcp package.
+#
+# NOTE: dpkg-deb does NOT strip comments from DEBIAN/conffiles — only absolute
+# pathnames may remain — so build_deb.sh strips comment/blank lines while
+# staging this template (and fails the build if nothing is left).
+#
+# The default MCP server config is a dpkg conffile (plan Phase 4):
+#   - dpkg places it at /etc/universal-db-mcp/config.yaml at unpack time;
+#   - admin edits are preserved on upgrade (dpkg prompts only on local
+#     modification vs. a changed shipped default);
+#   - it is kept on `remove` and deleted on `purge` (standard conffile
+#     semantics; postrm additionally removes it on purge).
+# postinst keeps its only-if-absent seeding as a fallback for a config an
+# admin deleted before an upgrade; it never overwrites an existing file.
+/etc/universal-db-mcp/config.yaml

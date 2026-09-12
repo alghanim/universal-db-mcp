@@ -26,8 +26,19 @@
 #     performs connectivity probes (no --connectivity).
 #
 # Parameters may also be supplied via environment variables for manual runs
-# from the delivered gate script (scripts/test_package_msi.ps1):
+# (e.g. from an elevated PowerShell session when debugging an install):
 #   UDBMCP_VENV_DIR, UDBMCP_CONFIG, UDBMCP_BUNDLE_MANIFEST
+#
+# PLACEHOLDER TEMPLATES: the config installed to -ConfigPath is the staged
+# template (config-templates/config.template.yaml), which intentionally
+# carries PLACEHOLDER_DIR / PLACEHOLDER_DB tokens for the admin to resolve.
+# A verbatim doctor run against those tokens would fail closed (missing
+# parent directories, missing sqlite data file) on every fresh install and
+# roll the install back, so when the installed config still contains
+# placeholders this action derives a smoke config that resolves them to real
+# paths under the config directory, materializes those paths, and validates
+# the derived config. Any unrecognized PLACEHOLDER_ token fails the install
+# (fail closed) rather than being validated half-substituted.
 #
 [CmdletBinding()]
 param(
@@ -75,12 +86,49 @@ try {
 
     # --- resolve the config to validate --------------------------------------
     # The MSI installs the staged config template to the machine-wide config
-    # path (NeverOverwrite), so on both fresh installs and upgrades the file
-    # at -ConfigPath is the template content the admin will run with.
+    # path (NeverOverwrite), so on fresh installs the file at -ConfigPath is
+    # the template content the admin will run with. On upgrades it may be the
+    # admin's own edited configuration. Both are validated: verbatim when
+    # they contain no placeholder tokens, via a derived smoke config when
+    # they still do (see the header notes).
     if (-not $ConfigPath) { $ConfigPath = $env:UDBMCP_CONFIG }
     if (-not $ConfigPath) { Fail "no config to validate: pass -ConfigPath or set UDBMCP_CONFIG" }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         Fail ("config not found at '" + $ConfigPath + "'")
+    }
+
+    # --- resolve placeholders into a smoke-passing config ---------------------
+    # The template ships with PLACEHOLDER_DIR / PLACEHOLDER_DB tokens; doctor
+    # treats their unresolved forms as fatal (missing audit/metadata-cache
+    # parent directories, missing sqlite data file). Resolve them against a
+    # dedicated smoke directory next to the installed config, which this
+    # action (running as LocalSystem) guarantees exists, and materialize the
+    # sqlite data file with the already-verified venv interpreter.
+    $doctorConfigPath = $ConfigPath
+    $configContent = [System.IO.File]::ReadAllText($ConfigPath)
+    if ($configContent -match 'PLACEHOLDER_') {
+        $configDir = Split-Path -LiteralPath $ConfigPath -Parent
+        $smokeDir = Join-Path $configDir 'smoke'
+        New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+        $demoDb = Join-Path $smokeDir 'finlink-demo.db'
+        if (-not (Test-Path -LiteralPath $demoDb -PathType Leaf)) {
+            Write-Output ("==> creating smoke demo database: " + $demoDb)
+            $createArgs = @(
+                '-c',
+                "import sqlite3; con = sqlite3.connect(r'" + $demoDb + "'); con.execute('CREATE TABLE IF NOT EXISTS smoke_probe (id INTEGER PRIMARY KEY)'); con.commit(); con.close()"
+            )
+            $dbCode = Invoke-Payload -Python $python -PythonArgs $createArgs
+            if ($dbCode -ne 0) {
+                Fail ("could not create the smoke demo database at '" + $demoDb + "' (exit code " + $dbCode + ")")
+            }
+        }
+        $smokeConfig = $configContent.Replace('PLACEHOLDER_DIR', $smokeDir).Replace('PLACEHOLDER_DB', $demoDb)
+        if ($smokeConfig -match 'PLACEHOLDER_') {
+            Fail "config contains an unrecognized PLACEHOLDER_ token; refusing to validate a half-substituted config"
+        }
+        $smokeConfigPath = Join-Path $smokeDir 'config.smoke.yaml'
+        [System.IO.File]::WriteAllText($smokeConfigPath, $smokeConfig)
+        $doctorConfigPath = $smokeConfigPath
     }
 
     # --- let doctor report the true installed profile ------------------------
@@ -94,8 +142,8 @@ try {
     }
 
     # --- run doctor (no --connectivity: install-time check is offline) -------
-    Write-Output ("==> running doctor against config: " + $ConfigPath)
-    $doctorArgs = @('-m', 'universal_db_mcp', 'doctor', '--config', $ConfigPath)
+    Write-Output ("==> running doctor against config: " + $doctorConfigPath)
+    $doctorArgs = @('-m', 'universal_db_mcp', 'doctor', '--config', $doctorConfigPath)
     $code = Invoke-Payload -Python $python -PythonArgs $doctorArgs
 
     if ($null -eq $code) {

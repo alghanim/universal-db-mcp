@@ -249,17 +249,25 @@ echo "==> version:   $RELEASE (from signed manifest)"
 
 # The trusted tools are distributed by prepare_offline_bundle.py as a
 # SIBLING of the bundle directory on the same trusted channel
-# (<staging-out>/trusted-tools/). Fall back to an in-bundle copy only for
-# layouts that ship it there. If neither exists, fail closed: verifying with
-# the bundle's own installers/ copies proves nothing (reference copies).
+# (<staging-out>/trusted-tools/), or via an explicit UDBMCP_TRUST_DIR
+# override. An IN-BUNDLE copy is NEVER used as the verifier: a tampered
+# bundle would ship a verifier that prints PASSED (the self-verification
+# bypass this check exists to prevent — commit security review flagged
+# exactly this fallback on 2026-09-12). If no out-of-bundle copy exists,
+# fail closed: verifying with the bundle's own copies proves nothing.
 TRUSTED=""
-for cand in "$BUNDLE/../trusted-tools" "$BUNDLE/trusted-tools"; do
-    if [ -f "$cand/verify_bundle.py" ]; then
-        TRUSTED="$(cd "$cand" && pwd -P)"
-        break
-    fi
+for cand in "${UDBMCP_TRUST_DIR:-}" "$BUNDLE/../trusted-tools"; do
+    [ -n "$cand" ] || continue
+    [ -f "$cand/verify_bundle.py" ] || continue
+    cand_real="$(cd "$cand" && pwd -P)"
+    bundle_real="$(cd "$BUNDLE" && pwd -P)"
+    case "$cand_real" in
+        "$bundle_real"/*) continue ;;  # in-bundle copy: never trusted
+    esac
+    TRUSTED="$cand_real"
+    break
 done
-[ -n "$TRUSTED" ] || die "trusted-tools/ (with verify_bundle.py) not found next to the bundle — cannot verify from the trusted channel"
+[ -n "$TRUSTED" ] || die "no trusted verifier found OUTSIDE the bundle (expected $BUNDLE/../trusted-tools or \$UDBMCP_TRUST_DIR) — an in-bundle verifier is never trusted; bootstrap the trust channel first"
 
 echo "==> verifying bundle via trusted-channel verifier: $TRUSTED/verify_bundle.py"
 # --allow-platform-mismatch is the documented STAGING-side mode (the staging
@@ -293,8 +301,15 @@ cp -a "$BUNDLE/." "$STAGE_BUNDLE/"
 # C:\ProgramData\universal-db-mcp\keys before the MSI runs; the deferred
 # verify action reads it from machine scope). Scan the staged payload for
 # public-key material and fail closed.
-if find_pubkey_material "$STAGE_BUNDLE" | grep -q .; then
-    find_pubkey_material "$STAGE_BUNDLE"
+# Fail closed: CAPTURE the scan output instead of piping into `grep -q`.
+# `grep -q` exits at the first match and closes the pipe; if find still has
+# output to write it dies of SIGPIPE (141) and, under the pipefail above, the
+# `if` would then treat that as "no key material found" — a fail-open race
+# whenever the payload holds more key-named files than the pipe buffer holds
+# bytes. Capturing reads find to completion, so ANY hit (one or many) dies.
+key_hits="$(find_pubkey_material "$STAGE_BUNDLE")"
+if [ -n "$key_hits" ]; then
+    printf '%s\n' "$key_hits"
     die "public key material found in staged msi payload — the release pubkey is never shipped inside a package"
 fi
 
@@ -331,8 +346,11 @@ done
 
 # Same trust invariant as the payload above, applied to the custom action
 # scripts: they are part of the package, so they may not ship key material.
-if find_pubkey_material "$CUSTOM_STAGE" | grep -q .; then
-    find_pubkey_material "$CUSTOM_STAGE"
+# Same fail-closed capture as the payload scan above (never `| grep -q`:
+# SIGPIPE + pipefail would turn a full buffer of hits into a false "clean").
+custom_key_hits="$(find_pubkey_material "$CUSTOM_STAGE")"
+if [ -n "$custom_key_hits" ]; then
+    printf '%s\n' "$custom_key_hits"
     die "public key material found in the staged custom action scripts — the release pubkey is never shipped inside a package"
 fi
 

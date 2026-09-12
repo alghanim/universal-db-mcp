@@ -15,7 +15,8 @@
 #      The MSI's own deferred verify custom action must have passed BEFORE
 #      anything executed payload; this gate independently re-proves it (8).
 #   3. installed_bundle_verified: the ADMIN-INSTALLED trusted verifier
-#      (C:\ProgramData\udbmcp-trust\verify_bundle.py --pubkey ...) re-verifies
+#      (C:\Program Files\udbmcp-trust\verify_bundle.py --pubkey ...; the
+#      fixed path the MSI pins via CustomActionData) re-verifies
 #      the installed bundle at "C:\Program Files\UniversalDB MCP\bundle" and
 #      prints its "bundle verification PASSED" proof. The bundle's own
 #      bundled verifier copy (installers/verify_bundle.py) is NEVER executed.
@@ -35,6 +36,15 @@
 #      tampered bundle - it MUST fail closed (nonzero exit + FAIL output).
 #      The wheel is then restored and the same verifier MUST pass again,
 #      proving the failure was caused by the tamper and nothing else.
+#   8. peruser_interpreter_refused: a per-user CPython 3.12 (HKCU PEP 514)
+#      whose interpreter is an attacker-controlled stub that prints
+#      'bundle verification PASSED' and exits 0 is registered, and the
+#      per-machine HKLM PythonCore\3.12 key is temporarily moved aside: BOTH
+#      the standalone verify custom action AND a full msiexec install must
+#      FAIL (the verifier refuses to run on anything but the per-machine
+#      interpreter; the stub must never execute - proven by a canary file the
+#      stub would write). The registry and environment are restored and the
+#      trusted verifier must pass again afterwards.
 #
 # TRUST INVARIANTS (identical to packaging/msi/custom/verify.ps1):
 #   * Every payload execution in this gate (doctor, probe, create_demo) is
@@ -72,15 +82,23 @@ param(
     [string]$RepoDir = '',
 
     # Trust directory holding the ADMIN-INSTALLED trusted verifier
-    # (verify_bundle.py + profiles.py). Must live OUTSIDE the bundle.
-    [string]$TrustDir = 'C:\ProgramData\udbmcp-trust',
+    # (verify_bundle.py + profiles.py). Must live OUTSIDE the bundle. Default:
+    # the fixed path the MSI passes via CustomActionData
+    # (TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust). A custom -TrustDir is
+    # STAGED (copied) to that fixed path before msiexec runs: the deferred
+    # verify custom action no longer reads a machine-scope UDBMCP_TRUST_DIR
+    # override, so it always looks in the Program Files location.
+    [string]$TrustDir = 'C:\Program Files\udbmcp-trust',
 
     # Release public key PEM (distributed out-of-band by the release
     # administrator; NEVER shipped in the MSI or the bundle). Default:
     # machine-scope UDBMCP_RELEASE_PUBKEY, else the documented default path.
     [string]$PubKey = '',
 
-    # Explicit CPython 3.12 interpreter. Default: PEP 514 registry / py.exe.
+    # Explicit CPython 3.12 interpreter. Default: the per-machine PEP 514
+    # registry value (HKLM\SOFTWARE\Python\PythonCore\3.12\InstallPath); a
+    # per-user (HKCU) interpreter or the py launcher is deliberately not used
+    # (a non-admin can register either; see Find-Cpython312 below).
     [string]$PythonExe = '',
 
     # The verify custom action for the standalone negative case. Default:
@@ -117,6 +135,11 @@ $BundleDir   = Join-Path $InstallRoot 'bundle'
 $VenvDir     = Join-Path $InstallRoot 'venv'
 $VenvPython  = Join-Path $VenvDir 'Scripts\python.exe'
 $WorkDir     = Join-Path $EvidenceDir ('work-' + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
+# The MSI's deferred verify custom action resolves its trust dir from
+# CustomActionData (TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust) and does
+# NOT read a machine-scope UDBMCP_TRUST_DIR override: msiexec will look for
+# the trusted verifier HERE no matter where -TrustDir points.
+$MsiTrustDir = Join-Path $env:ProgramFiles 'udbmcp-trust'
 
 # --------------------------------------------------------------- check ledger
 # Mirrors the bash gates (scripts/package/test_package_pkg.sh): every result
@@ -189,31 +212,27 @@ try {
 
     # ------------------------------------------------------------ helpers ----
     function Find-Cpython312 {
-        # Same resolution order as packaging/msi/custom/venv.ps1: explicit
-        # override, PEP 514 registry (HKLM per-machine preferred), py launcher.
+        # Same resolution order as packaging/msi/custom/verify.ps1 and venv.ps1:
+        # explicit override, then the PER-MACHINE PEP 514 registry value ONLY
+        # (HKLM\SOFTWARE\Python\PythonCore\3.12\InstallPath). The HKCU hive and
+        # the py launcher are deliberately NOT consulted: both resolve to a
+        # per-user installation a local non-admin can register (py.exe prefers
+        # per-user installs), and this gate executes the trusted verifier under
+        # the interpreter returned here. Returns $null if not found.
         if ($PythonExe) {
             if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { return $null }
             return $PythonExe
         }
-        foreach ($hive in 'HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath',
-                          'HKCU:\SOFTWARE\Python\PythonCore\3.12\InstallPath') {
-            if (-not (Test-Path -LiteralPath $hive)) { continue }
-            $props = Get-ItemProperty -LiteralPath $hive
-            $candidate = $props.ExecutablePath
-            if (-not $candidate) {
-                $installPath = $props.'(default)'
-                if ($installPath) { $candidate = Join-Path $installPath 'python.exe' }
-            }
-            if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-                return $candidate
-            }
+        $hive = 'HKLM:\SOFTWARE\Python\PythonCore\3.12\InstallPath'
+        if (-not (Test-Path -LiteralPath $hive)) { return $null }
+        $props = Get-ItemProperty -LiteralPath $hive
+        $candidate = $props.ExecutablePath
+        if (-not $candidate) {
+            $installPath = $props.'(default)'
+            if ($installPath) { $candidate = Join-Path $installPath 'python.exe' }
         }
-        $launcher = Get-Command -Name 'py.exe' -ErrorAction SilentlyContinue
-        if ($launcher) {
-            $found = Invoke-Native { & $launcher.Source -3.12 -c 'import sys; print(sys.executable)' 2>$null }
-            if ($LASTEXITCODE -eq 0 -and $found -and (Test-Path -LiteralPath $found.Trim() -PathType Leaf)) {
-                return $found.Trim()
-            }
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return $candidate
         }
         return $null
     }
@@ -314,7 +333,17 @@ try {
     $script:Py = Find-Cpython312
     $script:PyArgs = @()
     if (-not $script:Py) {
-        Stop-Gate 'cpython312_present' 'per-machine CPython 3.12 not found (PEP 514 registry / py.exe); install 64-bit python.org CPython 3.12 for all users (the MSI launch condition requires it)'
+        Stop-Gate 'cpython312_present' 'per-machine CPython 3.12 not found (HKLM\SOFTWARE\Python\PythonCore\3.12\InstallPath); install 64-bit python.org CPython 3.12 for all users (the MSI launch condition requires it; a per-user HKCU interpreter or the py launcher is deliberately not accepted)'
+    }
+    # Interpreter containment, BEFORE this gate executes anything under it
+    # (the version probe below and, later, the trusted verifier): a
+    # bundle-resident interpreter (misregistered in PEP 514 or passed via
+    # -PythonExe) is untrusted payload - running it would execute bundle
+    # content before verification passes. Same rule as
+    # packaging/msi/custom/verify.ps1, which refuses before its first
+    # interpreter invocation.
+    if (Test-InsideDir $script:Py $BundleDir) {
+        Stop-Gate 'cpython312_present' "host interpreter ($($script:Py)) is inside the installed bundle ($BundleDir); bundle payload (including its python) may not execute before verification passes (fail closed)"
     }
     $v = & $script:Py -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])'
     if ($LASTEXITCODE -ne 0 -or -not ($v -match '^3\.12\.')) {
@@ -348,16 +377,32 @@ try {
     }
     Add-Check 'trust_bootstrap' 'passed' "trusted verifier: $TrustVerifier; profiles: $ProfilesPy; pubkey: $PubKeyUsed"
 
-    # Make the key (and a non-default trust dir) visible to the deferred
-    # custom actions, which run as LocalSystem and see MACHINE env only.
+    # Make the key visible to the deferred custom actions, which run as
+    # LocalSystem and see MACHINE env only (the pubkey is NOT passed in
+    # CustomActionData, so this env var is still how the MSI finds it).
     $machineKey = [Environment]::GetEnvironmentVariable('UDBMCP_RELEASE_PUBKEY', 'Machine')
     if ($machineKey -ne $PubKeyUsed) {
         [Environment]::SetEnvironmentVariable('UDBMCP_RELEASE_PUBKEY', $PubKeyUsed, 'Machine')
         Add-Check 'pubkey_machine_env' 'passed' "set machine-scope UDBMCP_RELEASE_PUBKEY=$PubKeyUsed (deferred custom actions run as LocalSystem and read machine env)"
     }
-    if ($TrustDir -ne 'C:\ProgramData\udbmcp-trust') {
-        [Environment]::SetEnvironmentVariable('UDBMCP_TRUST_DIR', $TrustDir, 'Machine')
-        Add-Check 'trust_dir_machine_env' 'passed' "set machine-scope UDBMCP_TRUST_DIR=$TrustDir (non-default trust directory)"
+    # The trust dir, by contrast, is NOT read from the environment any more:
+    # VerifyBundleCA gets TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust via
+    # CustomActionData (an env override cannot win, and ProgramData would be
+    # non-admin squattable). When the admin bootstrapped the trust material
+    # somewhere else, STAGE (copy) it to the fixed path msiexec will resolve
+    # -- an admin-elevated write into the admin-write-only Program Files tree.
+    if ($TrustDir -ne $MsiTrustDir) {
+        New-Item -ItemType Directory -Force -Path $MsiTrustDir | Out-Null
+        foreach ($item in @('verify_bundle.py', 'profiles.py', 'lib')) {
+            $src = Join-Path $TrustDir $item
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination $MsiTrustDir -Recurse -Force
+            }
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $MsiTrustDir 'verify_bundle.py') -PathType Leaf)) {
+            Stop-Gate 'trust_dir_staged' "could not stage the trusted verifier from $TrustDir to $MsiTrustDir; VerifyBundleCA resolves TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust via CustomActionData and fails closed without it"
+        }
+        Add-Check 'trust_dir_staged' 'passed' "staged the trusted verifier + profiles registry from $TrustDir to the MSI's fixed trust dir $MsiTrustDir (VerifyBundleCA reads TRUST_DIR from CustomActionData; a machine-scope UDBMCP_TRUST_DIR env override is no longer read)"
     }
 
     if (-not $VerifyScript) { $VerifyScript = Join-Path $RepoDir 'packaging\msi\custom\verify.ps1' }
@@ -518,38 +563,194 @@ connections:
     $Backup = Join-Path $WorkDir ($wheel.Name + '.gate-backup')
     Copy-Item -LiteralPath $wheel.FullName -Destination $Backup -Force
 
-    # Append 16 bytes of junk: SHA256SUMS no longer matches.
-    $orig = [System.IO.File]::ReadAllBytes($wheel.FullName)
-    $tampered = New-Object byte[] ($orig.Length + 16)
-    [Array]::Copy($orig, $tampered, $orig.Length)
-    for ($i = $orig.Length; $i -lt $tampered.Length; $i++) { $tampered[$i] = 0xAB }
-    [System.IO.File]::WriteAllBytes($wheel.FullName, $tampered)
+    # Exception-safe tamper window: from the moment the wheel is corrupted in
+    # place until it is restored, ANY abnormal unwind (a terminating error
+    # reaching the outer catch, or Stop-Gate's `exit`) must restore the
+    # backup - otherwise the gate leaves a permanently corrupted bundle under
+    # Program Files. The finally below runs on every unwind (PowerShell runs
+    # finally blocks even for `exit`), so the explicit restores inside the try
+    # are belt-and-braces for the two decision paths whose evidence is saved
+    # before the unwind reaches the finally.
+    $WheelTampered = $false
+    try {
+        # Append 16 bytes of junk: SHA256SUMS no longer matches.
+        $orig = [System.IO.File]::ReadAllBytes($wheel.FullName)
+        $tampered = New-Object byte[] ($orig.Length + 16)
+        [Array]::Copy($orig, $tampered, $orig.Length)
+        for ($i = $orig.Length; $i -lt $tampered.Length; $i++) { $tampered[$i] = 0xAB }
+        [System.IO.File]::WriteAllBytes($wheel.FullName, $tampered)
+        $WheelTampered = $true
 
-    $cad = 'BUNDLE_DIR={0};TRUST_DIR={1};PUBKEY={2};PYTHON={3}' -f $BundleDir, $TrustDir, $PubKeyUsed, $script:Py
-    $tamperLog = Join-Path $LogDir 'verify-tampered.log'
-    Invoke-Native { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $VerifyScript -CustomActionData $cad 1> $tamperLog 2>&1 } | Out-Null
-    $tamperExit = $LASTEXITCODE
-    $tamperOut = (Get-Content -LiteralPath $tamperLog -Raw -ErrorAction SilentlyContinue)
-    if ($null -eq $tamperOut) { $tamperOut = '' }
+        $cad = 'BUNDLE_DIR={0};TRUST_DIR={1};PUBKEY={2};PYTHON={3}' -f $BundleDir, $TrustDir, $PubKeyUsed, $script:Py
+        $tamperLog = Join-Path $LogDir 'verify-tampered.log'
+        Invoke-Native { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $VerifyScript -CustomActionData $cad 1> $tamperLog 2>&1 } | Out-Null
+        $tamperExit = $LASTEXITCODE
+        $tamperOut = (Get-Content -LiteralPath $tamperLog -Raw -ErrorAction SilentlyContinue)
+        if ($null -eq $tamperOut) { $tamperOut = '' }
 
-    if ($tamperExit -eq 0) {
-        # Restore before failing so the machine is left as found.
+        if ($tamperExit -eq 0) {
+            # Restore before failing so the machine is left as found.
+            Copy-Item -LiteralPath $Backup -Destination $wheel.FullName -Force
+            Stop-Gate 'tamper_detected' "verify custom action exited 0 against a TAMPERED wheel ($($wheel.Name)); it must fail closed - this is a hard trust failure"
+        }
+        if ($tamperOut -notmatch 'FAIL:') {
+            Copy-Item -LiteralPath $Backup -Destination $wheel.FullName -Force
+            Stop-Gate 'tamper_detected' "verify custom action exited $tamperExit but printed no 'FAIL:' diagnostic against the tampered wheel; the canonical diagnostic is required"
+        }
+        Add-Check 'tamper_detected' 'passed' "corrupted $($wheel.Name) inside the installed bundle; standalone verify custom action exited $tamperExit with FAIL (log: $tamperLog)"
+
+        # Restore and require the verifier to pass again (same script, clean tree).
         Copy-Item -LiteralPath $Backup -Destination $wheel.FullName -Force
-        Stop-Gate 'tamper_detected' "verify custom action exited 0 against a TAMPERED wheel ($($wheel.Name)); it must fail closed - this is a hard trust failure"
+        $WheelTampered = $false
+    } finally {
+        if ($WheelTampered) {
+            # Abnormal unwind with the wheel still corrupted: leave the
+            # machine as found (best effort) even though the gate is failing.
+            Copy-Item -LiteralPath $Backup -Destination $wheel.FullName -Force -ErrorAction SilentlyContinue
+        }
     }
-    if ($tamperOut -notmatch 'FAIL:') {
-        Copy-Item -LiteralPath $Backup -Destination $wheel.FullName -Force
-        Stop-Gate 'tamper_detected' "verify custom action exited $tamperExit but printed no 'FAIL:' diagnostic against the tampered wheel; the canonical diagnostic is required"
-    }
-    Add-Check 'tamper_detected' 'passed' "corrupted $($wheel.Name) inside the installed bundle; standalone verify custom action exited $tamperExit with FAIL (log: $tamperLog)"
-
-    # Restore and require the verifier to pass again (same script, clean tree).
-    Copy-Item -LiteralPath $Backup -Destination $wheel.FullName -Force
     $restoreResult = Invoke-TrustedVerifier -TargetBundle $BundleDir
     if ($restoreResult.ExitCode -eq 0 -and $restoreResult.Output -match 'bundle verification PASSED' -and $restoreResult.Output -notmatch '(?m)^FAIL:') {
         Add-Check 'restore_reverified' 'passed' "wheel restored; trusted verifier PASSED again (tamper was the sole cause of the failure)"
     } else {
         Stop-Gate 'restore_reverified' "after restoring the wheel the trusted verifier did not pass (exit $($restoreResult.ExitCode)); the bundle may be left tampered - reinstall the MSI"
+    }
+
+    # ---------------------------------- 8. per-user interpreter refusal (fail closed)
+    # A local non-admin can register a per-user CPython 3.12 (HKCU PEP 514)
+    # whose interpreter is arbitrary code (Python startup auto-executes user
+    # site-packages .pth files). py.exe prefers per-user installs over
+    # per-machine ones, so an unpinned resolver would run attacker-controlled
+    # code as LocalSystem DURING INSTALL -- before the bundle is verified,
+    # i.e. the verify-before-execute gate itself would be attacker-controlled.
+    # The verify custom action must be pinned to the exact HKLM hive the
+    # LaunchCondition checks: with ONLY a per-user 3.12 available it must
+    # REFUSE (fail closed), never execute the stub.
+    #
+    # Exercise: register an HKCU PythonCore\3.12 pointing at a stub that prints
+    # 'bundle verification PASSED' and exits 0 (exactly what a defeated gate
+    # needs), temporarily move the per-machine HKLM
+    # SOFTWARE\Python\PythonCore\3.12 key aside (so the refusal -- not a
+    # legitimate per-machine hit -- is observable), and require BOTH:
+    #   (a) the standalone verify custom action (no PYTHON override) exits
+    #       nonzero with its FAIL diagnostic, and
+    #   (b) a full msiexec install FAILS rather than completing (the product is
+    #       Installed after check 2, so the LaunchCondition passes and the
+    #       deferred VerifyBundleCA itself must refuse).
+    # The stub writes a canary file when executed; its absence after both
+    # negatives proves the attacker interpreter never ran. Everything is
+    # restored in finally (registry + environment) and the trusted verifier
+    # must pass again afterwards, proving the machine was left as found.
+    $StubDir = Join-Path $WorkDir 'peruser-python'
+    New-Item -ItemType Directory -Force -Path $StubDir | Out-Null
+    $StubPython = Join-Path $StubDir 'stub-python.cmd'
+    $StubCanary = Join-Path $WorkDir 'peruser-python-ran.canary'
+    # Batch "interpreter": if it is ever executed it forges the verifier's
+    # proof AND drops the canary; the refusal must leave the canary nonexistent.
+    [System.IO.File]::WriteAllText($StubPython, "@echo off`r`n@echo attacked>`"$StubCanary`"`r`necho bundle verification PASSED`r`nexit /b 0`r`n")
+    $StubHive = 'HKCU:\SOFTWARE\Python\PythonCore\3.12\InstallPath'
+    $StubHiveExisted = Test-Path -LiteralPath $StubHive
+    $StubHiveCreated = $false
+    $StubOrigExec = $null
+    $StubOrigDefault = $null
+    if ($StubHiveExisted) {
+        $stubProps = Get-ItemProperty -LiteralPath $StubHive
+        if ($null -ne $stubProps.ExecutablePath) { $StubOrigExec = $stubProps.ExecutablePath }
+        if ($null -ne $stubProps.'(default)') { $StubOrigDefault = $stubProps.'(default)' }
+    }
+    $HklmPythonKey = 'HKLM:\SOFTWARE\Python\PythonCore\3.12'
+    $HklmPythonBackupName = '3.12.gate-backup'
+    $HklmPythonExisted = Test-Path -LiteralPath $HklmPythonKey
+    $HklmPythonMoved = $false
+    $SavedProcessUdbmcpPython = $env:UDBMCP_PYTHON
+    try {
+        # Register the attacker-controlled per-user interpreter (exactly what a
+        # local non-admin can do without any elevation).
+        if (-not $StubHiveExisted) {
+            New-Item -ItemType Directory -Force -Path $StubHive | Out-Null
+            $StubHiveCreated = $true
+        }
+        New-ItemProperty -LiteralPath $StubHive -Name 'ExecutablePath' -Value $StubPython -PropertyType String -Force | Out-Null
+        Set-Item -LiteralPath $StubHive -Value $StubDir
+        # Move the per-machine key aside so interpreter resolution CANNOT
+        # legitimately succeed (the key is restored in finally).
+        if ($HklmPythonExisted) {
+            Rename-Item -LiteralPath $HklmPythonKey -NewName $HklmPythonBackupName
+            $HklmPythonMoved = $true
+        }
+        # The custom actions see this process's environment; make sure an
+        # interpreter override cannot mask the refusal (restored in finally).
+        Remove-Item -Path 'env:UDBMCP_PYTHON' -ErrorAction SilentlyContinue
+
+        # (a) standalone verify custom action: no PYTHON override anywhere ->
+        #     it must refuse instead of falling back to the HKCU stub.
+        $peruserCad = 'BUNDLE_DIR={0};TRUST_DIR={1};PUBKEY={2}' -f $BundleDir, $TrustDir, $PubKeyUsed
+        $peruserLog = Join-Path $LogDir 'verify-peruser-refusal.log'
+        Invoke-Native { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $VerifyScript -CustomActionData $peruserCad 1> $peruserLog 2>&1 } | Out-Null
+        $peruserExit = $LASTEXITCODE
+        $peruserOut = (Get-Content -LiteralPath $peruserLog -Raw -ErrorAction SilentlyContinue)
+        if ($null -eq $peruserOut) { $peruserOut = '' }
+        if ($peruserExit -eq 0) {
+            Stop-Gate 'peruser_interpreter_refused' "verify custom action exited 0 with ONLY a per-user (HKCU) interpreter registered; it must fail closed - a non-admin-registered interpreter must never run the trusted verifier"
+        }
+        if ($peruserOut -notmatch 'FAIL:') {
+            Stop-Gate 'peruser_interpreter_refused' "verify custom action exited $peruserExit but printed no 'FAIL:' diagnostic with only a per-user interpreter registered; the canonical diagnostic is required (log: $peruserLog)"
+        }
+        if ($peruserOut -notmatch 'no python interpreter available to run the trusted verifier') {
+            Stop-Gate 'peruser_interpreter_refused' "verify custom action failed with an unexpected diagnostic (expected the interpreter refusal, got: $($peruserOut.Trim().Substring(0, [Math]::Min(300, $peruserOut.Length)))); it must refuse THE INTERPRETER, not fail for an unrelated reason"
+        }
+        if (Test-Path -LiteralPath $StubCanary) {
+            Stop-Gate 'peruser_interpreter_refused' "the per-user stub interpreter was EXECUTED during the refused verify run (canary written); a non-admin-registered interpreter must never execute"
+        }
+        Add-Check 'peruser_standalone_refused' 'passed' "standalone verify custom action exited $peruserExit with FAIL and never executed the HKCU stub interpreter (log: $peruserLog)"
+
+        # (b) full msiexec install: the product is Installed (check 2), so the
+        #     LaunchCondition passes and the deferred VerifyBundleCA itself
+        #     must refuse -> msiexec must NOT complete.
+        if ($SkipMsiInstall) {
+            Add-Check 'peruser_install_refused' 'passed' 'skipped (-SkipMsiInstall); the standalone refusal above proves a per-user interpreter is never accepted'
+        } else {
+            $peruserMsiLog = Join-Path $LogDir 'msi-install-peruser-refusal.log'
+            $peruserArgStr = "/i `"$MsiPath`" /qn /norestart /l*v `"$peruserMsiLog`""
+            $peruserProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $peruserArgStr -Wait -PassThru
+            if ($peruserProc.ExitCode -eq 0 -or $peruserProc.ExitCode -eq 3010) {
+                Stop-Gate 'peruser_interpreter_refused' "msiexec install SUCCEEDED ($($peruserProc.ExitCode)) with ONLY a per-user (HKCU) interpreter registered; the verify-before-execute gate must have refused it"
+            }
+            if (Test-Path -LiteralPath $StubCanary) {
+                Stop-Gate 'peruser_interpreter_refused' "the per-user stub interpreter was EXECUTED during the refused msiexec install (canary written); a non-admin-registered interpreter must never run as SYSTEM"
+            }
+            Add-Check 'peruser_install_refused' 'passed' "msiexec exited $($peruserProc.ExitCode) (nonzero) with only a per-user interpreter registered; the deferred verify action refused it (log: $peruserMsiLog)"
+        }
+    } finally {
+        # Restore the machine EXACTLY as found, on every unwind (Stop-Gate's
+        # `exit` included): registry keys/values, environment, canary.
+        if ($HklmPythonMoved) {
+            Rename-Item -LiteralPath (Join-Path (Split-Path $HklmPythonKey) $HklmPythonBackupName) -NewName '3.12' -ErrorAction SilentlyContinue
+        }
+        if ($StubHiveCreated) {
+            Remove-Item -LiteralPath $StubHive -Recurse -Force -ErrorAction SilentlyContinue
+        } elseif ($StubHiveExisted) {
+            if ($null -ne $StubOrigExec) {
+                New-ItemProperty -LiteralPath $StubHive -Name 'ExecutablePath' -Value $StubOrigExec -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+            } else {
+                Remove-ItemProperty -LiteralPath $StubHive -Name 'ExecutablePath' -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $StubOrigDefault) {
+                Set-Item -LiteralPath $StubHive -Value $StubOrigDefault -ErrorAction SilentlyContinue
+            }
+        }
+        if ($null -ne $SavedProcessUdbmcpPython) {
+            $env:UDBMCP_PYTHON = $SavedProcessUdbmcpPython
+        }
+        Remove-Item -LiteralPath $StubCanary -Force -ErrorAction SilentlyContinue
+    }
+    # Restore sanity proof: the per-machine interpreter and the bundle are back
+    # to as-found state and the trusted verifier still passes.
+    $peruserRestoreResult = Invoke-TrustedVerifier -TargetBundle $BundleDir
+    if ($peruserRestoreResult.ExitCode -eq 0 -and $peruserRestoreResult.Output -match 'bundle verification PASSED' -and $peruserRestoreResult.Output -notmatch '(?m)^FAIL:') {
+        Add-Check 'peruser_cleanup_reverified' 'passed' "per-machine HKLM key and HKCU stub restored; trusted verifier PASSED again (the negative case left the machine as found)"
+    } else {
+        Stop-Gate 'peruser_cleanup_reverified' "after restoring the per-machine interpreter the trusted verifier did not pass (exit $($peruserRestoreResult.ExitCode)); inspect $HklmPythonKey (backup name: $HklmPythonBackupName) and reinstall the MSI"
     }
 
     # ------------------------------------------------------------------ done
