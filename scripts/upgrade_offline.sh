@@ -51,6 +51,21 @@ case "$(cd "$(dirname "$VERIFIER")" && pwd -P)" in
     echo "FAIL: UDBMCP_VERIFIER points inside the bundle; the verifier must come from the trusted channel." >&2
     exit 1 ;;
 esac
+# Same rule for the release public key: a tampered bundle ships its own key
+# (and a re-signed SHA256SUMS/SIGNATURE), so a key read from inside the bundle
+# authenticates nothing — verification would PASS against attacker material.
+# Like the verifier, the key is distributed out-of-band on the trusted channel.
+# The RESOLVED FILE PATH is compared (not just its directory): a key sitting
+# directly in the bundle root has dirname == $bundle_real, which would slip
+# past a "$bundle_real"/* match on the directory alone.
+pubkey_dir="$(cd "$(dirname "$PUBKEY")" 2>/dev/null && pwd -P)" || pubkey_dir=""
+case "$pubkey_dir/$(basename "$PUBKEY")" in
+  "$bundle_real"/*)
+    echo "FAIL: UDBMCP_RELEASE_PUBKEY ($PUBKEY) is inside the bundle; refusing to verify with a pubkey shipped inside the bundle." >&2
+    echo "      Install the key outside the bundle from the trusted channel" >&2
+    echo "      (e.g. sudo install -m 644 <trusted-channel>/release.pub.pem $TRUST_DIR/)." >&2
+    exit 1 ;;
+esac
 LIB_DIR="$(dirname "$self_path")/lib"
 if [ ! -r "$LIB_DIR/os_packages.sh" ]; then
   echo "FAIL: shared OS-package helper not found at $LIB_DIR/os_packages.sh;" >&2
@@ -97,7 +112,31 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
 fi
 
-$sudo_ok $VEXEC "$VERIFIER" --bundle "$NEW_BUNDLE" --pubkey "$PUBKEY"
+# Proof-of-verification gate (same control as install_offline.sh, commit
+# security review 2026-09-12: the upgrade path lacked it): a verifier that
+# exits 0 WITHOUT printing the canonical PASS line — or that prints a FAIL
+# diagnostic — must abort the upgrade. Output is echoed through so the admin
+# sees the canonical diagnostics either way.
+verify_with_proof() {
+  # $1: the bundle directory to verify
+  local vout vrc=0
+  vout="$(mktemp "${TMPDIR:-/tmp}/udbmcp-upgrade-verify.XXXXXX")"
+  $sudo_ok $VEXEC "$VERIFIER" --bundle "$1" --pubkey "$PUBKEY" >"$vout" 2>&1 || vrc=$?
+  cat "$vout"
+  if [ "$vrc" -ne 0 ]; then
+    echo "FAIL: trusted verifier exited $vrc; the bundle is untrusted: upgrade ABORTED." >&2
+    rm -f "$vout"
+    exit 1
+  fi
+  if grep -q '^FAIL:' "$vout" || ! grep -q 'bundle verification PASSED' "$vout"; then
+    echo "FAIL: trusted verifier exited 0 but did not print 'bundle verification PASSED' (or printed a FAIL line); without explicit proof of verification the bundle is treated as untrusted: upgrade ABORTED." >&2
+    rm -f "$vout"
+    exit 1
+  fi
+  rm -f "$vout"
+}
+
+verify_with_proof "$NEW_BUNDLE"
 
 # --- verify-then-use: consume ONLY a private root-owned staging copy --------
 # Same race install_offline.sh closes: the tree is hashed once, then pip and
@@ -122,7 +161,7 @@ trap on_exit EXIT
 $sudo_ok chmod 700 "$STAGING"
 echo "==> staging a private copy of the verified bundle (closes the verify-then-use race)"
 $sudo_ok cp -a "$NEW_BUNDLE"/. "$STAGING/"
-$sudo_ok $VEXEC "$VERIFIER" --bundle "$STAGING" --pubkey "$PUBKEY"
+verify_with_proof "$STAGING"
 NEW_BUNDLE="$STAGING"
 
 echo "==> backing up current configuration and local state"

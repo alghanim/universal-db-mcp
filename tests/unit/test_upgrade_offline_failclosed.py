@@ -249,6 +249,8 @@ def test_upgrade_fails_closed_when_verifier_rejects_the_staged_copy(tmp_path: Pa
         "calls.mkdir(parents=True, exist_ok=True)\n"
         "seen = list(calls.glob('call-*'))\n"
         "(calls / ('call-%d' % len(seen))).write_text(' '.join(sys.argv))\n"
+        "# the proof gate requires the canonical PASS line on the success path\n"
+        "sys.stdout.write('bundle verification PASSED\\n')\n"
         "sys.exit(0 if len(seen) == 0 else 1)\n",
         encoding="utf-8",
     )
@@ -279,12 +281,75 @@ def test_verification_precedes_every_state_mutating_step() -> None:
     install and the venv demotion/switch, so ANY verification failure aborts
     before the running installation is touched."""
     text = UPGRADE.read_text(encoding="utf-8")
-    verify_new = text.index('$sudo_ok $VEXEC "$VERIFIER" --bundle "$NEW_BUNDLE" --pubkey "$PUBKEY"')
+    verify_new = text.index('verify_with_proof "$NEW_BUNDLE"')
     stage_copy = text.index('cp -a "$NEW_BUNDLE"/. "$STAGING/"')
-    verify_staging = text.index('$sudo_ok $VEXEC "$VERIFIER" --bundle "$STAGING" --pubkey "$PUBKEY"')
+    verify_staging = text.index('verify_with_proof "$STAGING"')
     os_packages = text.index("udbmcp_install_os_packages ")
     demote = text.index('mv "$TARGET/venv" "$TARGET/venv.previous"')
     assert verify_new < stage_copy < verify_staging < os_packages < demote, (
         "verify-then-use order broken: verify(bundle) -> stage -> verify(staging) "
         "-> os-packages -> venv switch"
     )
+    # proof gate (commit security review 2026-09-12): a verifier that exits 0
+    # without printing the canonical PASS line must abort the upgrade
+    assert "bundle verification PASSED" in text and "verify_with_proof" in text
+    pubkey_gate = text.index("is inside the bundle; refusing to verify with a pubkey shipped inside the bundle")
+    assert pubkey_gate < verify_new, "the pubkey containment gate must precede the first verification"
+
+
+def test_upgrade_refuses_pubkey_inside_the_bundle(tmp_path: Path) -> None:
+    """A release public key resolved from INSIDE the bundle authenticates
+    nothing (a tampered bundle ships its own key + re-signed manifests): the
+    upgrade must refuse it before any verification runs (commit security
+    review 2026-09-12: this gate existed only on the install path)."""
+    bundle = _dummy_bundle(tmp_path)
+    inside_key = bundle / "release.pub.pem"
+    inside_key.write_text("-----BEGIN PUBLIC KEY-----\nattacker\n-----END PUBLIC KEY-----\n", encoding="utf-8")
+    target = tmp_path / "target"
+    _installed_target(target)
+    # a valid-looking out-of-bundle verifier must exist so the flow reaches
+    # the pubkey containment gate (the verifier check fires first otherwise)
+    stub = tmp_path / "stub_verifier.py"
+    stub.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+
+    proc = _run_upgrade(
+        tmp_path, bundle, target,
+        env_extra={"UDBMCP_RELEASE_PUBKEY": str(inside_key),
+                   "UDBMCP_VERIFIER": str(stub)},
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    out = proc.stdout + proc.stderr
+    assert "pubkey shipped inside the bundle" in out, (
+        f"refusal must name the inside-the-bundle pubkey violation:\n{out}"
+    )
+    _assert_target_untouched(target)
+
+
+def test_upgrade_fails_closed_on_vacuous_verifier(tmp_path: Path) -> None:
+    """A verifier that exits 0 but prints neither the canonical
+    'bundle verification PASSED' line nor anything at all must abort the
+    upgrade: silent exit-0 proves nothing (proof-of-verification gate,
+    commit security review 2026-09-12: missing on the upgrade path)."""
+    bundle = _dummy_bundle(tmp_path)
+    target = tmp_path / "target"
+    _installed_target(target)
+    stub = tmp_path / "stub_verifier.py"
+    stub.write_text(
+        "import sys\n"
+        "sys.exit(0)\n",  # silent success: no canonical PASS line
+        encoding="utf-8",
+    )
+
+    proc = _run_upgrade(
+        tmp_path, bundle, target,
+        env_extra={"UDBMCP_RELEASE_PUBKEY": str(tmp_path / "release.pub.pem"),
+                   "UDBMCP_VERIFIER": str(stub)},
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    out = proc.stdout + proc.stderr
+    assert "bundle verification PASSED" in out and "ABORTED" in out, (
+        f"the vacuous verifier must be refused by the proof gate:\n{out}"
+    )
+    _assert_target_untouched(target)
