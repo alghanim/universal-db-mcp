@@ -116,6 +116,37 @@ wheelhouse under the `macos-arm64-cp312` profile. The clidriver is bundled
 with the wheel; the runtime round-trip remains unverified on all platforms,
 and the builder's fail-loud rule is the backstop if PyPI drifts.
 
+### Building the Windows .msi (Windows staging host required)
+
+The .msi compile step can only succeed on Windows. WiX v4–v7 reject every
+`Directory/@Name` on a Unix host (`error WIX0389: ... is not a relative
+path`), and WiX itself warns that **all behavior on non-Windows hosts is
+undefined** — an MSI linked under undefined behavior would not be shippable
+even if it built. On a Unix staging host `scripts/package/build_msi.sh`
+therefore fails closed at the compile step only, AFTER the full pre-compile
+pipeline has run and passed (trusted-channel verification of the signed
+bundle, staging, deterministic harvest, xmllint validation) — so every step
+except the final compile is already proven and reusable (recorded in
+`out/package-evidence/msi/`).
+
+On a Windows staging host (Git Bash — **not WSL**: WSL uses the Linux .NET
+runtime and hits the same WIX0389):
+
+1. Install the .NET 8 SDK, then `dotnet tool install --global wix`.
+2. If the `wix` shim reports "You must install .NET to run this application",
+   set `DOTNET_ROOT` to the SDK directory (e.g.
+   `export DOTNET_ROOT="/c/Program Files/dotnet"`) before running the script.
+3. Run the same script: `bash scripts/package/build_msi.sh
+   <signed-windows-bundle-dir> --pubkey <release.pub.pem>`.
+4. Run `scripts/test_package_msi.ps1` on that machine (msiexec install with
+   logging, service query, doctor, stdio protocol probe, tamper negative) and
+   only then update the ledger's Windows row from `not_run` to the observed
+   result.
+
+This procedure has **not** been exercised on a Windows host in this
+environment (none was available); the ledger records the Windows .msi as
+authored-but-not-built with the install gate `not_run` until step 4 passes.
+
 ## What the bundle contains
 
 - `manifest.json` — release, source rev, profile, dependency closure with
