@@ -634,15 +634,17 @@ admin user) are deliberately ignored by the scripts.
 - **macOS host with admin rights** (`sudo`). The package installs per-machine
   (`InstallScope` equivalent: fixed absolute paths under `/usr/local`,
   `/etc`, `/var`).
-- **CPython 3.12 as a per-machine (all-users) install** — the python.org
-  macOS installer, which lands in
+- **CPython 3.12 as a per-machine (all-users) install** — either the
+  python.org macOS installer (lands in
   `/Library/Frameworks/Python.framework/Versions/3.12/` and symlinks
-  `/usr/local/bin/python3`. Per-user installs (`~/Library/Python`) and
-  version managers do **not** satisfy this requirement: the venv is built
-  into `/usr/local/universal-db-mcp/venv` and the service runs as the
-  `_udbmcp` account, which cannot see a per-user interpreter. `preinstall`
-  checks the interpreter really is CPython 3.12 (a stale `/usr/local/bin/python3`
-  pointing at another version is rejected).
+  `/usr/local/bin/python3`) or `brew install python@3.12` (machine-wide,
+  world-executable Homebrew prefix: `/opt/homebrew/bin/python3.12` on Apple
+  Silicon, `/usr/local/bin/python3.12` on Intel). Per-user installs
+  (`~/Library/Python`) and version managers do **not** satisfy this
+  requirement: the venv is built into `/usr/local/universal-db-mcp/venv` and
+  the service runs as the `_udbmcp` account, which cannot see a per-user
+  interpreter. `preinstall` checks the interpreter really is CPython 3.12
+  (a stale `/usr/local/bin/python3` pointing at another version is rejected).
 - **The signed `macos-arm64-cp312` bundle**, transferred on approved media.
   The wheelhouse for this profile includes the `ibm-db` `macosx_14_0_arm64`
   wheel (see `docs/driver-matrix.md`); the builder fails loud if a connector

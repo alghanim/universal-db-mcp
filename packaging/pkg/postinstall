@@ -96,14 +96,18 @@ esac
 # approved; the same interpreter is reused to build the venv in step 3.
 FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
 USR_LOCAL_PY="/usr/local/bin/python3"
+# Same fixed Homebrew candidates preinstall validates (machine-wide prefix,
+# never a PATH search) — keep this list in lockstep with preinstall.
+BREW_ARM_PY="/opt/homebrew/bin/python3.12"
+BREW_INTEL_PY="/usr/local/bin/python3.12"
 PY=""
-for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY"; do
+for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY" "$BREW_ARM_PY" "$BREW_INTEL_PY"; do
   if [ -x "$candidate" ] && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
     PY="$candidate"
     break
   fi
 done
-[ -n "$PY" ] || fail "CPython 3.12 (all-users install) not found at $FRAMEWORK_PY or $USR_LOCAL_PY (the exact paths preinstall validated); install the python.org 3.12 framework installer and re-run"
+[ -n "$PY" ] || fail "CPython 3.12 (all-users install) not found at $FRAMEWORK_PY, $USR_LOCAL_PY, $BREW_ARM_PY or $BREW_INTEL_PY (the exact paths preinstall validated); install the python.org 3.12 framework installer or 'brew install python@3.12' and re-run"
 
 # Execute the verifier under the validated interpreter (it is installed with
 # install -m 644 on the documented channel); VEXEC is pinned to the absolute

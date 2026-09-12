@@ -95,8 +95,15 @@ fi
 # The python.org macOS installer provides exactly that:
 #   - /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
 #   - /usr/local/bin/python3 (symlink to the framework binary)
+# A Homebrew CPython 3.12 (brew install python@3.12) also qualifies: on
+# Apple Silicon it lives at the machine-wide, world-executable prefix
+# /opt/homebrew (on Intel at /usr/local/bin/python3.12). These are FIXED
+# absolute paths explicitly validated here — never a PATH search, which
+# could resolve to a per-user interpreter the service account cannot see.
 FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
 USR_LOCAL_PY="/usr/local/bin/python3"
+BREW_ARM_PY="/opt/homebrew/bin/python3.12"
+BREW_INTEL_PY="/usr/local/bin/python3.12"
 
 py_ok() {
   # Accept a candidate only if it really is CPython 3.12 (a stale
@@ -106,11 +113,19 @@ py_ok() {
 
 if [ -f "$FRAMEWORK_PY" ] && py_ok "$FRAMEWORK_PY"; then
   PY_OK=1
+  SELECTED_PY="$FRAMEWORK_PY"
 elif [ -x "$USR_LOCAL_PY" ] && py_ok "$USR_LOCAL_PY"; then
   PY_OK=1
+  SELECTED_PY="$USR_LOCAL_PY"
   echo "NOTE: $FRAMEWORK_PY not found; using $USR_LOCAL_PY ($( "$USR_LOCAL_PY" -V 2>&1 ))." >&2
   echo "      Prefer the python.org framework install so the interpreter is" >&2
   echo "      unambiguously per-machine." >&2
+elif [ -x "$BREW_ARM_PY" ] && py_ok "$BREW_ARM_PY"; then
+  PY_OK=1
+  SELECTED_PY="$BREW_ARM_PY"
+elif [ -x "$BREW_INTEL_PY" ] && py_ok "$BREW_INTEL_PY"; then
+  PY_OK=1
+  SELECTED_PY="$BREW_INTEL_PY"
 else
   PY_OK=0
 fi
@@ -121,13 +136,17 @@ if [ "$PY_OK" -ne 1 ]; then
   echo "Checked:" >&2
   echo "  $FRAMEWORK_PY" >&2
   echo "  $USR_LOCAL_PY" >&2
+  echo "  $BREW_ARM_PY" >&2
+  echo "  $BREW_INTEL_PY" >&2
   echo "" >&2
-  echo "Install the official macOS 64-bit universal2 installer for Python" >&2
-  echo "3.12 from https://www.python.org/downloads/macos/ (the python.org" >&2
-  echo "installer is per-machine and lands in /Library/Frameworks), then" >&2
-  echo "re-run this installer. Per-user installs (~/Library/Python) and" >&2
-  echo "version managers do NOT satisfy this requirement: the service runs" >&2
-  echo "as the _udbmcp account and cannot see them." >&2
+  echo "Install one of:" >&2
+  echo "  - the official macOS 64-bit universal2 installer for Python 3.12" >&2
+  echo "    from https://www.python.org/downloads/macos/ (per-machine," >&2
+  echo "    lands in /Library/Frameworks), or" >&2
+  echo "  - 'brew install python@3.12' (machine-wide Homebrew prefix)." >&2
+  echo "Then re-run this installer. Per-user installs (~/Library/Python)" >&2
+  echo "and version managers do NOT satisfy this requirement: the service" >&2
+  echo "runs as the _udbmcp account and cannot see them." >&2
   exit 1
 fi
 
