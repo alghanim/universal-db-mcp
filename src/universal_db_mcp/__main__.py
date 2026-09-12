@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import json
 import os
 import sys
 import textwrap
@@ -56,6 +57,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="NAME",
         help="only consider one harness (claude-code, claude-desktop, dsh, cursor, vscode, cline)",
+    )
+    configure.add_argument(
+        "--json",
+        action="store_true",
+        help="machine-readable output for GUI front ends; never prompts and never "
+        "writes unless --yes is also given (then applies only the writable "
+        "harness(es), restricted to --agent when set)",
     )
 
     args = parser.parse_args(argv)
@@ -247,7 +255,87 @@ def _configure_agents(args: argparse.Namespace) -> int:
         names = (args.agent,)
 
     if args.dry_run and args.yes:
-        print("dry-run: --yes ignored; nothing will be written or prompted")
+        notice = "dry-run: --yes ignored; nothing will be written or prompted"
+        if args.json:
+            # stdout stays pure JSON for GUI consumers; the notice is a
+            # human-facing diagnostic.
+            print(notice, file=sys.stderr)
+        else:
+            print(notice)
+
+    # --- machine-readable mode for GUI front ends ------------------------------
+    # Contract: --json NEVER prompts and NEVER writes unless --yes is also
+    # given (the GUI's dialog/checkbox selection is the consent step; --yes
+    # then applies exactly the harnesses the user selected, restricted to
+    # --agent when set). Detection itself is always read-only.
+    if args.json:
+        payload: dict[str, object] = {"home": str(home), "harnesses": []}
+        harnesses = payload["harnesses"]
+        assert isinstance(harnesses, list)
+        for name in names:
+            try:
+                status = registry.detect_status(name, env, home)
+            except AgentConfigError as exc:
+                harnesses.append(
+                    {"agent": name, "status": "adapter_error", "detail": str(exc), "writable": False}
+                )
+                continue
+            except Exception as exc:  # unexpected adapter crash: fail closed
+                harnesses.append(
+                    {
+                        "agent": name,
+                        "status": "fail_closed",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "writable": False,
+                    }
+                )
+                continue
+            harnesses.append(
+                {
+                    "agent": name,
+                    "status": status.value,
+                    "writable": status is AgentStatus.INSTALLED_UNCONFIGURED,
+                }
+            )
+        exit_code = 0
+        if args.yes and not args.dry_run:
+            applied: list[dict[str, object]] = []
+            for name in names:
+                writable = any(
+                    isinstance(h, dict)
+                    and h.get("agent") == name
+                    and h.get("writable") is True
+                    for h in harnesses
+                )
+                if not writable:
+                    continue
+                try:
+                    result = registry.apply_confirmed(name, env, home, True)
+                    applied.append(
+                        {
+                            "agent": name,
+                            "status": result.status.value,
+                            "summary": result.summary,
+                            "backups": [str(p) for p in result.backup_paths],
+                        }
+                    )
+                    # Adapters may report a REFUSED write by returning a
+                    # fail-closed Plan instead of raising (e.g. the config
+                    # changed state between detection and apply): that is a
+                    # failure for the caller even though nothing raised.
+                    if result.status is not AgentStatus.CONFIGURED:
+                        exit_code = 1
+                except AgentConfigError as exc:
+                    applied.append({"agent": name, "status": "error", "detail": str(exc)})
+                    exit_code = 1
+                except Exception as exc:  # adapter crash mid-write: report, never retry
+                    applied.append(
+                        {"agent": name, "status": "fail_closed", "detail": f"{type(exc).__name__}: {exc}"}
+                    )
+                    exit_code = 1
+            payload["applied"] = applied
+        print(json.dumps(payload, indent=2))
+        return exit_code
 
     # Phase 1: read-only detection table.
     print(f"Detecting agent harnesses (HOME={home}):")

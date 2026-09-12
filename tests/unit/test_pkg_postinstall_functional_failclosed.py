@@ -94,6 +94,11 @@ _PATH_REWRITES = [
         r'^PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"$',
         'PATH="$PATH"',
     ),
+    # The GUI app assembly must land inside the sandbox, not /Applications.
+    (
+        r'^APP_DIR="/Applications/Configure UniversalDB MCP\.app"$',
+        'APP_DIR="{app_dir}"',
+    ),
 ]
 
 
@@ -116,6 +121,7 @@ def _sandbox_postinstall(tmp_path: Path, *, verifier: str | None = None, pubkey:
         "log": str(tmp_path / "log"),
         "plist": str(tmp_path / "com.udbmcp.server.plist"),
         "pyshim": str(tmp_path / "shim-bin" / "python312-sandbox"),
+        "app_dir": str(tmp_path / "applications" / "Configure UniversalDB MCP.app"),
     }
     for pattern, replacement in _PATH_REWRITES:
         new_text, n = re.subn(pattern, replacement.format(**dirs), text, flags=re.MULTILINE)

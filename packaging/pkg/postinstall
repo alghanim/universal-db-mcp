@@ -291,6 +291,13 @@ if [ -f "$BUNDLE/manifest.json" ]; then
   install -m 644 -o root -g wheel "$BUNDLE/manifest.json" "$PREFIX/manifest.json"
 fi
 
+# --- step 7b: GUI app payload prerequisite (fail closed BEFORE the daemon) ---
+# Checked here rather than in step 9 so a missing payload script aborts the
+# install BEFORE the daemon is started: past that point fail()'s "nothing was
+# started" message would be false.
+APP_SRC="$PREFIX/share/configure_agents_app.sh"
+[ -f "$APP_SRC" ] || fail "GUI app script missing from the payload at $APP_SRC"
+
 # --- step 8: bootstrap the launchd daemon (fail closed) ----------------------
 echo "==> postinstall: bootstrapping launchd daemon $LABEL"
 [ -f "$PLIST" ] || fail "launchd plist missing at $PLIST"
@@ -309,8 +316,64 @@ launchctl bootstrap system "$PLIST" || {
   fail "launchctl bootstrap system $PLIST failed; start it manually with: launchctl bootstrap system $PLIST"
 }
 
+# --- step 9: assemble the /Applications GUI wrapper (agent configuration) ----
+# The dialog logic lives in the root-owned VERIFIED payload
+# ($PREFIX/share/configure_agents_app.sh, staged by build_pkg.sh; its
+# presence was a fatal prerequisite in step 7b). This is a thin launcher .app
+# so the flow is reachable from Finder as the logged-in user - agent harness
+# configs are per-user files and must never be written by the root
+# postinstall itself. The dialogs ask before anything is written
+# (configure-agents' ask-before-write contract).
+# BEST-EFFORT by design: the daemon is ALREADY RUNNING here, so an /Applications
+# failure must not abort the install (fail() would misreport a live service as
+# a failed install) - it degrades to a loud WARNING with the manual path.
+echo "==> postinstall: installing 'Configure UniversalDB MCP.app' (agent configuration GUI)"
+APP_DIR="/Applications/Configure UniversalDB MCP.app"
+if ! install -d -m 0755 -o root -g wheel "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" 2>/dev/null; then
+  echo "WARNING: could not create '$APP_DIR'; the agent-configuration GUI is" >&2
+  echo "         unavailable (the service itself is running). The dialog logic" >&2
+  echo "         can be run directly: $APP_SRC" >&2
+else
+cat > "$APP_DIR/Contents/Info.plist" <<'INFO_PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Configure UniversalDB MCP</string>
+	<key>CFBundleDisplayName</key>
+	<string>Configure UniversalDB MCP</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.udbmcp.configure-agents</string>
+	<key>CFBundleExecutable</key>
+	<string>udbmcp-configure</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
+INFO_PLIST
+cat > "$APP_DIR/Contents/MacOS/udbmcp-configure" <<WRAPPER
+#!/bin/bash
+# \$@ must survive as LITERAL wrapper args: this heredoc is unquoted so
+# \$PREFIX expands to the (sandbox-rewritten) install prefix at write time.
+exec "$PREFIX/share/configure_agents_app.sh" "\$@"
+WRAPPER
+chown root:wheel "$APP_DIR/Contents/Info.plist" "$APP_DIR/Contents/MacOS/udbmcp-configure" 2>/dev/null || true
+chmod 0644 "$APP_DIR/Contents/Info.plist"
+chmod 0755 "$APP_DIR/Contents/MacOS/udbmcp-configure"
+fi
+
 echo "==> postinstall complete. Next steps:"
-echo "    1. Edit $CONFIG (the template was installed only if absent)."
-echo "    2. Run: $VENV/bin/python -m universal_db_mcp doctor"
-echo "    3. Server logs: $LOG_DIR (launchd label: system/$LABEL)"
+echo "    1. Open 'Configure UniversalDB MCP' in /Applications to register your agent harnesses (it asks before writing)."
+echo "    2. Edit $CONFIG (the template was installed only if absent)."
+echo "    3. Run: $VENV/bin/python -m universal_db_mcp doctor"
+echo "    4. Server logs: $LOG_DIR (launchd label: system/$LABEL)"
 exit 0

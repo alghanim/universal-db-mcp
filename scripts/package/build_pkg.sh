@@ -207,6 +207,16 @@ log "    no key material in payload"
 log "==> staging launchd plist at /Library/LaunchDaemons/com.udbmcp.server.plist"
 install -m 0644 "$PLIST_SRC" "$LAUNCH_DEST/com.udbmcp.server.plist"
 
+# GUI front end for `configure-agents` (native dialogs; runs as the logged-in
+# user, never root — agent configs are per-user files). Staged as a root-owned
+# payload script at /usr/local/universal-db-mcp/share/; postinstall assembles
+# the thin /Applications app wrapper around it.
+APP_SRC="$PROJECT/packaging/macos-app/configure_agents_app.sh"
+[ -f "$APP_SRC" ] || fail "GUI app script missing at $APP_SRC"
+SHARE_DEST="$ROOT/usr/local/universal-db-mcp/share"
+mkdir -p "$SHARE_DEST"
+install -m 0755 "$APP_SRC" "$SHARE_DEST/configure_agents_app.sh"
+
 # --- pkgbuild: component package ---
 CORE_PKG="$WORK/core.pkg"
 log "==> pkgbuild (non-relocatable, ownership recommended)"
@@ -242,20 +252,24 @@ cat >"$DIST_XML" <<EOF
     </choice>
 </installer-gui-script>
 EOF
-# welcome/conclusion resources are optional; only wire them up if present.
+# welcome/conclusion resources are optional and wired PER FILE: resources
+# live in packaging/pkg-resources/ (a sibling of the pkgbuild --scripts dir,
+# so nothing here leaks into the component package's Scripts payload). A
+# referenced-but-missing page (e.g. <welcome> wired while only conclusion
+# exists) makes productbuild's output version-dependently skip the page or
+# fail the install, so each ref is stripped when its file is absent.
 RES_DIR="$WORK/resources"
-if [ -f "$PROJECT/packaging/pkg/resources/welcome.rtf" ] || [ -f "$PROJECT/packaging/pkg/resources/conclusion.rtf" ]; then
-  mkdir -p "$RES_DIR"
-  [ -f "$PROJECT/packaging/pkg/resources/welcome.rtf" ] && cp "$PROJECT/packaging/pkg/resources/welcome.rtf" "$RES_DIR/"
-  [ -f "$PROJECT/packaging/pkg/resources/conclusion.rtf" ] && cp "$PROJECT/packaging/pkg/resources/conclusion.rtf" "$RES_DIR/"
-  log "==> using distribution resources from packaging/pkg/resources/"
-else
-  # Strip the optional welcome/conclusion refs when no resources exist.
-  sed -i '' '/<welcome /d; /<conclusion /d' "$DIST_XML"
-fi
+mkdir -p "$RES_DIR"
+[ -f "$PROJECT/packaging/pkg-resources/welcome.rtf" ] && \
+  cp "$PROJECT/packaging/pkg-resources/welcome.rtf" "$RES_DIR/"
+[ -f "$PROJECT/packaging/pkg-resources/conclusion.rtf" ] && \
+  cp "$PROJECT/packaging/pkg-resources/conclusion.rtf" "$RES_DIR/"
+[ -f "$RES_DIR/welcome.rtf" ] || sed -i '' '/<welcome /d' "$DIST_XML"
+[ -f "$RES_DIR/conclusion.rtf" ] || sed -i '' '/<conclusion /d' "$DIST_XML"
 
 PRODUCTBUILD_ARGS=(--distribution "$DIST_XML" --package-path "$WORK" --identifier com.udbmcp.universal-db-mcp)
-if [ -n "$RES_DIR" ] && [ -d "$RES_DIR" ]; then
+if [ -f "$RES_DIR/welcome.rtf" ] || [ -f "$RES_DIR/conclusion.rtf" ]; then
+  log "==> using distribution resources from packaging/pkg-resources/"
   PRODUCTBUILD_ARGS+=(--resources "$RES_DIR")
 fi
 FINAL_PKG="$OUT_DIR/$PKG_NAME"

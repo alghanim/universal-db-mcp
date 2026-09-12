@@ -91,6 +91,12 @@ _PATH_REWRITES = [
         'FRAMEWORK_PY="{pyshim}"',
     ),
     (r'^USR_LOCAL_PY="/usr/local/bin/python3"$', 'USR_LOCAL_PY="{pyshim}"'),
+    # The GUI app assembly must land inside the sandbox, not the real
+    # /Applications.
+    (
+        r'^APP_DIR="/Applications/Configure UniversalDB MCP\.app"$',
+        'APP_DIR="{app_dir}"',
+    ),
 ]
 
 
@@ -114,6 +120,7 @@ def _sandbox_postinstall(tmp_path: Path) -> Path:
         "plist": str(tmp_path / "com.udbmcp.server.plist"),
         "shim": str(tmp_path / "shim-bin"),
         "pyshim": str(tmp_path / "shim-bin" / "python312-sandbox"),
+        "app_dir": str(tmp_path / "applications" / "Configure UniversalDB MCP.app"),
     }
     for pattern, replacement in _PATH_REWRITES:
         new_text, n = re.subn(pattern, replacement.format(**dirs), text, flags=re.MULTILINE)
@@ -274,6 +281,12 @@ def _build_bundle(tmp_path: Path, *, manifest: bool = True) -> Path:
         (bundle / "manifest.json").write_text("{}\n", encoding="utf-8")
     (bundle / "config-templates" / "config.yaml").write_text("# sandbox template\n", encoding="utf-8")
     (bundle / "requirements" / "runtime.lock").write_text("# sandbox lock\n", encoding="utf-8")
+    # The GUI app script is payload material staged BESIDE the bundle (by
+    # build_pkg.sh) at <prefix>/share/; the app-assembly step fails closed
+    # without it.
+    share = tmp_path / "prefix" / "share"
+    share.mkdir(parents=True, exist_ok=True)
+    (share / "configure_agents_app.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     return bundle
 
 
