@@ -208,6 +208,12 @@ echo "==> postinstall: installing application from bundle wheelhouse (no index, 
 # session must not be able to redirect these installs to a network source.
 # --no-index + --require-hashes make the bundle wheelhouse the only source and
 # the shipped runtime.lock the only acceptable resolution.
+# --force-reinstall is MANDATORY on upgrades: the app wheel's version string
+# does not change between code-only releases (0.1.0 -> 0.1.0), so without it
+# pip reports "already satisfied" and leaves the PREVIOUS release's code in
+# the venv while the plist/unit around it are new — an install that reports
+# success but runs stale code (found live 2026-09-12: the service crash-
+# looped because the new HTTP plist met the pre-fix venv).
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy || true
 env \
   PIP_CONFIG_FILE=/dev/null \
@@ -220,6 +226,7 @@ env \
   --find-links="$BUNDLE/wheelhouse" \
   --only-binary=:all: \
   --require-hashes \
+  --force-reinstall \
   -r "$BUNDLE/requirements/runtime.lock" || {
   fail "wheelhouse install failed; the runtime.lock resolution could not be installed from the verified bundle"
 }

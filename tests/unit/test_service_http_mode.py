@@ -215,6 +215,23 @@ def test_msi_service_injects_bearer_token_path_env() -> None:
     )
 
 
+# ------------------------------------ review fix: upgrade reinstall
+# (found live 2026-09-12: the app wheel's version string does not change
+# between code-only releases, so pip's "already satisfied" left the PREVIOUS
+# release's code in the venv while the new plist ran around it — the service
+# crash-looped with exit 1. Upgrades must --force-reinstall the hash-checked
+# lock from the verified wheelhouse.)
+
+
+def test_pkg_postinstall_force_reinstalls_on_upgrade() -> None:
+    text = _read(PKG_POSTINSTALL)
+    pip_block = text[text.index("postinstall: installing application") :]
+    assert "--force-reinstall" in pip_block, (
+        "the pkg venv must --force-reinstall from the verified wheelhouse: "
+        "same-version app wheels would otherwise never refresh on upgrade"
+    )
+
+
 # ------------------------------------ review fix: doctor token-check reachability
 # (adversarial review 2026-09-12: doctor gated the token checks on
 # config.transport == "http", which is unreachable in the deployed topology —
