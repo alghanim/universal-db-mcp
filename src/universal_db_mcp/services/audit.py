@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -66,7 +67,18 @@ class AuditLog:
                     0o600,
                 )
                 try:
-                    os.fchmod(fd, 0o600)
+                    # POSIX only: NTFS has no POSIX mode bits, so on Windows
+                    # there is no 0600 to apply (and fchmod would raise on
+                    # every write). On Windows the audit file inherits the ACL
+                    # of the state directory it lives in; hardening there means
+                    # provisioning THAT directory's ACL at install time (see
+                    # docs/offline-deployment.md) — documented, not faked with
+                    # a permission bit the filesystem cannot represent. The
+                    # 0600 file-creation mode in os.open above is equally
+                    # POSIX-only (ignored on Windows) and is still what makes
+                    # the file private regardless of the process umask here.
+                    if sys.platform != "win32":
+                        os.fchmod(fd, 0o600)
                 except OSError:
                     os.close(fd)
                     raise

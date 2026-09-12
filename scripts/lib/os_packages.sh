@@ -17,6 +17,42 @@
 
 # shellcheck shell=bash
 
+# _udbmcp_dpkg_locks_held — true (rc 0) when dpkg's fcntl record locks are
+# held by some other process RIGHT NOW. dpkg locks /var/lib/dpkg/lock-frontend
+# and /var/lib/dpkg/lock with fcntl record locks (flock(2) would not see
+# them), so each file is probed with a non-blocking fcntl exclusive lock that
+# is released immediately. A missing/unopenable lock file is treated as free
+# (dpkg creates them on demand); if python3 is unavailable the probe cannot
+# run and the caller must assume "held" (defer) rather than risk the
+# guaranteed "frontend lock" deadlock inside a maintainer script. Lock paths
+# are overridable via UDBMCP_DPKG_LOCK_FILES (space-separated) for sandboxed
+# tests; the default is exactly what dpkg uses on Ubuntu.
+_udbmcp_dpkg_locks_held() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  local lock_files="${UDBMCP_DPKG_LOCK_FILES:-/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock}"
+  if python3 - $lock_files 2>/dev/null <<'PYEOF'
+import fcntl, sys
+rc = 0
+for path in sys.argv[1:]:
+    try:
+        fh = open(path, "r+")
+    except OSError:
+        continue  # absent: dpkg creates it on demand; nothing held on it
+    try:
+        fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.lockf(fh, fcntl.LOCK_UN)
+    except OSError:
+        rc = 1  # someone else holds this lock
+    finally:
+        fh.close()
+sys.exit(rc)
+PYEOF
+  then
+    return 1  # probe succeeded everywhere: locks are free
+  fi
+  return 0   # at least one lock is held (or the probe could not run)
+}
+
 udbmcp_install_os_packages() {
   local bundle="$1" py="$2" sudo_ok="${3:-}"
   local ospkg_dir="$bundle/os-packages"
@@ -33,6 +69,42 @@ udbmcp_install_os_packages() {
   # ordering below and the manifest `file` values comparable.
   if ! _udbmcp_rootrun ls -1 "$ospkg_dir" 2>/dev/null | grep -q '\.deb$'; then
     echo "==> no OS packages in bundle os-packages/ (skipping dpkg step)"
+    return 0
+  fi
+
+  # --- dpkg critical section: DEFER, never nest dpkg --------------------------
+  # Inside a dpkg maintainer script (deb postinst) the OUTER `dpkg -i` holds
+  # the dpkg frontend/database locks for its whole run, so any nested `dpkg -i`
+  # here always aborts with "dpkg frontend lock was locked by another
+  # process". Skipping silently would hide the ODBC driver closure; failing
+  # would abort the configure step for a condition that resolves itself once
+  # dpkg exits. This branch is a fail-safe tripwire for that context: it is
+  # normally unreachable for the .deb (packaging/deb/postinst defers the whole
+  # dpkg-dependent install to its detached worker BEFORE install_offline.sh
+  # ever runs), but any future maintainer-script caller lands here instead of
+  # deadlocking. It triggers only when a maintainer-script context is combined
+  # with dpkg's locks being genuinely held RIGHT NOW (the deb's deferred
+  # worker inherits DPKG_MAINTSCRIPT_PACKAGE in its environment but runs AFTER
+  # dpkg released the locks, so it correctly proceeds to install). The pending
+  # state is recorded behind a root-owned marker under /run — NOT under the
+  # udbmcp-owned /var/lib/universal-db-mcp, which the service account could
+  # pre-create or remove — and the function returns success so the rest of the
+  # trusted install (venv, smoke check) still completes; the marker stays
+  # behind as a loud, inspectable record that the OS packages remain pending.
+  # Outside a maintainer script the behavior is unchanged: dpkg runs directly.
+  if { [ -n "${DPKG_MAINTSCRIPT_PACKAGE:-}" ] || [ -n "${DPKG_FRONTEND_LOCKED:-}" ]; } \
+     && _udbmcp_dpkg_locks_held; then
+    _defer_marker="${UDBMCP_OSPKG_DEFER_MARKER:-/run/universal-db-mcp/os-packages.pending}"
+    if ! { mkdir -p "$(dirname "$_defer_marker")" 2>/dev/null && : > "$_defer_marker"; }; then
+      echo "FAIL: cannot record deferred OS-package state at $_defer_marker;" >&2
+      echo "      refusing to either nest 'dpkg -i' (dpkg locks held) or" >&2
+      echo "      silently skip the bundle OS packages (fail closed)." >&2
+      return 1
+    fi
+    echo "==> dpkg maintainer-script context with dpkg locks held: OS-package installation DEFERRED"
+    echo "    (a nested 'dpkg -i' could never succeed against the outer dpkg's locks)."
+    echo "    PENDING marker: $_defer_marker — install the bundle OS packages"
+    echo "    once dpkg is idle, e.g.: dpkg -i $ospkg_dir/*.deb (no apt, no network)."
     return 0
   fi
 

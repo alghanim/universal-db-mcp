@@ -4,6 +4,7 @@ network access. Local prerequisite checks never require database credentials
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import stat
@@ -19,6 +20,57 @@ CHECKS: list[dict[str, Any]] = []
 MSSQL_ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
 
 
+def _bundle_profile() -> str:
+    """Identity of the bundle this installation came from, for reporting.
+
+    Sources, in order: the ``UDBMCP_BUNDLE_MANIFEST`` environment variable
+    (explicit override), the bundle ``manifest.json`` the installer copies
+    next to the venv (``<venv>/../manifest.json``), and — when neither is
+    available (e.g. a development checkout, or a bundle built without a
+    manifest) — an honest description of the running platform. The doctor
+    must never report a hardcoded profile name it did not verify: claiming
+    ``linux-x86_64-ubuntu24.04-cp312`` on a Windows host would be a lie, not
+    a diagnostic."""
+    manifest_path: Path | None = None
+    env_manifest = os.environ.get("UDBMCP_BUNDLE_MANIFEST")
+    if env_manifest:
+        manifest_path = Path(env_manifest)
+    else:
+        # scripts/install_offline.sh installs the verified bundle's
+        # manifest.json at $TARGET/manifest.json, i.e. one level above the
+        # venv that contains this interpreter.
+        candidate = Path(sys.executable).resolve().parent.parent / "manifest.json"
+        if candidate.is_file():
+            manifest_path = candidate
+    if manifest_path is not None and manifest_path.is_file():
+        try:
+            profile = json.loads(manifest_path.read_text(encoding="utf-8")).get("profile")
+            if isinstance(profile, str) and profile:
+                return profile
+        except (OSError, ValueError):
+            pass  # unreadable/corrupt manifest -> fall through to the honest default
+    return f"{platform.system()}/{platform.machine()} cpython {platform.python_version()}"
+
+
+def _mssql_odbc_remediation() -> str:
+    """Platform-correct remediation for a missing msodbcsql18 OS driver.
+
+    The .deb closure vendored in the bundle's ``os-packages/`` directory is
+    Linux-only; on Windows and macOS the driver is an administrator-supplied
+    MSI/pkg that the bundle cannot redistribute."""
+    if sys.platform == "win32":
+        return (
+            "install Microsoft ODBC Driver 18 for SQL Server (msodbcsql MSI, "
+            "administrator-supplied) via ODBC Administrator"
+        )
+    if sys.platform == "darwin":
+        return "install msodbcsql18.pkg (administrator-supplied) + unixodbc (Homebrew) via ODBC Manager"
+    return (
+        "install the .deb closure shipped in the bundle os-packages/ directory (dpkg only, no "
+        "network) — scripts/install_offline.sh does this in dependency order"
+    )
+
+
 def _check(name: str, ok: bool, detail: str, *, fatal: bool = False) -> dict[str, Any]:
     return {"check": name, "status": "ok" if ok else ("fatal" if fatal else "warning"), "detail": detail}
 
@@ -32,9 +84,8 @@ def _mssql_odbc_driver_check(conn_name: str, pyodbc_mod: Any) -> dict[str, Any]:
         return _check(
             key,
             False,
-            "cannot verify the OS-level ODBC driver until the pyodbc wheel is importable; the "
-            "driver package (msodbcsql18 + unixodbc) ships in the bundle os-packages/ directory "
-            "— run scripts/install_offline.sh, which installs it with dpkg (no network)",
+            "cannot verify the OS-level ODBC driver until the pyodbc wheel is importable; "
+            + _mssql_odbc_remediation(),
             fatal=True,
         )
     try:
@@ -47,9 +98,8 @@ def _mssql_odbc_driver_check(conn_name: str, pyodbc_mod: Any) -> dict[str, Any]:
     return _check(
         key,
         False,
-        f"'{MSSQL_ODBC_DRIVER}' is not registered with unixODBC (detected drivers: {detected}); "
-        "install the .deb closure shipped in the bundle os-packages/ directory (dpkg only, no "
-        "network) — scripts/install_offline.sh does this in dependency order",
+        f"'{MSSQL_ODBC_DRIVER}' is not registered with the platform ODBC driver manager "
+        f"(detected drivers: {detected}); {_mssql_odbc_remediation()}",
         fatal=True,
     )
 
@@ -58,9 +108,10 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
     results: list[dict[str, Any]] = []
 
     # --- platform baseline ---------------------------------------------------
+    profile = _bundle_profile()
     py_ok = sys.version_info[:2] == (3, 12)
     py_detail = f"running CPython {platform.python_version()} " + (
-        "matches the linux-x86_64-ubuntu24.04-cp312 profile" if py_ok else "profile expects CPython 3.12.x"
+        f"matches the {profile} profile" if py_ok else f"profile {profile} expects CPython 3.12.x"
     )
     results.append(_check("python-version", py_ok, py_detail, fatal=True))
     results.append(
@@ -68,8 +119,7 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
             "platform",
             True,
             f"{platform.system()} {platform.release()} {platform.machine()} "
-            f"(bundle profile is linux-x86_64 glibc; other platforms are "
-            f"different profiles)",
+            f"(bundle profile: {profile})",
         )
     )
 
@@ -214,10 +264,7 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                         f"wheel from the offline bundle wheelhouse (no network)"
                     )
                     if conn.type == "mssql":
-                        detail += (
-                            "; the OS-level ODBC driver package (msodbcsql18 + unixodbc) ships in "
-                            "the bundle os-packages/ directory — run scripts/install_offline.sh"
-                        )
+                        detail += f"; the OS-level ODBC driver behind the wheel: {_mssql_odbc_remediation()}"
                     results.append(_check(f"connection-{name}-driver", False, detail, fatal=True))
 
             # the OS-level driver behind the wheel (mssql only): report a

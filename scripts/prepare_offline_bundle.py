@@ -6,7 +6,7 @@ public endpoint at install or runtime).
 What it does:
 1. Builds the application wheel.
 2. Downloads the complete dependency closure as wheels for the target
-   profile (linux x86_64 / cp312 / manylinux), including connector wheels.
+   profile (see scripts/profiles.py), including connector wheels.
 3. Emits a fully pinned, hashed runtime.lock (application wheel included).
 4. Generates a CycloneDX-format SBOM from the wheelhouse.
 5. Vendors the pre-staged OS package closure (unixODBC stack + Microsoft
@@ -36,6 +36,10 @@ import tempfile
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
+if str(PROJECT) not in sys.path:
+    sys.path.insert(0, str(PROJECT))
+
+from scripts.profiles import PROFILES, Profile, get_profile  # noqa: E402  (repo-relative import)
 
 CONNECTOR_WHEELS = {
     "core": ["mcp", "PyYAML", "sqlglot"],
@@ -132,6 +136,66 @@ def wheel_meta(path: Path) -> tuple[str, str]:
     return name, m.group("ver")
 
 
+def check_signing_conflict(signing_key: str | None, allow_missing: bool) -> None:
+    """Refuse --allow-missing-connectors together with --signing-key.
+
+    A signed release can never ship a knowingly incomplete wheelhouse: either
+    complete the closure or build unsigned.
+    """
+    if allow_missing and signing_key:
+        raise SystemExit(
+            "--allow-missing-connectors cannot be combined with --signing-key: "
+            "a signed release can never ship a knowingly incomplete wheelhouse. "
+            "Complete the closure, or build without the signing key."
+        )
+
+
+def require_complete_wheelhouse(missing: list[str], profile_name: str, allow_missing: bool) -> None:
+    """Fail loud when top-level connector wheels are missing from the closure."""
+    if missing and not allow_missing:
+        raise SystemExit(
+            f"incomplete wheelhouse for profile '{profile_name}': missing connector "
+            f"wheels {missing}. The affected connectors cannot pass readiness checks "
+            "on targets. Re-run with --allow-missing-connectors to record them in "
+            "manifest.json and continue (unsigned bundles only)."
+        )
+
+
+def pip_download_command(profile: Profile, pkgs: list[str], wheelhouse: Path, constraints: Path) -> list[str]:
+    """Build the pip download command for the profile's target interpreter.
+
+    Multiple --platform flags (e.g. both macOS tags) are passed as repeated
+    flags, which pip accepts.
+    """
+    cmd = [sys.executable, "-m", "pip", "download", "--only-binary=:all:"]
+    for plat in profile.pip_platforms:
+        cmd += ["--platform", plat]
+    cmd += [
+        "--implementation", "cp",
+        "--python-version", profile.python_version,
+        "--abi", profile.abi,
+        "--dest", str(wheelhouse),
+        "-c", str(constraints),
+        *pkgs,
+    ]
+    return cmd
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--profile", default="linux-x86_64-ubuntu24.04-cp312", choices=sorted(PROFILES),
+                    help="target profile (see scripts/profiles.py)")
+    ap.add_argument("--out", required=True, help="bundle output directory")
+    ap.add_argument("--connectors", default="core,postgres,mysql,clickhouse,oracle,mssql,db2",
+                    help="comma list; 'core' is always included")
+    ap.add_argument("--allow-missing-connectors", action="store_true",
+                    help="record missing connector wheels in the manifest and continue "
+                         "instead of failing; refused together with --signing-key")
+    ap.add_argument("--signing-key", default=None, help="PEM file with an Ed25519 private key (staging only)")
+    ap.add_argument("--source-rev", default=os.environ.get("UDBMCP_SOURCE_REV", "unknown"))
+    return ap
+
+
 def stage_os_packages(out: Path, staging: Path) -> list[dict[str, object]]:
     """Vendor the staged .deb closure into the bundle's os-packages/ directory.
 
@@ -187,16 +251,10 @@ def stage_os_packages(out: Path, staging: Path) -> list[dict[str, object]]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", default="linux-x86_64-ubuntu24.04-cp312", choices=["linux-x86_64-ubuntu24.04-cp312"])
-    ap.add_argument("--out", required=True, help="bundle output directory")
-    ap.add_argument("--connectors", default="core,postgres,mysql,clickhouse,oracle,mssql,db2",
-                    help="comma list; 'core' is always included")
-    ap.add_argument("--signing-key", default=None, help="PEM file with an Ed25519 private key (staging only)")
-    ap.add_argument("--source-rev", default=os.environ.get("UDBMCP_SOURCE_REV", "unknown"))
-    args = ap.parse_args()
+    args = build_arg_parser().parse_args()
+    check_signing_conflict(args.signing_key, args.allow_missing_connectors)
+    profile = get_profile(args.profile)
 
-    pyver, abi, plat = "3.12", "cp312", "manylinux2014_x86_64"
     connectors = ["core"] + [c for c in args.connectors.split(",") if c != "core"]
     missing: list[str] = []
 
@@ -234,27 +292,22 @@ def main() -> None:
         )
         + "\n"
     )
-    cmd = [
-        sys.executable, "-m", "pip", "download",
-        "--only-binary=:all:",
-        "--platform", plat, "--implementation", "cp",
-        "--python-version", pyver, "--abi", abi,
-        "--dest", str(out / "wheelhouse"),
-        "-c", str(constraints),
-        *pkgs,
-    ]
+    cmd = pip_download_command(profile, pkgs, out / "wheelhouse", constraints)
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         print(res.stdout[-3000:], res.stderr[-3000:], file=sys.stderr)
         raise SystemExit("pip download failed for the target profile")
 
-    # record which top-level connector wheels actually landed
+    # record which top-level connector wheels actually landed, and fail loud
+    # when any are missing (a signed release can never ship a knowingly
+    # incomplete wheelhouse; see --allow-missing-connectors)
     wheelhouse = sorted((out / "wheelhouse").glob("*.whl"))
     names = {wheel_meta(w)[0] for w in wheelhouse}
     for c in connectors:
         for pkg in CONNECTOR_WHEELS[c]:
             if pkg.split("[")[0].lower().replace("_", "-") not in names:
                 missing.append(pkg)
+    require_complete_wheelhouse(missing, profile.name, args.allow_missing_connectors)
 
     # 3. runtime.lock (every wheel, hashed; application wheel included) --------
     lines = [
@@ -316,7 +369,8 @@ def main() -> None:
     trusted.mkdir(parents=True, exist_ok=True)
     trusted_lib = trusted / "lib"
     trusted_lib.mkdir(exist_ok=True)
-    for name in ("verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh"):
+    for name in ("verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh",
+                 "profiles.py"):
         shutil.copy2(PROJECT / "scripts" / name, trusted / name)
     # install_offline.sh / upgrade_offline.sh source lib/os_packages.sh from
     # the directory they run from; a trusted-tools copy without the helper
@@ -325,7 +379,7 @@ def main() -> None:
     shutil.copy2(PROJECT / "scripts" / "lib" / "os_packages.sh", trusted_lib / "os_packages.sh")
     trusted_names = (
         "verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh",
-        "lib/os_packages.sh",
+        "profiles.py", "lib/os_packages.sh",
     )
     (trusted / "SHA256SUMS").write_text(
         "".join(
@@ -350,8 +404,8 @@ def main() -> None:
     #     Microsoft ODBC Driver 18) when mssql is selected, so install targets
     #     never need apt, a vendor repository, or any network access.
     os_packages: list[dict[str, object]] = []
-    if "mssql" in connectors:
-        os_packages = stage_os_packages(out, PROJECT / "out" / "os-packages-ubuntu24.04")
+    if "mssql" in connectors and profile.os_packages_staging:
+        os_packages = stage_os_packages(out, PROJECT / profile.os_packages_staging)
     if os_packages:
         (out / "os-packages" / "README.md").write_text(
             "# OS packages\n\nThis bundle ships a pre-staged, hash-pinned OS package "
@@ -381,7 +435,7 @@ def main() -> None:
         admin_supplied["db2_connect_license"] = "Db2 Connect client licensing if connecting to z/OS or i"
     if "mssql" in connectors and not os_packages:
         admin_supplied["mssql_odbc_driver"] = (
-            "Microsoft ODBC Driver 18 for SQL Server (.deb) + EULA acceptance"
+            f"Microsoft ODBC Driver 18 for SQL Server ({profile.odbc_driver_package}) + EULA acceptance"
         )
     manifest = {
         "release": "0.1.0",
@@ -392,7 +446,7 @@ def main() -> None:
             "python": platform.python_version(),
             "pip": sh([sys.executable, "-m", "pip", "--version"]).stdout.split()[1],
         },
-        "target": {"os": "ubuntu-24.04", "arch": "x86_64", "python": "3.12", "abi": "cp312"},
+        "target": dict(profile.manifest_target),
         "selected_connectors": connectors,
         "connector_wheel_status": {
             "included": sorted(names), "missing_from_closure": missing,

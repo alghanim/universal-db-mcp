@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from universal_db_mcp.config import load_config, load_resolved
 from universal_db_mcp.errors import ConfigError
+
+# POSIX mode-bit security regression: NTFS has no 0600 semantics, so this must
+# be skipped on win32 ONLY (macOS/Linux run it for real).
+_WIN32_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX mode-bit semantics; run on linux/macos"
+)
 
 
 def test_loads_minimal_config(tmp_path: Path) -> None:
@@ -49,6 +56,7 @@ def test_rejects_tls_without_ca(tmp_path: Path) -> None:
         load_config(p)
 
 
+@_WIN32_ONLY
 def test_secret_file_permissions_enforced(tmp_path: Path) -> None:
     secret = tmp_path / "pw"
     secret.write_text("hunter2\n")

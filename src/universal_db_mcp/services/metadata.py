@@ -40,6 +40,11 @@ class MetadataCache:
         # never be group/world readable, regardless of the process umask.
         # Applied after connect (main db) and after the WAL pragma (-wal and
         # -shm sidecars are created lazily), idempotently on every open.
+        # Windows: os.chmod is effectively a no-op on NTFS — there are no
+        # POSIX mode bits, and the cache file's protection comes from the ACLs
+        # it inherits from the state directory. The `except OSError` below
+        # already tolerates that, so no platform guard is needed here; the
+        # real hardening on Windows is provisioning the state directory ACL.
         for suffix in ("", "-wal", "-shm"):
             sidecar = Path(str(self._path) + suffix)
             try:

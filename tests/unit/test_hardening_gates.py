@@ -5,6 +5,7 @@ data, cursor kind/policy rebinding, and config edge cases."""
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 
@@ -21,6 +22,13 @@ from universal_db_mcp.errors import ToolFailure
 from universal_db_mcp.security.cursors import CursorCodec
 from universal_db_mcp.services.executor import ExecutionService
 from universal_db_mcp.services.metadata import rank_search
+
+# These are security-regression tests asserting POSIX mode-bit (0600) semantics
+# or driving Linux-only tooling (bash/dpkg). The skip must be win32-ONLY:
+# macOS is POSIX and must run every one of them for real.
+_WIN32_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX mode-bit semantics; run on linux/macos"
+)
 
 # --------------------------------------------------------------------- executor
 
@@ -357,6 +365,7 @@ def test_p0_non_finite_timeout_rejected(bad: float) -> None:
         policy.clamp_row_limit(bad)  # type: ignore[arg-type]
 
 
+@_WIN32_ONLY
 def test_p0_installer_refuses_to_run_from_inside_bundle(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The verifier/installer must come from the trusted channel, never from the
     bundle being verified (a tampered bundle would verify itself otherwise)."""
@@ -1440,6 +1449,7 @@ def _assert_container_verifies_with(pub_file, docker_args, bundle):  # type: ign
     )
 
 
+@_WIN32_ONLY
 def test_airgap_bootstrap_signs_bundle_and_exports_matching_pubkey(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """With no prebuilt bundle the gate bootstraps one itself. It used to build
     that bundle UNSIGNED while still injecting UDBMCP_RELEASE_PUBKEY into the
@@ -1721,6 +1731,7 @@ def _db2_tls_script_path():
     return Path(__file__).resolve().parents[2] / "scripts" / "db2-enable-tls.sh"
 
 
+@_WIN32_ONLY
 def test_db2_tls_script_passes_bash_syntax_check() -> None:
     import subprocess
 
@@ -2398,6 +2409,7 @@ def test_verify_bundle_untrusted_signature_diagnostic(tmp_path) -> None:
 # ------------------------------------------------- installer dpkg env hardening
 
 
+@_WIN32_ONLY
 def test_installer_dpkg_env_reaches_dpkg_through_sudo() -> None:
     """Regression: ACCEPT_EULA/DEBIAN_FRONTEND prefixed onto `sudo` land in
     sudo's own environment, which `Defaults env_reset` strips before exec'ing
@@ -2480,6 +2492,7 @@ def _upgrade_offline_script_path():  # type: ignore[no-untyped-def]
     return Path(__file__).resolve().parents[2] / "scripts" / "upgrade_offline.sh"
 
 
+@_WIN32_ONLY
 def test_upgrade_offline_script_passes_bash_syntax_check() -> None:
     import subprocess
 
@@ -2513,6 +2526,7 @@ def _rollback_offline_script_path():  # type: ignore[no-untyped-def]
     return Path(__file__).resolve().parents[2] / "scripts" / "rollback_offline.sh"
 
 
+@_WIN32_ONLY
 def test_rollback_offline_script_passes_bash_syntax_check() -> None:
     import subprocess
 
@@ -3781,6 +3795,7 @@ def _doctor_checks(report: object, name: str) -> list[dict[str, object]]:
     return checks  # type: ignore[return-value]
 
 
+@_WIN32_ONLY
 def test_doctor_flags_unwritable_audit_file(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A root-owned/0444 audit.jsonl passes a parent-dir probe but fails at
     append time; doctor must probe the configured file itself."""
@@ -3804,6 +3819,84 @@ def test_doctor_flags_unwritable_audit_file(tmp_path) -> None:  # type: ignore[n
     assert check["status"] == "fatal", check
     assert "not writable" in str(check["detail"])
     assert os.access(audit, os.W_OK) is False
+
+
+def test_doctor_reports_installed_bundle_profile(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The reported profile must be derived from the installed bundle's
+    manifest (UDBMCP_BUNDLE_MANIFEST, then <venv>/../manifest.json) — never a
+    hardcoded linux profile string — falling back to an honest description of
+    the running platform when neither source exists."""
+    import json
+    import platform
+
+    from universal_db_mcp.diagnostics.doctor import run_doctor
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("application:\n  transport: stdio\n")
+
+    # explicit override via UDBMCP_BUNDLE_MANIFEST
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"profile": "macos-arm64-cp312"}))
+    monkeypatch.setenv("UDBMCP_BUNDLE_MANIFEST", str(manifest))
+    report = run_doctor(str(cfg))
+    platform_check = _doctor_checks(report, "platform")[0]
+    assert "macos-arm64-cp312" in str(platform_check["detail"]), platform_check
+    assert "linux-x86_64-ubuntu24.04-cp312" not in json.dumps(report)
+
+    # venv-relative discovery: the installer publishes the bundle manifest at
+    # $TARGET/manifest.json, i.e. one level above <venv>/bin/python
+    monkeypatch.delenv("UDBMCP_BUNDLE_MANIFEST")
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (tmp_path / "venv" / "manifest.json").write_text(json.dumps({"profile": "windows-x86_64-cp312"}))
+    monkeypatch.setattr(sys, "executable", str(venv_bin / "python.exe"))
+    report = run_doctor(str(cfg))
+    assert "windows-x86_64-cp312" in str(_doctor_checks(report, "platform")[0]["detail"])
+    assert "linux-x86_64-ubuntu24.04-cp312" not in json.dumps(report)
+
+    # honest fallback (no manifest anywhere): describe the running platform,
+    # never claim a profile the doctor did not verify
+    (tmp_path / "venv" / "manifest.json").unlink()
+    report = run_doctor(str(cfg))
+    fallback = str(_doctor_checks(report, "platform")[0]["detail"])
+    assert f"{platform.system()}/{platform.machine()}" in fallback, fallback
+    assert "linux-x86_64-ubuntu24.04-cp312" not in fallback
+
+
+def test_doctor_mssql_odbc_remediation_is_per_os(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The msodbcsql18 remediation must match the OS: a .deb/dpkg instruction
+    is meaningless (and the os-packages/ closure nonexistent) on Windows and
+    macOS, where the driver is administrator-supplied via MSI/pkg."""
+    import types
+
+    from universal_db_mcp.diagnostics.doctor import run_doctor
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("connections:\n  m:\n    type: mssql\n    host: h\n    database: d\n")
+    # fake pyodbc whose driver list lacks 'ODBC Driver 18 for SQL Server'
+    fake_pyodbc = types.SimpleNamespace(drivers=lambda: ["PostgreSQL ANSI"])
+    monkeypatch.setitem(sys.modules, "pyodbc", fake_pyodbc)
+
+    def _remediation() -> str:
+        report = run_doctor(str(cfg))
+        check = _doctor_checks(report, "connection-m-odbc-driver")[0]
+        assert check["status"] == "fatal", check
+        return str(check["detail"])
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    win = _remediation()
+    assert "msodbcsql MSI" in win and "ODBC Administrator" in win, win
+    assert ".deb" not in win and "dpkg" not in win
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    dar = _remediation()
+    assert "msodbcsql18.pkg" in dar and "Homebrew" in dar and "ODBC Manager" in dar, dar
+    assert ".deb" not in dar and "dpkg" not in dar
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    lin = _remediation()
+    assert ".deb" in lin and "os-packages/" in lin and "dpkg" in lin, lin
+    assert "install_offline.sh" in lin
 
 
 def test_doctor_flags_corrupt_metadata_cache(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -5571,6 +5664,7 @@ def _private_mode_assert(tmp_path, name):  # type: ignore[no-untyped-def]
     return mode
 
 
+@_WIN32_ONLY
 def test_audit_log_file_created_private_under_permissive_umask(tmp_path) -> None:
     """With a default umask 022 the audit trail (which may contain SQL text)
     must still be created 0600, and an already-loose file must be tightened."""
@@ -5596,6 +5690,7 @@ def test_audit_log_file_created_private_under_permissive_umask(tmp_path) -> None
         os.umask(old_umask)
 
 
+@_WIN32_ONLY
 def test_metadata_cache_file_created_private_under_permissive_umask(tmp_path) -> None:
     """The metadata cache sqlite (and its WAL/SHM sidecars) must be 0600 even
     when the process umask would otherwise leave them world-readable."""
@@ -5617,6 +5712,39 @@ def test_metadata_cache_file_created_private_under_permissive_umask(tmp_path) ->
                 assert mode & 0o077 == 0, f"{suffix} is group/world readable: {oct(mode)}"
     finally:
         os.umask(old_umask)
+
+
+def test_audit_fchmod_invoked_on_posix_and_skipped_on_windows(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """os.fchmod is the mechanism that enforces 0600 regardless of the umask
+    (and tightens files a looser older build created). It must run on POSIX,
+    and must NOT run on win32: NTFS has no mode bits, and an fchmod failure
+    there would make every audited call fail under audit_fail_closed=true
+    (the Windows reality is the state directory's inherited ACL, which is
+    documented rather than faked)."""
+    import os
+
+    from universal_db_mcp.services.audit import AuditLog
+
+    real_fchmod = os.fchmod
+    calls: list[tuple[int, int]] = []
+
+    def _spy(fd, mode):  # type: ignore[no-untyped-def]
+        calls.append((fd, mode))
+        return real_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fchmod", _spy)
+
+    log = AuditLog(str(tmp_path / "posix.jsonl"), fail_closed=True)
+    log.record({"event": "tool_call"})
+    assert calls, "fchmod must be invoked to tighten the audit file on POSIX"
+    assert calls[0][1] == 0o600
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    calls.clear()
+    win_log = AuditLog(str(tmp_path / "win.jsonl"), fail_closed=True)
+    win_log.record({"event": "tool_call"})  # must not raise AuditWriteFailure
+    assert calls == [], "fchmod must not be attempted on Windows"
+    assert (tmp_path / "win.jsonl").read_text(encoding="utf-8").count("tool_call") == 1
 
 
 def test_systemd_unit_sets_restrictive_umask() -> None:

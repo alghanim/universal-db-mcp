@@ -1,0 +1,115 @@
+#!/bin/bash
+# macOS .pkg preinstall — runs as root BEFORE the payload is unpacked.
+#
+# Trust model: this script validates TRUST PREREQUISITES ONLY. A pkg's
+# preinstall cannot see the unpacked payload, so it CANNOT verify the bundle
+# here — the payload itself is verified in postinstall via the trusted
+# verifier (the same verify-then-execute boundary as install_offline.sh).
+# Nothing in this script executes any payload file; it only stats/reads the
+# admin-installed trust material and the python.org CPython installation.
+#
+# Fail closed: every failed check exits 1 so the macOS Installer aborts
+# before a single payload byte lands on disk.
+set -euo pipefail
+
+# Fixed per-machine paths (non-relocatable package; absolute paths are
+# load-bearing). They match docs/offline-deployment.md ("Trust bootstrap")
+# and scripts/install_offline.sh defaults exactly, so postinstall can call
+# the trusted verifier without any reconfiguration.
+TRUST_DIR="/usr/local/lib/udbmcp-trust"
+VERIFIER="$TRUST_DIR/verify_bundle.py"
+PUBKEY="/etc/universal-db-mcp/keys/release.pub.pem"
+
+# --- trust prerequisite 1: trusted-channel verifier -------------------------
+# The verifier must NOT come from the bundle it verifies (a tampered bundle
+# would ship a verifier that prints PASSED). It is distributed on the trusted
+# channel alongside the release public key and installed at a root-owned path
+# outside the bundle BEFORE this package is installed.
+if [ ! -f "$VERIFIER" ]; then
+  echo "FAIL: trusted verifier not found at $VERIFIER." >&2
+  echo "" >&2
+  echo "This package never runs its payload without a prior trusted-channel" >&2
+  echo "verification. Complete the trust bootstrap first (see" >&2
+  echo "docs/offline-deployment.md, 'Trust bootstrap'):" >&2
+  echo "" >&2
+  echo "  sudo install -d -m 755 $TRUST_DIR" >&2
+  echo "  sudo install -m 644 <trusted-channel>/verify_bundle.py $TRUST_DIR/" >&2
+  echo "  sudo install -m 755 <trusted-channel>/install_offline.sh $TRUST_DIR/" >&2
+  echo "" >&2
+  echo "then re-run this installer." >&2
+  exit 1
+fi
+
+# --- trust prerequisite 2: release public key -------------------------------
+# The release public key is NEVER shipped inside any package: the admin
+# distributes it out-of-band on the same trusted channel as the verifier and
+# installs it at the runbook path before installing this package.
+if [ ! -f "$PUBKEY" ]; then
+  echo "FAIL: release public key not found at $PUBKEY." >&2
+  echo "" >&2
+  echo "An unsigned/unverified bundle must never be installed. Install the" >&2
+  echo "release public key (distributed out-of-band — it is intentionally NOT" >&2
+  echo "inside this package) at the runbook path:" >&2
+  echo "" >&2
+  echo "  sudo install -d -m 755 /etc/universal-db-mcp /etc/universal-db-mcp/keys" >&2
+  echo "  sudo install -m 644 <trusted-channel>/udbmcp-release.pub.pem $PUBKEY" >&2
+  echo "" >&2
+  echo "then re-run this installer." >&2
+  exit 1
+fi
+if [ ! -s "$PUBKEY" ]; then
+  echo "FAIL: release public key at $PUBKEY is empty; refusing to proceed." >&2
+  echo "      Re-install the real key from the trusted channel:" >&2
+  echo "" >&2
+  echo "  sudo install -m 644 <trusted-channel>/udbmcp-release.pub.pem $PUBKEY" >&2
+  echo "" >&2
+  echo "then re-run this installer." >&2
+  exit 1
+fi
+
+# --- runtime prerequisite: CPython 3.12 available to ALL users ---------------
+# The venv is built in postinstall by the launchd service context, so the
+# interpreter must be a per-machine (all-users) install — a per-user
+# ~/Library install is invisible to it and to the _udbmcp service account.
+# The python.org macOS installer provides exactly that:
+#   - /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+#   - /usr/local/bin/python3 (symlink to the framework binary)
+FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+USR_LOCAL_PY="/usr/local/bin/python3"
+
+py_ok() {
+  # Accept a candidate only if it really is CPython 3.12 (a stale
+  # /usr/local/bin/python3 pointing at another version must not pass).
+  "$1" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null
+}
+
+if [ -f "$FRAMEWORK_PY" ] && py_ok "$FRAMEWORK_PY"; then
+  PY_OK=1
+elif [ -x "$USR_LOCAL_PY" ] && py_ok "$USR_LOCAL_PY"; then
+  PY_OK=1
+  echo "NOTE: $FRAMEWORK_PY not found; using $USR_LOCAL_PY ($( "$USR_LOCAL_PY" -V 2>&1 ))." >&2
+  echo "      Prefer the python.org framework install so the interpreter is" >&2
+  echo "      unambiguously per-machine." >&2
+else
+  PY_OK=0
+fi
+
+if [ "$PY_OK" -ne 1 ]; then
+  echo "FAIL: CPython 3.12 (all-users install) not found." >&2
+  echo "" >&2
+  echo "Checked:" >&2
+  echo "  $FRAMEWORK_PY" >&2
+  echo "  $USR_LOCAL_PY" >&2
+  echo "" >&2
+  echo "Install the official macOS 64-bit universal2 installer for Python" >&2
+  echo "3.12 from https://www.python.org/downloads/macos/ (the python.org" >&2
+  echo "installer is per-machine and lands in /Library/Frameworks), then" >&2
+  echo "re-run this installer. Per-user installs (~/Library/Python) and" >&2
+  echo "version managers do NOT satisfy this requirement: the service runs" >&2
+  echo "as the _udbmcp account and cannot see them." >&2
+  exit 1
+fi
+
+echo "preinstall: trust prerequisites and CPython 3.12 present; payload" >&2
+echo "preinstall: will be signature-verified in postinstall before use." >&2
+exit 0

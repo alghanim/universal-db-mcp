@@ -13,7 +13,10 @@ sudo systemctl restart universal-db-mcp
 
 Properties:
 
-- The old venv is preserved at `/opt/universal-db-mcp/venv.previous`.
+- The old venv is preserved at `/opt/universal-db-mcp/venv.previous`, together
+  with a SHA256 integrity manifest at `/opt/universal-db-mcp/venv.previous.sha256`,
+  recorded BEFORE the rename (an upgrade interrupted between the two
+  operations still leaves a verifiable tree).
 - Configuration and metadata cache are backed up to
   `/var/backups/universal-db-mcp/pre-upgrade-<ts>/`.
 - An interrupted upgrade leaves `venv.new-*` behind and the running venv
@@ -30,6 +33,14 @@ sudo systemctl restart universal-db-mcp
 ```
 
 Restores the previous venv and (if present) the latest config/state backup.
+
+Trust discipline (fail closed): rollback executes `venv.previous` (the doctor
+validation) only after re-hashing the tree against
+`/opt/universal-db-mcp/venv.previous.sha256`. A missing or mismatched
+manifest aborts the rollback BEFORE any rename and BEFORE anything under the
+tree is executed; `venv.previous` is preserved for analysis. Recover by
+re-running `upgrade_offline.sh` (which rebuilds both the venv and its
+manifest) or by reinstalling from the signed bundle.
 
 ## Importing security fixes
 

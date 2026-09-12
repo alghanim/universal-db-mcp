@@ -41,9 +41,80 @@ docker save udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312 \
 UDBMCP_RELEASE_KEY=udbmcp-release.pem bash scripts/prepare_baseline_image.sh
 
 # 5. verify the finished bundle (what the target will run)
-.venv/bin/python out/bundle/universal-db-mcp-*/installers/verify_bundle.py \
+#    Run the trusted-tools/ copy: it travels OUTSIDE the bundle on the same
+#    trusted channel as the public key and carries profiles.py (the
+#    target-profile registry the verifier requires). The copy inside the
+#    bundle's installers/ directory is a reference for auditing only —
+#    executing it fails closed (no registry), and a bundle must never
+#    verify itself anyway. On a staging host whose platform differs from
+#    the bundle profile, add --allow-platform-mismatch (staging-side
+#    integrity/authenticity check only); on the actual install target,
+#    run WITHOUT it.
+.venv/bin/python out/bundle/trusted-tools/verify_bundle.py \
   --bundle out/bundle/universal-db-mcp-* --pubkey udbmcp-release.pub.pem
 ```
+
+## Per-profile Stage A build matrix
+
+The profile registry `scripts/profiles.py` drives the builder and the
+verifier. The default profile (`linux-x86_64-ubuntu24.04-cp312`) is unchanged:
+its Stage A flow is exactly the `## Procedure` block above, verbatim —
+including the baseline-image export/refresh (steps 3 and 4b), the optional
+container-mode application image (step 4), and the final trusted-channel
+`verify_bundle.py --pubkey` run (step 5).
+
+Windows and macOS have **no baseline image and no OS-package staging**
+(targets install natively), so their Stage A reduces to the bundle build plus
+the same final verification:
+
+```
+# windows-x86_64-cp312 (win_amd64; no OS-package staging, no baseline image)
+.venv/bin/python scripts/prepare_offline_bundle.py \
+  --profile windows-x86_64-cp312 --out out/bundle-win \
+  --source-rev "$(git rev-parse HEAD 2>/dev/null || date -u +%Y%m%dT%H%M%SZ)" \
+  --signing-key udbmcp-release.pem
+
+# macos-arm64-cp312 (macosx_11_0_arm64 + macosx_14_0_arm64 via repeated
+# --platform; no OS-package staging, no baseline image)
+.venv/bin/python scripts/prepare_offline_bundle.py \
+  --profile macos-arm64-cp312 --out out/bundle-macos \
+  --source-rev "$(git rev-parse HEAD 2>/dev/null || date -u +%Y%m%dT%H%M%SZ)" \
+  --signing-key udbmcp-release.pem
+
+# verification (all profiles): run the trusted-tools/ copy from the trusted
+# channel exactly as in step 5 above, against that profile's bundle
+# directory. Do not use the reference copy inside the bundle's installers/
+# directory — it fails closed without the profiles.py registry.
+.venv/bin/python out/bundle-win/trusted-tools/verify_bundle.py \
+  --bundle out/bundle-win/universal-db-mcp-* --pubkey udbmcp-release.pub.pem
+```
+
+### Fail-loud missing-wheel rule
+
+Missing top-level connector wheels fail the build (SystemExit naming the
+wheels and profile) — they are no longer merely recorded as a NOTE in the
+manifest. The only escape hatch is `--allow-missing-connectors`, which
+records the gaps and proceeds; and that flag is refused when `--signing-key`
+is set:
+
+```
+--allow-missing-connectors cannot be combined with --signing-key: ...
+Complete the closure, or build without the signing key.
+```
+
+A signed release can never ship a knowingly incomplete wheelhouse. If the
+closure genuinely cannot be completed, the unsigned escape-hatch bundle must
+go through the same trusted-channel verification before use, and its manifest
+carries the missing-wheel list for the administrator to resolve out-of-band.
+
+### Correction: ibm-db on macOS arm64
+
+An earlier revision of this document treated Db2 (ibm-db) as unavailable on
+macOS arm64. That is no longer true: **ibm-db 3.2.9 ships a
+`macosx_14_0_arm64` wheel**, so the Db2 connector rides in the macOS
+wheelhouse under the `macos-arm64-cp312` profile. The clidriver is bundled
+with the wheel; the runtime round-trip remains unverified on all platforms,
+and the builder's fail-loud rule is the backstop if PyPI drifts.
 
 ## What the bundle contains
 

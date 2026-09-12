@@ -1,0 +1,105 @@
+#!/bin/bash
+# Debian preinst for universal-db-mcp: trust-prerequisites check ONLY.
+#
+# ---------------------------------------------------------------------------
+# ORDERING — READ BEFORE "FIXING" THIS SCRIPT
+#
+# dpkg unpacks the package payload AFTER preinst runs. At this moment the
+# signed bundle (which this package ships at /usr/share/universal-db-mcp/)
+# is NOT on disk yet, so the payload CANNOT be verified here. This is not an
+# oversight to be repaired by adding a verifier invocation below — any such
+# call would fail (file not found) or, worse, tempt someone into verifying
+# against a copy inside the package itself, which proves nothing: a tampered
+# package ships a tampered verifier that prints PASSED.
+#
+# The honest equivalent, per the approved plan:
+#   preinst  (this script)  -> check that the trust PREREQUISITES exist:
+#                              the admin-installed trusted verifier and the
+#                              release public key (distributed out-of-band on
+#                              a trusted channel — never shipped in any
+#                              package). Exit 1 with bootstrap instructions
+#                              if either is absent; dpkg aborts the install.
+#   postinst                -> run the ONE trusted installer
+#                              (install_offline.sh), which re-verifies the
+#                              now-unpacked payload via verify_bundle.py
+#                              --pubkey BEFORE anything in it is executed.
+# Verify-then-execute is inherited from that installer, not re-implemented.
+# ---------------------------------------------------------------------------
+set -eu
+
+TRUST_DIR="/usr/local/lib/udbmcp-trust"
+VERIFIER="${TRUST_DIR}/verify_bundle.py"
+PUBKEY="/etc/universal-db-mcp/keys/release.pub.pem"
+
+# Print a failure diagnostic. Does NOT exit: callers append the matching
+# bootstrap instructions and exit 1 themselves (fail closed) so the admin
+# sees both the problem and the fix in one dpkg error report.
+fail() {
+    echo "FAIL: $1" >&2
+}
+
+bootstrap_verifier() {
+    cat >&2 <<'EOF'
+Bootstrap the trusted tools from the same trusted channel that delivered
+this package (see docs/offline-deployment.md, 'Trust bootstrap'). ALL of
+the files below are required, not just the two scripts: verify_bundle.py
+imports profiles.py (the target-profile registry) from its own directory,
+and install_offline.sh sources lib/os_packages.sh relative to its own
+location. A trust dir missing either file passes this preinst but aborts
+later in postinst with a diagnostic about that missing file instead.
+
+    sudo install -d -m 755 /usr/local/lib/udbmcp-trust
+    sudo install -m 644 <trusted-channel>/verify_bundle.py /usr/local/lib/udbmcp-trust/
+    sudo install -m 644 <trusted-channel>/profiles.py /usr/local/lib/udbmcp-trust/
+    sudo install -m 755 <trusted-channel>/install_offline.sh /usr/local/lib/udbmcp-trust/
+    sudo install -d -m 755 /usr/local/lib/udbmcp-trust/lib
+    sudo install -m 644 <trusted-channel>/lib/os_packages.sh /usr/local/lib/udbmcp-trust/lib/
+EOF
+}
+
+bootstrap_pubkey() {
+    cat >&2 <<'EOF'
+Install the release public key (distributed out-of-band by the release
+administrator; it is deliberately NOT shipped inside any package):
+
+    sudo install -d -m 755 /etc/universal-db-mcp /etc/universal-db-mcp/keys
+    sudo install -m 644 <trusted-path>/udbmcp-release.pub.pem /etc/universal-db-mcp/keys/release.pub.pem
+EOF
+}
+
+# --- prerequisite 1: the trusted verifier -----------------------------------
+# Installed by the admin with `install -m 644`, so it is executed via
+# python3, not directly: check readability, never the exec bit.
+if [ ! -r "$VERIFIER" ]; then
+    fail "trusted verifier not found (or not readable) at $VERIFIER.
+
+The package refuses to install without it: nothing in this package may run
+payload that has not passed verification by an admin-installed trusted
+verifier obtained outside the package/bundle supply chain."
+    bootstrap_verifier
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
+
+# --- prerequisite 2: the release public key ---------------------------------
+# Never shipped inside this package (or any artifact of the release): the
+# admin distributes it out-of-band so that verifying with it actually means
+# something. Fail closed if it is not in place.
+if [ ! -r "$PUBKEY" ]; then
+    fail "release public key not found (or not readable) at $PUBKEY.
+
+The package refuses to install without it: post-install verification of the
+signed bundle requires the admin-held public key, and an unsigned/unverified
+bundle must never be installed."
+    bootstrap_pubkey
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
+
+echo "universal-db-mcp preinst: trust prerequisites present."
+echo "  verifier: $VERIFIER"
+echo "  pubkey:   $PUBKEY"
+echo "Payload verification happens in postinst via the trusted installer"
+echo "(dpkg unpacks the payload only after this script exits)."
+
+exit 0

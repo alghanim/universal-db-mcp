@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  UniversalDB MCP - Windows MSI authoring (WiX v4/v5 schema, namespace below).
+
+  Trust model (MUST be preserved by every change here):
+    * The payload installed into INSTALLFOLDER\bundle is the SIGNED offline
+      bundle exactly as produced by scripts/prepare_offline_bundle.py. Nothing
+      in this package executes payload bits before the deferred
+      verify_bundle.py custom action has re-verified the installed tree with
+      the admin-distributed release public key (see plan Phase 5).
+    * The release public key is NEVER embedded in this package. The admin
+      provisions it out-of-band into C:\ProgramData\udbmcp-trust\ before
+      running the MSI; verification fails closed if it is absent.
+    * The venv build custom action MUST run pip in no-index mode with
+      require-hashes and PIP_CONFIG_FILE neutralized
+      (see packaging/msi/custom/*.ps1).
+
+  Build-time inputs (filled by scripts/package/build_msi.sh; do not hardcode):
+    * -define ProductVersion=<manifest.release.version>
+    * -define ConfigTemplateSource=<path to staged config template> and
+      -define ConfigTemplateGuid=<stable GUID for the config component>
+    * -define CustomActionScriptsDir=<staged copy of packaging/msi/custom/>
+      (the deferred custom action scripts below are shipped inside the MSI)
+    * -arch x64 (ProgramFiles64Folder resolves to "C:\Program Files").
+    * The staged signed bundle is harvested by build_msi.sh's built-in
+      fragment generator into harvest.wxi (included below as a fragment;
+      build_msi.sh GENERATES that file, it is not authored by hand). `heat`
+      is not part of the WiX v4+ `wix` CLI, so the harvest is generated
+      natively; its components land under DirectoryRef Id="BundleDir" and
+      resolve File/@Source through the -define BundleSourceDir variable.
+
+  Validation on the staging host: xmllint, noout mode, on packaging/msi/udbmcp.wxs
+  (syntactic only; full compilation requires `wix build` from Phase 0).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <!--
+    Build-time overrides (scripts/package/build_msi.sh) pass -define flags
+    for ProductVersion and ConfigTemplateSource. Every default here is
+    therefore guarded with <?ifndef>: an unguarded in-file define OVERWRITES
+    the command-line value (with only a preprocessor warning), which would
+    silently stamp a stale version or placeholder config path into the MSI.
+  -->
+  <?ifndef ProductVersion ?>
+  <?define ProductVersion = "0.1.0" ?>
+  <?endif?>
+  <?ifndef ConfigTemplateSource ?>
+  <!-- Overridden by build_msi.sh: -define ConfigTemplateSource=<abs path> -->
+  <?define ConfigTemplateSource = "config-template-placeholder.yaml" ?>
+  <?endif?>
+  <?ifndef ConfigTemplateGuid ?>
+  <?define ConfigTemplateGuid = "5EE39CAC-D6B9-4BFA-A3EC-8BA64CE51A2B" ?>
+  <?endif?>
+
+  <Package
+      Name="UniversalDB MCP"
+      Manufacturer="UniversalDB MCP project"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="8E2F9A9E-7214-4937-B72F-262CBC7DD1EA"
+      InstallerVersion="500"
+      Scope="perMachine"
+      Language="1033"
+      Compressed="yes">
+
+    <!--
+      Scope="perMachine" is the WiX v4/v5 name of the v3 InstallScope="perMachine".
+      UpgradeCode is FROZEN across all future releases of this product line;
+      changing it breaks upgrade/downgrade detection.
+    -->
+    <MajorUpgrade
+        Schedule="afterInstallValidate"
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      Prerequisite: an all-users (per-machine) CPython 3.12 from python.org.
+      Per-machine installers write HKLM\SOFTWARE\Python\PythonCore\3.12\InstallPath
+      (PEP 514 layout); a per-user install only writes HKCU, so this check
+      deliberately enforces the all-users prerequisite. Bitness="always64"
+      reads the 64-bit registry view of the x64 MSI (the WiX v4/v5 spelling;
+      the v3 attribute was Win64="yes"). "Installed OR" keeps
+      uninstall/repair working even if Python was later removed.
+    -->
+    <Property Id="CPYTHON312" Secure="yes">
+      <RegistrySearch
+          Id="CPython312PerMachineInstallPath"
+          Root="HKLM"
+          Key="SOFTWARE\Python\PythonCore\3.12\InstallPath"
+          Type="raw"
+          Bitness="always64" />
+    </Property>
+    <!-- WiX v4/v5 renamed the v3 <LaunchCondition> child of <Package> to
+         <Launch>; it must stay a direct child of Package. -->
+    <Launch
+        Condition="Installed OR CPYTHON312"
+        Message="CPython 3.12 (python.org, all-users) is required. Install the 64-bit CPython 3.12 from python.org for all users before running this installer." />
+
+    <!--
+      Optional service-account override for the deferred RegisterServiceCA
+      (public property, so admins may pass e.g.
+      UDBMCP_SERVICE_ACCOUNT="NT AUTHORITY\NetworkService" on the msiexec
+      command line). Empty by default: service.ps1 then falls back to the
+      machine-scope UDBMCP_SERVICE_ACCOUNT environment value and finally to
+      LocalSystem. Secure="yes" keeps the value available to the elevated
+      server side of this per-machine install. The account value is never
+      taken from a less-trusted source than the elevated command line, and
+      service.ps1 rejects quotes/line breaks in it (fail closed).
+    -->
+    <Property Id="UDBMCP_SERVICE_ACCOUNT" Secure="yes" />
+
+    <!--
+      Directory tree. The signed-bundle payload under BundleDir is NOT
+      authored here: build_msi.sh harvests the staged signed bundle with
+      heat into harvest.wxi, whose Fragment defines ComponentGroup
+      Id="HarvestedBundleComponents" with DirectoryRef Id="BundleDir"
+      components (Guid="*" heat-style). These components must carry no
+      custom actions or conditions that could run payload early.
+    -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="UniversalDB MCP">
+        <Directory Id="BundleDir" Name="bundle" />
+        <!--
+          The deferred custom action scripts (packaging/msi/custom/*.ps1),
+          staged by build_msi.sh and resolved here via -define
+          CustomActionScriptsDir. They are installed OUTSIDE the bundle
+          directory (INSTALLFOLDER\scripts is a SIBLING of
+          INSTALLFOLDER\bundle): verify.ps1 refuses to run from inside the
+          bundle — a verifier shipped in the payload would be a tampered
+          verifier that prints PASSED — and nothing from INSTALLFOLDER\bundle
+          may execute before verification has passed anyway. Each script is
+          its own single-file component (WiX generates a stable GUID).
+        -->
+        <Directory Id="ScriptsDir" Name="scripts">
+          <Component Id="VerifyPs1Component" Guid="*">
+            <File Id="VerifyPs1File" Name="verify.ps1"
+                  Source="$(var.CustomActionScriptsDir)/verify.ps1" KeyPath="yes" />
+          </Component>
+          <Component Id="VenvPs1Component" Guid="*">
+            <File Id="VenvPs1File" Name="venv.ps1"
+                  Source="$(var.CustomActionScriptsDir)/venv.ps1" KeyPath="yes" />
+          </Component>
+          <Component Id="DoctorPs1Component" Guid="*">
+            <File Id="DoctorPs1File" Name="doctor.ps1"
+                  Source="$(var.CustomActionScriptsDir)/doctor.ps1" KeyPath="yes" />
+          </Component>
+          <Component Id="ServicePs1Component" Guid="*">
+            <File Id="ServicePs1File" Name="service.ps1"
+                  Source="$(var.CustomActionScriptsDir)/service.ps1" KeyPath="yes" />
+          </Component>
+          <Component Id="UninstallPs1Component" Guid="*">
+            <File Id="UninstallPs1File" Name="uninstall.ps1"
+                  Source="$(var.CustomActionScriptsDir)/uninstall.ps1" KeyPath="yes" />
+          </Component>
+        </Directory>
+        <Directory Id="ConfigTemplatesDir" Name="config-templates" />
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      Machine-wide configuration: ProgramData\UniversalDB MCP\config.yaml
+      installed once, NeverOverwrite="yes" so upgrades and repairs never
+      clobber admin-edited configuration (mirrors the .deb conffile and
+      macOS pkg "install only if absent" semantics).
+    -->
+    <!-- CommonAppDataFolder is the MSI standard directory for
+         C:\ProgramData (there is no "ProgramDataFolder" standard directory;
+         the WiX compiler rejects any other Id under StandardDirectory). -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ProgramDataUdbmcpDir" Name="UniversalDB MCP">
+        <Component
+            Id="ConfigYamlComponent"
+            Guid="$(var.ConfigTemplateGuid)"
+            NeverOverwrite="yes">
+          <File
+              Id="ConfigYamlFile"
+              Name="config.yaml"
+              Source="$(var.ConfigTemplateSource)"
+              KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      ServiceControl / Service elements are DELIBERATELY ABSENT.
+      WiX ServiceInstall/ServiceControl require the service executable to
+      exist at authoring time, but the venv python.exe that runs
+      `python -m universal_db_mcp serve` is created by a custom action
+      during installation, so it does not exist when this .wxs is compiled.
+      The service is therefore registered by the deferred RegisterServiceCA
+      custom action below, which runs service.ps1 to invoke:
+        * sc.exe create udbmcp binPath= "<venv>\Scripts\python.exe" -m universal_db_mcp serve start= auto
+        * sc.exe failure udbmcp reset= 86400 actions= restart/60000
+      (mirroring packaging/systemd/universal-db-mcp.service Restart=on-failure),
+      and the uninstall custom action mirrors with sc.exe stop/delete.
+      The PowerShell implementations live in packaging/msi/custom/*.ps1 (see
+      the ScriptsDir components above); they are wired up HERE and by
+      build_msi.sh, which stages them and passes -define CustomActionScriptsDir.
+    -->
+
+    <!--
+      The deferred custom actions — the runtime half of this package's trust
+      model (verify before execute). Sequencing in the InstallExecuteSequence
+      below, in this exact order:
+
+        VerifyBundleCA           AFTER InstallFiles. Runs verify.ps1: the
+                                 ADMIN-installed trusted verify_bundle.py with
+                                 the admin pubkey (from
+                                 C:\ProgramData\udbmcp-trust, OUTSIDE the
+                                 bundle; the release public key is NEVER
+                                 shipped in this package — the admin
+                                 distributes it out-of-band and the action
+                                 reads it from machine scope) re-verifies the
+                                 installed bundle. NO payload may execute
+                                 before this action has passed.
+        BuildVenvCA              AFTER VerifyBundleCA. venv.ps1 builds the
+                                 venv from the verified wheelhouse only
+                                 (no-index + require-hashes pip modes,
+                                 PIP_CONFIG_FILE neutralized). Still no
+                                 payload execution.
+        DoctorSmokeCA            AFTER BuildVenvCA. doctor.ps1 — the FIRST
+                                 execution of payload code, strictly after
+                                 verification passed — validates the install.
+        RegisterServiceCA        AFTER DoctorSmokeCA. service.ps1 registers
+                                 the udbmcp service via sc.exe (auto start,
+                                 failure recovery). Only verified,
+                                 doctor-healthy payload is ever registered as
+                                 a service.
+        RollbackRemoveServiceCA  rollback twin BEFORE RegisterServiceCA: a
+                                 rollback action must ALWAYS precede the
+                                 deferred action it rolls back in the
+                                 sequence, otherwise a failure or user
+                                 cancellation during the register action
+                                 itself never enters the rollback script and
+                                 the half-created service would survive the
+                                 rolled-back install. sc.exe state is not
+                                 transactional, so the rollback script runs
+                                 uninstall.ps1 to stop and delete it. The
+                                 verify / venv / doctor actions need no
+                                 rollback twin: they make no machine-global
+                                 change — the MSI transaction itself rolls
+                                 back their installed files, and venv.ps1
+                                 rebuilds any stale venv from the verified
+                                 wheelhouse on the next install attempt.
+        RemoveServiceCA          BEFORE RemoveFiles, only on uninstall
+                                 (REMOVE="ALL"): uninstall.ps1 stops and
+                                 deletes the service while its script file
+                                 still exists on disk.
+
+      Every action runs Execute="deferred" (or "rollback" for the twin),
+      Impersonate="no" (LocalSystem: per-machine writes and sc.exe need it)
+      and Return="check": any nonzero exit — verify.ps1 fails closed on EVERY
+      verification failure — aborts the install and rolls it back.
+
+      Windows Installer formats the command line of a deferred exe custom
+      action when the installation sequence is processed into the execution
+      script, so the [INSTALLFOLDER]-style references below resolve at that
+      point; nothing is read from the session at execution time.
+    -->
+
+    <!--
+      powershell.exe lives at a fixed system path on every supported Windows
+      host (inbox Windows PowerShell 5.1; System64Folder = System32 in this
+      x64 package, so this is the 64-bit interpreter). The path is set by an
+      immediate custom action in the execute sequence so the deferred actions
+      below always see the resolved value at script-generation time — and so
+      a caller-supplied POWERSHELLEXE cannot redirect the deferred actions to
+      a different executable (the assignment is unconditional).
+    -->
+    <CustomAction
+        Id="SetPowerShellExe"
+        Property="POWERSHELLEXE"
+        Value="[System64Folder]WindowsPowerShell\v1.0\powershell.exe" />
+
+    <CustomAction
+        Id="VerifyBundleCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\verify.ps1&quot; -CustomActionData &quot;BUNDLE_DIR=[INSTALLFOLDER]bundle&quot;"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <CustomAction
+        Id="BuildVenvCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\venv.ps1&quot; -BundleDir &quot;[INSTALLFOLDER]bundle&quot; -VenvDir &quot;[INSTALLFOLDER]venv&quot;"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <CustomAction
+        Id="DoctorSmokeCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\doctor.ps1&quot; -VenvDir &quot;[INSTALLFOLDER]venv&quot; -ConfigPath &quot;[ProgramDataUdbmcpDir]config.yaml&quot; -BundleManifest &quot;[INSTALLFOLDER]bundle\manifest.json&quot;"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <CustomAction
+        Id="RegisterServiceCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\service.ps1&quot; -VenvDir &quot;[INSTALLFOLDER]venv&quot; -ConfigPath &quot;[ProgramDataUdbmcpDir]config.yaml&quot; -ServiceAccount &quot;[UDBMCP_SERVICE_ACCOUNT]&quot;"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <CustomAction
+        Id="RollbackRemoveServiceCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\uninstall.ps1&quot; -ServiceName &quot;udbmcp&quot;"
+        Execute="rollback"
+        Impersonate="no"
+        Return="check" />
+
+    <CustomAction
+        Id="RemoveServiceCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\uninstall.ps1&quot; -ServiceName &quot;udbmcp&quot;"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <InstallExecuteSequence>
+      <!-- Immediate type-51 assignment: runs during script generation right
+           before the first deferred action, so POWERSHELLEXE is the resolved
+           literal path from that point on. -->
+      <Custom Action="SetPowerShellExe" Before="VerifyBundleCA" />
+      <!-- Install / repair (NOT REMOVE); uninstall skips all of these. -->
+      <Custom Action="VerifyBundleCA" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="BuildVenvCA" After="VerifyBundleCA" Condition="NOT REMOVE" />
+      <Custom Action="DoctorSmokeCA" After="BuildVenvCA" Condition="NOT REMOVE" />
+      <Custom Action="RegisterServiceCA" After="DoctorSmokeCA" Condition="NOT REMOVE" />
+      <Custom Action="RollbackRemoveServiceCA" Before="RegisterServiceCA" Condition="NOT REMOVE" />
+      <!-- Uninstall only: remove the service before RemoveFiles deletes the
+           uninstall.ps1 file the action itself runs. -->
+      <Custom Action="RemoveServiceCA" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="UniversalDB MCP Server" Level="1">
+      <!-- Harvested signed-bundle payload: Fragment generated by build_msi.sh
+           (built-in WiX v4-native harvester -> harvest.wxi). Fails closed at
+           build time if absent. -->
+      <ComponentGroupRef Id="HarvestedBundleComponents" />
+      <ComponentRef Id="ConfigYamlComponent" />
+      <!-- The deferred custom action scripts, shipped inside the MSI. -->
+      <ComponentRef Id="VerifyPs1Component" />
+      <ComponentRef Id="VenvPs1Component" />
+      <ComponentRef Id="DoctorPs1Component" />
+      <ComponentRef Id="ServicePs1Component" />
+      <ComponentRef Id="UninstallPs1Component" />
+    </Feature>
+  </Package>
+
+  <!--
+    GENERATED AT BUILD TIME by scripts/package/build_msi.sh (built-in
+    heat-equivalent WiX v4 fragment generator — heat is not a command of the
+    WiX v4+ wix CLI):
+      components directly under DirectoryRef Id="BundleDir", one per payload
+      file, grouped as ComponentGroup Id="HarvestedBundleComponents", with
+      File/@Source resolved via -define BundleSourceDir.
+    This include must resolve to a Fragment containing ComponentGroup
+    Id="HarvestedBundleComponents". It is intentionally not committed.
+  -->
+  <?include "harvest.wxi" ?>
+</Wix>

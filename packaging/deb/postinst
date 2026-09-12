@@ -1,0 +1,423 @@
+#!/bin/bash
+# Debian postinst for universal-db-mcp (run by dpkg as root after unpack).
+#
+# Trust model (see scripts/install_offline.sh and docs/offline-deployment.md):
+#   - a package NEVER executes payload before a trusted verify_bundle.py
+#     --pubkey run has passed;
+#   - the release public key is NEVER shipped inside the package: the admin
+#     distributes it out-of-band and installs it at
+#     /etc/universal-db-mcp/keys/release.pub.pem before dpkg -i (checked by
+#     the preinst; re-checked here — fail closed);
+#   - this script does NOT fork the installer: it reuses the ONE trusted
+#     implementation, scripts/install_offline.sh, so verify-then-use staging
+#     (private root-owned copy, re-verified in the privileged context) and the
+#     hostile-env pip neutralization (--no-index --require-hashes,
+#     PIP_CONFIG_FILE=/dev/null) are inherited, not re-implemented.
+#
+# The deb payload (laid out by scripts/package/build_deb.sh) is:
+#   /usr/share/universal-db-mcp/bundle/         the SIGNED offline bundle
+#   /usr/share/universal-db-mcp/trusted-tools/  INERT reference copy of the
+#                              verifier + installer + lib/ — see step 1: the
+#                              package NEVER executes it and NEVER copies it
+#                              into the trust dir
+#   /usr/share/universal-db-mcp/systemd/        the deb-shipped systemd unit
+#
+# WHY the install is DEFERRED when the bundle ships OS packages:
+# dpkg holds its frontend and database locks for the WHOLE `dpkg -i` run,
+# INCLUDING while this postinst executes. install_offline.sh installs the
+# bundle's os-packages/*.deb closure with `dpkg -i` (via lib/os_packages.sh),
+# which deadlocks against the outer dpkg when run inside the postinst
+# (empirically: "dpkg frontend lock was locked by another process"; no
+# environment variable lifts the database lock either). So whenever the
+# unpacked bundle contains os-packages/*.deb, postinst:
+#   1. verifies the unpacked payload SYNCHRONOUSLY with the trusted verifier
+#      (hashing needs no dpkg lock): a tampered package still fails the
+#      configure step — fail closed is preserved at the dpkg level;
+#   2. pre-flights every file the install will need (still fail closed);
+#   3. hands the actual install to a detached root worker (written below)
+#      that waits until the outer dpkg has released its locks, then runs
+#      install_offline.sh VERBATIM (which re-verifies before anything
+#      executes) and only then installs the unit/config and enables the
+#      service. The worker records success/failed in a status file; on any
+#      failure nothing unverified is executed or enabled.
+# Bundles WITHOUT os-packages keep the fully synchronous flow below.
+#
+# set -e: ANY verification or pre-flight failure exits nonzero, which makes
+# dpkg abort the configure step (fail closed, never partially trusted).
+set -e
+
+BUNDLE=/usr/share/universal-db-mcp/bundle
+TRUST_DIR=/usr/local/lib/udbmcp-trust
+PUBKEY=/etc/universal-db-mcp/keys/release.pub.pem
+TARGET=/opt/universal-db-mcp
+UNIT_SRC=/usr/share/universal-db-mcp/systemd/universal-db-mcp.service
+UNIT_DST=/etc/systemd/system/universal-db-mcp.service
+CONFIG_DIR=/etc/universal-db-mcp
+CONFIG="$CONFIG_DIR/config.yaml"
+LOG=/var/log/universal-db-mcp-install.log
+STATUS=/var/log/universal-db-mcp-install.status
+
+# --- step 1: the ADMIN trust dir must already be complete (fail closed) ------
+# The package NEVER bootstraps /usr/local/lib/udbmcp-trust from its own
+# payload, and never "completes" a partial admin install from it either. The
+# deb ships a trusted-tools/ copy (see the payload layout above), but that
+# copy travels on the SAME channel as the payload it would verify: a tampered
+# package would ship a tampered verifier that prints PASSED and a tampered
+# installer that skips verification, and copying either into the trust dir
+# would run it as root right here in this privileged context. The deb-shipped
+# copy is therefore INERT reference material: nothing in this script reads,
+# copies or executes it. The trust dir is an admin prerequisite exactly like
+# the release pubkey: installed out-of-band from the trusted channel
+# (docs/offline-deployment.md, 'Trust bootstrap'). The preinst already
+# refuses without it; this re-check exists because postinst is ALSO reachable
+# without a preinst run (e.g. `dpkg --configure universal-db-mcp` after the
+# trust dir was removed, or a configure re-run following an unpack) — so it
+# must fail closed on its own here too.
+for f in "$TRUST_DIR/verify_bundle.py" \
+         "$TRUST_DIR/profiles.py" \
+         "$TRUST_DIR/install_offline.sh" \
+         "$TRUST_DIR/lib/os_packages.sh"; do
+  if [ ! -f "$f" ]; then
+    echo "FAIL: trusted tool missing from the admin trust dir: $f" >&2
+    echo "      The package NEVER bootstraps $TRUST_DIR from its own payload:" >&2
+    echo "      the deb-shipped trusted-tools/ copy rides on the same channel" >&2
+    echo "      as the payload it would verify, so a tampered package would" >&2
+    echo "      ship a tampered verifier that prints PASSED (and a tampered" >&2
+    echo "      installer that skips verification). Install ALL of the trusted" >&2
+    echo "      tools from the trusted channel (see docs/offline-deployment.md," >&2
+    echo "      'Trust bootstrap'):" >&2
+    echo "        sudo install -d -m 755 $TRUST_DIR $TRUST_DIR/lib" >&2
+    echo "        sudo install -m 644 <trusted-channel>/verify_bundle.py $TRUST_DIR/" >&2
+    echo "        sudo install -m 644 <trusted-channel>/profiles.py $TRUST_DIR/" >&2
+    echo "        sudo install -m 755 <trusted-channel>/install_offline.sh $TRUST_DIR/" >&2
+    echo "        sudo install -m 644 <trusted-channel>/lib/os_packages.sh $TRUST_DIR/lib/" >&2
+    echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
+    exit 1
+  fi
+done
+echo "==> admin trust dir complete at $TRUST_DIR (the package never writes to it)"
+
+# --- step 2: the release public key must already be installed (fail closed) -
+if [ ! -f "$PUBKEY" ]; then
+  echo "FAIL: release public key not found at $PUBKEY." >&2
+  echo "      The key is NEVER shipped inside the package; the admin must" >&2
+  echo "      distribute it out-of-band and install it before dpkg -i" >&2
+  echo "      (see docs/offline-deployment.md, 'Trust bootstrap'):" >&2
+  echo "        sudo install -d -m 755 /etc/universal-db-mcp/keys" >&2
+  echo "        sudo install -m 644 <trusted-path>/udbmcp-release.pub.pem $PUBKEY" >&2
+  exit 1
+fi
+
+# --- step 3: decide the install mode ----------------------------------------
+# os-packages/*.deb in the payload => the installer needs dpkg => the install
+# cannot run inside the dpkg-held critical section (see WHY above) and is
+# deferred to the worker. Otherwise the original synchronous flow runs.
+if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
+
+  # ---- deferred mode: verify now, install after dpkg releases the locks ----
+  echo "==> bundle ships OS packages: the dpkg-dependent install runs after dpkg exits"
+  echo "==> verifying the unpacked payload via the trusted verifier (fail closed, at configure time)"
+  # Same verifier-execution rule as install_offline.sh: a 644 Python verifier
+  # runs via python3; an executable non-Python verifier is exec'd directly.
+  # $VEXEC is deliberately unquoted at the call site (it is either empty, or
+  # the single word "python3").
+  VEXEC=""
+  if [ -x "$TRUST_DIR/verify_bundle.py" ]; then
+    case "$(head -n 1 "$TRUST_DIR/verify_bundle.py" 2>/dev/null)" in
+      *"python"*) VEXEC="python3" ;;
+    esac
+  else
+    VEXEC="python3"
+  fi
+  $VEXEC "$TRUST_DIR/verify_bundle.py" --bundle "$BUNDLE" --pubkey "$PUBKEY"
+
+  # Pre-flight everything the worker will need, while a failure can still
+  # abort the configure step (fail closed — not discovered in the background).
+  if [ ! -f "$UNIT_SRC" ] && [ ! -f "$BUNDLE/operations/universal-db-mcp.service" ]; then
+    echo "FAIL: systemd unit not found (deb payload and bundle both lack it)." >&2
+    exit 1
+  fi
+  if [ ! -f "$UNIT_SRC" ]; then
+    UNIT_SRC="$BUNDLE/operations/universal-db-mcp.service"
+  fi
+  if [ ! -f "$BUNDLE/config-templates/config.yaml" ]; then
+    echo "FAIL: $BUNDLE/config-templates/config.yaml missing from the deb payload." >&2
+    exit 1
+  fi
+
+  # Single flight: never spawn a second worker while one is still running
+  # (e.g. postinst re-run by `dpkg --configure -a` during a long install).
+  if ! (exec 8>/run/udbmcp-deferred-install.lock && flock -n 8); then
+    echo "WARNING: a deferred install from a previous configure is still running;" >&2
+    echo "         not spawning a second worker. Track it: cat $STATUS ; tail -f $LOG" >&2
+    exit 0
+  fi
+
+  export UDBMCP_DEB_BUNDLE="$BUNDLE" UDBMCP_DEB_TARGET="$TARGET" \
+    UDBMCP_DEB_TRUST_DIR="$TRUST_DIR" UDBMCP_DEB_PUBKEY="$PUBKEY" \
+    UDBMCP_DEB_UNIT_SRC="$UNIT_SRC" UDBMCP_DEB_UNIT_DST="$UNIT_DST" \
+    UDBMCP_DEB_CONFIG_DIR="$CONFIG_DIR" UDBMCP_DEB_CONFIG="$CONFIG" \
+    UDBMCP_INSTALL_LOG="$LOG" UDBMCP_INSTALL_STATUS="$STATUS"
+
+  WORKER_SCRIPT="$(mktemp /var/tmp/udbmcp-postinst-worker.XXXXXX)"
+  cat > "$WORKER_SCRIPT" <<'WORKER_EOF'
+#!/bin/bash
+# Deferred payload installer spawned by the universal-db-mcp deb postinst.
+# Runs as root, detached (setsid), stdio redirected to the install log.
+# dpkg holds its frontend + database locks for the whole `dpkg -i` run,
+# including while the postinst executes, so the actual install happens HERE,
+# after the outer dpkg has exited. Trust model unchanged:
+#   - the ONE installer (install_offline.sh) verifies with the trusted
+#     verify_bundle.py before ANY bundle payload is executed, and stages a
+#     private root-owned copy that it re-verifies before use;
+#   - nothing unverified is ever executed: the unit/config are installed and
+#     the service enabled ONLY after install_offline.sh succeeded;
+#   - every failure is recorded ('failed' status + log) and aborts the
+#     worker before the service is touched.
+set -eu
+# The worker is NOT a maintainer script: drop dpkg's maintainer-script
+# environment so lib/os_packages.sh can never mistake it for one (it defers
+# nested `dpkg -i` while dpkg's locks are held; by the time this worker runs,
+# dpkg has exited and the locks are free).
+unset DPKG_MAINTSCRIPT_PACKAGE DPKG_MAINTSCRIPT_NAME DPKG_MAINTSCRIPT_DPACKAGE \
+      DPKG_FRONTEND_LOCKED 2>/dev/null || true
+BUNDLE="${UDBMCP_DEB_BUNDLE:?}"
+TARGET="${UDBMCP_DEB_TARGET:?}"
+TRUST_DIR="${UDBMCP_DEB_TRUST_DIR:?}"
+PUBKEY="${UDBMCP_DEB_PUBKEY:?}"
+UNIT_SRC="${UDBMCP_DEB_UNIT_SRC:?}"
+UNIT_DST="${UDBMCP_DEB_UNIT_DST:?}"
+CONFIG_DIR="${UDBMCP_DEB_CONFIG_DIR:?}"
+CONFIG="${UDBMCP_DEB_CONFIG:?}"
+LOG="${UDBMCP_INSTALL_LOG:?}"
+STATUS="${UDBMCP_INSTALL_STATUS:?}"
+umask 077
+
+on_exit() {
+  rc=$?
+  rm -f -- "$0" 2>/dev/null || true
+  if [ "$rc" -ne 0 ] && [ "${REPORT_FAILURE:-1}" = "1" ]; then
+    echo failed > "$STATUS" 2>/dev/null || true
+    echo "==> deferred deb install FAILED (rc=$rc; details above; nothing unverified was executed)"
+  fi
+}
+trap on_exit EXIT
+
+exec >>"$LOG" 2>&1
+echo "==> deferred deb install started $(date -u '+%Y-%m-%dT%H:%M:%SZ') (pid $$)"
+
+# --- single flight -----------------------------------------------------------
+exec 9>/run/udbmcp-deferred-install.lock
+if ! flock -n 9; then
+  # Another worker owns the install (postinst already warned); do not touch
+  # the status file it manages.
+  echo "FAIL: another deferred install is already in progress; not starting a second one." >&2
+  REPORT_FAILURE=0
+  exit 1
+fi
+echo running > "$STATUS"
+
+# --- wait for the outer dpkg to release its locks ----------------------------
+# dpkg uses fcntl record locks (flock(2) would not see them), so probe BOTH
+# lock files with fcntl via python3: try a non-blocking exclusive fcntl lock
+# and release it immediately — if that fails, dpkg still holds it. Require
+# two consecutive free probes 2s apart plus a settle delay before touching
+# the dpkg database; give up (loudly, 'failed') after one hour.
+dpkg_locks_free() {
+  python3 - 2>/dev/null <<'PYEOF'
+import fcntl, sys
+for path in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
+    try:
+        fh = open(path, "r+")
+    except OSError:
+        continue
+    try:
+        fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.lockf(fh, fcntl.LOCK_UN)
+    except OSError:
+        sys.exit(1)
+    finally:
+        fh.close()
+sys.exit(0)
+PYEOF
+}
+echo "==> waiting for the outer dpkg to release its locks"
+waited=0
+free_runs=0
+while [ "$free_runs" -lt 2 ]; do
+  if [ "$waited" -ge 3600 ]; then
+    echo "FAIL: dpkg locks still held after one hour; giving up." >&2
+    echo "      Re-run the install once dpkg is idle:" >&2
+    echo "        sudo bash $TRUST_DIR/install_offline.sh $BUNDLE $TARGET" >&2
+    exit 1
+  fi
+  if dpkg_locks_free; then
+    free_runs=$((free_runs + 1))
+  else
+    free_runs=0
+  fi
+  sleep 2
+  waited=$((waited + 2))
+done
+sleep 2
+echo "==> dpkg locks are free (waited ${waited}s)"
+
+# --- verify + install the unpacked payload via the ONE installer -------------
+echo "==> verifying and installing the bundle payload via $TRUST_DIR/install_offline.sh"
+UDBMCP_RELEASE_PUBKEY="$PUBKEY" \
+  bash "$TRUST_DIR/install_offline.sh" "$BUNDLE" "$TARGET"
+
+# --- systemd unit, config, enable: kept in lockstep with the postinst tail ---
+# /etc/systemd/system is an admin-controlled path (not dpkg-managed): install
+# the deb-shipped canonical unit only if absent or already identical, and
+# NEVER clobber an admin-modified unit on upgrade — point at the canonical
+# copy instead.
+if [ ! -e "$UNIT_DST" ]; then
+  echo "==> installing systemd unit to $UNIT_DST"
+  install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
+elif cmp -s "$UNIT_SRC" "$UNIT_DST"; then
+  echo "==> $UNIT_DST already matches the deb-shipped unit (no change)"
+else
+  echo "WARNING: $UNIT_DST exists and differs from the deb-shipped unit;" >&2
+  echo "         keeping the admin-controlled unit untouched. Canonical copy:" >&2
+  echo "         $UNIT_SRC (review with: diff $UNIT_SRC $UNIT_DST)" >&2
+fi
+
+systemctl daemon-reload 2>/dev/null || \
+  echo "==> systemctl daemon-reload unavailable (no running systemd?) — skipping"
+
+if [ ! -e "$CONFIG" ]; then
+  echo "==> installing default config to $CONFIG (only because it is absent)"
+  # 0755 root:root dir: the udbmcp service account (User=udbmcp in the unit)
+  # must be able to TRAVERSE to the 0640 udbmcp:udbmcp config file below it.
+  install -d -m 755 -o root -g root "$CONFIG_DIR"
+  install -m 640 -o udbmcp -g udbmcp "$BUNDLE/config-templates/config.yaml" "$CONFIG"
+else
+  echo "==> $CONFIG already present: leaving the admin's config untouched"
+fi
+
+if systemctl enable --now universal-db-mcp.service 2>/dev/null; then
+  echo "==> universal-db-mcp.service enabled and started"
+else
+  echo "WARNING: could not enable/start universal-db-mcp.service" >&2
+  echo "         (no systemd as PID 1? container install?) — the package is" >&2
+  echo "         installed; start it later with:" >&2
+  echo "           systemctl enable --now universal-db-mcp" >&2
+fi
+
+echo success > "$STATUS"
+echo "==> deferred deb install complete (install at $TARGET, config: $CONFIG)"
+WORKER_EOF
+  chmod 700 "$WORKER_SCRIPT"
+  echo deferred > "$STATUS"
+  # --fork: setsid forks, the parent returns immediately and the child is
+  # reparented to init — the worker survives dpkg and holds none of dpkg's
+  # stdio pipes (stdin/out/err go to /dev/null here; the worker re-points
+  # them at the log itself).
+  setsid --fork "$WORKER_SCRIPT" </dev/null >/dev/null 2>&1
+  # Fail closed if the worker did not actually start: it must confirm by
+  # marking the status file 'running' within a few seconds.
+  launched=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if [ "$(cat "$STATUS" 2>/dev/null || true)" = "running" ]; then
+      launched=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$launched" ]; then
+    echo "FAIL: deferred install worker did not start (status stayed 'deferred')." >&2
+    exit 1
+  fi
+  echo "==> postinst complete: payload VERIFIED at configure time; the install"
+  echo "    (venv, wheelhouse, bundle OS packages, service) continues in the"
+  echo "    background because dpkg holds its locks while this postinst runs."
+  echo "    Track progress: cat $STATUS ; tail -f $LOG"
+  echo "    On success the service is enabled and started; on failure the log"
+  echo "    records it and NOTHING unverified is executed or enabled."
+  exit 0
+fi
+
+# --- step 4 (synchronous path, OS-package-free bundles): verify + install ----
+# Re-verify the unpacked payload in this privileged context before ANY of it
+# executes: this closes the verify-then-use race for the deb (dpkg unpacked
+# the tree since preinst) and reuses scripts/install_offline.sh verbatim —
+# it verifies with the trusted verifier, stages a private root-owned copy,
+# re-verifies THE COPY, creates the udbmcp service account and state/log
+# dirs, builds the venv with --no-index --require-hashes and a neutralized
+# pip environment, installs bundle OS packages with dpkg only (no apt, no
+# network), and smoke-checks the result. Running as root (dpkg postinst),
+# the installer takes its no-sudo path. Any failure exits nonzero under
+# set -e so dpkg aborts the install. (A bundle without os-packages/*.deb
+# never reaches a nested dpkg -i, so the synchronous install cannot
+# deadlock against the outer dpkg.)
+echo "==> verifying and installing the bundle payload via $TRUST_DIR/install_offline.sh"
+# Explicit `bash`: the deb-shipped copy is installed 644 in the bundle layout
+# and the trust-dir copy carries the exec bit; invoking via bash makes the
+# call independent of how the bootstrap above (or the admin) installed it.
+UDBMCP_RELEASE_PUBKEY="$PUBKEY" \
+  bash "$TRUST_DIR/install_offline.sh" "$BUNDLE" "$TARGET"
+
+# --- step 5: install the systemd unit and reload the manager ----------------
+# The unit mirrors packaging/systemd/universal-db-mcp.service (shipped in the
+# deb by build_deb.sh); fall back to the signed bundle's own copy so the unit
+# always matches the payload that was just verified. Installing to
+# /etc/systemd/system (not a dpkg-managed path) keeps the unit under admin
+# control: it is installed only if absent or already identical to the shipped
+# copy — an admin-modified unit is NEVER clobbered on upgrade.
+if [ ! -f "$UNIT_SRC" ]; then
+  UNIT_SRC="$BUNDLE/operations/universal-db-mcp.service"
+fi
+if [ ! -f "$UNIT_SRC" ]; then
+  echo "FAIL: systemd unit not found (deb payload and bundle both lack it)." >&2
+  exit 1
+fi
+if [ ! -e "$UNIT_DST" ]; then
+  echo "==> installing systemd unit to $UNIT_DST"
+  install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
+elif cmp -s "$UNIT_SRC" "$UNIT_DST"; then
+  echo "==> $UNIT_DST already matches the deb-shipped unit (no change)"
+else
+  echo "WARNING: $UNIT_DST exists and differs from the deb-shipped unit;" >&2
+  echo "         keeping the admin-controlled unit untouched. Canonical copy:" >&2
+  echo "         $UNIT_SRC (review with: diff $UNIT_SRC $UNIT_DST)" >&2
+fi
+
+# --- step 6 (before enable --now): install config ONLY if absent ------------
+# Done before the service is started so the first start already sees a config
+# at the path the unit exports (UDBMCP_CONFIG). NEVER overwrite: the config is
+# seeded by postinst (not a dpkg conffile), so an admin's edited config
+# survives every upgrade; postrm deletes it on purge, keeps it on remove.
+if [ ! -e "$CONFIG" ]; then
+  echo "==> installing default config to $CONFIG (only because it is absent)"
+  # 0755 root:root dir: the udbmcp service account (User=udbmcp in the unit)
+  # must be able to TRAVERSE to the 0640 udbmcp:udbmcp config file below it.
+  install -d -m 755 -o root -g root "$CONFIG_DIR"
+  install -m 640 -o udbmcp -g udbmcp "$BUNDLE/config-templates/config.yaml" "$CONFIG"
+else
+  echo "==> $CONFIG already present: leaving the admin's config untouched"
+fi
+
+# --- step 7: reload systemd (guarded) ---------------------------------------
+# Container installs often have systemctl but no PID-1 systemd ("System has
+# not been booted with systemd"); that must not fail the package configure
+# step. Real enable/start failures are still surfaced by the guarded call
+# below on hosts that do run systemd.
+systemctl daemon-reload 2>/dev/null || \
+  echo "==> systemctl daemon-reload unavailable (no running systemd?) — skipping"
+
+# --- step 8: enable + start the service (guarded, container-safe) -----------
+# On a normal host this enables and starts the service. In a container
+# without PID-1 systemd the call fails; the guard swallows it so the install
+# still succeeds (dpkg -i in the no-network gate runs exactly this case) and
+# prints how to start the service later.
+if systemctl enable --now universal-db-mcp.service 2>/dev/null; then
+  echo "==> universal-db-mcp.service enabled and started"
+else
+  echo "WARNING: could not enable/start universal-db-mcp.service" >&2
+  echo "         (no systemd as PID 1? container install?) — the package is" >&2
+  echo "         installed; start it later with:" >&2
+  echo "           systemctl enable --now universal-db-mcp" >&2
+fi
+
+echo "==> postinst complete: install at $TARGET (config: $CONFIG)"

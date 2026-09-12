@@ -8,6 +8,13 @@
 # flag. When it runs, the live configuration is displaced to
 # <backup-root>/pre-rollback-<ts>/ and preserved — never deleted — and the
 # backup is validated through the restored venv before anything is moved.
+#
+# Verify-then-use: the restored venv is executed (doctor below) exactly in the
+# failure scenarios where on-disk state is least trustworthy, so nothing under
+# it runs until it matches the SHA256 manifest upgrade_offline.sh recorded
+# when it was demoted to venv.previous. A missing or mismatched manifest
+# fails closed: the rollback aborts with venv.previous preserved and nothing
+# executed.
 set -euo pipefail
 
 usage() {
@@ -35,8 +42,54 @@ done
 ETC_DIR="${UDBMCP_CONFIG_DIR:-/etc/universal-db-mcp}"
 STATE_DIR="${UDBMCP_STATE_DIR:-/var/lib/universal-db-mcp}"
 
+# Re-verify the demoted venv against the manifest upgrade_offline.sh recorded
+# at demotion time ($TARGET/venv.previous.sha256), using the same recipe
+# (relative paths, because the tree is renamed after verification,
+# deterministic order, NUL-safe). The manifest lives OUTSIDE the tree so
+# hashing it never includes itself. Every verification failure — missing
+# manifest, unreadable tree, hashing tool unavailable, content mismatch —
+# returns nonzero and the caller aborts BEFORE any rename and BEFORE the
+# doctor call executes anything under the tree.
+udbmcp_verify_previous_venv() {
+  manifest="$TARGET/venv.previous.sha256"
+  if [ ! -f "$manifest" ]; then
+    echo "FAIL: no integrity manifest at $manifest; refusing to execute venv.previous" >&2
+    echo "      rollback executes venv.previous only after it verifies against the" >&2
+    echo "      SHA256 manifest recorded by upgrade_offline.sh; re-run" >&2
+    echo "      upgrade_offline.sh to rebuild both, or reinstall from the signed bundle." >&2
+    return 1
+  fi
+  hash_cmd=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash_cmd="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    hash_cmd="shasum -a 256"
+  else
+    echo "FAIL: neither sha256sum nor shasum is available; cannot verify venv.previous" >&2
+    return 1
+  fi
+  actual="$(mktemp "${TMPDIR:-/tmp}/udbmcp-rollback-verify.XXXXXX")" || return 1
+  if ! (cd "$TARGET/venv.previous" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 $hash_cmd) > "$actual"; then
+    rm -f "$actual"
+    echo "FAIL: hashing $TARGET/venv.previous failed; refusing to execute it" >&2
+    return 1
+  fi
+  if ! cmp -s "$actual" "$manifest"; then
+    rm -f "$actual"
+    echo "FAIL: $TARGET/venv.previous does not match its recorded SHA256 manifest" >&2
+    echo "      ($manifest); refusing to execute it. The tree is left in place for" >&2
+    echo "      analysis; reinstall from the signed bundle instead." >&2
+    return 1
+  fi
+  rm -f "$actual"
+}
+
 if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl stop universal-db-mcp || true; fi
 if [ -d "$TARGET/venv.previous" ]; then
+  # Integrity gate BEFORE any rename and before the doctor call below executes
+  # the payload: a tampered or drifted venv.previous must never run, and a
+  # failed gate must leave the tree exactly as found.
+  udbmcp_verify_previous_venv || exit 1
   echo "==> rolling back venv"
   # An upgrade killed between its two renames leaves NO current venv at all;
   # under set -e that used to abort here, before venv.previous was restored,

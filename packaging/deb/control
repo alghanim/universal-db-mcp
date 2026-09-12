@@ -1,0 +1,30 @@
+Package: universal-db-mcp
+Version: 0.1.0
+Section: database
+Priority: optional
+Architecture: amd64
+Depends: python3 (>= 3.12~), python3-venv, libc6 (>= 2.36)
+Recommends: systemd
+Maintainer: Universal DB MCP Release Engineering <release-eng@example.invalid>
+Description: Air-gapped MCP server for universal database access
+ Universal DB MCP exposes PostgreSQL, MySQL/MariaDB, ClickHouse, Oracle,
+ Microsoft SQL Server and Db2 to MCP clients behind a single hardened
+ protocol. This package carries the signed offline bundle (installed under
+ /usr/share/universal-db-mcp/bundle/) plus the trusted verification tools
+ (/usr/share/universal-db-mcp/trusted-tools/).
+ .
+ Verify-before-execute: no payload code runs until postinst has re-verified
+ the unpacked bundle with the trusted verify_bundle.py against the release
+ public key that the administrator distributes out-of-band. The public key
+ is never shipped inside this package, and any verification failure aborts
+ the install before a single byte of the payload is executed (fail closed).
+ .
+ The Python virtual environment is built strictly offline with pip
+ --no-index --require-hashes against the bundle's wheelhouse and
+ runtime.lock, with pip configuration from the environment neutralized
+ (PIP_CONFIG_FILE).
+ .
+ /etc/universal-db-mcp/config.yaml is seeded by the postinst script only if
+ absent (owner udbmcp:udbmcp, mode 0640), so it is never a dpkg-owned file:
+ admin edits survive every upgrade, the file is retained on package removal,
+ and it is deleted on purge.

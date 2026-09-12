@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Universal Database MCP Server - launchd daemon (macOS).
+
+  This plist mirrors packaging/systemd/universal-db-mcp.service line for line:
+
+    systemd                                   launchd
+    ----------------------------------------  --------------------------------------
+    [Unit] Description                        (comment above / service description)
+    [Service] Type=simple                     (default launchd behavior: on-demand
+                                               daemon, no forking)
+    [Service] User=udbmcp / Group=udbmcp      UserName _udbmcp (GroupName via
+                                               dscl primary group of the account,
+                                               set by postinstall)
+    [Service] UMask=0077                      Umask 63  (launchd requires decimal:
+                                               0077 octal == 63 decimal)
+    [Service] Environment=UDBMCP_CONFIG=...   EnvironmentVariables
+    [Service] ExecStart=... serve             ProgramArguments
+    [Service] Restart=on-failure              KeepAlive { SuccessfulExit = false; }
+    [Service] RestartSec=5                    ThrottleInterval 5
+    [Install] WantedBy=multi-user.target      RunAtLoad (start at boot/load),
+                                               installed in /Library/LaunchDaemons/
+    (implicit low priority service)           ProcessType Background, LowPriorityIO
+
+  HONEST DELTA vs. the systemd unit (documented, not hidden):
+
+  * launchd has NO equivalent of systemd's ProtectSystem=strict /
+    ReadWritePaths= sandbox directives (nor NoNewPrivileges,
+    ProtectHome, PrivateTmp, ProtectKernelTunables, CapabilityBoundingSet).
+    On macOS the following compensating controls apply:
+      - Audit-file privacy is enforced by the CODE: the server creates audit
+        and metadata-cache files with 0600 permissions (see
+        src/universal_db_mcp/services/audit.py), so the Umask 63 here is
+        defense-in-depth, not the sole control.
+      - State-directory hardening (0750 on /var/lib/universal-db-mcp and
+        /var/log/universal-db-mcp, ownership by _udbmcp) is an ADMIN STEP
+        performed by postinstall at package install time and documented in
+        docs/offline-deployment.md; launchd itself cannot express it.
+      - The daemon runs as the dedicated non-privilege service account
+        (_udbmcp), which bounds the blast radius of the missing FS sandbox.
+
+  Trust model (unchanged from the signed bundle): this plist only starts the
+  already-verified payload under /usr/local/universal-db-mcp/venv/. The venv
+  is built by postinstall AFTER the trusted-channel verify_bundle.py run has
+  passed against the admin's out-of-band-distributed pubkey. The release
+  pubkey is NEVER shipped inside the package.
+-->
+<plist version="1.0">
+<dict>
+	<!-- Label MUST equal the installed filename stem
+	     (/Library/LaunchDaemons/com.udbmcp.server.plist), the pkg identifier's
+	     service label used by packaging/pkg/postinstall (LABEL="com.udbmcp.server",
+	     driving launchctl bootout/bootstrap/print), and the admin docs: launchd
+	     registers the job under THIS key, not the plist's filename. -->
+	<key>Label</key>
+	<string>com.udbmcp.server</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/universal-db-mcp/venv/bin/python</string>
+		<string>-m</string>
+		<string>universal_db_mcp</string>
+		<string>serve</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>UDBMCP_CONFIG</key>
+		<string>/etc/universal-db-mcp/config.yaml</string>
+	</dict>
+
+	<!-- Mirrors systemd User=udbmcp (macOS service account created by
+	     postinstall is named _udbmcp, following the _-prefixed convention). -->
+	<key>UserName</key>
+	<string>_udbmcp</string>
+
+	<!-- launchd Umask is DECIMAL. systemd UMask=0077 (octal) == 63 decimal.
+	     0077 octal = 0*64 + 7*8 + 7 = 63. Keeps group/other bits off for files
+	     the server creates (audit trail, metadata cache). -->
+	<key>Umask</key>
+	<integer>63</integer>
+
+	<!-- Mirrors [Install] WantedBy=multi-user.target: start at boot. -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Mirrors systemd Restart=on-failure: restart only when the process
+	     exits non-zero (a clean exit is NOT restarted). -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<!-- Mirrors systemd RestartSec=5. -->
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>LowPriorityIO</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/universal-db-mcp/server.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/var/log/universal-db-mcp/server.err.log</string>
+</dict>
+</plist>

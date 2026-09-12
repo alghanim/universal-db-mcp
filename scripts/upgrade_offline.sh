@@ -160,6 +160,15 @@ echo "==> switching (old venv kept for rollback; depth 1)"
 if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl stop universal-db-mcp || true; fi
 if [ -d "$TARGET/venv" ]; then
   $sudo_ok rm -rf "$TARGET/venv.previous"   # rollback depth is one release
+  $sudo_ok rm -f "$TARGET/venv.previous.sha256"   # manifest of the discarded release
+  # rollback_offline.sh executes the demoted venv only after it matches this
+  # manifest, so record it BEFORE the rename: an upgrade killed between these
+  # two operations still leaves a verifiable venv.previous behind. Relative
+  # paths keep the manifest valid across the venv.previous -> venv rename.
+  echo "==> recording the rollback integrity manifest for the demoted venv"
+  $sudo_ok sh -c 'cd "$1/venv" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$1/venv.previous.sha256"' sh "$TARGET" \
+    || { $sudo_ok rm -f "$TARGET/venv.previous.sha256"; \
+         echo "FAIL: could not record the rollback integrity manifest; aborting without switching" >&2; exit 1; }
   $sudo_ok mv "$TARGET/venv" "$TARGET/venv.previous"
 fi
 $sudo_ok mv "$NEWVENV" "$TARGET/venv"

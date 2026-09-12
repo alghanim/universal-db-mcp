@@ -1,0 +1,99 @@
+#!/bin/bash
+# Debian postrm for universal-db-mcp: delete installer-generated payload
+# artifacts on purge; keep the conffile on remove (standard dpkg semantics).
+#
+# ---------------------------------------------------------------------------
+# WHAT dpkg ALREADY DOES vs. WHAT THIS SCRIPT DOES
+#
+# dpkg deletes every file this package OWNS on both `remove` and `purge`
+# (package payload: the signed bundle copy, trusted-tools copy, the systemd
+# unit). What dpkg does NOT track are files GENERATED after unpack by
+# postinst's trusted installer (install_offline.sh):
+#
+#   /opt/universal-db-mcp/venv           <- built from the wheelhouse
+#   /opt/universal-db-mcp/manifest.json  <- the verified bundle's manifest,
+#                                           published next to the venv so
+#                                           `doctor` can report the profile
+#
+# That is the entire job of this script: on `purge`, remove the venv tree and
+# the published manifest (rm -rf / rm -f, deliberate and scoped — every target
+# is a quoted path literal defined at the top of this script). Without the
+# manifest removal the guarded parent `rmdir` below would always fail and a
+# stale manifest.json would survive `dpkg -P`.
+#
+# The installed bundle tree (/usr/share/universal-db-mcp/bundle) needs NO
+# cleanup here: install_offline.sh never writes inside it — it stages into a
+# private `mktemp -d` directory under /var/tmp that an EXIT trap removes — and
+# dpkg has already deleted the dpkg-owned bundle tree by the time this script
+# runs with `purge`. The parent `rmdir`s below are therefore only defensive.
+#
+# On `remove`, the venv (and the manifest) are kept so that a subsequent
+# reinstall is fast and so that a rollback to an older package version keeps a
+# working installation; they are destroyed by the next `purge`.
+#
+# CONFIG (/etc/universal-db-mcp/config.yaml): NOT a dpkg conffile — it is
+# seeded by postinst from the verified bundle's config-templates/ copy, only
+# if absent, so admin edits survive every upgrade untouched. Because dpkg
+# therefore does not own the file, it would survive `purge` forever unless
+# this script removes it: on `purge` the config is deleted (the /keys
+# subdirectory with the admin-held release public key is NEVER touched); on
+# `remove` it is kept, mirroring standard conffile retention semantics.
+#
+# AUDIT / STATE DIRECTORIES (/var/lib/universal-db-mcp, /var/log/universal-db-mcp):
+# deliberately NOT removed here, not even on purge: they hold the audit
+# trail, which must outlive the package that produced it. An admin who wants
+# them gone deletes them explicitly.
+# ---------------------------------------------------------------------------
+set -eu
+
+VENV_DIR="/opt/universal-db-mcp/venv"
+MANIFEST_FILE="/opt/universal-db-mcp/manifest.json"
+CONFIG_FILE="/etc/universal-db-mcp/config.yaml"
+
+warn() {
+    echo "WARN: $1" >&2
+}
+
+case "${1:-}" in
+    purge)
+        if [ -e "$VENV_DIR" ]; then
+            rm -rf "$VENV_DIR"
+            echo "universal-db-mcp postrm: purged $VENV_DIR."
+        fi
+        if [ -f "$MANIFEST_FILE" ]; then
+            rm -f "$MANIFEST_FILE"
+            echo "universal-db-mcp postrm: purged $MANIFEST_FILE."
+        fi
+        if [ -f "$CONFIG_FILE" ]; then
+            rm -f "$CONFIG_FILE"
+            echo "universal-db-mcp postrm: purged $CONFIG_FILE."
+        fi
+        # Remove the parent directories only if now empty (never with -r:
+        # anything left beside them — e.g. unrelated files under /opt or
+        # /usr/share — must survive). Failures are expected and fine.
+        # /etc/universal-db-mcp is rmdir'd the same guarded way: it holds the
+        # admin's keys/ directory (the out-of-band release public key), which
+        # must survive a purge, so the rmdir only succeeds if it is empty.
+        rmdir --ignore-fail-on-non-empty /opt/universal-db-mcp 2>/dev/null || true
+        rmdir --ignore-fail-on-non-empty /usr/share/universal-db-mcp 2>/dev/null || true
+        rmdir --ignore-fail-on-non-empty /etc/universal-db-mcp 2>/dev/null || true
+        ;;
+    remove)
+        echo "universal-db-mcp postrm: remove — seeded config $CONFIG_FILE" \
+             "and installer-generated $VENV_DIR and $MANIFEST_FILE are retained" \
+             "(purge deletes them)."
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade)
+        # No cleanup: the installation continues or rolls back as-is.
+        ;;
+    "")
+        # dpkg always passes an action; refuse to act without one (fail closed).
+        echo "universal-db-mcp postrm: no dpkg action argument; refusing to act." >&2
+        exit 1
+        ;;
+    *)
+        warn "unexpected postrm action '$1'; taking no cleanup action."
+        ;;
+esac
+
+exit 0

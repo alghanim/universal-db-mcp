@@ -1,10 +1,21 @@
 # Implementation status (honest ledger)
 
-Last updated: 2026-09-11 (second production-readiness review + fix pass:
-4 reproduced P0 defects and 36 reproduced P1 defects fixed across the
-codebase, gates and bundle re-run green — see §1c; the 2026-09-08
-ledger-honesty revision and its residual P1 disclosure in §1b remain in
-force).
+Last updated: 2026-09-12 (native-packages §1d records the honest
+per-platform status of the .deb / .pkg / .msi packages derived from the
+signed offline bundle: the Ubuntu .deb no-network gate was re-run and
+**PASSED** end-to-end — positive install, doctor, stdio protocol probe,
+and the tamper negative all green with evidence; the
+macOS .pkg was built and its payload verified natively on this arm64
+host, but its latest gate re-run failed on the unit-suite check alone
+(transient tree state; the affected tests pass on re-run — the pkg gate
+must be re-run green), the full `installer` run is `not_run`, and the
+.pkg is
+**UNSIGNED** (no developer signing identity); the Windows .msi was
+**NOT built** — dotnet/wix are absent on this staging host and only the
+WiX toolchain files plus the PowerShell gate script are delivered; the
+2026-09-11 second production-readiness review + fix pass (§1c) and the
+2026-09-08 ledger-honesty revision with its residual P1 disclosure in
+§1b remain in force).
 Every `passed` claim below points at machine-readable evidence in
 `test-evidence/`. Claims without evidence are labeled `unverified`,
 `blocked`, or `not_run`.
@@ -198,6 +209,23 @@ defects:
   truncated columns. SQLite's generic (unnamed) truncation warning and
   `db_explain` ignoring its `parameters` argument are recorded in the
   review archive as residual polish, not claimed as fixed.
+
+## 1d. Native packages (.deb / .pkg / .msi)
+
+All three package types derive from the ONE signed offline bundle (one
+signing ceremony, three artifacts) and preserve the trust model on every
+platform: no package executes payload before a trusted-channel
+`verify_bundle.py --pubkey` run has passed, the release pubkey is never
+shipped inside any package (administrators distribute it out-of-band),
+every venv build runs `pip --no-index --require-hashes` with
+`PIP_CONFIG_FILE` neutralized, and every verification failure fails
+closed.
+
+| Package | Status | What was and was not verified |
+| --- | --- | --- |
+| Ubuntu `.deb` (linux-x86_64-ubuntu24.04-cp312) | full no-network gate **PASSED** 2026-09-12 (re-run green after the same-day positive-path failure) | `scripts/package/test_package_deb.sh` mirrors Gates A/B: sign → `dpkg-deb` build inside the baseline container → install under `docker --network none` → doctor with demo config → stdio protocol probe, plus a negative case (a tampered wheel repacked into the deb must fail closed at postinst verification with the canonical diagnostic). Evidence (`out/package-evidence/deb/results.json`, 2026-09-12, status `passed`, 22/22 checks): **positive path** — `dpkg -i` succeeded (preinst checked trust prerequisites only; postinst re-verified the unpacked payload through the existing `install_offline.sh` — no installer fork — at configure time: 91 artifacts, 42 pinned wheels, 11/11 bundle OS packages hash-checked, `signature: verified`); the dpkg-dependent install (venv, wheelhouse, bundle OS packages, service enable) then completed in a background worker after dpkg released its locks (18 s wait, `deferred-install.log`); doctor passed (12/12 checks, 0 fatal) against the deb-installed venv and the stdio MCP protocol probe passed inside the same no-network container. The minimal baseline image carries no `python3`/`python3-venv` .debs (its CPython 3.12 is installed outside dpkg), so the gate configures the package with forced dependencies — real ubuntu-24.04 targets satisfy the declared `Depends` normally. **Negative path** — a byte-flipped sqlglot wheel inside a repacked deb (its SHA256SUMS line refreshed so the rejection must come from the SIGNATURE, not the integrity hash) is rejected by the trusted verifier with the canonical `signature verification FAILED` diagnostic, and `dpkg -i` of the tampered package fails closed at postinst verification. **`systemctl enable --now` under a real systemd PID 1: `not_run`** — the gate container runs without systemd; the unit is installed and the enable is guarded so container installs still succeed, but no host with PID 1 = systemd was exercised. Cosmetic residual: with no package revision supplied, the built version renders as `0.1.0~unknown`. |
+| macOS `.pkg` (macos-arm64-cp312) | built + payload verified natively on this arm64 staging host; **package is UNSIGNED** (no developer signing identity); latest gate re-run (2026-09-12T10:17Z) recorded **`failed`** on the unit-suite check only — the gate must be re-run green before any `passed` claim; full `installer` run `not_run` | `scripts/package/test_package_pkg.sh`: the signed macos-arm64-cp312 bundle is built and re-verified by the trusted verifier before packaging; the wheelhouse is fully resolved **including the `ibm-db` `macosx_14_0_arm64` wheel**; and the package payload is proven to be the signed bundle (`pkgutil --expand-full`, then the trusted verifier run against the expanded payload). Evidence (`out/package-evidence/pkg/results.json`, 2026-09-12T10:17Z, status `failed`, 19/20 checks passed): `pkg_built`, `payload_signature_verified` (trusted verifier accepted the expanded payload), `no_keys_in_payload`, install-script hardening, and all plist checks (incl. `launchd_label_consistency`) **passed** for the on-disk package (`dist/universal-db-mcp-0.1.0-macos-arm64.pkg`, 10:16Z rebuild, `out/package-evidence/pkg/build-20260912T101626Z.log`); the single **failed** check is `unit_suite` — three `tests/unit/test_deb_packaging.py` postinst-bootstrap tests were transiently failing in the tree at gate time; those tests pass on re-run now, but the gate itself has not been re-run green after that, so no gate `passed` status is claimed. An earlier same-day run (09:56Z, superseded on disk) passed all checks including the native unit suite. preinstall validates trust prerequisites only (trusted verifier + admin pubkey, else exit with bootstrap instructions); postinstall re-verifies the payload, builds the venv with the same hostile-pip neutralization, and bootstraps the LaunchDaemon. **Honesty caveat recorded per the build log's explicit WARNING:** the `.pkg` is **UNSIGNED** — no Apple Developer ID signing identity is configured on this host, so Gatekeeper/`installer` will not attribute the package to a developer; product signing is an organizational key-ceremony step, not performed here. **The full `installer` run and the launchd daemon start: `not_run`** (opt-in behind `UDBMCP_PKG_INSTALL=1`, off by default). Documented delta: macOS has no ProtectSystem-equivalent; the plist otherwise mirrors the systemd unit line-for-line. |
+| Windows `.msi` (win_amd64) | **NOT built**; install gate `not_run` | The MSI was never compiled: `dotnet` and `wix` are not installed on this staging host and `scripts/package/build_msi.sh` fails closed without them (it would also delete any empty/failed output), and no MSI build log or evidence exists. The only file named `*.msi` in `dist/` (`universal-db-mcp-1.2.3-win-x86_64.msi`) is a 12-byte placeholder whose content is not a valid MSI document (literal `FAKE` after the OLE magic) and whose 1.2.3 filename matches nothing in the signed manifest release (0.1.0) — it was not produced by `build_msi.sh`. No win_amd64 bundle has been built on this host either (only the linux-x86_64 and macos-arm64 bundles exist). Delivered and awaiting a staging host with the plan-Phase-0 prerequisites (.NET 8 SDK + WiX v4): `scripts/package/build_msi.sh` + `packaging/msi/udbmcp.wxs` (+ deferred, impersonate=no custom actions — trusted `verify_bundle.py` against the installed bundle with the admin pubkey, venv build `--no-index --require-hashes` with hostile pip env neutralized, doctor smoke, `sc.exe` service registration). No Windows machine was available, so once built the install gate still must be exercised on the target OS before anything is claimed: service behavior, the admin-supplied msodbcsql MSI, and NTFS ACL behavior remain unexercised — the ledger records no pass for any Windows runtime step. The gate script **`scripts/test_package_msi.ps1` is delivered** for a real Windows machine (msiexec with `/l*v`, `sc.exe query`, doctor, stdio protocol probe, tamper negative case, evidence JSON). |
 
 ## 2. Implemented, NOT verified (code-complete, honest capability state)
 

@@ -1,0 +1,252 @@
+#!/bin/bash
+# macOS .pkg postinstall: runs as root AFTER the installer has unpacked the
+# payload to /usr/local/universal-db-mcp/bundle.
+#
+# Trust model (invariants that must never break):
+#   1. NO payload code executes before the trusted-channel verifier has passed
+#      against the unpacked bundle with the ADMIN-provided release pubkey
+#      (step 1 below; the smoke check in step 4 is the first execution).
+#   2. The release pubkey is NEVER shipped inside this package. It is
+#      distributed out-of-band and read from /etc/universal-db-mcp/keys/ —
+#      preinstall validated its presence; we still fail closed here if absent.
+#   3. pip runs --no-index --require-hashes against the bundle wheelhouse only,
+#      with the inherited (hostile) pip environment neutralized.
+#   4. Every verification failure exits nonzero so the install aborts.
+#
+# This script is a pkg-embedded copy of the trusted-channel installer logic
+# (scripts/install_offline.sh); the verifier it invokes is NOT — it must come
+# from the trusted channel installed at /usr/local/lib/udbmcp-trust/, never
+# from the bundle it verifies (a tampered bundle would ship a verifier that
+# prints PASSED).
+#
+# Non-relocatable: every path below is absolute and load-bearing. The
+# installer-provided arguments (target volume, boot volume, admin user) are
+# deliberately ignored.
+set -euo pipefail
+
+PREFIX="/usr/local/universal-db-mcp"
+BUNDLE="$PREFIX/bundle"
+VENV="$PREFIX/venv"
+PLIST="/Library/LaunchDaemons/com.udbmcp.server.plist"
+LABEL="com.udbmcp.server"
+CONFIG_DIR="/etc/universal-db-mcp"
+CONFIG="$CONFIG_DIR/config.yaml"
+STATE_DIR="/var/lib/universal-db-mcp"
+LOG_DIR="/var/log/universal-db-mcp"
+SERVICE_USER="_udbmcp"
+SERVICE_GROUP="_udbmcp"
+
+# Trust prerequisites. Defaults are the documented trusted-channel locations;
+# the overrides exist for parity with install_offline.sh (and our gate
+# scripts), not to relocate trust onto the bundle.
+TRUST_DIR="${UDBMCP_TRUST_DIR:-/usr/local/lib/udbmcp-trust}"
+VERIFIER="${UDBMCP_VERIFIER:-$TRUST_DIR/verify_bundle.py}"
+PUBKEY="${UDBMCP_RELEASE_PUBKEY:-$CONFIG_DIR/keys/release.pub.pem}"
+
+# launchd runs pkg scripts with a minimal PATH that may exclude /usr/local/bin,
+# where a staging-host python3.12 typically lives. Extend it for the
+# interpreter lookup only; everything we execute afterwards is referenced by
+# absolute path (the venv) or is an OS binary.
+PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export PATH
+
+fail() {
+  echo "FAIL: $*" >&2
+  echo "      The installation has been aborted; nothing was started." >&2
+  exit 1
+}
+
+# --- step 1: re-verify the unpacked payload BEFORE anything executes it ------
+# The pkg payload was verified on the build host and again by preinstall
+# (prerequisites only); this is the gate that stands between unpacking and the
+# first execution of bundle code. pkgbuild unpacks as root into a root-owned
+# path, so no operator-writable window exists between this verification and
+# the use below (the verify-then-use staging dance in install_offline.sh is
+# not needed here — but failing closed on any verifier complaint is).
+echo "==> postinstall: verifying unpacked payload with the trusted verifier"
+
+# Fail closed on missing prerequisites (preinstall already checked these; a
+# missing pubkey here means the admin skipped trust bootstrap — never proceed,
+# and never fall back to a key shipped inside the bundle or the package).
+[ -f "$BUNDLE/manifest.json" ] || fail "bundle payload missing at $BUNDLE"
+[ -f "$PUBKEY" ] || fail "release pubkey not found at $PUBKEY; install it from the trusted channel (out-of-band) and re-run the installer"
+[ -f "$VERIFIER" ] || fail "trusted verifier not found at $VERIFIER; install the trusted tools (see docs/offline-deployment.md, 'Trust bootstrap')"
+
+# The verifier must not come from the bundle it verifies (see header comment).
+bundle_real="$(cd "$BUNDLE" && pwd -P)"
+case "$(cd "$(dirname "$VERIFIER")" && pwd -P)" in
+  "$bundle_real"/*)
+    fail "refusing to verify with a verifier inside the bundle; install the trusted tools at $TRUST_DIR" ;;
+esac
+case "$(cd "$(dirname "$PUBKEY")" && pwd -P)" in
+  "$bundle_real"/*)
+    fail "refusing to verify with a pubkey shipped inside the bundle; install it at $PUBKEY from the trusted channel" ;;
+esac
+
+# Execute the verifier via python3 (it is installed with install -m 644 on the
+# documented channel); mirrors install_offline.sh's VEXEC handling.
+VEXEC="python3"
+$VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" || {
+  fail "bundle verification FAILED — the payload may be tampered or corrupt; nothing will be installed or executed"
+}
+
+# --- step 2: create the _udbmcp service group and user (idempotent) ----------
+# Mirrors the Linux udbmcp account: no login shell, no home, hidden from the
+# login window. macOS has no groupadd/useradd; use dscl against the local
+# directory. A UID/GID is picked at random from the reserved service range
+# (400-499, below regular users at 501+), skipping anything already in use.
+echo "==> postinstall: ensuring $SERVICE_GROUP service group and $SERVICE_USER service user"
+
+used_ids="$( { dscl . -list /Users UniqueID 2>/dev/null; dscl . -list /Groups PrimaryGroupID 2>/dev/null; } | awk '{print $NF}' | sort -u)"
+
+free_id() {
+  # $1 = range start, $2 = range end; prints a free id or returns 1
+  local start=$(( $1 + (RANDOM % ($2 - $1 + 1)) ))
+  local id
+  for id in $(seq "$start" "$2") $(seq "$1" "$((start - 1))"); do
+    if ! printf '%s\n' "$used_ids" | grep -qx "$id"; then
+      printf '%s\n' "$id"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if dscl . -read "/Groups/$SERVICE_GROUP" >/dev/null 2>&1; then
+  GROUP_GID="$(dscl . -read "/Groups/$SERVICE_GROUP" PrimaryGroupID | awk '{print $2}')"
+else
+  GROUP_GID="$(free_id 400 499)" || fail "no free GID available in the 400-499 service range for $SERVICE_GROUP"
+  dscl . -create "/Groups/$SERVICE_GROUP" || fail "could not create group $SERVICE_GROUP (dscl)"
+  dscl . -create "/Groups/$SERVICE_GROUP" PrimaryGroupID "$GROUP_GID"
+  dscl . -create "/Groups/$SERVICE_GROUP" RealName "Universal DB MCP service group"
+  dscl . -create "/Groups/$SERVICE_GROUP" Password "*"
+fi
+
+if dscl . -read "/Users/$SERVICE_USER" >/dev/null 2>&1; then
+  :  # already provisioned (upgrade/re-install): keep the existing UID
+else
+  USER_UID="$(free_id 400 499)" || fail "no free UID available in the 400-499 service range for $SERVICE_USER"
+  dscl . -create "/Users/$SERVICE_USER" || fail "could not create user $SERVICE_USER (dscl)"
+  dscl . -create "/Users/$SERVICE_USER" UniqueID "$USER_UID"
+  dscl . -create "/Users/$SERVICE_USER" PrimaryGroupID "$GROUP_GID"
+  dscl . -create "/Users/$SERVICE_USER" RealName "Universal DB MCP service user"
+  dscl . -create "/Users/$SERVICE_USER" UserShell /usr/bin/false
+  dscl . -create "/Users/$SERVICE_USER" NFSHomeDirectory /var/empty
+  dscl . -create "/Users/$SERVICE_USER" Password "*"
+  dscl . -create "/Users/$SERVICE_USER" IsHidden 1
+fi
+dscl . -read "/Users/$SERVICE_USER" >/dev/null 2>&1 || {
+  fail "could not create the $SERVICE_USER service account; the launchd daemon runs as this user"
+}
+
+# --- step 3: build the venv from the bundle wheelhouse (no index, hashed) ----
+echo "==> postinstall: creating virtual environment at $VENV"
+
+# Interpreter is an admin-provisioned staging-host prerequisite (same trust
+# position as libc6/python3 on the .deb). Re-validate EXACTLY the candidates
+# preinstall approved — never a PATH search: `command -v python3.12` could
+# resolve to a Homebrew or per-user interpreter that preinstall never checked
+# and that is writable by someone other than root, yet it would be executed
+# as root here and remain the target of the venv's python symlink.
+FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+USR_LOCAL_PY="/usr/local/bin/python3"
+PY=""
+for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY"; do
+  if [ -x "$candidate" ] && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
+    PY="$candidate"
+    break
+  fi
+done
+[ -n "$PY" ] || fail "CPython 3.12 (all-users install) not found at $FRAMEWORK_PY or $USR_LOCAL_PY (the exact paths preinstall validated); install the python.org 3.12 framework installer and re-run"
+"$PY" -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"' || {
+  fail "CPython 3.12.x is required (the wheelhouse is built for cp312)"
+}
+"$PY" -c 'import ensurepip, venv' 2>/dev/null || fail "venv/ensurepip not available in $PY"
+
+if [ ! -d "$PREFIX" ]; then
+  # Root-owned 755: the venv is code that root-run tools and the service
+  # execute; it must never be owned or writable by anyone else.
+  install -d -m 755 -o root -g wheel "$PREFIX"
+fi
+"$PY" -m venv "$VENV" || fail "could not create the virtual environment at $VENV"
+
+echo "==> postinstall: installing application from bundle wheelhouse (no index, hashed)"
+# Hostile-env neutralization (mirrors scripts/install_offline.sh): a curated
+# pip.conf, an index override or proxy variables inherited from the admin's
+# session must not be able to redirect these installs to a network source.
+# --no-index + --require-hashes make the bundle wheelhouse the only source and
+# the shipped runtime.lock the only acceptable resolution.
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy || true
+env \
+  PIP_CONFIG_FILE=/dev/null \
+  PIP_DISABLE_PIP_VERSION_CHECK=1 \
+  PIP_NO_INDEX=1 \
+  PIP_FIND_LINKS="$BUNDLE/wheelhouse" \
+  "$VENV/bin/python" -m pip --isolated --disable-pip-version-check install \
+  --no-index \
+  --no-cache-dir \
+  --find-links="$BUNDLE/wheelhouse" \
+  --only-binary=:all: \
+  --require-hashes \
+  -r "$BUNDLE/requirements/runtime.lock" || {
+  fail "wheelhouse install failed; the runtime.lock resolution could not be installed from the verified bundle"
+}
+
+# --- step 4: smoke check — the FIRST execution of payload code, so it is only
+# reached after the step-1 verification passed -------------------------------
+echo "==> postinstall: smoke check"
+"$VENV/bin/python" -m universal_db_mcp version || {
+  fail "smoke check failed: the installed package does not respond to 'universal_db_mcp version'"
+}
+
+# --- step 5: install config.yaml ONLY if absent (never clobber the admin's) --
+echo "==> postinstall: installing config template (only if absent)"
+if [ ! -f "$CONFIG" ]; then
+  [ -f "$BUNDLE/config-templates/config.yaml" ] || fail "config template missing from the bundle at $BUNDLE/config-templates/config.yaml"
+  install -d -m 755 -o root -g wheel "$CONFIG_DIR"
+  # Root-owned, group-readable by the service account only: the config may
+  # reference credentials; the service runs as $SERVICE_USER and must read it.
+  install -m 640 -o root -g "$SERVICE_GROUP" "$BUNDLE/config-templates/config.yaml" "$CONFIG"
+else
+  echo "    $CONFIG already present — left untouched (never clobber)"
+fi
+
+# --- step 6: state and log directories, owned by the service account ---------
+echo "==> postinstall: provisioning state and log directories"
+# 0750: audit trail and metadata cache contain SQL text / schema metadata;
+# only the service account (and root) may read them.
+install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$LOG_DIR" || {
+  fail "could not create $STATE_DIR and $LOG_DIR (the service's state and log directories)"
+}
+
+# --- step 7: publish manifest.json next to the venv (doctor hook) ------------
+# doctor derives the installed profile from this file instead of guessing from
+# the running platform. Guarded: a bundle without a manifest must not fail the
+# install — doctor falls back to an honest platform description.
+if [ -f "$BUNDLE/manifest.json" ]; then
+  install -m 644 -o root -g wheel "$BUNDLE/manifest.json" "$PREFIX/manifest.json"
+fi
+
+# --- step 8: bootstrap the launchd daemon (fail closed) ----------------------
+echo "==> postinstall: bootstrapping launchd daemon $LABEL"
+[ -f "$PLIST" ] || fail "launchd plist missing at $PLIST"
+# On an upgrade the daemon may already be bootstrapped; bootout first so the
+# (possibly changed) plist is picked up. Every failure here is FATAL: a
+# bootout that silently fails leaves the stale daemon running with the OLD
+# plist while its payload and venv have just been replaced, and reporting
+# that as success would be a masked failed upgrade — the exact failure this
+# step exists to prevent. There is no already-bootstrapped tolerance.
+if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+  launchctl bootout "system/$LABEL" || {
+    fail "launchctl bootout system/$LABEL failed; the running daemon must be unloaded before the upgraded plist can take effect"
+  }
+fi
+launchctl bootstrap system "$PLIST" || {
+  fail "launchctl bootstrap system $PLIST failed; start it manually with: launchctl bootstrap system $PLIST"
+}
+
+echo "==> postinstall complete. Next steps:"
+echo "    1. Edit $CONFIG (the template was installed only if absent)."
+echo "    2. Run: $VENV/bin/python -m universal_db_mcp doctor"
+echo "    3. Server logs: $LOG_DIR (launchd label: system/$LABEL)"
+exit 0

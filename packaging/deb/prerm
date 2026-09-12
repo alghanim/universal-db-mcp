@@ -1,0 +1,80 @@
+#!/bin/bash
+# Debian prerm for universal-db-mcp: stop/disable the service before removal.
+#
+# ---------------------------------------------------------------------------
+# SCOPE
+#
+# This script only manages the systemd service. It never verifies, inspects
+# or executes any payload from the signed bundle: the verify-before-execute
+# invariant lives in preinst (trust prerequisites) and postinst (the trusted
+# installer re-verifies the payload via verify_bundle.py --pubkey before
+# anything in it runs). Removal is the reverse: stop first, then let dpkg
+# unpack the replacement (upgrade) or delete the files (remove/purge).
+#
+# TOLERANCE: container installs have no systemd as PID 1 (dpkg -i must
+# succeed there too — the deb gate runs under `docker --network none`), and
+# the unit may legitimately be absent if postinst never got to register it.
+# Both cases degrade to a no-op with a warning; they MUST NOT abort the
+# removal, so every systemctl call is guarded and non-fatal.
+# ---------------------------------------------------------------------------
+set -eu
+
+UNIT="universal-db-mcp.service"
+
+warn() {
+    echo "WARN: $1" >&2
+}
+
+systemd_available() {
+    # systemctl binary present AND systemd actually running as init.
+    # Without the /run/systemd/system check, systemctl would try to talk to
+    # systemd over D-Bus and fail (or hang) inside containers.
+    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+stop_service() {
+    if systemd_available; then
+        # try-restart-style tolerance: a stopped or masked unit is not an
+        # error worth failing the removal over.
+        if systemctl stop "$UNIT" 2>/dev/null; then
+            echo "universal-db-mcp prerm: stopped $UNIT."
+        else
+            warn "could not stop $UNIT (already stopped, masked, or not registered?) — continuing."
+        fi
+    else
+        warn "systemd not active (container or non-systemd host): skipping service stop."
+    fi
+}
+
+disable_service() {
+    # Only on final removal (not upgrade): an upgrade keeps the enablement
+    # and postinst re-establishes it with `systemctl enable --now`.
+    if systemd_available; then
+        if systemctl disable "$UNIT" 2>/dev/null; then
+            echo "universal-db-mcp prerm: disabled $UNIT."
+        else
+            warn "could not disable $UNIT (not registered?) — continuing."
+        fi
+    fi
+}
+
+case "${1:-}" in
+    remove|upgrade|deconfigure|failed-upgrade)
+        stop_service
+        if [ "$1" = "remove" ]; then
+            disable_service
+        fi
+        ;;
+    "")
+        # dpkg always passes an action; an empty argument means the script
+        # was invoked outside dpkg. Refuse rather than guess (fail closed).
+        echo "universal-db-mcp prerm: no dpkg action argument; refusing to act." >&2
+        exit 1
+        ;;
+    *)
+        # Unknown action: nothing destructive to do, but say so loudly.
+        warn "unexpected prerm action '$1'; taking no service action."
+        ;;
+esac
+
+exit 0

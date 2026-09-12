@@ -185,6 +185,16 @@ udbmcp_install_os_packages "$BUNDLE" "$PY" "$sudo_ok"
 echo "==> smoke check"
 $sudo_ok "$TARGET/venv/bin/python" -m universal_db_mcp version
 
+# Publish the verified bundle's manifest next to the venv ($TARGET/manifest.json)
+# so `doctor` can report the profile it was actually built for instead of
+# guessing from the running platform. Guarded: a bundle without a manifest must
+# not fail the install — doctor falls back to an honest platform description.
+# $BUNDLE is the re-verified private staging copy here, so what is published is
+# exactly what was verified.
+if [ -f "$BUNDLE/manifest.json" ]; then
+  $sudo_ok install -m 644 -o root -g root "$BUNDLE/manifest.json" "$TARGET/manifest.json"
+fi
+
 echo "==> installed. Next steps:"
 echo "    1. Copy $ORIG_BUNDLE/config-templates/config.yaml to /etc/universal-db-mcp/config.yaml and edit."
 echo "    2. Run: $TARGET/venv/bin/python -m universal_db_mcp doctor"

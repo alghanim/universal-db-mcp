@@ -29,6 +29,24 @@ from pathlib import Path
 WHEEL_RE = re.compile(r"^(?P<name>[^-]+)-(?P<ver>[^-]+)-[^-]+-[^-]+-[^-]+\.whl$")
 
 
+def load_profiles_module():
+    """Import scripts/profiles.py (the target-profile registry).
+
+    The verifier travels on the trusted channel, outside this repository, so
+    the registry is located next to this file (as shipped in trusted-tools/)
+    or in its lib/ directory. Missing registry = fail closed.
+    """
+    here = Path(__file__).resolve().parent
+    for base in (here, here / "lib"):
+        if (base / "profiles.py").is_file():
+            if str(base) not in sys.path:
+                sys.path.insert(0, str(base))
+            import profiles  # type: ignore[import-not-found]
+
+            return profiles
+    raise ImportError("profiles.py not found next to this verifier or in its lib/ directory")
+
+
 def fail(msg: str) -> None:
     print(f"FAIL: {msg}")
     global failed
@@ -56,22 +74,34 @@ def main() -> int:
     manifest = json.loads(manifest_p.read_text())
     profile = manifest["profile"]
 
-    # profile compatibility
-    if "linux-x86_64" in profile:
-        if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
-            if args.allow_platform_mismatch:
-                print(
-                    f"WARNING: verifying a linux-x86_64 bundle on "
-                    f"{platform.system()}/{platform.machine()}. This is a STAGING-side "
-                    f"integrity/authenticity check only. The bundle must still be verified "
-                    f"WITHOUT this flag on the actual install target."
-                )
-            else:
-                fail(f"bundle profile '{profile}' does not match this platform "
-                     f"({platform.system()}/{platform.machine()}); pass "
-                     f"--allow-platform-mismatch only when verifying on a staging machine")
-        if not sys.version.startswith("3.12") and not args.allow_platform_mismatch:
-            fail(f"bundle profile requires CPython 3.12; running {platform.python_version()}")
+    # profile compatibility: registry lookup (scripts/profiles.py) replaces the
+    # previously hardcoded 'linux-x86_64' branch. Known profiles are checked
+    # against their declared target; unknown profiles (not from this registry)
+    # only draw a loud warning — integrity/authenticity above still cover them.
+    try:
+        profiles = load_profiles_module()
+        prof = profiles.PROFILES.get(profile)
+        if prof is None:
+            print(f"WARNING: unknown bundle profile '{profile}' (this verifier knows: "
+                  f"{', '.join(sorted(profiles.PROFILES))}); skipping platform compatibility check")
+        else:
+            mismatches = profiles.profile_host_mismatches(prof)
+            if mismatches:
+                if args.allow_platform_mismatch:
+                    print(
+                        f"WARNING: verifying a {profile} bundle on "
+                        f"{platform.system()}/{platform.machine()}. This is a STAGING-side "
+                        f"integrity/authenticity check only. The bundle must still be verified "
+                        f"WITHOUT this flag on the actual install target."
+                    )
+                else:
+                    fail(f"bundle profile '{profile}' does not match this machine "
+                         f"({platform.system()}/{platform.machine()}/"
+                         f"{platform.python_version()}): {'; '.join(mismatches)}; pass "
+                         f"--allow-platform-mismatch only when verifying on a staging machine")
+    except Exception as exc:  # pragma: no cover - fail closed on any registry problem
+        fail(f"cannot load the target-profile registry: {exc}. Install profiles.py "
+             f"next to this verifier (trusted-tools ships it) and re-run")
 
     # integrity
     sums = bundle / "SHA256SUMS"
