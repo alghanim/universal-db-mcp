@@ -1,9 +1,11 @@
 """CLI entry point: ``python -m universal_db_mcp <command>``.
 
 Commands:
-  serve    Run the MCP server (stdio by default; http optional).
-  doctor   Check local artifacts and effective policy (no network).
-  version  Print version and pinned SDK information.
+  serve             Run the MCP server (stdio by default; http optional).
+  doctor            Check local artifacts and effective policy (no network).
+  version           Print version and pinned SDK information.
+  configure-agents  Register the server into detected AI-agent harnesses
+                    (ask-before-write; see docs/claude-code-integration.md).
 """
 
 from __future__ import annotations
@@ -12,6 +14,10 @@ import argparse
 import hmac
 import os
 import sys
+import textwrap
+from collections.abc import Mapping
+from pathlib import Path
+from types import ModuleType
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,6 +36,27 @@ def main(argv: list[str] | None = None) -> int:
     doctor.add_argument("--connectivity", action="store_true", help="also probe configured databases")
 
     sub.add_parser("version", help="print version information")
+
+    configure = sub.add_parser(
+        "configure-agents",
+        help="register the MCP server into detected AI-agent harnesses (ask-before-write)",
+    )
+    configure.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be written; never prompt and never write",
+    )
+    configure.add_argument(
+        "--yes",
+        action="store_true",
+        help="apply without interactive confirmation (for non-interactive use)",
+    )
+    configure.add_argument(
+        "--agent",
+        default=None,
+        metavar="NAME",
+        help="only consider one harness (claude-code, claude-desktop, dsh, cursor, vscode, cline)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -53,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "serve":
         return _serve(args)
+
+    if args.command == "configure-agents":
+        return _configure_agents(args)
 
     parser.error(f"unknown command {args.command!r}")
     return 2
@@ -160,6 +190,148 @@ def _serve_http(cfg, server) -> int:  # type: ignore[no-untyped-def]
         log_level="warning",
         access_log=False,
     )
+    return 0
+
+
+def _indent_block(text: str, prefix: str = "    ") -> str:
+    return textwrap.indent(text, prefix) if text else ""
+
+
+def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str], home: Path) -> None:
+    """Run one confirmed apply and print the outcome; never raises."""
+    from universal_db_mcp.agents.core import AgentConfigError
+
+    try:
+        result = registry.apply_confirmed(name, env, home, True)
+    except AgentConfigError as exc:
+        print(f"  -> write skipped, adapter unavailable: {exc}")
+        return
+    except Exception as exc:  # adapter crash mid-write: report, never retry
+        print(f"  -> FAIL CLOSED: write aborted ({type(exc).__name__}: {exc})")
+        return
+    for backup in result.backup_paths:
+        print(f"  backup: {backup}")
+    print(f"  -> {result.status.value}: {result.summary}")
+
+
+def _configure_agents(args: argparse.Namespace) -> int:
+    """``configure-agents``: detect harnesses, show exact plans, ask, then write.
+
+    Ask-before-write contract:
+
+    * Detection and planning never write anything.
+    * ``--dry-run`` prints the plans and exits without prompting or writing.
+    * On a TTY, each candidate is applied only after an explicit ``y`` answer.
+    * Without a TTY, a write requires ``--yes``; otherwise nothing is written
+      and the command exits 1.
+    * Malformed/unreadable existing configs and unavailable adapter modules
+      are reported and never overwritten (fail closed). Writes go through the
+      adapter's ``apply(confirmed=True)``, which backs up each target with a
+      timestamped ``.bak`` and is idempotent.
+    """
+    from universal_db_mcp.agents import registry
+    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus
+
+    env = os.environ
+    home = Path.home()
+
+    names = registry.HARNESS_NAMES
+    if args.agent is not None:
+        if args.agent not in names:
+            valid = ", ".join(names)
+            print(
+                f"CONFIG_ERROR: unknown agent {args.agent!r}; valid --agent values: {valid}",
+                file=sys.stderr,
+            )
+            return 2
+        names = (args.agent,)
+
+    if args.dry_run and args.yes:
+        print("dry-run: --yes ignored; nothing will be written or prompted")
+
+    # Phase 1: read-only detection table.
+    print(f"Detecting agent harnesses (HOME={home}):")
+    detected: dict[str, AgentStatus | None] = {}
+    for name in names:
+        try:
+            status = registry.detect_status(name, env, home)
+        except AgentConfigError as exc:
+            detected[name] = None
+            print(f"  {name:<16} adapter-unavailable; skipped ({exc})")
+        except Exception as exc:  # unexpected adapter crash: fail closed
+            detected[name] = None
+            print(f"  {name:<16} fail-closed; skipped (adapter error: {type(exc).__name__}: {exc})")
+        else:
+            detected[name] = status
+            print(f"  {name:<16} {status.value}")
+
+    # Phase 2: print the exact plan per actionable harness and ask.
+    pending: list[str] = []
+    for name in names:
+        if detected.get(name) is None:
+            continue
+        try:
+            planned = registry.build_plan(name, env, home)
+        except AgentConfigError as exc:
+            print(f"\n== {name} ==\n  adapter unavailable; nothing written: {exc}")
+            continue
+        except Exception as exc:
+            print(f"\n== {name} ==\n  FAIL CLOSED: adapter error ({type(exc).__name__}: {exc}); nothing written")
+            continue
+
+        if planned.status is AgentStatus.NOT_INSTALLED:
+            continue
+        if planned.status is AgentStatus.CONFIGURED:
+            print(f"\n== {name} ==\n  {planned.summary}")
+            continue
+
+        print(f"\n== {name} ==")
+        if planned.config_path is not None:
+            print(f"  config file: {planned.config_path}")
+        for extra in planned.config_paths:
+            if extra != planned.config_path:
+                print(f"  also: {extra}")
+        print(f"  {planned.summary}")
+        block = planned.config_block or planned.block
+        if block:
+            print("  would add:")
+            print(_indent_block(block))
+
+        if planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
+            print("  FAIL CLOSED: fix or inspect the existing config above; nothing will be written")
+            continue
+        if planned.status is not AgentStatus.INSTALLED_UNCONFIGURED:
+            print(f"  no write offered (status: {planned.status.value})")
+            continue
+        if args.dry_run:
+            print("  dry-run: nothing written")
+            continue
+
+        if args.yes:
+            _apply_registration(name, registry, env, home)
+            continue
+
+        if not sys.stdin.isatty():
+            print("  NOT CONFIRMED: stdin is not a TTY and --yes was not given; nothing written")
+            pending.append(name)
+            continue
+
+        try:
+            answer = input(f"  Register universal-db into {name} ({planned.config_path})? [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() in ("y", "yes"):
+            _apply_registration(name, registry, env, home)
+        else:
+            print("  skipped (declined)")
+
+    if pending:
+        print(
+            f"\nCONFIG_ERROR: {len(pending)} harness(es) need confirmation but stdin is not a TTY; "
+            "re-run with --yes to apply non-interactively. Nothing was written.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

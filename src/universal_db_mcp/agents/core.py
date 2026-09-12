@@ -1,0 +1,139 @@
+"""Agent-harness registration adapters (``universal_db_mcp configure-agents``).
+
+Each adapter module detects one installed AI-agent harness on the local
+machine and, after explicit confirmation at the CLI layer, registers the
+universal-db MCP server into that harness's config file. Shared primitives
+live here so every adapter behaves identically:
+
+* :class:`AgentStatus` — the four fail-closed-aware states.
+* :class:`Plan` — a printable description of exactly what would be added.
+* :func:`backup_path` — timestamped ``.bak`` sibling path.
+* :func:`load_json_or_fail_closed` — parse-or-report helper that never
+  raises and never silently overwrites malformed user state.
+* :func:`load_yaml_or_fail_closed` — the same fail-closed contract for
+  YAML-config harnesses.
+* :class:`AgentConfigError` — typed fail-closed error for infrastructure
+  problems (e.g. an adapter module that cannot be imported).
+
+``Plan`` is a superset of the fields used by the individual adapters
+(single- vs multi-file harnesses, JSON vs generated-config harnesses);
+adapters populate only the fields that apply to them.
+"""
+
+from __future__ import annotations
+
+import enum
+import json
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+
+class AgentConfigError(Exception):
+    """Fail-closed error in the agent-registration infrastructure itself.
+
+    Raised by the adapter registry (for example when an adapter module cannot
+    be imported). This is distinct from a harness's ``unknown_state_fail_closed``
+    status: an :class:`AgentConfigError` means the CLI cannot even evaluate the
+    harness, so it reports the problem and never writes to that harness.
+    """
+
+
+class AgentStatus(enum.Enum):
+    """State of one agent harness on this machine."""
+
+    NOT_INSTALLED = "not_installed"
+    INSTALLED_UNCONFIGURED = "installed_unconfigured"
+    CONFIGURED = "configured"
+    UNKNOWN_STATE_FAIL_CLOSED = "unknown_state_fail_closed"
+
+
+@dataclass(frozen=True)
+class Plan:
+    """What an adapter would do / did, for printing at the CLI layer.
+
+    Common fields (every adapter sets ``agent`` and ``status``):
+
+    * ``agent`` — adapter name (``"cline"``, ``"cursor"``, ...).
+    * ``status`` — the detected / resulting :class:`AgentStatus`.
+    * ``config_path`` — the primary config file (single-file harnesses).
+    * ``summary`` / ``description`` — human-readable explanation.
+    * ``config_block`` / ``block`` — the exact bytes that would be added,
+      pretty-printed; empty when no write would happen. In a fail-closed
+      state this carries the operator-inspection block instead.
+    * ``entry`` / ``server_block`` — the dict written under the harness's
+      ``mcpServers`` key; never contains secrets.
+
+    Multi-file harnesses (e.g. Claude Code's user + project scopes) use the
+    plural ``config_paths`` / ``backup_paths``; ``action`` describes the
+    write mode for generated-config harnesses (``"none"``,
+    ``"append-registration"``, ...).
+    """
+
+    agent: str
+    status: AgentStatus
+    config_path: Path | None = None
+    config_paths: tuple[Path, ...] = ()
+    backup_paths: tuple[Path, ...] = ()
+    action: str = ""
+    summary: str = ""
+    description: str = ""
+    config_block: str = ""
+    block: str = ""
+    entry: dict[str, Any] = field(default_factory=dict)
+    server_block: dict[str, Any] = field(default_factory=dict)
+
+
+def backup_path(target: Path) -> Path:
+    """Timestamped sibling backup path for ``target`` (never overwrites)."""
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return target.parent / f"{target.name}.bak.{stamp}"
+
+
+def load_json_or_fail_closed(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Read ``path`` as a JSON object, reporting problems instead of raising.
+
+    Returns ``(data, None)`` on success or ``(None, reason)`` when the file
+    is missing, unreadable, malformed, or not a JSON object. Callers treat
+    the failure case as fail-closed: report, never overwrite.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, f"{path} does not exist"
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"{path} could not be read: {exc}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, f"{path} is not valid JSON: {exc}"
+    if not isinstance(data, dict):
+        return None, f"{path} does not contain a JSON object at the top level"
+    return data, None
+
+
+def load_yaml_or_fail_closed(path: Path) -> tuple[Any | None, str | None]:
+    """Read ``path`` as YAML, reporting problems instead of raising.
+
+    Same fail-closed contract as :func:`load_json_or_fail_closed`: returns
+    ``(data, None)`` on success or ``(None, reason)`` when the file is
+    missing, unreadable, or malformed. Unlike the JSON helper, the top-level
+    document is returned as-is (YAML harness configs may legitimately be
+    sequences, e.g. the dsh patch layer).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, f"{path} does not exist"
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"{path} could not be read: {exc}"
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover — PyYAML is a hard dependency
+        return None, f"PyYAML is not available: {exc}"
+    try:
+        data = yaml.safe_load(raw)
+    except Exception as exc:
+        return None, f"{path} is not valid YAML: {exc}"
+    return data, None
