@@ -617,3 +617,82 @@ def test_executed_passing_verification_reaches_provisioning(tmp_path: Path) -> N
     assert verifier_calls and verifier_calls[0] < first_provision, (
         f"verify-then-provision order broken:\n{joined}"
     )
+
+
+# ------------------------------------------------- bootout/bootstrap upgrade race
+# Seen live (2026-09-13 upgrade): launchctl bootout reports success while the
+# job is still being torn down, and an immediate bootstrap fails - the install
+# died at this step and left the service UNLOADED with the payload already
+# upgraded. postinstall must poll until the job is gone and retry bootstrap
+# (bounded) before failing.
+
+
+def _stateful_launchctl_shim(tmp_path: Path, *, bootstrap_failures: int | None) -> None:
+    """Replace the sandbox launchctl shim with one that simulates the upgrade
+    race: the job is loaded (print rc=0), bootout succeeds, TWO polls still
+    see it, the third does not; bootstrap fails `bootstrap_failures` times
+    then succeeds (None = always fails). Every call is logged in the shim
+    format the assertions below read."""
+    shim = tmp_path / "shim-bin" / "launchctl"
+    actions = tmp_path / "shim-actions.log"
+    prints = tmp_path / "launchctl-prints"
+    bootstraps = tmp_path / "launchctl-bootstraps"
+    shim.write_text(
+        "#!/bin/bash\n"
+        f'printf \'LAUNCHCTL %s\\n\' "$*" >> "{actions}"\n'
+        'case "$1" in\n'
+        "  print)\n"
+        f'    n=0; [ -f "{prints}" ] && n=$(cat "{prints}")\n'
+        f'    echo $((n + 1)) > "{prints}"\n'
+        "    if [ \"$n\" -lt 3 ]; then exit 0; else exit 1; fi ;;\n"
+        "  bootout) exit 0 ;;\n"
+        "  bootstrap)\n"
+        f'    n=0; [ -f "{bootstraps}" ] && n=$(cat "{bootstraps}")\n'
+        f'    echo $((n + 1)) > "{bootstraps}"\n'
+        + (
+            '    exit 1 ;;\n' if bootstrap_failures is None else
+            f'    if [ "$n" -lt {bootstrap_failures} ]; then exit 1; else exit 0; fi ;;\n'
+        )
+        + "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+
+
+def test_executed_bootout_bootstrap_race_is_retried(tmp_path: Path) -> None:
+    bundle = _build_bundle(tmp_path)
+    _verifier_stub(tmp_path, "verify_bundle.py", exit_code=0, output="bundle verification PASSED")
+    pubkey = _pubkey_stub(tmp_path)
+    _build_shims(tmp_path)
+    _stateful_launchctl_shim(tmp_path, bootstrap_failures=1)
+    plist = tmp_path / "com.udbmcp.server.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+
+    proc = _run_postinstall(tmp_path, bundle, pubkey=pubkey)
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"the race must be survived by retrying:\n{out}"
+    assert "FAIL" not in out, out
+    bootstraps = [ln for ln in _actions(tmp_path) if ln.startswith("LAUNCHCTL bootstrap")]
+    assert len(bootstraps) == 2, (
+        f"bootstrap must be retried until it succeeds (1 failure + 1 success):\n{bootstraps}"
+    )
+
+
+def test_executed_bootstrap_failure_after_retries_is_fatal(tmp_path: Path) -> None:
+    bundle = _build_bundle(tmp_path)
+    _verifier_stub(tmp_path, "verify_bundle.py", exit_code=0, output="bundle verification PASSED")
+    pubkey = _pubkey_stub(tmp_path)
+    _build_shims(tmp_path)
+    _stateful_launchctl_shim(tmp_path, bootstrap_failures=None)  # always fails
+    plist = tmp_path / "com.udbmcp.server.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+
+    proc = _run_postinstall(tmp_path, bundle, pubkey=pubkey)
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "exhausted bootstrap retries must fail the install"
+    assert "failed after 3 attempts" in out, out
+    bootstraps = [ln for ln in _actions(tmp_path) if ln.startswith("LAUNCHCTL bootstrap")]
+    assert len(bootstraps) == 3, f"exactly 3 bounded attempts expected:\n{bootstraps}"

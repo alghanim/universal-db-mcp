@@ -311,10 +311,27 @@ if launchctl print "system/$LABEL" >/dev/null 2>&1; then
   launchctl bootout "system/$LABEL" || {
     fail "launchctl bootout system/$LABEL failed; the running daemon must be unloaded before the upgraded plist can take effect"
   }
+  # bootout teardown is ASYNCHRONOUS: it can report success while the job is
+  # still registered, and an immediate bootstrap then fails (seen live
+  # 2026-09-13: an upgrade died at this step and left the service unloaded).
+  # Poll (bounded) until the job is actually gone before re-registering.
+  waited=0
+  while launchctl print "system/$LABEL" >/dev/null 2>&1 && [ "$waited" -lt 10 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
 fi
-launchctl bootstrap system "$PLIST" || {
-  fail "launchctl bootstrap system $PLIST failed; start it manually with: launchctl bootstrap system $PLIST"
-}
+# bootstrap can also lose the race against a just-torn-down registry entry:
+# retry (bounded) before giving up. Every retry is silent; only the final
+# failure is fatal, with the manual command as the remedy.
+bootstrap_attempt=0
+until launchctl bootstrap system "$PLIST" 2>/dev/null; do
+  bootstrap_attempt=$((bootstrap_attempt + 1))
+  if [ "$bootstrap_attempt" -ge 3 ]; then
+    fail "launchctl bootstrap system $PLIST failed after 3 attempts; start it manually with: launchctl bootstrap system $PLIST"
+  fi
+  sleep 2
+done
 
 # --- step 9: assemble the /Applications GUI wrapper (agent configuration) ----
 # The dialog logic lives in the root-owned VERIFIED payload

@@ -173,12 +173,17 @@ def test_postinstall_bootstrap_failure_is_fatal_no_already_bootstrapped_toleranc
     """A failed `launchctl bootstrap` must abort the install. The previous
     print-based tolerance could leave a stale daemon running the OLD plist
     while the payload/venv beneath it were already replaced — a masked failed
-    upgrade. The tolerance text must be gone and the bootstrap must fail into
-    the fail() helper."""
+    upgrade. The tolerance text must be gone. bootstrap now RETRIES (bounded)
+    against the live bootout->bootstrap teardown race (seen 2026-09-13: an
+    immediate re-register after bootout failed and left the service
+    unloaded), but exhausted retries must still fail into the fail() helper."""
     text = _postinstall_text()
     assert "already bootstrapped" not in text, "the 'already bootstrapped — left running' tolerance must be removed"
-    m = re.search(r'launchctl bootstrap system "\$PLIST" \|\| \{\n\s*fail ', text)
-    assert m, "launchctl bootstrap must fail into fail() — bootstrap failures abort the install"
+    m = re.search(r'until launchctl bootstrap system "\$PLIST" 2>/dev/null; do', text)
+    assert m, "bootstrap must run in a bounded retry loop (bootout teardown is asynchronous)"
+    assert 'failed after 3 attempts' in text, "exhausted retries must name the bound"
+    m2 = re.search(r'"\$bootstrap_attempt" -ge 3 \]; then\n\s*fail ', text)
+    assert m2, "exhausted bootstrap retries must fail into fail() — bootstrap failures abort the install"
 
 
 # --------------------------------------------------------------------------
