@@ -207,7 +207,7 @@ def _indent_block(text: str, prefix: str = "    ") -> str:
 
 def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str], home: Path) -> None:
     """Run one confirmed apply and print the outcome; never raises."""
-    from universal_db_mcp.agents.core import AgentConfigError
+    from universal_db_mcp.agents.core import AgentConfigError, ensure_per_user_harness_config
 
     try:
         result = registry.apply_confirmed(name, env, home, True)
@@ -220,6 +220,12 @@ def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str],
     for backup in result.backup_paths:
         print(f"  backup: {backup}")
     print(f"  -> {result.status.value}: {result.summary}")
+    # The advertised config path may be the per-user default (the system
+    # deployment is service-account owned and unreadable by this user): seed
+    # it so the harness's spawns actually start. Only-if-absent.
+    seeded, note = ensure_per_user_harness_config(env, home)
+    if seeded is not None:
+        print(f"  seeded per-user harness config: {seeded} ({note})")
 
 
 def _configure_agents(args: argparse.Namespace) -> int:
@@ -238,7 +244,7 @@ def _configure_agents(args: argparse.Namespace) -> int:
       timestamped ``.bak`` and is idempotent.
     """
     from universal_db_mcp.agents import registry
-    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus
+    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus, ensure_per_user_harness_config
 
     env = os.environ
     home = Path.home()
@@ -311,12 +317,14 @@ def _configure_agents(args: argparse.Namespace) -> int:
                     continue
                 try:
                     result = registry.apply_confirmed(name, env, home, True)
+                    seeded, _seed_note = ensure_per_user_harness_config(env, home)
                     applied.append(
                         {
                             "agent": name,
                             "status": result.status.value,
                             "summary": result.summary,
                             "backups": [str(p) for p in result.backup_paths],
+                            "config_seeded": str(seeded) if seeded else None,
                         }
                     )
                     # Adapters may report a REFUSED write by returning a

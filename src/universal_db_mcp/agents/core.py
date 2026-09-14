@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import enum
 import json
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -137,3 +139,78 @@ def load_yaml_or_fail_closed(path: Path) -> tuple[Any | None, str | None]:
     except Exception as exc:
         return None, f"{path} is not valid YAML: {exc}"
     return data, None
+
+
+# ---------------------------------------------------------------------------
+# per-user harness config resolution + seeding
+# ---------------------------------------------------------------------------
+
+# The root-owned system deployment. It belongs to the launchd/systemd service
+# account (mode 0640, group = service account) and is NOT readable by a normal
+# user - harness (stdio) spawns run as the logged-in user and died right after
+# connecting with "Permission denied" when pointed at it (seen live
+# 2026-09-14). Resolution therefore checks READABILITY, not mere existence.
+SYSTEM_CONFIG_PATH = Path("/etc/universal-db-mcp/config.yaml")
+PER_USER_CONFIG_DIR = ".universal-db-mcp"
+
+_SEED_CONFIG_TEMPLATE = """\
+# Per-user configuration for universal-db-mcp harness (stdio) spawns, seeded
+# by `configure-agents`: the root-owned system deployment
+# (/etc/universal-db-mcp/config.yaml) belongs to the launchd/systemd service
+# account and is NOT readable by your user, so personal spawns get their own
+# config and state. Add connections below (secrets are referenced via
+# *_env / password_file, never inlined) and validate with:
+#   universal_db_mcp doctor --config {config_path}
+application:
+  transport: stdio
+  metadata_cache_path: {metadata_path}
+  audit_path: {audit_path}
+"""
+
+
+def resolve_harness_config_path(env: Mapping[str, str], home: Path) -> str:
+    """Config path advertised to a per-user harness (stdio) spawn.
+
+    Harness spawns run AS THE LOGGED-IN USER, so the advertised path must be
+    readable by that user. Resolution order: explicit ``UDBMCP_CONFIG`` from
+    the current environment (the operator's override - their responsibility),
+    then the system deployment when it exists AND is readable, then the
+    per-user default (which :func:`ensure_per_user_harness_config` seeds on
+    apply).
+    """
+    from_env = env.get("UDBMCP_CONFIG", "").strip()
+    if from_env:
+        return from_env
+    if SYSTEM_CONFIG_PATH.is_file() and os.access(SYSTEM_CONFIG_PATH, os.R_OK):
+        return str(SYSTEM_CONFIG_PATH)
+    return str(home / PER_USER_CONFIG_DIR / "config.yaml")
+
+
+def ensure_per_user_harness_config(
+    env: Mapping[str, str], home: Path
+) -> tuple[Path | None, str]:
+    """Seed the per-user harness config when the advertised path needs it.
+
+    Only-if-absent: an existing per-user config is never clobbered. Returns
+    ``(created_path, note)``; ``created_path`` is None when the advertised
+    config needs no seeding (explicit env override, readable system
+    deployment, or the per-user file already exists).
+    """
+    advertised = resolve_harness_config_path(env, home)
+    per_user = home / PER_USER_CONFIG_DIR / "config.yaml"
+    if advertised != str(per_user):
+        return None, f"advertised config needs no seeding ({advertised})"
+    if per_user.is_file():
+        return None, "per-user config already present (left untouched)"
+    parent = per_user.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    per_user.write_text(
+        _SEED_CONFIG_TEMPLATE.format(
+            config_path=per_user,
+            metadata_path=parent / "metadata.sqlite",
+            audit_path=parent / "audit.jsonl",
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(per_user, 0o600)
+    return per_user, "seeded per-user config (0600; state and audit are per-user)"

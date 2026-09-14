@@ -48,7 +48,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from universal_db_mcp.agents.core import AgentStatus, Plan, backup_path
+from universal_db_mcp.agents.core import (
+    AgentStatus,
+    Plan,
+    backup_path,
+    resolve_harness_config_path,
+)
 
 AGENT_NAME = "dsh"
 PATCH_FILENAME = "cordis.patch.yml"
@@ -133,11 +138,17 @@ def _resolve_config_path() -> str:
     from_env = os.environ.get("UDBMCP_CONFIG")
     if from_env:
         return from_env
+    # Editable-install dev case: a real config at the checkout root wins.
     root = Path(__file__).resolve().parents[3]
-    for candidate in ("config.yaml", "config.mockdbs.yaml", "config.example.yaml"):
+    for candidate in ("config.yaml", "config.mockdbs.yaml"):
         if (root / candidate).is_file():
             return str(root / candidate)
-    return str(root / "config.yaml")
+    # Installed case: the system deployment only when the USER can READ it
+    # (harness spawns run as the user; the service-owned 0640 config killed
+    # them right after connecting - seen live 2026-09-14), else the per-user
+    # config that `configure-agents` seeds on apply. config.example.yaml is
+    # no longer advertised: it is a documentation artifact, not runnable.
+    return resolve_harness_config_path({}, Path.home())
 
 
 def _yaml_scalar(value: str) -> str:

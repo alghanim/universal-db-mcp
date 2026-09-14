@@ -51,7 +51,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .core import AgentStatus, Plan, backup_path, load_json_or_fail_closed
+from .core import (
+    AgentStatus,
+    Plan,
+    backup_path,
+    load_json_or_fail_closed,
+    resolve_harness_config_path,
+)
 
 AGENT_NAME = "cline"
 SERVER_KEY = "universal-db"
@@ -106,16 +112,14 @@ def _venv_python(env: Mapping[str, str]) -> str:
 def _udbmcp_config_path(env: Mapping[str, str], home: Path) -> str:
     """Config path advertised to the launched server via ``UDBMCP_CONFIG``.
 
-    Resolution order: explicit ``UDBMCP_CONFIG`` from the current
-    environment, then the canonical system deployment path when it exists,
-    then a per-user default under the given HOME.
+    Delegates to the shared resolver (agents.core): harness spawns run as the
+    logged-in USER, so the advertised path must be readable by them - the
+    system deployment is service-account owned (0640 root:_udbmcp) and is
+    not. Unreadable-system spawns died right after connecting (seen live
+    2026-09-14); the resolver falls back to the per-user config, which
+    ``configure-agents`` seeds on apply.
     """
-    from_env = env.get(UDBMCP_CONFIG_ENV, "").strip()
-    if from_env:
-        return from_env
-    if SYSTEM_CONFIG_PATH.is_file():
-        return str(SYSTEM_CONFIG_PATH)
-    return str(home / ".universal-db-mcp" / "config.yaml")
+    return resolve_harness_config_path(env, home)
 
 
 def registration_entry(env: Mapping[str, str], home: Path) -> dict[str, Any]:
