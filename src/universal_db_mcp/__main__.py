@@ -19,6 +19,7 @@ import textwrap
 from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,6 +67,41 @@ def main(argv: list[str] | None = None) -> int:
         "harness(es), restricted to --agent when set)",
     )
 
+    add_conn = sub.add_parser(
+        "add-connection",
+        help="interactive wizard: add a database connection to a config file",
+    )
+    add_conn.add_argument(
+        "--config", default=None,
+        help="config file to edit (default: the per-user/harness-resolved config)",
+    )
+    add_conn.add_argument("--name", default=None, help="connection name (skips the prompt)")
+    add_conn.add_argument(
+        "--engine", default=None,
+        choices=["sqlite", "postgres", "mysql", "clickhouse", "oracle", "mssql", "db2"],
+        help="engine type (skips the prompt)",
+    )
+    add_conn.add_argument("--host", default=None)
+    add_conn.add_argument("--port", type=int, default=None)
+    add_conn.add_argument("--database", default=None)
+    add_conn.add_argument(
+        "--username", default=None,
+        help="username (stored as a 0600 secrets file, never in the config)",
+    )
+    add_conn.add_argument(
+        "--password-file", default=None,
+        help="file with the password (first line); the password itself is only read interactively",
+    )
+    add_conn.add_argument(
+        "--read-write", action="store_true",
+        help="allow writes for this connection (server policy may still forbid them)",
+    )
+    add_conn.add_argument("--no-test", action="store_true", help="skip the live connection test")
+    add_conn.add_argument(
+        "--json", action="store_true",
+        help="machine-readable result (non-interactive: all flags required)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -91,6 +127,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "configure-agents":
         return _configure_agents(args)
+
+    if args.command == "add-connection":
+        return _add_connection(args)
 
     parser.error(f"unknown command {args.command!r}")
     return 2
@@ -429,6 +468,133 @@ def _configure_agents(args: argparse.Namespace) -> int:
         )
         return 1
     return 0
+
+
+def _add_connection(args: argparse.Namespace) -> int:
+    """``add-connection``: interactive wizard (or fully-flagged non-interactive
+    run) that adds one connection to a config file. Secrets become 0600 files
+    under <config dir>/secrets/; the config itself never holds credentials."""
+    from pydantic import ValidationError
+
+    from universal_db_mcp.agents.core import resolve_harness_config_path
+    from universal_db_mcp.errors import ConfigError
+    from universal_db_mcp.wizard import (
+        WizardError,
+        apply_connection,
+        build_connection,
+        collect_answers_interactive,
+        ensure_config_exists,
+        validate_connection_name,
+    )
+
+    cfg_path = Path(args.config) if args.config else Path(
+        resolve_harness_config_path(dict(os.environ), Path.home())
+    )
+    interactive = not args.json
+
+    provided = all(
+        v is not None for v in (args.name, args.engine, args.database)
+    )
+    if interactive and not sys.stdin.isatty() and not provided:
+        print(
+            "CONFIG_ERROR: add-connection needs a TTY for the interactive wizard; "
+            "for non-interactive use pass --json with --name/--engine/--database "
+            "(and --username/--password-file for server-backed engines)",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        if args.name is not None:
+            # Validate BEFORE any filesystem effect: the name derives secret
+            # file paths, and store_credentials must never see a path-like name.
+            validate_connection_name(args.name)
+        created = ensure_config_exists(cfg_path)
+        if created:
+            # stdout stays pure in --json mode: the creation notice is a
+            # human-facing diagnostic.
+            notice = f"==> created new config: {cfg_path}"
+            if args.json:
+                print(notice, file=sys.stderr)
+            else:
+                print(notice)
+
+        if args.json or provided:
+            if not provided:
+                print(
+                    "CONFIG_ERROR: --json mode is non-interactive; provide --name, "
+                    "--engine and --database (plus --username/--password-file for "
+                    "server-backed engines)",
+                    file=sys.stderr,
+                )
+                return 2
+            username_file = password_file = None
+            if args.engine != "sqlite":
+                if not args.username or not args.password_file:
+                    print(
+                        "CONFIG_ERROR: server-backed connections need --username and "
+                        "--password-file (the password is never a command-line value)",
+                        file=sys.stderr,
+                    )
+                    return 2
+                from universal_db_mcp.wizard import store_credentials
+
+                password = Path(args.password_file).read_text(encoding="utf-8").strip("\r\n")
+                username_file, password_file = store_credentials(
+                    cfg_path, args.name, args.username, password
+                )
+            connection = build_connection(
+                name=args.name,
+                engine=args.engine,
+                database=args.database,
+                host=args.host,
+                port=args.port,
+                username_file=str(username_file) if username_file else None,
+                password_file=str(password_file) if password_file else None,
+                read_only=not args.read_write,
+            )
+            result = apply_connection(
+                cfg_path, args.name, connection, run_test=not args.no_test
+            )
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                _print_add_result(result)
+            return 0 if not result.get("tested") or result["test"].get("healthy", True) else 1
+
+        name, connection, run_test = collect_answers_interactive(cfg_path)
+        result = apply_connection(cfg_path, name, connection, run_test=run_test)
+        _print_add_result(result)
+        return 0 if not result.get("tested") or result["test"].get("healthy", True) else 1
+    except WizardError as exc:
+        print(f"CONFIG_ERROR: {exc}", file=sys.stderr)
+        return 1
+    except ConfigError as exc:
+        print(f"CONFIG_ERROR: {exc}", file=sys.stderr)
+        return 1
+    except ValidationError as exc:
+        print(f"CONFIG_ERROR: invalid value: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"CONFIG_ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def _print_add_result(result: dict[str, Any]) -> None:
+    verb = "replaced" if result.get("replaced") else "added"
+    print(f"==> {verb} connection {result['connection']!r} in {result['config']}")
+    print(f"    backup: {result['backup']}")
+    if result.get("comments_dropped"):
+        print("    NOTE: comments inside the config body were not preserved (the header was).")
+    if result.get("tested"):
+        test = result["test"]
+        if test.get("healthy"):
+            print(f"    live test: HEALTHY ({test.get('server_version')}, {test.get('latency_ms')} ms)")
+        else:
+            print(f"    live test: FAILED ({test.get('error')}) — the connection was kept; check host/port/credentials")
+    else:
+        print("    validate with: universal_db_mcp doctor --config <config>")
+    print("    restart your agent harness to pick up the new connection")
 
 
 if __name__ == "__main__":

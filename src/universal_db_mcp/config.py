@@ -136,6 +136,10 @@ class ConnectionConfig(StrictModel):
     username_env: str | None = None
     password_env: str | None = None
     password_file: str | None = None
+    # File-based username (mirrors password_file; added for the add-connection
+    # wizard so credential FILES can carry both halves without env juggling).
+    # Never inline credentials in this config.
+    username_file: str | None = None
     tls: TlsConfig = Field(default_factory=TlsConfig)
     allowed_schemas: list[str] = Field(default_factory=list)
     read_only: bool = True
@@ -350,11 +354,23 @@ class ResolvedConnection:
         self.config = config
         self.username: SecretMark | None = None
         self.password: SecretMark | None = None
+        if config.username_env and config.username_file:
+            raise ConfigError(
+                f"connection '{name}': username_env and username_file are mutually "
+                "exclusive (pick one credential source)"
+            )
         if config.username_env:
             env = resolve_env_name(config.username_env, kind="username_env")
             val = os.environ.get(env)
             if not val:
                 raise ConfigError(f"connection '{name}': environment variable {env} (username_env) is not set")
+            self.username = SecretMark(val)
+        elif config.username_file:
+            p = Path(config.username_file)
+            _check_secret_file_permissions(p)
+            val = p.read_text(encoding="utf-8").strip("\r\n")
+            if not val:
+                raise ConfigError(f"connection '{name}': username file '{p}' is empty")
             self.username = SecretMark(val)
         if config.password_env:
             env = resolve_env_name(config.password_env, kind="password_env")

@@ -414,8 +414,10 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
 
         # unsafe secret-file perms double-check (belt and braces)
         for name, conn in cfg.connections.items():
-            if conn.password_file:
-                pf = Path(conn.password_file)
+            for secret_file in (conn.password_file, conn.username_file):
+                if not secret_file:
+                    continue
+                pf = Path(secret_file)
                 if pf.exists():
                     import sys as _sys
 
