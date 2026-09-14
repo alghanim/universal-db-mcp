@@ -240,6 +240,22 @@ udbmcp_install_os_packages "$BUNDLE" "$PY" "$sudo_ok"
 echo "==> smoke check"
 $sudo_ok "$TARGET/venv/bin/python" -m universal_db_mcp version
 
+# Short CLI alias on PATH: pip's [project.scripts] entry point lands at
+# $TARGET/venv/bin/udbmcp; link it into /usr/local/bin so `udbmcp doctor`
+# etc. work without the venv path. Guarded: an existing udbmcp that is NOT
+# our symlink (an admin's own wrapper) is never clobbered.
+echo "==> linking udbmcp CLI alias into /usr/local/bin"
+$sudo_ok mkdir -p /usr/local/bin
+ALIAS="/usr/local/bin/udbmcp"
+if $sudo_ok test -e "$ALIAS" && [ "$($sudo_ok readlink "$ALIAS" 2>/dev/null)" != "$TARGET/venv/bin/udbmcp" ]; then
+  echo "    WARNING: $ALIAS already exists and is not our symlink; left untouched." >&2
+  echo "         The CLI stays available at $TARGET/venv/bin/udbmcp." >&2
+elif ! $sudo_ok ln -sfn "$TARGET/venv/bin/udbmcp" "$ALIAS" 2>/dev/null; then
+  # BEST-EFFORT by design: a PATH-convenience alias must never abort an
+  # otherwise complete install.
+  echo "    WARNING: could not create $ALIAS; the CLI stays available at $TARGET/venv/bin/udbmcp." >&2
+fi
+
 # Publish the verified bundle's manifest next to the venv ($TARGET/manifest.json)
 # so `doctor` can report the profile it was actually built for instead of
 # guessing from the running platform. Guarded: a bundle without a manifest must

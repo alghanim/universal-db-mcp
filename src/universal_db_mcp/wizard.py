@@ -45,7 +45,7 @@ DEFAULT_PORTS: dict[str, int] = {
 
 MINIMAL_CONFIG = """\
 # universal-db-mcp configuration (created by the add-connection wizard).
-# Add connections with: universal_db_mcp add-connection
+# Add connections with: udbmcp add-connection
 application:
   transport: stdio
 """

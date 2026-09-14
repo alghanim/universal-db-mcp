@@ -593,7 +593,7 @@ def _print_add_result(result: dict[str, Any]) -> None:
         else:
             print(f"    live test: FAILED ({test.get('error')}) — the connection was kept; check host/port/credentials")
     else:
-        print("    validate with: universal_db_mcp doctor --config <config>")
+        print("    validate with: udbmcp doctor --config <config>")
     print("    restart your agent harness to pick up the new connection")
 
 

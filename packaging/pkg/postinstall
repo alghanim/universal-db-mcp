@@ -238,6 +238,24 @@ echo "==> postinstall: smoke check"
   fail "smoke check failed: the installed package does not respond to 'universal_db_mcp version'"
 }
 
+# --- step 4b: short CLI alias on PATH ----------------------------------------
+# pip's [project.scripts] entry point lands at $VENV/bin/udbmcp; link it into
+# /usr/local/bin so `udbmcp doctor` etc. work without the venv path. Guarded:
+# an existing udbmcp that is NOT our symlink (an admin's own wrapper) is never
+# clobbered.
+echo "==> postinstall: linking udbmcp CLI alias into /usr/local/bin"
+install -d -m 0755 /usr/local/bin 2>/dev/null || true
+ALIAS="/usr/local/bin/udbmcp"
+if [ -e "$ALIAS" ] && [ "$(readlink "$ALIAS" 2>/dev/null)" != "$VENV/bin/udbmcp" ]; then
+  echo "    WARNING: $ALIAS already exists and is not our symlink; left untouched." >&2
+  echo "         The CLI stays available at $VENV/bin/udbmcp." >&2
+elif ! ln -sfn "$VENV/bin/udbmcp" "$ALIAS" 2>/dev/null; then
+  # BEST-EFFORT by design: the daemon is already running; a PATH-convenience
+  # alias must never abort an otherwise complete install.
+  echo "    WARNING: could not create $ALIAS (non-root or read-only /usr/local/bin?)." >&2
+  echo "         The CLI stays available at $VENV/bin/udbmcp." >&2
+fi
+
 # --- step 5: install config.yaml ONLY if absent (never clobber the admin's) --
 echo "==> postinstall: installing config template (only if absent)"
 if [ ! -f "$CONFIG" ]; then

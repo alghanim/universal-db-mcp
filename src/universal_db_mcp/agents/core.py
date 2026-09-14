@@ -160,7 +160,7 @@ _SEED_CONFIG_TEMPLATE = """\
 # account and is NOT readable by your user, so personal spawns get their own
 # config and state. Add connections below (secrets are referenced via
 # *_env / password_file, never inlined) and validate with:
-#   universal_db_mcp doctor --config {config_path}
+#   udbmcp doctor --config {config_path}
 application:
   transport: stdio
   metadata_cache_path: {metadata_path}

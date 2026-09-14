@@ -31,6 +31,9 @@ oracle = ["oracledb>=4,<5"]
 mssql = ["pyodbc>=5.1,<6"]
 db2 = ["ibm-db>=3.2,<4"]
 
+[project.scripts]
+udbmcp = "universal_db_mcp.__main__:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/universal_db_mcp"]
 

@@ -108,6 +108,11 @@ sudo -u udbmcp /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp doctor
 Doctor checks wheels, TLS material, secret-file permissions, writable paths,
 and policy consistency — no database credentials required.
 
+The installers also link a short CLI alias into `/usr/local/bin`: every
+command can be run as `udbmcp doctor`, `udbmcp add-connection`,
+`udbmcp configure-agents` — equivalent to the long
+`<venv>/bin/python -m universal_db_mcp ...` form used in the examples.
+
 ## Service
 
 ```bash
