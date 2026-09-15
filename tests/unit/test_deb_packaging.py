@@ -417,3 +417,24 @@ def test_maint_scripts_refuse_to_act_without_dpkg_action(name: str) -> None:
     )
     assert proc.returncode == 1
     assert "refusing to act" in proc.stderr
+
+
+def test_install_offline_normalizes_venv_modes() -> None:
+    """Seen live (Ubuntu, 2026-09-15): the installing context's umask leaked
+    into the venv (0700 root:root) and the udbmcp service died with 203/EXEC
+    'Permission denied' - the interpreter was fine, the SERVICE ACCOUNT just
+    could not traverse into the tree. install_offline.sh must normalize the
+    venv modes unconditionally after the build: dirs traversable (755), files
+    readable (644), bin executables (755) - read+traverse only, never write -
+    and BEFORE anything that hands the venv to a service or the PATH alias."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[2] / "scripts" / "install_offline.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'find "$TARGET/venv" -type d -exec chmod 755' in text
+    assert 'find "$TARGET/venv" -type f -exec chmod 644' in text
+    assert 'find "$TARGET/venv/bin" -type f -exec chmod 755' in text
+    assert text.index("-type d -exec chmod 755") < text.index("udbmcp CLI alias"), (
+        "the venv must be normalized before the PATH alias step exposes it"
+    )

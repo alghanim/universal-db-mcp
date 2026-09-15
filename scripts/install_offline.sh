@@ -240,6 +240,17 @@ udbmcp_install_os_packages "$BUNDLE" "$PY" "$sudo_ok"
 echo "==> smoke check"
 $sudo_ok "$TARGET/venv/bin/python" -m universal_db_mcp version
 
+# Venv mode normalization: the venv is CODE the service account executes, but
+# the creating context's umask leaks into it (seen live 2026-09-15: a umask
+# 077 install left the venv 0700 root:root and the udbmcp service died with
+# 203/EXEC Permission denied - the interpreter was fine, the SERVICE ACCOUNT
+# just could not traverse into the tree). Normalize unconditionally: dirs
+# 0755 (traversable), files 0644, bin executables 0755. $TARGET/venv itself
+# is root-owned either way - this grants read+traverse, never write.
+$sudo_ok find "$TARGET/venv" -type d -exec chmod 755 {} +
+$sudo_ok find "$TARGET/venv" -type f -exec chmod 644 {} +
+$sudo_ok find "$TARGET/venv/bin" -type f -exec chmod 755 {} +
+
 # Short CLI alias on PATH: pip's [project.scripts] entry point lands at
 # $TARGET/venv/bin/udbmcp; link it into /usr/local/bin so `udbmcp doctor`
 # etc. work without the venv path. Guarded: an existing udbmcp that is NOT
