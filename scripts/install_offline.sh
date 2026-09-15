@@ -220,6 +220,14 @@ fi
 $sudo_ok "$PY" -m venv "$TARGET/venv"
 
 echo "==> installing application from bundle wheelhouse (no index, hashed)"
+# --force-reinstall is MANDATORY on upgrades (mirrors packaging/pkg/postinstall):
+# the app wheel's version string does not change between code-only releases
+# (0.1.0 -> 0.1.0) and the .deb postinst re-runs this installer over the
+# EXISTING venv, so without it pip reports "already satisfied" and keeps the
+# previous release's code while dpkg reports a successful upgrade (seen live
+# 2026-09-15: the Db2 credential fix was dpkg-installed yet the same
+# SQL30082N errors persisted). Every package is still resolved only from the
+# verified wheelhouse and checked against runtime.lock's hashes.
 $sudo_ok env \
   PIP_CONFIG_FILE=/dev/null \
   PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -231,6 +239,7 @@ $sudo_ok env \
   --find-links="$BUNDLE/wheelhouse" \
   --only-binary=:all: \
   --require-hashes \
+  --force-reinstall \
   -r "$BUNDLE/requirements/runtime.lock"
 
 # --- OS packages (ODBC driver closure): dpkg only, no apt, no network -------

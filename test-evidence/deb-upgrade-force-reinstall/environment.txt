@@ -1,0 +1,9 @@
+# .deb upgrade keeps stale app code without --force-reinstall: live evidence
+date_utc: 2026-09-15T11:21:53Z
+container: udbmcp-baseline:ubuntu24.04-cp312, --network none, --platform linux/amd64, dpkg -i --force-depends (baseline image lacks python3/python3-venv metapackages, as in the deb gate)
+packages: OLD=universal-db-mcp_0.1.0~ac75f19 (pre Db2 fix), NEW=universal-db-mcp_0.1.0~854b50d (Db2 fix)
+check: installed venv connectors/db2.py contains the in-string PWD field (the Db2 fix)
+phase A: trust dir holds the pre-fix install_offline.sh (no --force-reinstall)
+phase B: rm -rf venv, re-run the same pre-fix trusted installer on /usr/share/universal-db-mcp/bundle
+phase C: trust dir holds the fixed install_offline.sh (--force-reinstall)
+note: dpkg --compare-versions sorts 0.1.0~854b50d OLDER than 0.1.0~ac75f19 (hash-suffix versions do not order); dpkg -i installs regardless
