@@ -377,3 +377,49 @@ def test_add_connection_cli_traversal_name_writes_nothing(
     assert "CONFIG_ERROR" in err
     assert victim.read_text(encoding="utf-8") == "original\n"
     assert not (home / ".universal-db-mcp" / "secrets").exists()
+
+
+def test_apply_refuses_unwritable_config_with_guidance(tmp_path: Path) -> None:
+    """Seen live (2026-09-15): a sudo-created root-owned secrets dir in /etc
+    made a later non-sudo wizard run die with errno 1 EPERM on os.chmod. The
+    wizard must refuse a config it cannot WRITE up front, with the --config
+    guidance, instead of failing halfway through credential creation."""
+    from universal_db_mcp.wizard import apply_connection as _apply
+
+    cfg = tmp_path / "system-config.yaml"
+    cfg.write_text("application:\n  transport: stdio\n", encoding="utf-8")
+    cfg.chmod(0o444)  # readable, NOT writable by this user
+
+    conn = build_connection(name="a", engine="sqlite", database=str(tmp_path / "a.db"))
+    with pytest.raises(WizardError, match="not writable by this user"):
+        _apply(cfg, "a", conn, run_test=False)
+
+
+def test_cli_default_falls_back_to_per_user_when_system_not_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from universal_db_mcp.agents import core as agents_core
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
+    # a READABLE but NOT writable system config (0444, owned by this user)
+    system = tmp_path / "etc-config.yaml"
+    system.write_text("application:\n  transport: stdio\n", encoding="utf-8")
+    system.chmod(0o444)
+    monkeypatch.setattr(agents_core, "SYSTEM_CONFIG_PATH", system)
+
+    rc = main([
+        "add-connection", "--json", "--no-test",
+        "--name", "demo_sqlite",
+        "--engine", "sqlite",
+        "--database", str(tmp_path / "demo.db"),
+    ])
+    err = capsys.readouterr().err
+
+    assert rc == 0, err
+    # the connection landed in the PER-USER config, never in the system file
+    cfg = load_config(fake_home / ".universal-db-mcp" / "config.yaml")
+    assert cfg.connections["demo_sqlite"].type == "sqlite"
+    assert "demo_sqlite" not in system.read_text(encoding="utf-8")

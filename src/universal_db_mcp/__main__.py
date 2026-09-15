@@ -498,9 +498,16 @@ def _add_connection(args: argparse.Namespace) -> int:
         validate_connection_name,
     )
 
-    cfg_path = Path(args.config) if args.config else Path(
-        resolve_harness_config_path(dict(os.environ), Path.home())
-    )
+    if args.config:
+        cfg_path = Path(args.config)
+    else:
+        cfg_path = Path(resolve_harness_config_path(dict(os.environ), Path.home()))
+        if cfg_path.is_file() and not os.access(cfg_path, os.W_OK):
+            # The wizard WRITES: a readable-but-not-writable default (the
+            # root-owned system deployment) must not be chosen - fall back to
+            # the per-user config instead of failing halfway through
+            # credential creation (seen live 2026-09-15).
+            cfg_path = Path.home() / ".universal-db-mcp" / "config.yaml"
     interactive = not args.json
 
     provided = all(

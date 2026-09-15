@@ -329,6 +329,16 @@ def apply_connection(
     """Merge + validate + optionally live-test. Returns a result dict used by
     both the human and --json outputs."""
     existing = Path(cfg_path)
+    if existing.is_file() and not os.access(existing, os.W_OK):
+        # The wizard WRITES (config + secret files beside it): defaulting into
+        # a readable-but-not-writable config (the root-owned system
+        # deployment) would fail halfway through credential creation and
+        # leave root-owned artifacts behind (seen live 2026-09-15).
+        raise WizardError(
+            f"config {existing} is not writable by this user; pass --config with a "
+            "per-user config (e.g. ~/.universal-db-mcp/config.yaml), or re-run with "
+            "sudo to edit the system config"
+        )
     replaced = False
     comments_dropped = False
     if existing.is_file():
