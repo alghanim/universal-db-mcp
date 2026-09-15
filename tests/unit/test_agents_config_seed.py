@@ -166,3 +166,30 @@ def test_json_apply_reports_seeded_config(
         harness_cfg["mcpServers"]["universal-db"]["env"]["UDBMCP_CONFIG"]
         == str(fake_home / ".universal-db-mcp" / "config.yaml")
     )
+
+
+def test_bare_doctor_resolves_the_per_user_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`udbmcp doctor` with NO --config and NO UDBMCP_CONFIG must resolve the
+    same per-user default as the wizard/configure-agents - failing with
+    'no config path' while a valid per-user config exists made the doctor
+    useless exactly when the user needed it (seen live 2026-09-15)."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".universal-db-mcp").mkdir(parents=True)
+    (fake_home / ".universal-db-mcp" / "config.yaml").write_text(
+        "application:\n  transport: stdio\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
+    monkeypatch.setattr(
+        agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-such-etc" / "config.yaml"
+    )
+
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    assert "no config path" not in out
+    report = json.loads(out)
+    assert report["fatal_count"] == 0, report

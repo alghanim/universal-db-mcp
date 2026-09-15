@@ -116,9 +116,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         import json
 
+        from universal_db_mcp.agents.core import resolve_harness_config_path
         from universal_db_mcp.diagnostics.doctor import run_doctor
 
-        report = run_doctor(args.config or os.environ.get("UDBMCP_CONFIG"), connectivity=args.connectivity)
+        # Bare `udbmcp doctor` resolves the SAME default config as the wizard
+        # and configure-agents (env override -> READABLE system deployment ->
+        # per-user). Failing with "no config path" while a valid per-user
+        # config sits beside the command made the doctor useless exactly when
+        # the user needed it (seen live 2026-09-15).
+        config = (
+            args.config
+            or os.environ.get("UDBMCP_CONFIG")
+            or resolve_harness_config_path(dict(os.environ), Path.home())
+        )
+        report = run_doctor(config, connectivity=args.connectivity)
         print(json.dumps(report, indent=2))
         return 0 if report["healthy"] else 1
 
