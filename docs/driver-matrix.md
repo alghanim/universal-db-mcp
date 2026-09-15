@@ -11,15 +11,15 @@ docs/acceptance-tests.md). Everything else is labeled truthfully.
 | ClickHouse | clickhouse-connect 1.8.0 | lz4 + zstd are hard dependencies (in wheelhouse); driver-default lz4 write compression (no `compress` kwarg passed) | HTTPS + CA | `KILL QUERY` by pinned `query_id` (client has no `cancel_query`) | EXPLAIN | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | Oracle | oracledb 4.0.2 **Thin only** | none in Thin mode | TCPS + wallet (admin-provided) | `connection.cancel()` | unsupported (plan table provisioning required) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | SQL Server | pyodbc 5.3.0 + **Microsoft ODBC Driver 18 (admin-supplied OS package)** | unixODBC + driver .deb | Encrypt=yes, CA | none (documented) | unsupported (SHOWPLAN needs separate batch) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
-| IBM Db2 (LUW) | ibm_db 3.2.9 wheel (bundled clidriver) | clidriver in wheel | SSL via cert file | none (documented) | unsupported (explain tables admin-provisioned) | unverified |
+| IBM Db2 (LUW) | ibm_db 3.2.9 wheel (bundled clidriver) | clidriver in wheel | SSL via cert file | none (documented) | unsupported (explain tables admin-provisioned) | **passed** (direct live run after the 2026-09-15 credential fix: roundtrip + themed data — `test-evidence/integration-db2-credentials-fix/`; Gate C orchestrator not re-run); other capabilities unverified |
 
 Notes:
 
 - **Gate C run (`test-evidence/integration-gateC/`):** 13 tests collected,
   11 passed, 2 skipped — the two skips are the Db2 tests
   (`tests/integration/test_connectors.py`, blocked: pinned `ibm_db` 3.2.9
-  clidriver auth failed (`SQL30082N` rc17) under amd64 emulation — see the
-  Db2 Gate C note below).
+  clidriver auth failed (`SQL30082N` rc17) under amd64 emulation; that
+  attribution was wrong — see the Db2 note below).
   The run therefore covers, per engine: PostgreSQL (roundtrip, db-side
   permission denial, themed data), MySQL, ClickHouse, Oracle, SQL Server
   (roundtrip + themed data each). "Other capabilities unverified" above means
@@ -33,18 +33,22 @@ Notes:
   no silent mode switch).
 - **Db2 for z/OS and Db2 for i are not implemented**; catalog SQL, licensing,
   and binding requirements differ.
-- **Db2 Gate C status (observed):** the fixture server (Db2 11.5.9 LUW)
-  starts, seeds themed data, authenticates locally, and authenticates over
-  loopback TCP via its own clidriver. The pinned `ibm_db` 3.2.9 client fails
-  REMOTE password authentication over plaintext TCP with `SQL30082N reason
-  17` on every platform tried (emulated amd64 container AND native arm64
-  macOS), against both Db2 12.1 and 11.5.9 servers. Server-side TCP
-  authentication itself is verified working. The documented remediation is a
-  TLS connection (the connector supports `SECURITY=SSL` with
-  `SSLServerCertificate`), but Gate C's no-TLS fixtures cannot exercise it;
-  Db2 live capabilities therefore remain `not verified` until a deployment
-  that allows Db2-side TLS (or a server/driver combination that accepts
-  plaintext remote passwords) runs the gate.
+- **Db2 status (root cause corrected 2026-09-15):** Gate C and every
+  earlier attempt recorded the pinned `ibm_db` 3.2.9 client failing remote
+  password authentication with `SQL30082N reason 17` on every platform.
+  The cause was the connector itself (and the Gate C auth probe): both
+  passed the username/password as `ibm_db.connect` positional arguments,
+  which ibm_db ignores for connection-string DSNs, so no credentials were
+  sent. Credentials now travel as `UID`/`PWD` inside the connection string.
+  A direct live run of both Db2 integration tests then passed against the
+  local Db2 11.5.9 fixture over plaintext TCP with `AUTHENTICATION=SERVER`
+  (`test-evidence/integration-db2-credentials-fix/`, including the raw-driver
+  reproduction: positional credentials give reason 17, forced SERVER auth
+  gives reason 3, in-string credentials connect, a wrong in-string password
+  gives reason 24). A `;` in any connection value is refused before
+  dialing, because no CLI quoting form carries it. The Gate C orchestrator
+  has not been re-run; Db2 TLS and the remaining capabilities stay
+  unverified.
 - SQL validation dialects: mssql statements are validated as T-SQL (`tsql`)
   and db2 statements are parsed under the postgres dialect for validation
   (sqlglot has no DB2 dialect); any parse failure is a denial, never approval.

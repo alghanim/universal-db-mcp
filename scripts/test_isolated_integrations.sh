@@ -192,20 +192,19 @@ if [ "${UDBMCP_TEST_ALLOW_HEAVY:-0}" = "1" ]; then
      && wait_ready db2 'su - db2inst1 -c "db2 connect to testdb >/dev/null && db2 disconnect testdb >/dev/null"' 1800; then
     if docker exec udbmcp-fixture-db2 su - db2inst1 -c 'db2 -tvf /seed/db2_moi.sql' >/tmp/db2_seed.log 2>&1; then
       echo "[fixture db2] themed data seeded (civil registry)"
-      # Client-auth probe: the pinned ibm_db 3.2.9 clidriver fails its LOCAL
-      # security init under amd64-on-arm64 qemu emulation (SQL30082N reason 17
-      # is returned even for a dead port, i.e. before any network exchange),
-      # while the server's own clidriver authenticates fine over TCP. Export
-      # the fixture env only if the pinned client can truly authenticate;
-      # otherwise record Db2 as blocked on the staging host's emulation.
+      # Client-auth probe: export the fixture env only if the pinned client can
+      # truly authenticate. Credentials go INSIDE the connection string: for a
+      # connection-string DSN ibm_db ignores connect()'s positional user/password,
+      # so the earlier probe (positional credentials) sent none and failed with
+      # SQL30082N reason 17 on every host - misrecorded as an emulation block.
       if docker run --rm --platform linux/amd64 --network "$NET" "$CLIENT_IMG" \
-           python -c "import ibm_db; ibm_db.connect('DATABASE=TESTDB;HOSTNAME=udbmcp-fixture-db2;PORT=50000;PROTOCOL=TCPIP;', 'db2inst1', 'udbmcp_db2_1')" >/dev/null 2>&1; then
+           python -c "import ibm_db; ibm_db.connect('DATABASE=TESTDB;HOSTNAME=udbmcp-fixture-db2;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=udbmcp_db2_1;', '', '')" >/dev/null 2>&1; then
         echo "[fixture db2] pinned-client authentication probe OK"
         ENV_ARGS+=(-e UDBMCP_TEST_DB2_HOST=udbmcp-fixture-db2 -e UDBMCP_TEST_DB2_PORT=50000
                    -e UDBMCP_TEST_DB2_DB=TESTDB -e UDBMCP_TEST_DB2_USER=db2inst1
                    -e UDBMCP_TEST_DB2_PASSWORD=udbmcp_db2_1)
       else
-        reason="pinned ibm_db 3.2.9 clidriver auth failed (SQL30082N rc17) under amd64 emulation on this staging host; server verified: started, seeded, local+TCP auth OK via its own clidriver; re-run on a native x86_64 host"
+        reason="pinned ibm_db 3.2.9 client could not authenticate to the fixture (probe sends UID/PWD in the connection string); server verified: started, seeded, local+TCP auth OK via its own clidriver"
         echo "db2: BLOCKED - $reason"
         ENV_ARGS+=(-e UDBMCP_TEST_DB2_BLOCKED="$reason")
       fi

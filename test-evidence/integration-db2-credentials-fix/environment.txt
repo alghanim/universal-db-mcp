@@ -1,0 +1,6 @@
+# Db2 credential-passing fix: live evidence
+date_utc: 2026-09-15T10:49:30Z
+git_head_before_fix: ac75f19
+client: native Darwin arm64, CPython 3.12.13 ibm_db 3.2.9
+server: icr.io/db2_community/db2:11.5.9.0 platform=linux (local fixture, loopback 127.0.0.1:50002, database TESTDB)
+scope: direct pytest run of tests/integration/test_connectors.py -k db2 against the local fixture; NOT the Gate C --internal orchestrator

@@ -4,27 +4,30 @@ Status: operational runbook for the Db2 Gate C remediation. Companion script:
 `scripts/db2-enable-tls.sh`. Related: `docs/driver-matrix.md` (Db2 Gate C
 status), `docs/offline-deployment.md`, `docs/security.md`.
 
-## Why TLS is required (root cause)
+## Is TLS required? (root cause corrected 2026-09-15)
 
-The pinned `ibm_db` 3.2.9 client (with its bundled clidriver) fails **REMOTE**
-password authentication over plaintext TCP against Db2 LUW with
+**No, not for logins.** This runbook was written while every remote login
+from the pinned `ibm_db` 3.2.9 client failed with
 `SQL30082N  Security processing failed with reason "17"`. Per IBM's
-SQL30082N reason-code table, **reason 17 is UNSUPPORTED FUNCTION**: "the
-security mechanism specified by the client is invalid for this server" — the
-server rejected the security mechanism the client proposed (an
-`AUTHENTICATION` / `SRVCON_AUTH` / `SERVER_ENCRYPT` negotiation mismatch).
-It is **not** a credential problem: reason 1 is PASSWORD EXPIRED, so
-resetting the password cannot change this error. First diagnostic when it
-appears: `db2 get dbm cfg | grep -E 'AUTHENTICATION|SRVCON_AUTH|ALTERNATE_AUTH_ENC'`.
-This occurred on every platform tried
-(emulated amd64 container and native arm64 macOS) and against both Db2 12.1
-and 11.5.9 servers, while the server's own loopback TCP authentication works —
-i.e. the server accepts remote TCP logins; the pinned client's DRDA password
-path is the broken half. This is recorded as the **Db2 Gate C** block in
-`docs/driver-matrix.md`. The connector already supports the documented
-remediation, a TLS connection (`SECURITY=SSL` + `SSLServerCertificate`),
-which is expected to bypass the failing plaintext authentication path; the
-server side therefore needs SSL enabled with a certificate the client can pin.
+SQL30082N reason-code table, **reason 17 is UNSUPPORTED FUNCTION**: the
+server rejected the security mechanism the client proposed. The cause was
+the connector, not the server or the client library: it passed the
+username and password as `ibm_db.connect` positional arguments, which
+ibm_db ignores for connection-string DSNs, so no credentials were ever
+sent. The same bug yields reason 3 (PASSWORD MISSING) when SERVER
+authentication is forced. Since the fix the connector sends `UID`/`PWD`
+inside the connection string; plaintext TCP logins against Db2 11.5.9 with
+`AUTHENTICATION=SERVER` then succeed, and a wrong password returns reason
+24 (`test-evidence/integration-db2-credentials-fix/`).
+
+If reason 17 still appears on a fixed build, it is a genuine mechanism
+mismatch. First diagnostic when it appears:
+`db2 get dbm cfg | grep -E 'AUTHENTICATION|SRVCON_AUTH|ALTERNATE_AUTH_ENC'`.
+
+Use this runbook when policy requires encrypting Db2 traffic in transit.
+The server's default `security.require_remote_tls: true` refuses non-TLS
+remote connections, so either enable Db2 TLS with this recipe or set that
+policy to `false` knowingly. It is in-transit hardening, not a login fix.
 
 ## Evidence status (read before relying on this recipe)
 
@@ -38,7 +41,7 @@ demonstrated, in the terms used by `docs/acceptance-tests.md`
 | Server side — `db2 update dbm cfg using SSL_*` + instance restart (step 3) | run (manual), unverified | Run by hand; `db2 get dbm cfg` showed the `SSL_*` values afterwards. Whether the SSL listener actually opened was **not** checked. |
 | Server side — `DB2COMM` registry variable including `SSL` (step 3) | `not_run` | The original recipe omitted this step; without it Db2 never opens the `SSL_SVCENAME` listener. Added after review; not re-run here. |
 | Client side — `ibm_db` connect over TLS returns a handle (no `SQL30082N`) | `not_run` | **Not demonstrated in this environment.** The session notes behind this runbook record the client still failing with `SQL30082N reason 17` after the server-side steps; that attempt predates the `DB2COMM` fix, was not diagnosed (listener never opened / client fell back to plaintext / label mismatch are all open), and is not reproducible from this repository. |
-| Gate C live capabilities for Db2 through the connector | `blocked` | Unchanged; see `docs/driver-matrix.md` and `IMPLEMENTATION_STATUS.md`. |
+| Db2 live round-trip through the connector (plaintext TCP) | passed (direct run) | Blocked until the 2026-09-15 credential-passing fix, now passed against the local Db2 11.5.9 fixture: `test-evidence/integration-db2-credentials-fix/`. Gate C orchestrator not re-run; see `docs/driver-matrix.md`. |
 
 **What closes the `not_run` items.** On a machine that can reach a Db2
 instance configured with this recipe (including the `DB2COMM` step):
@@ -266,6 +269,6 @@ the SQLSTATE / reason code), not silently left as `not_run`.
 | `SSL_SVCENAME` is set but nothing listens on that port after `db2start` (`ss -ltn` shows no `:50001`; client gets `SQL30081N` / connection refused) | `DB2COMM` does not include `SSL`, so the instance started without the SSL listener — `db2 update dbm cfg` alone never opens it | `db2set -i db2inst1 DB2COMM=SSL,TCPIP`, then `db2stop force && db2start`; confirm with `db2set -i db2inst1 DB2COMM` and `ss -ltn`. If it still does not listen, read `db2diag -l Severe,Error` for GSKit errors. |
 | Client gets `Connection refused` / `SQL30081N` with the SSL listener up | The client port points at the plaintext `SVCENAME` (typically 50000/50002), not the SSL service port | Set the YAML `port:` to the `SSL_SVCENAME` value (e.g. 50001). `SVCENAME` and `SSL_SVCENAME` are separate settings; both can listen simultaneously. |
 | udbmcp refuses the config with an "extra fields not permitted" / unknown key error mentioning `databases` | The connection block was pasted under a `databases:` key; the strict schema only accepts `connections:` | Move the entry under `connections:` exactly as shown above. |
-| `SQL30082N reason 17` still appears over TLS | The client is not actually negotiating SSL (missing `tls.enabled` / connector fell back to plaintext / SSL listener never opened so the client hit the plaintext port), or the certificate label in `SSL_SVR_LABEL` does not exist in the keydb | First confirm the listener is up (previous rows). Then confirm `SSL_SVR_LABEL` matches a label listed by `gsk8capicmd_64 -cert -list -db $HOME/server.kdb -pw ...`; confirm the YAML has `tls.enabled: true` and `ca_file` pointing at the extracted `server.crt`. |
+| `SQL30082N reason 17` still appears over TLS | A udbmcp build older than the 2026-09-15 credential-passing fix sends no credentials at all, so upgrade first. Otherwise the client is not actually negotiating SSL (missing `tls.enabled` / connector fell back to plaintext / SSL listener never opened so the client hit the plaintext port), or the certificate label in `SSL_SVR_LABEL` does not exist in the keydb | First confirm the listener is up (previous rows). Then confirm `SSL_SVR_LABEL` matches a label listed by `gsk8capicmd_64 -cert -list -db $HOME/server.kdb -pw ...`; confirm the YAML has `tls.enabled: true` and `ca_file` pointing at the extracted `server.crt`. |
 | `SQL30081N` / protocol error right after enabling SSL | Client connecting with TLS to the plaintext port or vice versa | Match port to protocol: plaintext port <-> no `tls`, SSL port <-> `tls.enabled: true`. |
 | Certificate verification failure on the client (`verify_server: true`) | `ca_file` does not match the server certificate (old extraction, wrong host's cert) | Re-extract with `-cert -extract -format ascii` from the keydb actually referenced by `SSL_SVR_KEYDB` and redeploy the file. |

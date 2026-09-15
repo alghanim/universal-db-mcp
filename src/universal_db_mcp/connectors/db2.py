@@ -24,6 +24,7 @@ from typing import Any
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.connectors.base import (
     ColumnInfo,
+    ConnectorError,
     DatabaseConnector,
     HealthInfo,
     KeyInfo,
@@ -84,15 +85,37 @@ class Db2Connector(DatabaseConnector):
         import ibm_db_dbi  # type: ignore[import-not-found,import-untyped,unused-ignore] # noqa: F401 - ships with ibm_db
 
         cfg = self.connection.config
-        dsn = f"DATABASE={cfg.database};HOSTNAME={cfg.host};PORT={cfg.port or 50000};PROTOCOL=TCPIP;"
+        fields: list[tuple[str, str]] = [
+            ("DATABASE", f"{cfg.database}"),
+            ("HOSTNAME", f"{cfg.host}"),
+            ("PORT", f"{cfg.port or 50000}"),
+            ("PROTOCOL", "TCPIP"),
+        ]
         if cfg.tls.enabled:
-            dsn += "SECURITY=SSL;"
+            fields.append(("SECURITY", "SSL"))
             if cfg.tls.ca_file:
-                dsn += f"SSLServerCertificate={cfg.tls.ca_file};"
-        if self.connection.username and self.connection.password:
-            return self._module.connect(
-                dsn, self.connection.username.value, self.connection.password.value, database="", connoptions={}
-            )
+                fields.append(("SSLServerCertificate", cfg.tls.ca_file))
+        # Credentials MUST travel inside the connection string. For a
+        # connection-string DSN, ibm_db ignores connect()'s positional
+        # user/password arguments, so passing them there sends NO credentials:
+        # the server answers SQL30082N reason 17 (UNSUPPORTED FUNCTION) under
+        # default negotiation and reason 3 (PASSWORD MISSING) under SERVER auth.
+        # Reproduced live 2026-09-15; long misdiagnosed as a server/TLS block.
+        if self.connection.username:
+            fields.append(("UID", self.connection.username.value))
+        if self.connection.password:
+            fields.append(("PWD", self.connection.password.value))
+        for key, value in fields:
+            # No quoting form carries ';' in a CLI connection-string value
+            # (raw, braces, doubled braces and quotes were all rejected live);
+            # unrefused it would split into extra connection keywords. The
+            # message names the keyword only, never the value.
+            if ";" in value:
+                raise ConnectorError(
+                    f"db2 connection value for {key} contains ';', which a Db2 CLI "
+                    "connection string cannot carry in any quoting form; change that value"
+                )
+        dsn = "".join(f"{key}={value};" for key, value in fields)
         return self._module.connect(dsn, "", "")
 
     def _dbi_conn(self) -> Any:
