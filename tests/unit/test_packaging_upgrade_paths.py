@@ -97,3 +97,12 @@ def test_same_version_rebuilds_are_treated_as_upgrades() -> None:
     assert 'AllowSameVersionUpgrades="yes"' in MSI_WXS, (
         "the product version does not change between code-only builds"
     )
+
+
+def test_bundle_builder_requests_the_mysql_auth_plugins() -> None:
+    """requirements/runtime.in only CONSTRAINS versions; the download list is
+    CONNECTOR_WHEELS. PyNaCl was pinned there and still never shipped, so a
+    MariaDB client_ed25519 account failed with a package that cannot be
+    installed offline."""
+    builder = (ROOT / "scripts" / "prepare_offline_bundle.py").read_text(encoding="utf-8")
+    assert '"mysql": ["PyMySQL[ed25519,rsa]"]' in builder

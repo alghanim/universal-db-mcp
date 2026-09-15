@@ -44,7 +44,13 @@ from scripts.profiles import PROFILES, Profile, get_profile  # noqa: E402  (repo
 CONNECTOR_WHEELS = {
     "core": ["mcp", "PyYAML", "sqlglot"],
     "postgres": ["psycopg[binary]"],
-    "mysql": ["PyMySQL"],
+    # The extras carry the authentication plugins, which no other package
+    # pulls in: ed25519 -> PyNaCl (the default for many MariaDB accounts) and
+    # rsa -> cryptography (MySQL 8.0's caching_sha2_password). Without them a
+    # site hits a RuntimeError naming a package that cannot be installed
+    # offline. runtime.in only CONSTRAINS versions; what gets downloaded is
+    # this list, so pinning a package there alone never shipped it.
+    "mysql": ["PyMySQL[ed25519,rsa]"],
     "clickhouse": ["clickhouse-connect"],
     "oracle": ["oracledb"],
     "mssql": ["pyodbc"],
