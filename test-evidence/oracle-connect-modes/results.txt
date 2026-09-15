@@ -1,0 +1,18 @@
+# Oracle connect modes: live evidence
+date_utc: 2026-09-15T18:45:15Z
+client: native Darwin arm64, python-oracledb 4.0.2 (Thin mode; no Oracle Instant Client installed on this host)
+server: container-registry.oracle.com/database/free:latest on 127.0.0.1:1522, service FREEPDB1, SID FREE
+server banner: Oracle AI Database 26ai Free Release 23.26.3.0.0, compatible=23.6.0
+
+## Live results (through OracleConnector.health_check)
+[service-name form] healthy=True version=Oracle AI Database 26ai Free Release 23.26.3.0.0 - Develop,  detail=
+[tns alias form] healthy=True version=Oracle AI Database 26ai Free Release 23.26.3.0.0 - Develop,  detail=
+[legacy SID form] healthy=True version=Oracle AI Database 26ai Free Release 23.26.3.0.0 - Develop,  detail=
+
+## Why the 10G-verifier case is NOT live here
+dba_users.password_versions on this server: SYSTEM='11G 12C', TRAVEL='11G 12C'
+alter system set sec_case_sensitive_logon=FALSE -> ORA-25138: parameter has been made obsolete
+Oracle 21c+ desupported the 10G verifier, so an account carrying ONLY 0x939 cannot be created here.
+Status: DPY-3015 error mapping and thick_mode are covered by unit tests
+        (tests/unit/test_oracle_connect_modes.py) with a driver fake; the live thick-mode
+        round trip is not_run and needs an administrator-supplied Oracle Instant Client.

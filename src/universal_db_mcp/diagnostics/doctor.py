@@ -246,6 +246,55 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                         )
                     )
 
+                # Thick mode: the administrator-supplied Instant Client is the
+                # only client-side way to authenticate an account that carries
+                # just the legacy 10G verifier. doctor checks the DIRECTORY
+                # only - loading the client would switch this whole process to
+                # Thick mode permanently, which a diagnostic must never do.
+                if conn.options.get("thick_mode"):
+                    lib_dir = conn.options.get("lib_dir")
+                    if isinstance(lib_dir, str) and lib_dir:
+                        present = Path(lib_dir).is_dir()
+                        results.append(
+                            _check(
+                                f"connection-{name}-oracle-instant-client",
+                                present,
+                                (
+                                    f"Instant Client directory '{lib_dir}' present"
+                                    if present
+                                    else f"oracle thick_mode: Instant Client directory '{lib_dir}' "
+                                    "not found (options.lib_dir); the client is Oracle-licensed and "
+                                    "administrator-supplied"
+                                ),
+                                fatal=not present,
+                            )
+                        )
+                    else:
+                        results.append(
+                            _check(
+                                f"connection-{name}-oracle-instant-client",
+                                True,
+                                "oracle thick_mode without options.lib_dir: the driver's default "
+                                "library search path must find the Instant Client",
+                            )
+                        )
+                # A TNS alias is unresolvable without tnsnames.ora in tns_admin.
+                tns_alias = conn.options.get("tns_alias")
+                if isinstance(tns_alias, str) and tns_alias and isinstance(tns_admin, str) and tns_admin:
+                    names = Path(tns_admin) / "tnsnames.ora"
+                    results.append(
+                        _check(
+                            f"connection-{name}-oracle-tnsnames",
+                            names.is_file(),
+                            (
+                                f"tnsnames.ora present for alias '{tns_alias}'"
+                                if names.is_file()
+                                else f"oracle tns_alias '{tns_alias}' needs '{names}', which is missing"
+                            ),
+                            fatal=not names.is_file(),
+                        )
+                    )
+
             # driver availability: our connector class AND the real vendor
             # module (a registered class can exist while the driver wheel is
             # absent; the tool layer would fail with DRIVER_MISSING).

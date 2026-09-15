@@ -118,7 +118,20 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
     "postgres": {},
     "mysql": {},
     "clickhouse": {},
-    "oracle": {"tns_admin": str, "wallet_location": str, "thick_mode": bool},
+    # thick_mode + lib_dir: Thick mode via an ADMINISTRATOR-SUPPLIED Oracle
+    # Instant Client (licensed by Oracle, never shipped here). It is the only
+    # client-side way to authenticate an account that carries just the legacy
+    # 10G password verifier, which Thin mode refuses with DPY-3015.
+    # sid / tns_alias: pre-12c databases reached by SID, and tnsnames.ora
+    # aliases (with tns_admin), neither expressible as an easy-connect service.
+    "oracle": {
+        "tns_admin": str,
+        "wallet_location": str,
+        "thick_mode": bool,
+        "lib_dir": str,
+        "sid": str,
+        "tns_alias": str,
+    },
     # MssqlConnector reads options.odbc_driver to select the installed ODBC
     # driver (and doctor matches the exact name); a wrong name fails closed
     # at connect time naming the installed drivers.
@@ -169,10 +182,20 @@ class ConnectionConfig(StrictModel):
             if not isinstance(value, allowed[key]):
                 raise ValueError(f"connections: option '{key}' for type '{self.type}' must be {allowed[key].__name__}")
         if self.type == "oracle":
-            if self.options.get("thick_mode"):
+            if self.options.get("sid") and self.options.get("tns_alias"):
                 raise ValueError(
-                    "oracle thick_mode is not supported in this build; use Thin "
-                    "mode or run a separately reviewed deployment for the Instant Client"
+                    "oracle options 'sid' and 'tns_alias' are mutually exclusive: "
+                    "a TNS alias already names its own connect descriptor"
+                )
+            if self.options.get("tns_alias") and not self.options.get("tns_admin"):
+                raise ValueError(
+                    "oracle options.tns_alias requires options.tns_admin (the directory "
+                    "holding tnsnames.ora); without it the alias cannot be resolved"
+                )
+            if self.options.get("lib_dir") and not self.options.get("thick_mode"):
+                raise ValueError(
+                    "oracle options.lib_dir only applies to Thick mode; set "
+                    "options.thick_mode: true or drop lib_dir"
                 )
             if self.tls.enabled and not self.options.get("wallet_location"):
                 raise ValueError(
@@ -268,6 +291,24 @@ class AppConfig(StrictModel):
     application: ApplicationConfig = Field(default_factory=ApplicationConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     connections: dict[str, ConnectionConfig] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _oracle_thick_mode_is_all_or_nothing(self) -> AppConfig:
+        """python-oracledb's init_oracle_client() switches the WHOLE process to
+        Thick mode, so a config that mixes thick and thin oracle connections
+        would silently make every oracle connection thick. Refuse instead."""
+        modes = {
+            bool(conn.options.get("thick_mode"))
+            for conn in self.connections.values()
+            if conn.type == "oracle"
+        }
+        if len(modes) > 1:
+            raise ValueError(
+                "oracle thick_mode is process-global (init_oracle_client switches the "
+                "whole interpreter): either every oracle connection sets "
+                "options.thick_mode: true, or none does"
+            )
+        return self
 
     @model_validator(mode="after")
     def _state_isolated_from_data_sources(self) -> AppConfig:

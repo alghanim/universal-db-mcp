@@ -239,8 +239,12 @@ closed.
   queries, cancel hook. Gate C round-trips (health, SELECT, themed
   travellers data) **passed** against the live Oracle fixture
   (2026-09-11); the remaining capability surface (catalog batteries,
-  explain, remote cancel) is `unverified`. Thick mode deliberately not
-  implemented.
+  explain, remote cancel) is `unverified`. Thick mode is opt-in since 2026-09-15
+  (`options.thick_mode`, admin-supplied Instant Client) because Thin mode
+  refuses accounts carrying only the legacy 10G verifier (`DPY-3015`); the
+  live thick-mode round trip is `not_run` (no Instant Client on this host).
+  Service-name, legacy SID and tnsnames alias connect forms were verified
+  live against Oracle 23ai (`test-evidence/oracle-connect-modes/`).
 - **SQL Server connector** (pyodbc + admin-supplied ODBC Driver 18):
   full module incl. driver-presence detection. Gate C round-trips
   **passed** against the live HospitalDB fixture (2026-09-11); the

@@ -40,6 +40,45 @@ from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
 
 
+class ThickState:
+    """Process-global python-oracledb mode.
+
+    init_oracle_client() switches the ENTIRE interpreter to Thick mode and
+    cannot be undone, so it runs once under a lock. Config validation refuses
+    a mix of thick and thin oracle connections, so one flag decides the process.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.initialized = False
+
+
+_THICK_STATE = ThickState()
+
+
+def _enable_thick_mode(module: Any, lib_dir: str | None, tns_admin: str | None) -> None:
+    """Load the administrator-supplied Oracle Instant Client, once per process."""
+    with _THICK_STATE.lock:
+        if _THICK_STATE.initialized:
+            return
+        kwargs: dict[str, Any] = {}
+        if lib_dir:
+            kwargs["lib_dir"] = lib_dir
+        if tns_admin:
+            # Thick mode reads tnsnames.ora from the client config dir given here.
+            kwargs["config_dir"] = tns_admin
+        try:
+            module.init_oracle_client(**kwargs)
+        except Exception as exc:
+            raise ConnectorError(
+                "oracle thick_mode is enabled but the Oracle Instant Client could not be "
+                f"loaded ({str(exc).strip()[:160]}). Install the Instant Client for this "
+                "platform (Oracle-licensed, administrator-supplied, never shipped in our "
+                "artifacts) and point options.lib_dir at its directory."
+            ) from exc
+        _THICK_STATE.initialized = True
+
+
 class OracleConnector(DatabaseConnector):
     engine = "oracle"
 
@@ -50,11 +89,6 @@ class OracleConnector(DatabaseConnector):
         self._exec_lock = threading.Lock()  # serializes queries: cancel slot correctness
         self._pool_lock = threading.Lock()
         self._meta_conn: Any = None  # reused metadata connection (probe on checkout)
-        if connection.config.options.get("thick_mode"):
-            raise ValueError(
-                "oracle thick_mode is not supported in this build; use Thin mode "
-                "or run a separately reviewed deployment for the Instant Client"
-            )
 
     def _shared_meta_conn(self) -> Any:
         """Lock-guarded reusable metadata connection with probe-on-checkout
@@ -75,8 +109,26 @@ class OracleConnector(DatabaseConnector):
             return self._meta_conn
 
     def _connect(self) -> Any:
-        self._module = open_module("oracledb", "oracledb (manylinux cp312 wheel; Thin mode)")
+        self._module = open_module("oracledb", "oracledb (manylinux cp312 wheel; Thin or Thick mode)")
         cfg = self.connection.config
+        opts = cfg.options
+        if opts.get("thick_mode"):
+            # Process-global: config validation guarantees every oracle
+            # connection agrees on the mode before we get here.
+            _enable_thick_mode(self._module, opts.get("lib_dir"), opts.get("tns_admin"))
+        if opts.get("tns_alias"):
+            # The alias carries its own descriptor from tnsnames.ora; host/port
+            # in the config are not used to reach it.
+            alias_kw: dict[str, Any] = {
+                "user": (self.connection.username.value if self.connection.username else None),
+                "password": (self.connection.password.value if self.connection.password else None),
+                "dsn": opts["tns_alias"],
+            }
+            if not opts.get("thick_mode"):
+                # Thin mode resolves tnsnames.ora through connect(config_dir=);
+                # Thick mode was given the directory in init_oracle_client().
+                alias_kw["config_dir"] = opts["tns_admin"]
+            return self._dial(alias_kw)
         if cfg.tls.enabled:
             # TCPS must be selected by the connect descriptor itself; setting
             # wallet parameters alone leaves the wire protocol as plaintext.
@@ -87,9 +139,19 @@ class OracleConnector(DatabaseConnector):
                     "(administrator-supplied, outside distributable artifacts); "
                     "refusing a plaintext connection"
                 )
+            connect_data = (
+                f"(SID={opts['sid']})" if opts.get("sid") else f"(SERVICE_NAME={cfg.database})"
+            )
             dsn = (
                 f"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST={cfg.host})"
-                f"(PORT={cfg.port or 1521}))(CONNECT_DATA=(SERVICE_NAME={cfg.database})))"
+                f"(PORT={cfg.port or 1521}))(CONNECT_DATA={connect_data}))"
+            )
+        elif opts.get("sid"):
+            # Pre-12c databases register a SID, which the easy-connect service
+            # form cannot express; a full descriptor can.
+            dsn = (
+                f"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={cfg.host})"
+                f"(PORT={cfg.port or 1521}))(CONNECT_DATA=(SID={opts['sid']})))"
             )
         else:
             dsn = f"{cfg.host}:{cfg.port or 1521}/{cfg.database}"  # service_name form
@@ -99,10 +161,31 @@ class OracleConnector(DatabaseConnector):
             "dsn": dsn,
         }
         if cfg.tls.enabled:
-            kw["wallet_location"] = cfg.options.get("wallet_location")
-            if cfg.options.get("tns_admin"):
-                kw["config_dir"] = cfg.options.get("tns_admin")
-        return self._module.connect(**kw)
+            kw["wallet_location"] = opts.get("wallet_location")
+        if opts.get("tns_admin") and not opts.get("thick_mode"):
+            kw["config_dir"] = opts.get("tns_admin")
+        return self._dial(kw)
+
+    def _dial(self, kw: dict[str, Any]) -> Any:
+        """connect() with the driver's account-level refusals translated into
+        remediation the operator can act on."""
+        try:
+            return self._module.connect(**kw)
+        except Exception as exc:
+            text = str(exc)
+            if "DPY-3015" in text:
+                # Seen live 2026-09-15: an account carrying ONLY the legacy 10G
+                # verifier. Thin mode supports 11G/12C verifiers only, so name
+                # both the server-side and the client-side remedy.
+                raise ConnectorError(
+                    f"oracle refused this account's password verifier ({text.strip()[:120]}). "
+                    "Thin mode supports 11G and 12C verifiers only. Either ask the DBA to run "
+                    "ALTER USER <user> IDENTIFIED BY <new password> so a modern verifier is "
+                    "generated (sec_case_sensitive_logon must not be FALSE), or set "
+                    "options.thick_mode: true with an administrator-supplied Oracle Instant "
+                    "Client (options.lib_dir), which still accepts the 10G verifier."
+                ) from exc
+            raise
 
     def cancel_current(self) -> bool:
         target = self._cancel_target

@@ -3672,16 +3672,28 @@ def test_mssql_odbc_driver_option_is_allowlisted_and_typed() -> None:
         ConnectionConfig(type="mssql", host="h", database="d", options={"odbc_driver": 17})
 
 
-def test_oracle_thick_mode_rejected_at_config_time() -> None:
-    """OracleConnector raises on thick_mode at first use; config must refuse
-    it up front so doctor/serve do not report a healthy deployment."""
+def test_oracle_thick_mode_is_opt_in_and_constrained() -> None:
+    """Thick mode is ACCEPTED since 2026-09-15 (policy change).
+
+    It was refused outright, which left a deployment whose account carries only
+    the legacy 10G password verifier with no client-side path at all: Thin mode
+    refuses such accounts with DPY-3015 and only a DBA password reset would
+    help. Thick mode loads an Oracle-licensed Instant Client that the
+    administrator supplies out of band - the same arrangement already used for
+    the Microsoft ODBC driver on mssql - so it is opt-in, never shipped in our
+    artifacts, and constrained: lib_dir only with thick_mode, and (in
+    test_oracle_connect_modes.py) all-or-nothing across oracle connections
+    because init_oracle_client() switches the whole process."""
     from universal_db_mcp.config import ConnectionConfig
 
-    with pytest.raises(Exception, match="thick_mode"):
-        ConnectionConfig(type="oracle", host="h", database="d", options={"thick_mode": True})
+    conn = ConnectionConfig(type="oracle", host="h", database="d", options={"thick_mode": True})
+    assert conn.options["thick_mode"] is True
     # the boolean type-check still applies
     with pytest.raises(Exception, match="must be bool"):
         ConnectionConfig(type="oracle", host="h", database="d", options={"thick_mode": "yes"})
+    # lib_dir is meaningless without thick mode: refuse the silent no-op
+    with pytest.raises(Exception, match="lib_dir"):
+        ConnectionConfig(type="oracle", host="h", database="d", options={"lib_dir": "/opt/oracle"})
 
 
 def test_oracle_tls_requires_wallet_location() -> None:

@@ -9,7 +9,7 @@ docs/acceptance-tests.md). Everything else is labeled truthfully.
 | PostgreSQL | psycopg 3.3.5 `[binary]` | libpq bundled in wheel | verify-full w/ CA | `connection.cancel()` | EXPLAIN (no ANALYZE) | **passed** (Gate C run: roundtrip, db-side permission denial, themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | MySQL/MariaDB | PyMySQL 1.2.0 | none (pure Python) | TLS w/ CA (`ssl` dict) | none (documented) | EXPLAIN (no ANALYZE) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | ClickHouse | clickhouse-connect 1.8.0 | lz4 + zstd are hard dependencies (in wheelhouse); driver-default lz4 write compression (no `compress` kwarg passed) | HTTPS + CA | `KILL QUERY` by pinned `query_id` (client has no `cancel_query`) | EXPLAIN | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
-| Oracle | oracledb 4.0.2 **Thin only** | none in Thin mode | TCPS + wallet (admin-provided) | `connection.cancel()` | unsupported (plan table provisioning required) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
+| Oracle | oracledb 4.0.2 (Thin default; opt-in **Thick** via admin-supplied Instant Client) | none in Thin mode; Instant Client in Thick mode (admin-supplied) | TCPS + wallet (admin-provided) | `connection.cancel()` | unsupported (plan table provisioning required) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | SQL Server | pyodbc 5.3.0 + **Microsoft ODBC Driver 18 (admin-supplied OS package)** | unixODBC + driver .deb | Encrypt=yes, CA | none (documented) | unsupported (SHOWPLAN needs separate batch) | **passed** (Gate C run: roundtrip + themed data — `test-evidence/integration-gateC/`); other capabilities unverified |
 | IBM Db2 (LUW) | ibm_db 3.2.9 wheel (bundled clidriver) | clidriver in wheel | SSL via cert file | none (documented) | unsupported (explain tables admin-provisioned) | **passed** (direct live run after the 2026-09-15 credential fix: roundtrip + themed data — `test-evidence/integration-db2-credentials-fix/`; Gate C orchestrator not re-run); other capabilities unverified |
 
@@ -29,8 +29,14 @@ Notes:
   `IBM_DB_HOME` is not used to override the bundled driver.** Import alone
   is not a connectivity test; the bundled driver's operation on the target
   is an explicit unverified item until a LUW instance proves it.
-- **Oracle Thick mode is not implemented** in this build (no Instant Client,
-  no silent mode switch).
+- **Oracle Thick mode is opt-in since 2026-09-15** (`options.thick_mode: true`,
+  optionally `options.lib_dir`). It exists for accounts carrying only the legacy
+  10G password verifier, which Thin mode refuses with `DPY-3015`; see
+  `docs/oracle-connect-modes.md`. The Instant Client is Oracle-licensed and
+  administrator-supplied, never shipped in our artifacts, and
+  `init_oracle_client()` is process-global so the config refuses mixing thick
+  and thin oracle connections. Live thick-mode round trip: `not_run` (no Instant
+  Client on the staging host).
 - **Db2 for z/OS and Db2 for i are not implemented**; catalog SQL, licensing,
   and binding requirements differ.
 - **Db2 status (root cause corrected 2026-09-15):** Gate C and every
@@ -76,7 +82,7 @@ integration status in the table above is unaffected.
 | postgres (psycopg[binary]) | yes | yes | yes | none |
 | mysql (PyMySQL) | pure | pure | pure | none |
 | clickhouse-connect | yes | yes | yes | none |
-| oracle (oracledb, Thin only) | yes | yes | yes | thick mode: Instant Client (admin-supplied, not shipped) |
+| oracle (oracledb, Thin + opt-in Thick) | yes | yes | yes | thick mode: Instant Client (admin-supplied, not shipped) |
 | mssql (pyodbc) | yes (+ .deb closure) | yes | yes | msodbcsql18: .deb shipped in bundle / MSI admin-supplied on Windows / .pkg admin-supplied on macOS |
 | db2 (ibm-db) | yes | yes | **yes** (`macosx_14_0_arm64`) | clidriver bundled in wheel; round-trip unverified on ALL platforms |
 
@@ -93,7 +99,8 @@ Notes on this table:
   is an admin-supplied prerequisite (msodbcsql MSI / msodbcsql18.pkg,
   Microsoft EULA applies).
 - **Oracle Thick mode needs the Instant Client,** which is admin-supplied
-  and never shipped in the bundle; Thin mode needs no OS driver.
+  (Oracle-licensed) and delivered on the trusted channel; `options.lib_dir`
+  points at it. `doctor` checks that directory without loading the client.
 - The builder fails loud on missing connector wheels (`SystemExit` unless
   `--allow-missing-connectors`, which is refused for signed releases), so
   this table is backstopped if PyPI availability drifts.
