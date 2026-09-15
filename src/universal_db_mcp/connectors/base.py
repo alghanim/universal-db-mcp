@@ -23,6 +23,15 @@ class ConnectorError(Exception):
     credentials, or raw connection dumps)."""
 
 
+class ObjectNotFound(LookupError):
+    """A requested schema/table/view does not exist or is not visible.
+
+    A dedicated type so the server can distinguish it from the KeyError and
+    IndexError that driver and catalog code raise on internal defects; both
+    are LookupError subclasses.
+    """
+
+
 class DriverUnavailableError(ConnectorError):
     """The optional driver module/wheel for this engine is not installed.
     The message names the missing local artifact; callers map this to
@@ -160,10 +169,10 @@ class DatabaseConnector(ABC):
 
     def get_table(self, schema: str | None, name: str) -> dict[str, Any]:
         """Default composition from primitive metadata calls; engines with
-        richer detail override this. Unknown objects raise LookupError."""
+        richer detail override this. Unknown objects raise ObjectNotFound."""
         cols = self.list_columns(schema, name)
         if not cols:
-            raise LookupError(f"table '{schema}.{name}' not found or not visible")
+            raise ObjectNotFound(f"table '{schema}.{name}' not found or not visible")
         return {
             "schema": schema,
             "name": name,

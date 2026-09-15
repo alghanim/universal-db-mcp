@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import importlib.metadata
 import json
 import os
 import sys
@@ -98,6 +99,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_conn.add_argument("--no-test", action="store_true", help="skip the live connection test")
     add_conn.add_argument(
+        "--tls-ca-file",
+        help="enable TLS for this connection and verify the server against this CA certificate "
+        "(without it the server refuses every call while security.require_remote_tls is on)",
+    )
+    add_conn.add_argument(
         "--json", action="store_true",
         help="machine-readable result (non-interactive: all flags required)",
     )
@@ -110,7 +116,15 @@ def main(argv: list[str] | None = None) -> int:
         from universal_db_mcp import __version__
 
         print(f"universal-db-mcp {__version__}")
-        print(f"mcp-sdk {getattr(mcp, '__version__', 'unknown')}")
+        # The mcp package defines no __version__, so the attribute lookup
+        # always fell through to "unknown": the one command whose job is to
+        # report the pinned SDK reported nothing, and a wheel that resolved a
+        # different 2.x was undetectable.
+        try:
+            mcp_version = importlib.metadata.version("mcp")
+        except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+            mcp_version = getattr(mcp, "__version__", "unknown")
+        print(f"mcp-sdk {mcp_version}")
         return 0
 
     if args.command == "doctor":
@@ -182,6 +196,42 @@ def _serve(args: argparse.Namespace) -> int:
     return 1
 
 
+def build_http_app(cfg, server, token_value: str):  # type: ignore[no-untyped-def]
+    """Bearer-authenticated ASGI app for the Streamable HTTP transport.
+
+    ``host`` must be handed to ``streamable_http_app``: when it is omitted the
+    SDK defaults to 127.0.0.1 and AUTO-ENABLES DNS-rebinding protection pinned
+    to loopback Host headers, so every client that connects by hostname - the
+    documented cross-machine deployment, and any reverse proxy forwarding the
+    original Host - is answered 421 "Invalid Host header" no matter what the
+    listener binds. The comment here used to claim host checking was left to
+    the proxy; the SDK had silently turned it on.
+    """
+    asgi_app = server.streamable_http_app(host=cfg.application.http_host)
+    token_bytes = token_value.encode()
+
+    async def _auth_app(scope, receive, send):  # type: ignore[no-untyped-def]
+        # Pure ASGI bearer-auth wrapper (Starlette's app.middleware helper is
+        # not available on a bare ASGI app).
+        if scope["type"] != "http":
+            await asgi_app(scope, receive, send)
+            return
+        auth = next((v for k, v in scope.get("headers", []) if k == b"authorization"), b"")
+        if not (auth.startswith(b"Bearer ") and hmac.compare_digest(auth[7:], token_bytes)):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [(b"www-authenticate", b"Bearer"), (b"content-type", b"application/json")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b'{"error": "unauthorized"}'})
+            return
+        await asgi_app(scope, receive, send)
+
+    return _auth_app
+
+
 def _serve_http(cfg, server) -> int:  # type: ignore[no-untyped-def]
     """Authenticated internal Streamable HTTP deployment.
 
@@ -219,27 +269,7 @@ def _serve_http(cfg, server) -> int:  # type: ignore[no-untyped-def]
         return 1
     token = SecretMark(raw_token)
 
-    asgi_app = server.streamable_http_app()
-    token_bytes = token.value.encode()
-
-    async def _auth_app(scope, receive, send):  # type: ignore[no-untyped-def]
-        # Pure ASGI bearer-auth wrapper (Starlette's app.middleware helper is
-        # not available on a bare ASGI app).
-        if scope["type"] != "http":
-            await asgi_app(scope, receive, send)
-            return
-        auth = next((v for k, v in scope.get("headers", []) if k == b"authorization"), b"")
-        if not (auth.startswith(b"Bearer ") and hmac.compare_digest(auth[7:], token_bytes)):
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [(b"www-authenticate", b"Bearer"), (b"content-type", b"application/json")],
-                }
-            )
-            await send({"type": "http.response.body", "body": b'{"error": "unauthorized"}'})
-            return
-        await asgi_app(scope, receive, send)
+    _auth_app = build_http_app(cfg, server, token.value)
 
     uvicorn.run(
         _auth_app,
@@ -570,6 +600,8 @@ def _add_connection(args: argparse.Namespace) -> int:
                 username_file=str(username_file) if username_file else None,
                 password_file=str(password_file) if password_file else None,
                 read_only=not args.read_write,
+                tls_enabled=bool(args.tls_ca_file),
+                tls_ca_file=args.tls_ca_file,
             )
             result = apply_connection(
                 cfg_path, args.name, connection, run_test=not args.no_test
@@ -604,6 +636,9 @@ def _print_add_result(result: dict[str, Any]) -> None:
     print(f"    backup: {result['backup']}")
     if result.get("comments_dropped"):
         print("    NOTE: comments inside the config body were not preserved (the header was).")
+    policy = result.get("policy") or {}
+    if policy.get("would_be_refused"):
+        print(f"    WARNING: {policy['detail']}")
     if result.get("tested"):
         test = result["test"]
         if test.get("healthy"):

@@ -124,6 +124,9 @@ def build_connection(  # noqa: PLR0913 - explicit wizard answer fields
     username_file: str | None = None,
     password_file: str | None = None,
     read_only: bool = True,
+    tls_enabled: bool = False,
+    tls_ca_file: str | None = None,
+    tls_verify_server: bool = True,
 ) -> ConnectionConfig:
     """Construct (and schema-validate) a ConnectionConfig from wizard answers."""
     validate_connection_name(name)
@@ -140,6 +143,12 @@ def build_connection(  # noqa: PLR0913 - explicit wizard answer fields
         kwargs["username_file"] = username_file
     if password_file:
         kwargs["password_file"] = password_file
+    if tls_enabled:
+        kwargs["tls"] = {
+            "enabled": True,
+            "verify_server": tls_verify_server,
+            "ca_file": tls_ca_file,
+        }
     return ConnectionConfig(**kwargs)
 
 
@@ -309,6 +318,21 @@ def collect_answers_interactive(cfg_path: Path) -> tuple[str, ConnectionConfig, 
 
     read_only = _ask_bool("Read-only connection?", True)
 
+    tls_enabled = False
+    tls_ca_file: str | None = None
+    if engine != "sqlite":
+        # Without this the wizard writes a connection the server refuses on
+        # every tool call whenever security.require_remote_tls is on.
+        tls_enabled = _ask_bool("Use TLS for this connection?", True)
+        while tls_enabled:
+            tls_ca_file = _ask("CA certificate file (absolute path)")
+            if tls_ca_file and Path(tls_ca_file).is_file():
+                break
+            print("  that file does not exist; TLS verification needs the CA certificate")
+            if not _ask_bool("Try another path?", True):
+                tls_enabled = False
+                tls_ca_file = None
+
     connection = build_connection(
         name=name,
         engine=engine,
@@ -318,6 +342,8 @@ def collect_answers_interactive(cfg_path: Path) -> tuple[str, ConnectionConfig, 
         username_file=str(username_file) if username_file else None,
         password_file=str(password_file) if password_file else None,
         read_only=read_only,
+        tls_enabled=tls_enabled,
+        tls_ca_file=tls_ca_file,
     )
     run_test = _ask_bool("Test the connection now?", True)
     return name, connection, run_test
@@ -353,10 +379,31 @@ def apply_connection(
     backup = merge_connection(existing, name, connection)
     cfg = load_config(existing)  # schema-valid (merge already verified)
 
+    # The server refuses a tool call on a non-sqlite connection without TLS
+    # whenever security.require_remote_tls is on (the default). The wizard's
+    # own live test talks to the connector directly and would NOT hit that
+    # gate, so without this preview the wizard could report a healthy
+    # connection that fails on every later db_* call.
+    require_tls = connection.type != "sqlite" and (
+        cfg.security.require_remote_tls or connection.tls.enabled
+    )
+    would_be_refused = require_tls and not connection.tls.enabled
+    policy = {
+        "require_tls": require_tls,
+        "would_be_refused": would_be_refused,
+        "detail": (
+            "security.require_remote_tls is true and this connection has no tls block, so the "
+            "server will refuse every db_* call on it: add tls.enabled with a ca_file, or set "
+            "security.require_remote_tls: false deliberately"
+            if would_be_refused
+            else "the connection satisfies the server's TLS policy"
+        ),
+    }
     result: dict[str, Any] = {
         "config": str(existing),
         "connection": name,
         "engine": connection.type,
+        "policy": policy,
         "replaced": replaced,
         "kept": True,
         "comments_dropped": comments_dropped,

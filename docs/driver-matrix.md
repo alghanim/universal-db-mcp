@@ -69,6 +69,36 @@ Notes:
 - All drivers are lazily imported; an absent wheel cannot break other
   engines. `doctor` names the missing wheel per connection.
 
+## Server version floors (pinned drivers, 2026-09-15 audit)
+
+The driver, not our SQL, is usually the binding constraint. Nothing below was
+run against an old server: our fixtures pin the newest release of each engine,
+so these are documented floors, not tested ones.
+
+| Engine | Floor | Source of the limit |
+|---|---|---|
+| PostgreSQL | 10 | psycopg 3 supports 10-18. `pg_proc.prokind` is 11+, so `db_list_routines` falls back to a pre-11 query. |
+| MySQL / MariaDB | MySQL 5.7, MariaDB 10.3 | PyMySQL's stated range. Our catalog SQL uses `information_schema` only and is portable across it. |
+| ClickHouse | actively supported releases | clickhouse-connect 1.7.0 removed its compatibility branches for servers older than 25.8; older servers may work but are outside the driver's support. |
+| Oracle | Thin 12.1, Thick 11.2 | python-oracledb. Sampling uses `ROWNUM`, not the 12c-only `FETCH FIRST`, so the Thick-mode floor is genuinely reachable. |
+| SQL Server | 2017 | Microsoft lists only 2017/2019/2022/2025 for ODBC Driver 18. Our catalog SQL itself is portable back to 2012. |
+| **IBM Db2 LUW** | **11.1** | ibm_db 3.2.7+ bundles clidriver 12.1, which supports LUW 12.1/11.5/11.1 and **drops 10.5**. A 10.5 server is not reachable with this pin. |
+
+Least-privilege accounts also hit catalog-visibility rules that are not
+connection errors:
+
+- **MySQL 8.0:** `information_schema.ROUTINES` shows only rows the account
+  defined, unless it holds `SHOW_ROUTINE` (8.0.20+), global `SELECT`, or
+  `CREATE/ALTER/EXECUTE ROUTINE`. Without one, `db_list_routines` returns an
+  empty list rather than an error, and a reader concludes there are no
+  routines. Grant `SHOW_ROUTINE` to the read-only account.
+- **Oracle and Db2:** version reporting needs `V$VERSION` and
+  `SYSIBMADM.ENV_INST_INFO` respectively. `db_test_connection` no longer fails
+  without them; it reports the connection healthy with the version omitted.
+- **ClickHouse:** the client reads `system.settings` at connection time. A
+  profile that denies it fails during client initialization, before any of our
+  code runs, and looks like a connectivity fault.
+
 ## Per-platform connector availability (offline bundle wheelhouse)
 
 Platform availability of the connector wheels the offline bundle builder
@@ -122,8 +152,37 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA reporting GRANT SELECT ON TABLES TO udbmcp_ro
 CREATE USER 'udbmcp_ro'@'%' IDENTIFIED BY '...';
 GRANT SELECT ON reporting.* TO 'udbmcp_ro'@'%';
 
+-- MySQL 8.0: without SHOW_ROUTINE, information_schema.ROUTINES hides rows the
+-- account did not define and db_list_routines returns an empty list, silently.
+GRANT SHOW_ROUTINE ON *.* TO 'udbmcp_ro'@'%';
+
 -- Db2 LUW (admin)
 GRANT CONNECT ON DATABASE TO USER udbmcp_ro;
 GRANT SELECT ON SYSIBM.SYSDUMMY1 TO USER udbmcp_ro; -- plus per-table grants
+-- Optional: version reporting in db_test_connection reads this admin view.
+-- Without it the connection is still reported healthy, with no version.
+GRANT EXECUTE ON FUNCTION SYSPROC.ENV_GET_INST_INFO TO USER udbmcp_ro;
 -- Explain tables (optional, admin-created under SYSTOOLS) — the app never creates them.
+
+-- Oracle
+CREATE USER udbmcp_ro IDENTIFIED BY "...";
+GRANT CREATE SESSION TO udbmcp_ro;
+GRANT SELECT ON app.customers TO udbmcp_ro;      -- per object
+-- Optional: version reporting only. db_test_connection works without it.
+GRANT SELECT ON V_$VERSION TO udbmcp_ro;
+
+-- SQL Server
+CREATE LOGIN udbmcp_ro WITH PASSWORD = '...';     -- or: FROM WINDOWS (trusted_connection)
+USE reporting;
+CREATE USER udbmcp_ro FOR LOGIN udbmcp_ro;
+ALTER ROLE db_datareader ADD MEMBER udbmcp_ro;
+GRANT VIEW DEFINITION TO udbmcp_ro;               -- catalog metadata
+
+-- ClickHouse
+CREATE USER udbmcp_ro IDENTIFIED WITH sha256_password BY '...' SETTINGS readonly = 1;
+GRANT SELECT ON reporting.* TO udbmcp_ro;
+-- The client reads these at connection time; denying them fails client startup
+-- before any of our code runs.
+GRANT SELECT ON system.settings TO udbmcp_ro;
+GRANT SELECT ON system.tables, system.columns TO udbmcp_ro;
 ```

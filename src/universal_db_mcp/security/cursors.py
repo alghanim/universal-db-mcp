@@ -10,6 +10,7 @@ so metadata or counts cannot leak across authorization boundaries.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -91,10 +92,46 @@ class CursorCodec:
         return body
 
 
+def _normalize(value: Any) -> Any:
+    """Order-independent, process-independent view of a policy field.
+
+    Sets are sorted (frozenset repr order follows per-process string hashing)
+    and compiled patterns contribute their FULL pattern text: re.Pattern.__repr__
+    truncates at 200 characters, so two long mask patterns differing only past
+    that point produced the same fingerprint.
+    """
+    if isinstance(value, (set, frozenset)):
+        return sorted(_normalize(v) for v in value)
+    if isinstance(value, dict):
+        return {str(k): _normalize(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(v) for v in value]
+    pattern = getattr(value, "pattern", None)
+    if pattern is not None and hasattr(value, "match"):
+        return f"re:{pattern}"
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _normalize(getattr(value, f.name)) for f in dataclasses.fields(value)}
+    return value
+
+
 def policy_fingerprint(policy: Any) -> str:
-    """Short fingerprint of the effective security policy for cursor binding."""
-    try:
-        blob = json.dumps(policy.model_dump(mode="json"), sort_keys=True, default=str)
-    except Exception:  # pragma: no cover
-        blob = repr(policy)
+    """Short fingerprint of the effective security policy for cursor binding
+    and metadata-cache keys.
+
+    This used to call ``model_dump`` inside a try/except that fell back to
+    ``repr``. EffectivePolicy is a dataclass, so EVERY call took the fallback,
+    and the repr of its frozenset fields varies per process: the cache key
+    changed on every restart and the on-disk metadata cache never produced a
+    hit. An unsupported object now fails loudly instead of silently hashing
+    its repr.
+    """
+    if hasattr(policy, "model_dump"):
+        data: Any = policy.model_dump(mode="json")
+    elif dataclasses.is_dataclass(policy) and not isinstance(policy, type):
+        data = {f.name: getattr(policy, f.name) for f in dataclasses.fields(policy)}
+    else:
+        raise TypeError(
+            f"policy_fingerprint needs a pydantic model or a dataclass, got {type(policy).__name__}"
+        )
+    blob = json.dumps(_normalize(data), sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]

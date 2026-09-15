@@ -64,9 +64,17 @@ POSTINSTALL = PROJECT / "packaging" / "pkg" / "postinstall"
 # fail closed when this disappears; this tight text gate names the regression
 # directly (a swallowed `|| { fail ... }` is the mutant that passed all
 # content-gate suites).
+# The verifier gate became a proof gate on 2026-09-15: exit 0 is no longer
+# enough (python3 on an empty or no-op verifier exits 0 having verified
+# nothing), so the run is captured and BOTH a nonzero exit and a missing
+# 'bundle verification PASSED' line are fatal - the rule every other call site
+# already enforced.
 _FATAL_VERIFY_BRANCH = re.compile(
-    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY"\s*\|\|\s*\{\s*\n'
-    r'\s*fail "bundle verification FAILED'
+    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY" >"\$VERIFY_OUT" 2>&1 \|\| VRC=\$\?'
+    r'[\s\S]{0,400}?fail "bundle verification FAILED'
+)
+_VERIFY_PROOF_REQUIRED = re.compile(
+    r"grep -q 'bundle verification PASSED'[\s\S]{0,400}?fail \"trusted verifier exited 0"
 )
 
 _PATH_REWRITES = [

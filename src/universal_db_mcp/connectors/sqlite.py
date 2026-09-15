@@ -29,6 +29,7 @@ from universal_db_mcp.connectors.base import (
     HealthInfo,
     IndexInfo,
     KeyInfo,
+    ObjectNotFound,
     QueryOutcome,
     QuerySpec,
     RoutineInfo,
@@ -223,7 +224,16 @@ class SQLiteConnector(DatabaseConnector):
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
         except Exception as exc:  # noqa: BLE001 - health reports failures
-            return HealthInfo(healthy=False, detail=str(exc)[:300], latency_ms=int((time.monotonic() - start) * 1000))
+            detail = str(exc)
+            if "file is not a database" in detail.lower():
+                # The stdlib driver reports the same text for an encrypted file
+                # and for a corrupt one, and operators read it as corruption.
+                detail = (
+                    f"{detail} - the file is not readable as plain SQLite: it may be ENCRYPTED "
+                    "(SQLCipher or SQLite SEE, which the standard-library driver cannot open; "
+                    "this build ships no encryption extension), truncated, or not a database"
+                )
+            return HealthInfo(healthy=False, detail=detail[:300], latency_ms=int((time.monotonic() - start) * 1000))
 
     # ---- metadata ----------------------------------------------------------
 
@@ -304,7 +314,7 @@ class SQLiteConnector(DatabaseConnector):
                 None,
             )
             if found is None:
-                raise LookupError(f"table '{schema}.{name}' not found")
+                raise ObjectNotFound(f"table '{schema}.{name}' not found")
             kind = "view" if found[2] == "view" else "table"
             cols = self.list_columns(schema, name)
             fks = self.get_foreign_keys(schema, name)

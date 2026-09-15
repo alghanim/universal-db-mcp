@@ -71,8 +71,14 @@
       UpgradeCode is FROZEN across all future releases of this product line;
       changing it breaks upgrade/downgrade detection.
     -->
+    <!-- AllowSameVersionUpgrades: the product version is the release string
+         (0.1.0) and does not change between code-only builds, so without this
+         a rebuilt MSI is not detected as related: the old product is never
+         removed and two entries share one install folder - the Windows shape
+         of the stale-code incident the .deb avoids with a revision suffix. -->
     <MajorUpgrade
         Schedule="afterInstallValidate"
+        AllowSameVersionUpgrades="yes"
         DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
 
     <MediaTemplate EmbedCab="yes" />

@@ -27,8 +27,37 @@ services:
     # HTTP mode REQUIRES application.http_bearer_token_file in the mounted
     # config AND /run/secrets/udbmcp_http_token (mode 600) to exist; the
     # server exits with CONFIG_ERROR otherwise (fail-fast, by design).
+    #
+    # TWO container-specific requirements, both silent failures otherwise:
+    #  1. the mounted config must set application.http_host: "0.0.0.0". The
+    #     default 127.0.0.1 binds the container's own loopback (nothing
+    #     reaches the published port) AND makes the transport answer 421 to
+    #     any Host header that is not loopback.
+    #  2. the 0600 token file must be readable by the container's udbmcp UID,
+    #     which is assigned by the image's useradd and does NOT match the
+    #     host's udbmcp. Set the owner to that UID on the host, e.g.
+    #     `chown $(docker run --rm --entrypoint id IMAGE -u udbmcp) /run/secrets/udbmcp_http_token`.
+    #
+    # The healthcheck speaks MCP rather than opening a socket: a bare TCP
+    # connect stays green through a 421 host rejection, a 401, and a server
+    # that binds loopback inside its own namespace.
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 2).close()"]
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import json, pathlib, urllib.request
+          token = pathlib.Path("/run/secrets/udbmcp_http_token").read_text().strip()
+          body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                        "clientInfo": {"name": "healthcheck", "version": "1"}}}).encode()
+          req = urllib.request.Request("http://127.0.0.1:8765/mcp", data=body, method="POST")
+          req.add_header("Content-Type", "application/json")
+          req.add_header("Accept", "application/json, text/event-stream")
+          req.add_header("Authorization", "Bearer " + token)
+          with urllib.request.urlopen(req, timeout=5) as r:
+              raise SystemExit(0 if r.status == 200 else 1)
       interval: 30s
       timeout: 5s
       retries: 3

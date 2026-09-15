@@ -244,20 +244,24 @@ def test_worker_records_success_before_enabling_the_service() -> None:
 
 @_POSIX
 def test_sync_path_clears_stale_deferred_status() -> None:
-    """P3: the synchronous path must clear a stale deferred-install status
-    file (possibly 'failed' from a previous attempt), so the guard drop-in a
-    previous postinst installed cannot block service starts on stale state —
-    the sync install just completed in the privileged context, so no
-    deferred install is outstanding. The clear must come after the sync
-    enable call (the install is genuinely done)."""
+    """The synchronous path must clear a stale deferred-install status file
+    (possibly 'failed' from a previous attempt) BEFORE it restarts or enables
+    the service.
+
+    Corrected 2026-09-15: the clear used to run at the very end, after
+    `enable --now`, so this install's own service start was refused by the
+    guard drop-in describing an install that had already finished. The
+    install itself is complete by then - everything that can fail ran above
+    under set -eu - so clearing first is safe and is what makes the start
+    work."""
     code = _executable_lines(_read_postinst())
     clear_at = code.index('rm -f -- "$STATUS"')
     sync_enable_at = code.rindex("systemctl enable --now")
     sync_installer_calls = [
         m.start() for m in re.finditer(re.escape('bash "$TRUST_DIR/install_offline.sh" "$BUNDLE" "$TARGET"'), code)
     ]
-    assert clear_at > sync_enable_at > sync_installer_calls[-1], (
-        "the stale-status clear belongs at the very end of the synchronous path"
+    assert sync_installer_calls[-1] < clear_at < sync_enable_at, (
+        "the stale-status clear must follow the install and precede the service start"
     )
 
 

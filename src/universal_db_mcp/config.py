@@ -115,9 +115,20 @@ class TlsConfig(StrictModel):
 # no-op) would mislead operators into believing a setting is enforced.
 _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
     "sqlite": {},
-    "postgres": {},
-    "mysql": {},
-    "clickhouse": {},
+    # gssencmode/krbsrvname reach Kerberos deployments (the bundled libpq is
+    # built --with-gssapi); service/passfile reach libpq's own config files;
+    # sslmode is only for the TLS-disabled case (an enabled tls: block already
+    # pins verify-full and must not be weakened from options).
+    "postgres": {
+        "os_authentication": bool,
+        "gssencmode": str,
+        "krbsrvname": str,
+        "service": str,
+        "passfile": str,
+        "sslmode": str,
+    },
+    "mysql": {"os_authentication": bool, "unix_socket": str},
+    "clickhouse": {"os_authentication": bool},
     # thick_mode + lib_dir: Thick mode via an ADMINISTRATOR-SUPPLIED Oracle
     # Instant Client (licensed by Oracle, never shipped here). It is the only
     # client-side way to authenticate an account that carries just the legacy
@@ -131,13 +142,45 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
         "lib_dir": str,
         "sid": str,
         "tns_alias": str,
+        "wallet_password": str,
     },
     # MssqlConnector reads options.odbc_driver to select the installed ODBC
     # driver (and doctor matches the exact name); a wrong name fails closed
     # at connect time naming the installed drivers.
-    "mssql": {"odbc_driver": str},
-    "db2": {},
+    "mssql": {"odbc_driver": str, "trusted_connection": bool},
+    # authentication: the CLI keyword the bundled clidriver already supports;
+    # without it a server demanding a specific mechanism answers SQL30082N
+    # reason 17, indistinguishable from the credential bug fixed in 854b50d.
+    "db2": {"authentication": str},
 }
+
+
+# Characters that are GRAMMAR, not data, in an Oracle connect string. Verified
+# against oracledb 4.0.2's own parser (2026-09-15): a `database` of
+# "ORCL?ssl_server_dn_match=false" disables certificate matching - defeating
+# this module's own refusal to set tls.verify_server=false - and a `host`
+# carrying ")(ADDRESS=(PROTOCOL=TCP)(HOST=..." appends a PLAINTEXT fallback
+# address. In Thick mode the driver does not parse the string at all
+# (thick_mode_dsn_passthrough defaults to True), so the value reaches Oracle
+# Net unchecked. Values are therefore validated here, at config time.
+_ORACLE_GRAMMAR = set("()?&,;:/@= \t\r\n\"'\\")
+_IPV6_ALLOWED = set("0123456789abcdefABCDEF:.")
+
+
+def _reject_oracle_grammar(field: str, value: str | None) -> None:
+    if not value:
+        return
+    if value.startswith("[") and value.endswith("]"):
+        # bracketed IPv6 literal: colons are the address, not the port separator
+        if set(value[1:-1]) <= _IPV6_ALLOWED:
+            return
+    bad = sorted(set(value) & _ORACLE_GRAMMAR)
+    if bad:
+        raise ValueError(
+            f"oracle {field} contains connect string grammar {bad!r}; those characters are "
+            "parsed as Oracle Net syntax (they can disable certificate matching, add a "
+            "plaintext address or set a proxy), so they are not allowed in a value"
+        )
 
 
 class ConnectionConfig(StrictModel):
@@ -163,7 +206,7 @@ class ConnectionConfig(StrictModel):
     @model_validator(mode="after")
     def _hosts(self) -> ConnectionConfig:
         if self.type != "sqlite":
-            if not self.host:
+            if not self.host and not self.options.get("unix_socket"):
                 raise ValueError(f"connections: host is required for type '{self.type}'")
             if not self.database:
                 raise ValueError(f"connections: database is required for type '{self.type}'")
@@ -181,7 +224,57 @@ class ConnectionConfig(StrictModel):
         for key, value in self.options.items():
             if not isinstance(value, allowed[key]):
                 raise ValueError(f"connections: option '{key}' for type '{self.type}' must be {allowed[key].__name__}")
+        if self.type in ("postgres", "mysql", "clickhouse") and not (
+            self.username_env or self.username_file or self.options.get("os_authentication")
+        ):
+            # Omitting the username is NOT "send no credential": psycopg and
+            # PyMySQL substitute the OS account of the server process and
+            # clickhouse-connect substitutes 'default' (verified in the
+            # installed drivers, 2026-09-15). Make that identity explicit.
+            raise ValueError(
+                f"connections: {self.type} needs username_env or username_file; omitting it "
+                "makes the driver authenticate as an implicit identity (the service account's "
+                "OS user, or 'default' on clickhouse). Set options.os_authentication: true to "
+                "choose that deliberately"
+            )
+        if self.type == "clickhouse" and self.port in (9000, 9440):
+            raise ValueError(
+                f"clickhouse port {self.port} is the NATIVE TCP protocol; clickhouse-connect "
+                "speaks HTTP only and would report an opaque protocol error. Use the HTTP "
+                "interface (8123, or 8443 with tls.enabled)"
+            )
+        if self.type == "mssql" and self.options.get("trusted_connection") and (
+            self.username_env or self.username_file
+        ):
+            raise ValueError(
+                "mssql options.trusted_connection uses the process's Windows/Kerberos identity; "
+                "remove username_env/username_file (a SQL login cannot be combined with it)"
+            )
+        if self.type == "db2" and (auth := self.options.get("authentication")):
+            allowed_auth = {
+                "CERTIFICATE", "SERVER", "SERVER_ENCRYPT", "SERVER_ENCRYPT_AES",
+                "KERBEROS", "GSSPLUGIN", "TOKEN",
+            }
+            if str(auth).upper() not in allowed_auth:
+                raise ValueError(
+                    f"db2 options.authentication '{auth}' is not a CLI value; use one of "
+                    f"{sorted(allowed_auth)}"
+                )
+        if self.type == "postgres" and self.options.get("sslmode") and self.tls.enabled:
+            raise ValueError(
+                "postgres options.sslmode cannot be combined with tls.enabled: the tls block "
+                "already pins verify-full, and an sslmode from options could only weaken it"
+            )
+        if self.type == "postgres" and self.host and "," in self.host:
+            raise ValueError(
+                "postgres host contains a comma, which libpq reads as a multi-host failover "
+                "list: the credentials would be offered to every host in turn"
+            )
         if self.type == "oracle":
+            _reject_oracle_grammar("host", self.host)
+            _reject_oracle_grammar("database", self.database)
+            _reject_oracle_grammar("options.sid", self.options.get("sid"))
+            _reject_oracle_grammar("options.tns_alias", self.options.get("tns_alias"))
             if self.options.get("sid") and self.options.get("tns_alias"):
                 raise ValueError(
                     "oracle options 'sid' and 'tns_alias' are mutually exclusive: "

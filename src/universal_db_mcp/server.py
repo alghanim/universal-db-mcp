@@ -25,6 +25,7 @@ from mcp.server.mcpserver import MCPServer
 # message to the client; any other exception is masked as UnexpectedToolError
 # with a generic message (verified against the pinned SDK source).
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from sqlglot import exp
 
 from universal_db_mcp.config import AppConfig, ResolvedConnection
@@ -33,6 +34,7 @@ from universal_db_mcp.connectors.base import (
     ConnectorError,
     DatabaseConnector,
     DriverUnavailableError,
+    ObjectNotFound,
     QuerySpec,
 )
 from universal_db_mcp.errors import ToolFailure
@@ -217,9 +219,20 @@ async def tool_span(
     except ConnectorError as exc:
         outcome, category = "error", ErrorCategory.CONNECTION
         raise ToolError(f"{ErrorCategory.CONNECTION}: {scrub_exception(exc)}") from exc
-    except LookupError as exc:
+    except ObjectNotFound as exc:
+        # Only a genuine "that object is not there" is the caller's problem.
+        # This used to catch bare LookupError, whose subclasses KeyError and
+        # IndexError are raised by driver and catalog code: a server-side bug
+        # was reported to the model as ITS invalid arguments and audited as a
+        # policy deny.
         outcome, category = "deny", ErrorCategory.VALIDATION
         raise ToolError(f"{ErrorCategory.VALIDATION}: {redact_text(str(exc))}") from exc
+    except NotImplementedError as exc:
+        # A capability the connector declares unsupported (db_get_capabilities
+        # already says so); reporting it as INTERNAL_ERROR invited bug reports
+        # for a documented limitation.
+        outcome, category = "deny", ErrorCategory.CAPABILITY
+        raise ToolError(f"{ErrorCategory.CAPABILITY}: {redact_text(str(exc))}") from exc
     except anyio.get_cancelled_exc_class():
         # Cancellation (client disconnect, shutdown) is not an error: it is a
         # request that happened and must still leave an audit trail below.
@@ -482,8 +495,23 @@ def build_server(app: AppContext) -> MCPServer:
         ),
     )
 
+    # Every tool here reads: without annotations a conformant client must treat
+    # them as destructive (readOnlyHint defaults false, destructiveHint true)
+    # and prompt for approval on something as harmless as db_list_connections.
+    read_only_annotations = ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
+    )
+
     def register(name: str, description: str, handler: Callable[..., Any]) -> None:
-        mcp.tool(name=name, description=description, structured_output=True)(handler)
+        mcp.tool(
+            name=name,
+            description=description,
+            structured_output=True,
+            annotations=read_only_annotations,
+        )(handler)
 
     # ---- discovery ---------------------------------------------------------
 

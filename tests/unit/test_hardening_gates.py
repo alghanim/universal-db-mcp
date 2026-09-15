@@ -4441,7 +4441,10 @@ def _clickhouse_connector():  # type: ignore[no-untyped-def]
     from universal_db_mcp.config import ConnectionConfig, ResolvedConnection
     from universal_db_mcp.connectors.clickhouse import ClickHouseConnector
 
-    cfg = ConnectionConfig.model_validate({"type": "clickhouse", "host": "h", "database": "d"})
+    cfg = ConnectionConfig.model_validate(
+        {"type": "clickhouse", "host": "h", "database": "d",
+         "options": {"os_authentication": True}}
+    )
     resolved = ResolvedConnection("ch", cfg)
     return ClickHouseConnector(resolved, _policy_for(resolved))
 

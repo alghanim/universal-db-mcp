@@ -384,6 +384,15 @@ elif [ -f "$SHIPPED_UNIT_RECORD" ] \
   # on exactly the fleets that need the fix.
   echo "==> $UNIT_DST matches the previously-shipped unit (hash record); deploying the updated unit"
   install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
+elif ! grep -q -- "--transport http" "$UNIT_DST"; then
+  # A unit deployed by a release OLDER than the hash record still carries the
+  # stdio ExecStart. Under a service manager that transport reads EOF and
+  # exits 0, which Restart=on-failure treats as a clean stop: the service
+  # never runs and the journal stays silent. Those units predate the record,
+  # so the matches-or-absent rule alone would keep the broken unit forever on
+  # exactly the fleets that need the fix.
+  echo "==> $UNIT_DST still runs the stdio transport (pre-HTTP unit); deploying the updated unit"
+  install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 else
   echo "WARNING: $UNIT_DST exists and differs from the deb-shipped unit;" >&2
   echo "         keeping the admin-controlled unit untouched. Canonical copy:" >&2
@@ -450,9 +459,12 @@ fi
 # match above): a RUNNING service must be restarted to pick it up — `enable
 # --now` alone is a no-op on an already-active unit. Stopped services are
 # unaffected (try-restart on an inactive unit does nothing).
-systemctl try-restart universal-db-mcp.service 2>/dev/null || true
-
 echo success > "$STATUS"
+
+# Written BEFORE try-restart: the guard drop-in refuses to start the service
+# while the status file says anything but 'success', so restarting first would
+# stop a running service and leave it failed.
+systemctl try-restart universal-db-mcp.service 2>/dev/null || true
 
 if systemctl enable --now universal-db-mcp.service 2>/dev/null; then
   echo "==> universal-db-mcp.service enabled and started"
@@ -551,6 +563,15 @@ elif [ -f "$SHIPPED_UNIT_RECORD" ] \
   # on exactly the fleets that need the fix.
   echo "==> $UNIT_DST matches the previously-shipped unit (hash record); deploying the updated unit"
   install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
+elif ! grep -q -- "--transport http" "$UNIT_DST"; then
+  # A unit deployed by a release OLDER than the hash record still carries the
+  # stdio ExecStart. Under a service manager that transport reads EOF and
+  # exits 0, which Restart=on-failure treats as a clean stop: the service
+  # never runs and the journal stays silent. Those units predate the record,
+  # so the matches-or-absent rule alone would keep the broken unit forever on
+  # exactly the fleets that need the fix.
+  echo "==> $UNIT_DST still runs the stdio transport (pre-HTTP unit); deploying the updated unit"
+  install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 else
   echo "WARNING: $UNIT_DST exists and differs from the deb-shipped unit;" >&2
   echo "         keeping the admin-controlled unit untouched. Canonical copy:" >&2
@@ -625,6 +646,13 @@ systemctl daemon-reload 2>/dev/null || \
 # match in step 5): a RUNNING service must be restarted to pick it up —
 # `enable --now` alone is a no-op on an already-active unit. try-restart on
 # an inactive (or containerless) system does nothing.
+# A previous deferred install may have left a status file ('deferred',
+# 'running' or 'failed') and, with it, the deferred-install guard drop-in.
+# This synchronous install just completed, so nothing is outstanding: drop the
+# stale file HERE, before the restart/enable below, otherwise this install's
+# own service start is refused by a guard describing a finished install.
+rm -f -- "$STATUS" 2>/dev/null || true
+
 systemctl try-restart universal-db-mcp.service 2>/dev/null || true
 
 # --- step 8: enable + start the service (guarded, container-safe) -----------
@@ -640,12 +668,5 @@ else
   echo "         installed; start it later with:" >&2
   echo "           systemctl enable --now universal-db-mcp" >&2
 fi
-
-# A previous deferred install may have left a status file ('deferred',
-# 'running', or 'failed') and, with it, the deferred-install guard drop-in.
-# This synchronous install just completed in this privileged context, so no
-# deferred install is outstanding: drop the stale status file so the guard
-# (absent status file => allow) cannot block service starts on stale state.
-rm -f -- "$STATUS" 2>/dev/null || true
 
 echo "==> postinst complete: install at $TARGET (config: $CONFIG)"

@@ -60,9 +60,17 @@ POSTINSTALL = PROJECT / "packaging" / "pkg" / "postinstall"
 # Mutation-kill anchors: these are the exact lines whose absence/regression the
 # executed tests below detect behaviorally; the text gates fail fast and name
 # the regression if the producer script is ever restructured.
+# The verifier gate became a proof gate on 2026-09-15: exit 0 is no longer
+# enough (python3 on an empty or no-op verifier exits 0 having verified
+# nothing), so the run is captured and BOTH a nonzero exit and a missing
+# 'bundle verification PASSED' line are fatal - the rule every other call site
+# already enforced.
 _FATAL_VERIFY_BRANCH = re.compile(
-    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY"\s*\|\|\s*\{\s*\n'
-    r'\s*fail "bundle verification FAILED'
+    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY" >"\$VERIFY_OUT" 2>&1 \|\| VRC=\$\?'
+    r'[\s\S]{0,400}?fail "bundle verification FAILED'
+)
+_VERIFY_PROOF_REQUIRED = re.compile(
+    r"grep -q 'bundle verification PASSED'[\s\S]{0,400}?fail \"trusted verifier exited 0"
 )
 _PUBKEY_INSIDE_BUNDLE_REFUSAL = re.compile(
     r'fail "refusing to verify with a pubkey shipped inside the bundle'
@@ -337,6 +345,13 @@ def _run_postinstall(
 # --------------------------------------------------------------------------
 # text gates: pin the exact lines the executed tests detect behaviorally
 # --------------------------------------------------------------------------
+
+
+def test_verifier_exit_zero_without_proof_is_fatal() -> None:
+    assert _VERIFY_PROOF_REQUIRED.search(_require_script()), (
+        "an empty or no-op verifier exits 0 without verifying anything; postinstall must "
+        "require the literal 'bundle verification PASSED' line, as every other call site does"
+    )
 
 
 def test_fatal_verifier_branch_is_pinned() -> None:

@@ -276,6 +276,96 @@ closed.
 | Bundle signing key pair | supported end-to-end (sign + offline verify + failure test); not generated in this environment | organization key ceremony |
 | Db2 remote password authentication for the pinned `ibm_db` client | **resolved 2026-09-15** — the long-recorded block (SQL30082N reason 17 on every platform) was the connector passing credentials positionally, which ibm_db ignores for connection-string DSNs; credentials now travel as `UID`/`PWD` inside the connection string and a direct live run passed (`test-evidence/integration-db2-credentials-fix/`). A `;` in any connection value is refused before dialing (no CLI quoting form carries it). Db2-side TLS is optional in-transit hardening, not a login remediation | DBA/infrastructure owners (TLS only) |
 
+## 3b. Connector audit, 2026-09-15 (auth, versions, connection strings)
+
+Triggered by two live customer blockers (Db2 credentials never sent; an Oracle
+account carrying only the 10G verifier). Three parallel audits reviewed every
+connector against the installed driver sources and vendor docs. Fixed in this
+pass, each with regression tests:
+
+- **Silently dropped credentials:** clickhouse skipped Basic auth whenever a
+  client certificate was configured; a password without a username
+  authenticated as `default`; postgres/mysql substituted the service account's
+  OS user when the username was omitted. All now explicit or refused.
+- **Connection-string injection:** mssql doubled `}` as if ODBC had an escape
+  (it has none, so credentials truncated and an injected `Encrypt=no` could
+  win); oracle interpolated host/database/sid into a connect descriptor, where
+  `?ssl_server_dn_match=false` defeated this build's own refusal to disable
+  certificate verification. Both refuse such values now; encryption keywords
+  are emitted first as defense in depth.
+- **A TLS bypass introduced earlier the same day:** the new oracle `tns_alias`
+  path returned before the TLS branch. It now requires the alias descriptor to
+  select TCPS and carries the wallet.
+- **Unreachable deployments:** SQL Server Windows/Kerberos auth and named
+  instances, Db2 authentication mechanisms, PostgreSQL GSSAPI, MySQL over a
+  Unix socket. All expressible now.
+- **Misleading failures:** oracle/db2 health checks demanded administrative
+  views a least-privilege account cannot read; `FETCH FIRST` broke sampling on
+  the Oracle 11.2 servers Thick mode reaches; PostgreSQL 10 lost
+  `db_list_routines` to `prokind`; MySQL legacy auth surfaced as an
+  AttributeError; a ClickHouse native port gave protocol garbage; an encrypted
+  SQLite file read as corruption; the mssql CA check called an installed CA
+  missing on hashed trust stores.
+- **Onboarding:** `add-connection` never asked about TLS and its live test
+  bypassed the server's require_tls gate, so it reported success for a
+  connection every later call would refuse. It now prompts, accepts
+  `--tls-ca-file`, and previews the policy verdict.
+- **Wheelhouse:** PyNaCl (MariaDB `client_ed25519`) and an explicit
+  `cryptography` pin (MySQL 8 `caching_sha2_password`, previously transitive
+  through oracledb only).
+
+Server version floors are documented in `docs/driver-matrix.md`; note that the
+pinned ibm_db bundles clidriver 12.1, which **drops Db2 LUW 10.5**. None of the
+floors were exercised against an old server: the fixtures pin newest releases,
+so those rows are documented, not tested.
+
+## 3c. MCP surface audit, 2026-09-15 (protocol, transports, packaging)
+
+Fixed in this pass, each with a regression test:
+
+- **HTTP was unusable off loopback.** The ASGI app was built without the bind
+  host, so the SDK auto-enabled DNS-rebinding protection pinned to loopback and
+  answered `421 Invalid Host header` to every client connecting by hostname,
+  including the documented cross-machine deployment. Nothing had ever started
+  the HTTP transport in a test; `tests/unit/test_http_transport.py` now drives
+  initialize end to end (hostname client, bearer auth, 401 cases) and pins the
+  SDK behavior the fix exists for.
+- **The metadata cache never hit across restarts.** `policy_fingerprint` called
+  `model_dump` on a dataclass, so every call fell back to `repr()`, whose
+  frozenset order varies per process. It now normalizes fields (sorted sets,
+  full regex patterns) and refuses an unsupported object loudly.
+- **Tools advertised nothing about being read-only,** so a conformant client
+  had to treat all 20 as destructive. They now carry read-only annotations.
+- **`udbmcp version` reported `mcp-sdk unknown`** (the package defines no
+  `__version__`); it now reads the installed distribution metadata.
+- **Error classification:** a `KeyError` from driver code was reported to the
+  model as its own validation error and audited as a deny (`ObjectNotFound`
+  now carries that meaning); an unimplemented capability surfaced as
+  `INTERNAL_ERROR` instead of `CAPABILITY_UNSUPPORTED`; a huge JSON integer
+  raised `OverflowError` inside the row-limit clamp.
+- **Packaging:** the macOS postinstall was the only verifier call site that
+  trusted an exit code; a `.deb` upgrade kept a pre-HTTP (stdio) unit on hosts
+  installed before the shipped-unit hash record existed; two status-file
+  ordering bugs let the deferred-install guard refuse the install that had just
+  succeeded; `upgrade_offline.sh` skipped the venv mode normalization whose
+  absence caused the live 203/EXEC failure; the shipped template referenced a
+  demo database no installer created, making doctor fatally unhealthy on every
+  clean install; the MSI wrote service environment variables in a form Windows
+  ignores and did not allow same-version upgrades.
+- **VS Code could never be configured** when `mcp.json` lacked a `servers` key.
+- **doctor no longer claims** "safe permissions" for a token file it skipped
+  checking on Windows.
+
+Known and NOT fixed here, now documented rather than implied away:
+
+| Item | State |
+|---|---|
+| Windows service registration | `blocked`: a bare interpreter registered with `sc.exe` cannot answer the service control dispatcher, so the service would fail with error 1053. A service wrapper is required; none is bundled. The whole Windows install path remains `not_run`. |
+| HTTP caller identity | Process-scoped, not per request: `db_get_query_history` and cursor identity binding cannot separate two HTTP callers. Documented in `docs/tools.md`. |
+| Response size | Every result is transmitted twice (structured + pretty-printed text), so wire bytes are ~2.7x `security.max_response_bytes`. Documented in `docs/tools.md`. |
+| Client adapters | stdio only; an HTTP registration is written by hand. Adapters also do not propagate `*_env` credential variable names into the harness environment. |
+| Container mode | Needs `http_host: 0.0.0.0` and a token file owned by the image's udbmcp UID; both are documented in `packaging/compose.offline.yaml`, neither is exercised by a gate. |
+
 ## 4. Gates not (fully) run (recorded truthfully)
 
 - **Gate D (egress observation):** harness provided

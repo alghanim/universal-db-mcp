@@ -27,6 +27,7 @@ from typing import Any
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.connectors.base import (
     ColumnInfo,
+    ConnectorError,
     DatabaseConnector,
     HealthInfo,
     KeyInfo,
@@ -51,6 +52,20 @@ from universal_db_mcp.security.redact import scrub_exception
 ODBC_DRIVER_NAME = "ODBC Driver 18 for SQL Server"
 
 
+def _mssql_server_value(cfg: Any) -> str:
+    """``Server=`` value: host, instance and port.
+
+    A named instance (``host\\INSTANCE``) resolves its port through SQL Server
+    Browser on UDP 1434. Appending a port anyway sent the client to the default
+    instance instead, which surfaced as a connect timeout that looked like a
+    firewall problem - so the port is appended only when the config sets one.
+    """
+    host = str(cfg.host or "")
+    if "\\" in host and cfg.port is None:
+        return host
+    return f"{host},{cfg.port or 1433}"
+
+
 class MssqlConnector(DatabaseConnector):
     engine = "mssql"
 
@@ -60,10 +75,25 @@ class MssqlConnector(DatabaseConnector):
         self._exec_lock = threading.Lock()  # serializes queries
 
     @staticmethod
-    def _odbc_escape(value: str) -> str:
-        """Brace-quote an ODBC connection-string value per SQLDriverConnect
-        rules so ';', '{' and '}' inside values cannot inject attributes."""
-        return "{" + value.replace("}", "}}") + "}"
+    def _odbc_escape(value: str, field: str = "value") -> str:
+        """Brace-quote an ODBC connection-string value, refusing what braces
+        cannot carry.
+
+        ODBC has NO escape for a closing brace: Microsoft's grammar states the
+        first '}' terminates a braced value. The previous '}}' doubling was
+        invented - it truncated the credential and let the remainder be parsed
+        as further attributes. Since the driver honors the FIRST occurrence of
+        a repeated keyword, an injected Encrypt=no could even beat our own
+        Encrypt=yes. Refuse instead (the db2 connector takes the same line for
+        ';'), and never echo the value itself.
+        """
+        if "}" in value:
+            raise ConnectorError(
+                f"mssql {field} contains '}}', which an ODBC connection string cannot carry in "
+                "any quoting form (the first closing brace ends the value and the rest is "
+                "parsed as connection attributes); change that value"
+            )
+        return "{" + value + "}"
 
     @staticmethod
     def _require_ca_in_os_trust_store(ca_file: str) -> None:
@@ -100,6 +130,31 @@ class MssqlConnector(DatabaseConnector):
         trust_anchors = ssl.create_default_context().get_ca_certs(binary_form=True)
         trusted = {hashlib.sha256(der).hexdigest() for der in trust_anchors}
         if not pinned <= trusted:
+            # A hashed CApath store (RHEL/SUSE and anything using
+            # /etc/ssl/certs/<hash>.0 symlinks) enumerates nothing through
+            # get_ca_certs(), so the check above would declare an installed CA
+            # missing and refuse a perfectly good deployment. Scan the CApath.
+            paths = ssl.get_default_verify_paths()
+            for directory in {paths.capath, paths.openssl_capath}:
+                if not directory:
+                    continue
+                try:
+                    entries = list(Path(directory).iterdir())
+                except OSError:
+                    continue
+                for entry in entries:
+                    try:
+                        text = entry.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    for block in re.findall(
+                        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", text, flags=re.DOTALL
+                    ):
+                        try:
+                            trusted.add(hashlib.sha256(ssl.PEM_cert_to_DER_cert(block)).hexdigest())
+                        except ValueError:
+                            continue
+        if not pinned <= trusted:
             raise RuntimeError(
                 f"tls.ca_file '{ca_file}' names a CA that is NOT installed in "
                 f"the OS trust store. ODBC Driver 18 has no connection-string "
@@ -130,15 +185,18 @@ class MssqlConnector(DatabaseConnector):
                 f"installed one via options.odbc_driver. The application cannot download it."
             )
         esc = self._odbc_escape
+        # Encryption keywords are emitted BEFORE any config-derived value:
+        # ODBC honors the first occurrence of a repeated keyword, so even if a
+        # value ever escaped the brace check it could not downgrade TLS.
         parts = [
-            f"Driver={esc(driver_name)}",
+            f"Driver={esc(driver_name, 'options.odbc_driver')}",
+            "Encrypt=yes" if cfg.tls.enabled else "Encrypt=no",
+            "TrustServerCertificate=no" if cfg.tls.verify_server else "TrustServerCertificate=yes",
             # host AND port are brace-quoted TOGETHER: quoting the host alone
             # (port outside the braces) makes ODBC Driver 18 mis-parse the
             # attribute and fail the TLS/cert path even with Encrypt=no.
-            f"Server={esc(str(cfg.host or '') + ',' + str(cfg.port or 1433))}",
-            f"Database={esc(cfg.database or '')}",  # validator guarantees non-None for mssql
-            "Encrypt=yes" if cfg.tls.enabled else "Encrypt=no",
-            "TrustServerCertificate=no" if cfg.tls.verify_server else "TrustServerCertificate=yes",
+            f"Server={esc(_mssql_server_value(cfg), 'host')}",
+            f"Database={esc(cfg.database or '', 'database')}",  # validator guarantees non-None
         ]
         if cfg.tls.enabled and cfg.tls.ca_file:
             # ODBC Driver 18 has no connection-string keyword for a CA bundle;
@@ -146,10 +204,16 @@ class MssqlConnector(DatabaseConnector):
             # fall back to the OS trust store. Honor tls.ca_file by failing
             # closed unless the pinned CA is installed there.
             self._require_ca_in_os_trust_store(cfg.tls.ca_file)
-        if self.connection.username:
-            parts.append(f"Uid={esc(self.connection.username.value)}")
-        if self.connection.password:
-            parts.append(f"Pwd={esc(self.connection.password.value)}")
+        if cfg.options.get("trusted_connection"):
+            # Windows/Kerberos identity of the service process. On Linux this
+            # needs a krb5 configuration and a ticket (kinit) before start;
+            # the driver does not fall back to NTLM.
+            parts.append("Trusted_Connection=yes")
+        else:
+            if self.connection.username:
+                parts.append(f"Uid={esc(self.connection.username.value, 'Uid')}")
+            if self.connection.password:
+                parts.append(f"Pwd={esc(self.connection.password.value, 'Pwd')}")
         return self._module.connect(";".join(parts), timeout=int(cfg.connect_timeout_seconds))
 
     # pyodbc exposes no safe out-of-band cancel through this API surface.

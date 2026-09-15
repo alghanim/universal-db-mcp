@@ -76,7 +76,16 @@ class EffectivePolicy:
     def _finite(value: float, what: str) -> None:
         # NaN compares False against every bound and min(nan, x) returns nan,
         # so an unchecked NaN would silently disable the ceiling (policy bypass).
-        if isinstance(value, bool) or not math.isfinite(value):
+        if isinstance(value, bool):
+            raise ToolFailure(ErrorCategory.VALIDATION, f"{what} must be a finite number")
+        if isinstance(value, int) and abs(value) > 2**53:
+            # JSON carries arbitrary-precision integers; math.isfinite() raises
+            # OverflowError converting one to float, which surfaced as
+            # INTERNAL_ERROR. The NaN sibling was already handled.
+            raise ToolFailure(
+                ErrorCategory.VALIDATION, f"{what} is too large to be a meaningful limit"
+            )
+        if not math.isfinite(value):
             raise ToolFailure(ErrorCategory.VALIDATION, f"{what} must be a finite number")
 
     def clamp_row_limit(self, requested: int | None) -> int:

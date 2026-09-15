@@ -231,6 +231,22 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                                 fatal=True,
                             )
                         )
+                    elif not conn.options.get("thick_mode") and not (wp / "ewallet.pem").is_file():
+                        # Thin mode reads a PEM wallet only. An orapki wallet
+                        # directory (cwallet.sso / ewallet.p12) passes a
+                        # directory-exists check and then fails at connect
+                        # time with a raw driver error, so doctor looked green
+                        # while the connection could never work.
+                        results.append(
+                            _check(
+                                f"connection-{name}-oracle-wallet",
+                                False,
+                                f"oracle wallet directory '{wp}' has no ewallet.pem; Thin mode reads "
+                                "a PEM wallet only (export it from the orapki wallet, or enable "
+                                "options.thick_mode to use cwallet.sso/ewallet.p12)",
+                                fatal=True,
+                            )
+                        )
                     else:
                         results.append(
                             _check(f"connection-{name}-oracle-wallet", True, f"wallet directory '{wp}' present")
@@ -274,8 +290,10 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                             _check(
                                 f"connection-{name}-oracle-instant-client",
                                 True,
-                                "oracle thick_mode without options.lib_dir: the driver's default "
-                                "library search path must find the Instant Client",
+                                "oracle thick_mode without options.lib_dir: the Instant Client must "
+                                "be on the system library search path before the process starts "
+                                "(Linux: /etc/ld.so.conf.d + ldconfig, which survives the env reset "
+                                "systemd applies to LD_LIBRARY_PATH)",
                             )
                         )
                 # A TNS alias is unresolvable without tnsnames.ora in tns_admin.
@@ -444,7 +462,20 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                     results.append(
                         _check("http-bearer-token", False, f"bearer token file '{tp}' not found", fatal=True)
                     )
-                elif sys.platform != "win32" and stat.S_IMODE(tp.stat().st_mode) & 0o077:
+                elif sys.platform == "win32":
+                    # The POSIX mode bits carry no meaning here and the check
+                    # is skipped; saying "safe permissions" would be a claim
+                    # about a file that was never inspected. NTFS ACLs are the
+                    # real control and are the administrator's responsibility.
+                    results.append(
+                        _check(
+                            "http-bearer-token",
+                            True,
+                            f"bearer token file '{tp}' present; permissions NOT verified on "
+                            "Windows (NTFS ACLs are administrator-managed)",
+                        )
+                    )
+                elif stat.S_IMODE(tp.stat().st_mode) & 0o077:
                     mode = stat.S_IMODE(tp.stat().st_mode)
                     results.append(
                         _check(

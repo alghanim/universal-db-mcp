@@ -196,6 +196,16 @@ $sudo_ok env PIP_CONFIG_FILE=/dev/null PIP_DISABLE_PIP_VERSION_CHECK=1 \
   --only-binary=:all: --require-hashes \
   -r "$NEW_BUNDLE/requirements/runtime.lock"
 
+# Venv mode normalization, identical to install_offline.sh: the creating
+# umask leaks into the tree, and a umask 077 upgrade leaves the venv 0700
+# root:root so the service account cannot traverse it and systemd reports
+# 203/EXEC Permission denied - blaming the interpreter. Both doctor runs below
+# execute as root and would pass regardless, so the failure would only surface
+# after the switch, on the next service start.
+$sudo_ok find "$NEWVENV" -type d -exec chmod 755 {} +
+$sudo_ok find "$NEWVENV" -type f -exec chmod 644 {} +
+$sudo_ok find "$NEWVENV/bin" -type f -exec chmod 755 {} +
+
 echo "==> smoke check + doctor on the NEW venv before switching"
 $sudo_ok "$NEWVENV/bin/python" -m universal_db_mcp version
 if [ -f /etc/universal-db-mcp/config.yaml ]; then

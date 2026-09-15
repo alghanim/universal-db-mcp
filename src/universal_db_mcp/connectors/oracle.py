@@ -1,4 +1,4 @@
-"""Oracle connector — python-oracledb Thin mode ONLY.
+"""Oracle connector — python-oracledb Thin mode by default; Thick mode opt-in.
 
 Thin mode needs no Oracle Client libraries. Thick mode is deliberately not
 implemented in this build: no silent mode switching, no Instant Client
@@ -10,8 +10,11 @@ artifacts. Live behaviors are ``unverified`` until Gate C.
 
 from __future__ import annotations
 
+import re
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from universal_db_mcp.config import ResolvedConnection
@@ -40,6 +43,61 @@ from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
 
 
+def _tns_entry(tns_admin: str, alias: str) -> str | None:
+    """Return the descriptor text for ``alias`` from ``tns_admin``/tnsnames.ora.
+
+    Entries start at column 0 as ``NAME =`` (or ``NAME, OTHER =``) and run
+    until the next such line, so the scan keys on unindented lines.
+    """
+    path = Path(tns_admin) / "tnsnames.ora"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    entries: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        if line[:1].strip() and "=" in line:
+            names = line.split("=", 1)[0]
+            current = None
+            for name in names.split(","):
+                key = name.strip().upper()
+                if key:
+                    entries.setdefault(key, [])
+                    current = current or key
+            if current is not None:
+                entries[current].append(line.split("=", 1)[1])
+        elif current is not None:
+            entries[current].append(line)
+    body = entries.get(alias.strip().upper())
+    return "\n".join(body) if body is not None else None
+
+
+def _require_tcps_alias(tns_admin: str, alias: str) -> None:
+    """Fail closed unless the alias's descriptor selects TCPS.
+
+    tls.enabled means the operator (and the server's require_remote_tls policy)
+    were promised an encrypted wire. On the alias path only tnsnames.ora can
+    confirm that, so an unreadable file, an unknown alias or a non-TCPS
+    PROTOCOL is refused rather than dialed.
+    """
+    body = _tns_entry(tns_admin, alias)
+    if body is None:
+        raise ConnectorError(
+            f"oracle tls.enabled with options.tns_alias '{alias}', but that alias was not found "
+            f"in {Path(tns_admin) / 'tnsnames.ora'}; the descriptor is the only place the wire "
+            "protocol can be confirmed, so the connection is refused instead of risking plaintext"
+        )
+    protocols = {m.upper() for m in re.findall(r"PROTOCOL\s*=\s*([A-Za-z]+)", body)}
+    if not protocols or protocols - {"TCPS"}:
+        raise ConnectorError(
+            f"oracle tls.enabled with options.tns_alias '{alias}', but its descriptor selects "
+            f"{sorted(protocols) or ['no PROTOCOL']} instead of TCPS: the credentials would "
+            "travel in plaintext while the TLS policy reported compliance. Point the alias at a "
+            "TCPS address, or use the host/port/database form with tls.enabled"
+        )
+
+
 class ThickState:
     """Process-global python-oracledb mode.
 
@@ -56,11 +114,48 @@ class ThickState:
 _THICK_STATE = ThickState()
 
 
+def _thick_client_remedy() -> str:
+    """Platform-correct remediation for a client that will not load.
+
+    python-oracledb's own rule (initialization.rst, DPI-1047 troubleshooting):
+    on Linux lib_dir must NOT normally be passed - the client has to be on the
+    system library search path before the process starts, and daemons reset
+    LD_LIBRARY_PATH, so ldconfig is the reliable route. Windows and macOS do
+    use lib_dir. One generic message would send half of all admins the wrong
+    way.
+    """
+    if sys.platform.startswith("linux"):
+        return (
+            "On Linux, put the Instant Client on the system library search path BEFORE the "
+            "process starts: write its directory into /etc/ld.so.conf.d/oracle-instantclient.conf "
+            "and run ldconfig (preferred: systemd and other daemons reset LD_LIBRARY_PATH), "
+            "install libaio, and keep the client under /opt or /usr/local so the loader may open "
+            "it. options.lib_dir works only when libclntsh.so resolves its dependencies with "
+            "RPATH=$ORIGIN."
+        )
+    return (
+        "Set options.lib_dir to the Instant Client directory for this platform (for example "
+        "/opt/oracle/instantclient_23_5) and make sure its architecture matches this interpreter."
+    )
+
+
 def _enable_thick_mode(module: Any, lib_dir: str | None, tns_admin: str | None) -> None:
     """Load the administrator-supplied Oracle Instant Client, once per process."""
     with _THICK_STATE.lock:
         if _THICK_STATE.initialized:
             return
+        is_thin = getattr(module, "is_thin_mode", None)
+        if callable(is_thin):
+            try:
+                already_thick = not is_thin()
+            except Exception:  # noqa: BLE001 - a driver without the probe is not an error
+                already_thick = False
+            if already_thick:
+                # init_oracle_client() must always be called with the SAME
+                # arguments; an embedding process already enabled Thick mode,
+                # so re-initializing could raise on an argument mismatch.
+                _THICK_STATE.initialized = True
+                return
         kwargs: dict[str, Any] = {}
         if lib_dir:
             kwargs["lib_dir"] = lib_dir
@@ -72,9 +167,8 @@ def _enable_thick_mode(module: Any, lib_dir: str | None, tns_admin: str | None) 
         except Exception as exc:
             raise ConnectorError(
                 "oracle thick_mode is enabled but the Oracle Instant Client could not be "
-                f"loaded ({str(exc).strip()[:160]}). Install the Instant Client for this "
-                "platform (Oracle-licensed, administrator-supplied, never shipped in our "
-                "artifacts) and point options.lib_dir at its directory."
+                f"loaded ({str(exc).strip()[:160]}). The client is Oracle-licensed and "
+                f"administrator-supplied, never shipped in our artifacts. {_thick_client_remedy()}"
             ) from exc
         _THICK_STATE.initialized = True
 
@@ -118,12 +212,19 @@ class OracleConnector(DatabaseConnector):
             _enable_thick_mode(self._module, opts.get("lib_dir"), opts.get("tns_admin"))
         if opts.get("tns_alias"):
             # The alias carries its own descriptor from tnsnames.ora; host/port
-            # in the config are not used to reach it.
+            # in the config are not used to reach it. That also means the ALIAS
+            # decides the wire protocol, so tls.enabled has to be checked
+            # against the descriptor - otherwise the policy gate and doctor
+            # would report TLS compliance while a TCP alias sent the
+            # credentials in plaintext.
             alias_kw: dict[str, Any] = {
                 "user": (self.connection.username.value if self.connection.username else None),
                 "password": (self.connection.password.value if self.connection.password else None),
                 "dsn": opts["tns_alias"],
             }
+            if cfg.tls.enabled:
+                _require_tcps_alias(opts["tns_admin"], opts["tns_alias"])
+                alias_kw["wallet_location"] = opts.get("wallet_location")
             if not opts.get("thick_mode"):
                 # Thin mode resolves tnsnames.ora through connect(config_dir=);
                 # Thick mode was given the directory in init_oracle_client().
@@ -162,6 +263,10 @@ class OracleConnector(DatabaseConnector):
         }
         if cfg.tls.enabled:
             kw["wallet_location"] = opts.get("wallet_location")
+            if opts.get("wallet_password"):
+                # An orapki wallet protected by a password (ewallet.p12 and the
+                # PEM exported from it) cannot be opened without this.
+                kw["wallet_password"] = opts["wallet_password"]
         if opts.get("tns_admin") and not opts.get("thick_mode"):
             kw["config_dir"] = opts.get("tns_admin")
         return self._dial(kw)
@@ -201,7 +306,7 @@ class OracleConnector(DatabaseConnector):
         return CapabilityMatrix(
             engine="oracle",
             engine_family="oracle",
-            driver="python-oracledb (Thin mode only)",
+            driver="python-oracledb (Thin mode; opt-in Thick mode via admin-supplied Instant Client)",
             capabilities={
                 Cap.CONNECT: CapabilityState.UNVERIFIED,
                 Cap.HEALTH: CapabilityState.UNVERIFIED,
@@ -232,7 +337,12 @@ class OracleConnector(DatabaseConnector):
                 ),
                 Limitation(
                     scope="modes",
-                    detail="Thick mode is not implemented; no Instant Client is bundled or fetched.",
+                    detail=(
+                        "Thick mode is opt-in (options.thick_mode + administrator-supplied "
+                        "Oracle Instant Client, never bundled or fetched); Thin mode is the "
+                        "default and refuses accounts that carry only the legacy 10G password "
+                        "verifier."
+                    ),
                 ),
             ],
             required_privileges=[
@@ -249,8 +359,19 @@ class OracleConnector(DatabaseConnector):
             conn = self._connect()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT banner FROM v$version WHERE rownum = 1")
-                    row = cur.fetchone()
+                    # v$version is an administrative view: the least-privilege
+                    # account our own docs prescribe (CREATE SESSION + table
+                    # SELECTs) cannot read it. Reporting such a connection as
+                    # unhealthy sent operators chasing connectivity problems
+                    # that did not exist, so the version is best-effort and the
+                    # liveness probe is privilege-free.
+                    row = None
+                    try:
+                        cur.execute("SELECT banner FROM v$version WHERE rownum = 1")
+                        row = cur.fetchone()
+                    except Exception:  # noqa: BLE001 - version is optional
+                        cur.execute("SELECT 1 FROM DUAL")
+                        cur.fetchone()
             finally:
                 conn.close()
             return HealthInfo(
@@ -495,4 +616,7 @@ class OracleConnector(DatabaseConnector):
             if schema
             else self.quote_identifier(table)
         )
-        return f"SELECT {cols} FROM {qualified} FETCH FIRST {int(limit)} ROWS ONLY"
+        # ROWNUM, not FETCH FIRST: the latter is 12c syntax and Thick mode
+        # reaches Oracle 11.2, exactly the servers that still carry 10G
+        # verifiers. ROWNUM is valid on every supported release.
+        return f"SELECT * FROM (SELECT {cols} FROM {qualified}) WHERE ROWNUM <= {int(limit)}"

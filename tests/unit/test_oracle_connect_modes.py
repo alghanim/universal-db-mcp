@@ -197,3 +197,61 @@ def test_all_thick_oracle_connections_are_accepted(tmp_path: Path) -> None:
     )
     loaded = load_config(cfg)
     assert loaded.connections["a"].options["thick_mode"] is True
+
+
+# ------------------------------------------------- platform-correct thick-mode guidance
+# python-oracledb docs (initialization.rst, troubleshooting DPI-1047): on Linux
+# lib_dir must NOT normally be passed - the Instant Client has to be on the
+# system library search path (ldconfig, or LD_LIBRARY_PATH set before Python
+# starts; daemons reset env vars, so ldconfig is preferred). Windows/macOS do
+# use lib_dir. A single generic message would send a Linux admin down the wrong
+# path, which is how the Db2 misdiagnosis started.
+
+
+def _load_failure_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, options: dict[str, Any]
+) -> str:
+    fake = _FakeOracleDb()
+
+    def boom(**_kwargs: Any) -> None:
+        raise RuntimeError("DPI-1047: Cannot locate a 64-bit Oracle Client library")
+
+    fake.init_oracle_client = boom  # type: ignore[method-assign]
+    conn, _ = _connector(tmp_path, monkeypatch, options=options, fake=fake)
+    monkeypatch.setattr(oracle_module.sys, "platform", platform)
+    with pytest.raises(ConnectorError) as exc:
+        conn._connect()
+    return str(exc.value)
+
+
+def test_linux_client_load_failure_points_at_ldconfig(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _load_failure_text(tmp_path, monkeypatch, "linux", {"thick_mode": True})
+    assert "ldconfig" in text and "LD_LIBRARY_PATH" in text
+    assert "DPI-1047" in text
+
+
+def test_macos_client_load_failure_points_at_lib_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _load_failure_text(tmp_path, monkeypatch, "darwin", {"thick_mode": True})
+    assert "lib_dir" in text
+    assert "ldconfig" not in text, "ldconfig is not the macOS remedy"
+
+
+def test_thick_init_is_skipped_when_driver_is_already_thick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """init_oracle_client() must be called with the SAME arguments every time
+    (python-oracledb docs). If the interpreter is already in Thick mode - an
+    embedding process enabled it - re-initializing risks an argument-mismatch
+    error, so skip it."""
+    fake = _FakeOracleDb()
+    fake.is_thin_mode = lambda: False  # type: ignore[attr-defined]
+    conn, _ = _connector(tmp_path, monkeypatch, options={"thick_mode": True}, fake=fake)
+
+    conn._connect()
+
+    assert fake.init_calls == [], "already in Thick mode: do not re-initialize"
+    assert len(fake.connect_kwargs) == 1

@@ -11,6 +11,32 @@ config validity, secret references, secret-file permissions, CA files,
 SQLite data files, writable audit/cache paths, per-connection driver
 availability.
 
+## Authentication failures by engine
+
+Every row below was a real dead end before the 2026-09-15 audit: the message
+named the wrong component, or no config could express the deployment. Symptoms
+are quoted as the driver reports them.
+
+| Symptom | What it really means | Fix |
+| --- | --- | --- |
+| Oracle `DPY-3015: password verifier type 0x939 is not supported` | The account carries only the legacy 10G verifier. Thin mode supports 11G/12C. | DBA: `ALTER USER <u> IDENTIFIED BY <pw>` (and `sec_case_sensitive_logon` must not be FALSE). Or set `options.thick_mode: true` with an administrator-supplied Instant Client. See `docs/oracle-connect-modes.md`. |
+| Oracle `ORA-00933` from `db_sample_table` on an old server | `FETCH FIRST` is 12c syntax. | Fixed: sampling uses `ROWNUM`. Upgrade to a build after 2026-09-15. |
+| Oracle connect works but `db_test_connection` says unhealthy | The account cannot read `V$VERSION`. | Fixed: liveness no longer needs it; the version is reported as unavailable. |
+| Db2 `SQL30082N ... reason "17" (UNSUPPORTED FUNCTION)` | The server refused the security mechanism. Historically this was our own bug (credentials were never sent, fixed in 854b50d). On a current build it is a genuine mismatch. | `db2 get dbm cfg | grep -E 'AUTHENTICATION|SRVCON_AUTH|ALTERNATE_AUTH_ENC'`, then set `options.authentication` (`SERVER`, `SERVER_ENCRYPT`, `SERVER_ENCRYPT_AES`, `KERBEROS`, `GSSPLUGIN`, `TOKEN`, `CERTIFICATE`). |
+| Db2 connects nowhere on a 10.5 server | The bundled clidriver is 12.1, which dropped Db2 LUW 10.5. | Upgrade the server, or use a build pinned to ibm_db 3.2.6 or earlier. |
+| MySQL `AttributeError: ... scramble_old_password` | The account uses the pre-4.1 `mysql_old_password` plugin. | Fixed: a clear message now names the plugin. DBA: move the account to `caching_sha2_password`. |
+| MariaDB `RuntimeError: 'pynacl' package is required for ed25519_password` | The account uses `client_ed25519`. | Fixed: PyNaCl ships in the bundle from 2026-09-15. Older bundles cannot install it offline. |
+| MySQL `db_list_routines` returns an empty list | MySQL 8.0 hides `information_schema.ROUTINES` rows from accounts without `SHOW_ROUTINE`. | `GRANT SHOW_ROUTINE ON *.* TO '<user>'@'%';` |
+| ClickHouse authenticates by certificate and ignores the password | With a client certificate the driver takes the mutual-TLS path. | Fixed: a configured password now forces `tls_mode=strict`. |
+| ClickHouse opaque protocol error | Port 9000/9440 is the native TCP protocol; this client speaks HTTP. | Use 8123, or 8443 with `tls.enabled`. Now refused at config time. |
+| SQL Server `Login failed for user ''` | No SQL login configured; the site uses Windows/Kerberos only. | `options.trusted_connection: true`, with `/etc/krb5.conf` and a ticket (`kinit`) before the service starts. There is no NTLM fallback on Linux. |
+| SQL Server connect timeout to a named instance | The port was appended, sending the client to the default instance. | Fixed: `host\INSTANCE` with no `port` keeps the instance. SQL Server Browser must be reachable on UDP 1434. |
+| SQL Server "names a CA that is NOT installed in the OS trust store" although it is | The trust store is a hashed directory rather than a bundle. | Fixed: the check now scans the CApath too. |
+| PostgreSQL Kerberos-only site cannot connect | GSSAPI options were unreachable. | `options.gssencmode: require` and `options.krbsrvname`. |
+| `connections: <engine> needs username_env or username_file` | Omitting the username does not send "no credential": PostgreSQL and MySQL send the service account's OS user, ClickHouse sends `default`. | Set the username, or `options.os_authentication: true` to choose the implicit identity deliberately. |
+| SQLite `file is not a database` | Often an encrypted database (SQLCipher/SEE), which the standard-library driver cannot open. | Decrypt it, or use a build with an encryption extension. Not shipped here. |
+| Every `db_*` call fails `CONFIG_ERROR: ... requires TLS` right after adding a connection | `security.require_remote_tls` is on and the connection has no `tls:` block. | Add `tls.enabled` with a `ca_file`. `udbmcp add-connection --tls-ca-file <path>` does this, and the wizard now warns when the policy would refuse. |
+
 ## Common failures
 
 | Symptom | Cause | Fix |

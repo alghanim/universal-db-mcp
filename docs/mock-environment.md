@@ -94,10 +94,29 @@ with `transport: http`, a `http_bearer_token_file`, and an internal reverse
 proxy in front; the agent registers:
 
 ```json
-{ "mcpServers": { "universal-db": { "type": "http", "url": "http://udbmcp.internal.example:8765/mcp" } } }
+{
+  "mcpServers": {
+    "universal-db": {
+      "type": "http",
+      "url": "http://udbmcp.internal.example:8765/mcp",
+      "headers": { "Authorization": "Bearer <contents of /etc/universal-db-mcp/http-token>" }
+    }
+  }
+}
 ```
 
-with the bearer token supplied through the client's own secret store.
+The `headers` entry is mandatory: the listener answers 401 to every request
+without it, and the bare `WWW-Authenticate: Bearer` challenge sends
+spec-conformant clients into OAuth discovery, so the client reports an
+authentication or OAuth failure rather than a missing header. Clients take a
+literal `headers` object; there is no separate secret store to read it from.
+
+Note also that `application.http_host` decides which `Host` values the
+transport accepts, not just the bind address. Binding loopback and connecting
+by hostname is answered `421 Invalid Host header`.
+
+`udbmcp configure-agents` writes stdio registrations only; an HTTP
+registration is written by hand, as above.
 
 ## 5. Smoke-test exactly like an agent
 

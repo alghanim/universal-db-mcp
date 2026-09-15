@@ -276,6 +276,27 @@ elif ! $sudo_ok ln -sfn "$TARGET/venv/bin/udbmcp" "$ALIAS" 2>/dev/null; then
   echo "    WARNING: could not create $ALIAS; the CLI stays available at $TARGET/venv/bin/udbmcp." >&2
 fi
 
+# The shipped config template carries a demo_sqlite connection pointing at
+# /var/lib/universal-db-mcp/demo/finlink_demo.db, and doctor marks a missing
+# SQLite data file FATAL. Without the file, the documented post-install doctor
+# run fails on every clean install, and upgrade_offline.sh's pre-switch doctor
+# aborts the upgrade blaming the new release. Create an empty database (never
+# clobbering a seeded one) so the template's own example is valid.
+# BEST-EFFORT by design: a convenience file for the template's example
+# connection, never a reason to fail an otherwise complete install.
+DEMO_DB=/var/lib/universal-db-mcp/demo/finlink_demo.db
+if [ ! -f "$DEMO_DB" ]; then
+  if $sudo_ok install -d -o udbmcp -g udbmcp -m 750 /var/lib/universal-db-mcp/demo 2>/dev/null \
+     && $sudo_ok "$TARGET/venv/bin/python" -c \
+        "import sqlite3, sys; sqlite3.connect(sys.argv[1]).close()" "$DEMO_DB" 2>/dev/null; then
+    $sudo_ok chown udbmcp:udbmcp "$DEMO_DB" 2>/dev/null || true
+    $sudo_ok chmod 640 "$DEMO_DB" 2>/dev/null || true
+  else
+    echo "    WARNING: could not create the demo database at $DEMO_DB; doctor will report" >&2
+    echo "             the template's demo_sqlite connection as a missing data file." >&2
+  fi
+fi
+
 # Publish the verified bundle's manifest next to the venv ($TARGET/manifest.json)
 # so `doctor` can report the profile it was actually built for instead of
 # guessing from the running platform. Guarded: a bundle without a manifest must

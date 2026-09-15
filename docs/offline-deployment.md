@@ -355,7 +355,9 @@ inspection and manual recovery, the equivalent commands:
 ```bat
 sc.exe create udbmcp binPath= "\"C:\Program Files\UniversalDB MCP\venv\Scripts\python.exe\" -m universal_db_mcp serve --transport http" start= auto
 sc.exe failure udbmcp reset= 86400 actions= restart/60000/restart/60000//0
-sc.exe config udbmcp env= "UDBMCP_CONFIG=C:\ProgramData\UniversalDB MCP\config.yaml"
+REM sc.exe has no env= option. The service environment is a REG_MULTI_SZ
+REM value named Environment directly under the service key:
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\udbmcp" /v Environment /t REG_MULTI_SZ /d "UDBMCP_CONFIG=C:\ProgramData\UniversalDB MCP\config.yaml" /f
 sc.exe query udbmcp
 sc.exe start udbmcp
 sc.exe stop udbmcp

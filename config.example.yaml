@@ -15,6 +15,10 @@ application:
   audit_fail_closed: true     # refuse operations if the audit write fails
   telemetry_enabled: false    # must remain false; this build has no telemetry
   # HTTP transport only (stdio ignores these):
+  # This value is BOTH the bind address and the Host header the transport
+  # accepts: with 127.0.0.1 a client connecting by hostname (or a proxy that
+  # forwards the original Host) is answered 421 Invalid Host header. A
+  # container must set 0.0.0.0, otherwise the published port reaches nothing.
   http_host: "127.0.0.1"      # restrictive default; put an internal reverse
                               # proxy in front for shared deployments
   http_port: 8765
@@ -75,6 +79,37 @@ connections:
   #     ca_file: /etc/universal-db-mcp/certs/internal-ca.pem
   #   allowed_schemas: [REPORTING]
   #   read_only: true
+
+  # Engine-specific options (all optional; each is refused unless the engine
+  # actually consumes it). Added 2026-09-15 for deployments that no plain
+  # host/port/database connection can express:
+  #
+  #   oracle:
+  #     thick_mode: true          # Instant Client; the only client-side way to
+  #     lib_dir: /opt/oracle/instantclient_23_5   # reach a 10G-verifier account
+  #                               # (on Linux prefer ldconfig and omit lib_dir)
+  #     sid: ORCL                 # pre-12c databases that register a SID
+  #     tns_alias: PRODDB         # entry in tnsnames.ora (needs tns_admin)
+  #     tns_admin: /etc/universal-db-mcp/tns
+  #     wallet_location: /etc/universal-db-mcp/oracle-wallet   # with tls.enabled
+  #     wallet_password: ...      # only for a password-protected wallet
+  #   mssql:
+  #     trusted_connection: true  # Windows/Kerberos identity; no username/password
+  #     odbc_driver: ODBC Driver 18 for SQL Server
+  #   db2:
+  #     authentication: SERVER_ENCRYPT_AES   # or SERVER, KERBEROS, GSSPLUGIN,
+  #                                          # TOKEN, CERTIFICATE
+  #   postgres:
+  #     gssencmode: require       # Kerberos/GSSAPI deployments
+  #     krbsrvname: postgres
+  #     service: prod             # libpq service file entry
+  #     sslmode: disable          # only when tls.enabled is false
+  #   mysql:
+  #     unix_socket: /var/run/mysqld/mysqld.sock   # co-located server, no TCP
+  #   postgres / mysql / clickhouse:
+  #     os_authentication: true   # deliberately use the driver's implicit
+  #                               # identity (OS user, or 'default' on
+  #                               # clickhouse) instead of a configured username
 
   # PostgreSQL example:
   # analytics_pg:

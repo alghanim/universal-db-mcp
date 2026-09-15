@@ -120,6 +120,14 @@ class PostgresConnector(DatabaseConnector):
                 kw["sslcert"] = cfg.tls.client_cert_file
             if cfg.tls.client_key_file:
                 kw["sslkey"] = cfg.tls.client_key_file
+        # Pass-through options for deployments libpq can reach but our schema
+        # cannot describe: Kerberos/GSSAPI, service files, and an explicit
+        # sslmode when TLS is deliberately off (config refuses one that could
+        # weaken an enabled tls block).
+        for key in ("gssencmode", "krbsrvname", "service", "passfile", "sslmode"):
+            value = cfg.options.get(key)
+            if value:
+                kw[key] = value
         return self._module.connect(**kw)
 
     def cancel_current(self) -> bool:
@@ -302,9 +310,22 @@ class PostgresConnector(DatabaseConnector):
             + (" AND n.nspname = %s" if schema else "")
             + " ORDER BY 1, 2"
         )
+        # pg_proc.prokind is PostgreSQL 11+, while psycopg 3 supports servers
+        # from 10. Without a fallback, db_list_routines is the single tool that
+        # dies on an older server while everything else keeps working.
+        legacy_sql = (
+            "SELECT n.nspname, p.proname, CASE WHEN p.proisagg THEN 'aggregate' ELSE 'function' END "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname NOT IN ('pg_catalog','information_schema')"
+            + (" AND n.nspname = %s" if schema else "")
+            + " ORDER BY 1, 2"
+        )
         params: tuple[Any, ...] = (schema,) if schema else ()
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except Exception:  # noqa: BLE001 - pre-11 servers lack prokind
+                rows = conn.execute(legacy_sql, params).fetchall()
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2]) for r in rows]
 
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:

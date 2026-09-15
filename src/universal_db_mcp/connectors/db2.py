@@ -91,6 +91,11 @@ class Db2Connector(DatabaseConnector):
             ("PORT", f"{cfg.port or 50000}"),
             ("PROTOCOL", "TCPIP"),
         ]
+        if auth := cfg.options.get("authentication"):
+            # Servers that demand a specific mechanism (Kerberos, TOKEN, AES)
+            # otherwise answer SQL30082N reason 17, which reads exactly like
+            # the credential bug fixed in 854b50d.
+            fields.append(("AUTHENTICATION", str(auth).upper()))
         if cfg.tls.enabled:
             fields.append(("SECURITY", "SSL"))
             if cfg.tls.ca_file:
@@ -214,8 +219,19 @@ class Db2Connector(DatabaseConnector):
         try:
             conn = self._connect()
             try:
-                stmt = self._module.exec_immediate(conn, "SELECT service_level FROM SYSIBMADM.ENV_INST_INFO")
-                row = self._module.fetch_tuple(stmt)
+                # SYSIBMADM.ENV_INST_INFO needs EXECUTE on an admin table
+                # function that a bare CONNECT+SELECT identity does not have.
+                # Version reporting is best-effort; liveness uses SYSDUMMY1,
+                # which every connectable account can read.
+                row = None
+                try:
+                    stmt = self._module.exec_immediate(
+                        conn, "SELECT service_level FROM SYSIBMADM.ENV_INST_INFO"
+                    )
+                    row = self._module.fetch_tuple(stmt)
+                except Exception:  # noqa: BLE001 - version is optional
+                    stmt = self._module.exec_immediate(conn, "SELECT 1 FROM SYSIBM.SYSDUMMY1")
+                    self._module.fetch_tuple(stmt)
             finally:
                 self._module.close(conn)
             return HealthInfo(

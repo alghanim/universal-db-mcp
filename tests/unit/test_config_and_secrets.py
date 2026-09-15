@@ -64,6 +64,7 @@ def test_secret_file_permissions_enforced(tmp_path: Path) -> None:
     p = tmp_path / "c.yaml"
     p.write_text(
         f"connections:\n  pg:\n    type: postgres\n    host: h\n    database: d\n    password_file: {secret}\n"
+        "    options:\n      os_authentication: true\n"
     )
     with pytest.raises(ConfigError, match="unsafe permissions"):
         load_resolved(p)
@@ -76,6 +77,7 @@ def test_password_file_resolves(tmp_path: Path) -> None:
     p = tmp_path / "c.yaml"
     p.write_text(
         f"connections:\n  pg:\n    type: postgres\n    host: h\n    database: d\n    password_file: {secret}\n"
+        "    options:\n      os_authentication: true\n"
     )
     cfg, resolved = load_resolved(p)
     pw = resolved["pg"].password

@@ -114,9 +114,24 @@ done
 # candidate path — the same contract as install_offline.sh's VEXEC handling
 # without its PATH search.
 VEXEC="$PY"
-$VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" || {
+# Exit code alone is not proof: python3 on an empty, truncated or no-op
+# verifier exits 0 without certifying anything. Every other call site (deb
+# postinst, install_offline.sh, upgrade_offline.sh, msi verify.ps1) requires
+# the literal proof line and the absence of a FAIL: diagnostic; this one was
+# the only gap.
+VERIFY_OUT="$(mktemp /var/tmp/udbmcp-verify.XXXXXX)"
+VRC=0
+$VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" >"$VERIFY_OUT" 2>&1 || VRC=$?
+cat "$VERIFY_OUT"
+if [ "$VRC" -ne 0 ]; then
+  rm -f "$VERIFY_OUT"
   fail "bundle verification FAILED — the payload may be tampered or corrupt; nothing will be installed or executed"
-}
+fi
+if grep -q '^FAIL:' "$VERIFY_OUT" || ! grep -q 'bundle verification PASSED' "$VERIFY_OUT"; then
+  rm -f "$VERIFY_OUT"
+  fail "trusted verifier exited 0 but did not print 'bundle verification PASSED' (or printed a FAIL line); without explicit proof of verification the bundle is treated as untrusted"
+fi
+rm -f "$VERIFY_OUT"
 
 # --- step 2: create the _udbmcp service group and user (idempotent) ----------
 # Mirrors the Linux udbmcp account: no login shell, no home, hidden from the
@@ -298,6 +313,23 @@ echo "==> postinstall: provisioning state and log directories"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$LOG_DIR" || {
   fail "could not create $STATE_DIR and $LOG_DIR (the service's state and log directories)"
 }
+
+# The shipped config template references this demo database and doctor marks a
+# missing SQLite data file FATAL, so without it the documented post-install
+# check fails on every clean install. Never clobber a seeded one.
+# BEST-EFFORT by design: this is a convenience file for the template's example
+# connection, never a reason to fail an otherwise complete install.
+DEMO_DB="$STATE_DIR/demo/finlink_demo.db"
+if [ ! -f "$DEMO_DB" ]; then
+  if install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR/demo" 2>/dev/null \
+     && "$VENV/bin/python" -c "import sqlite3, sys; sqlite3.connect(sys.argv[1]).close()" "$DEMO_DB" 2>/dev/null; then
+    chown "$SERVICE_USER":"$SERVICE_GROUP" "$DEMO_DB" 2>/dev/null || true
+    chmod 0640 "$DEMO_DB" 2>/dev/null || true
+  else
+    echo "WARNING: could not create the demo database at $DEMO_DB; doctor will report the" >&2
+    echo "         template's demo_sqlite connection as a missing data file." >&2
+  fi
+fi
 
 # --- step 7: publish manifest.json next to the venv (doctor hook) ------------
 # doctor derives the installed profile from this file instead of guessing from

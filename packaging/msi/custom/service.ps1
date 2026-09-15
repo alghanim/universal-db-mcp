@@ -373,22 +373,22 @@ try {
     # exactly the interpreter plus "serve"; the validated machine-wide config
     # path is injected via the service Environment registry value, which
     # services.exe merges into the service process environment.
-    $envKey = 'HKLM\SYSTEM\CurrentControlSet\Services\' + $ServiceName + '\Environment'
+    # services.exe reads ONE REG_MULTI_SZ value named Environment directly
+    # under the service key, holding NAME=VALUE entries. Writing each variable
+    # as its own value under an Environment SUBKEY (what this did) is ignored
+    # by Windows while reg.exe still exits 0, so the action reported success
+    # and the service started with no UDBMCP_CONFIG: a CONFIG_ERROR on a
+    # stderr nobody reads, surfacing as "the service terminated unexpectedly".
+    # reg.exe separates REG_MULTI_SZ entries with \0.
+    $svcKey = 'HKLM\SYSTEM\CurrentControlSet\Services\' + $ServiceName
+    $envValue = 'UDBMCP_CONFIG=' + (ConvertTo-ScArgument $ConfigPath) +
+        '\0UDBMCP_HTTP_BEARER_TOKEN_FILE=' + (ConvertTo-ScArgument $tokenFile)
     $r = Invoke-Tool -Tool $script:RegExe -Arguments (
-        'add "' + $envKey + '" /v UDBMCP_CONFIG /t REG_MULTI_SZ /d "' + (ConvertTo-ScArgument $ConfigPath) + '" /f')
+        'add "' + $svcKey + '" /v Environment /t REG_MULTI_SZ /d "' + $envValue + '" /f')
     Write-ToolOutput $r
     if ($r.ExitCode -ne 0) {
-        Abort ("could not write UDBMCP_CONFIG under " + $envKey + " (reg.exe exit code " + $r.ExitCode + ")")
-    }
-    # Bearer-token PATH for HTTP mode (the token VALUE stays in the file; an
-    # explicit config value would win). The config template keeps
-    # transport: stdio so per-harness stdio spawns can share it.
-    $r = Invoke-Tool -Tool $script:RegExe -Arguments (
-        'add "' + $envKey + '" /v UDBMCP_HTTP_BEARER_TOKEN_FILE /t REG_MULTI_SZ /d "' +
-        (ConvertTo-ScArgument $tokenFile) + '" /f')
-    Write-ToolOutput $r
-    if ($r.ExitCode -ne 0) {
-        Abort ("could not write UDBMCP_HTTP_BEARER_TOKEN_FILE under " + $envKey + " (reg.exe exit code " + $r.ExitCode + ")")
+        Abort ("could not write the service Environment value under " + $svcKey +
+               " (reg.exe exit code " + $r.ExitCode + ")")
     }
 
     Write-Output ("==> service '" + $ServiceName + "' registered (the installer does not auto-start it; the admin or the delivered gate script starts it)")

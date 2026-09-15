@@ -13,3 +13,11 @@ clickhouse-connect==1.8.0
 oracledb==4.0.2
 pyodbc==5.3.0
 ibm-db==3.2.9  # tested wheel in the bundle wheelhouse
+
+# Authentication plugins the connectors need but no connector declares:
+# PyNaCl backs MariaDB's client_ed25519 (the default on many MariaDB builds);
+# cryptography backs MySQL 8.0's caching_sha2_password. cryptography arrived
+# only transitively via oracledb, so a profile built without the oracle extra
+# would have broken MySQL 8 logins with no wheel available to fix it offline.
+PyNaCl==1.6.2
+cryptography==50.0.1

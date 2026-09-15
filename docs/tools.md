@@ -41,7 +41,7 @@ stable category:
 | `db_query` | validated, bounded read; masking applied |
 | `db_sample_table` | default 20 rows; masking/omission policy applied |
 | `db_explain` | non-executing plans only |
-| `db_get_query_history` | caller-scoped, fingerprints only |
+| `db_get_query_history` | process-scoped, fingerprints only (see the identity note below) |
 
 ## Value representation
 
@@ -56,6 +56,29 @@ stable category:
   Heuristics are not the security boundary — grants are.
 
 ## Pagination
+
+## Caller identity (read before relying on the two notes below)
+
+The server derives one identity per PROCESS (the account it runs as), not one
+per request. Under stdio that is exactly the caller, because each agent spawns
+its own server. Under HTTP there is a single shared bearer token and a single
+service account, so:
+
+* `db_get_query_history` returns the history of the whole process: every
+  authenticated caller sees every other caller's request ids, connection ids,
+  SQL fingerprints and row counts. It is not caller-scoped under HTTP.
+* Cursor binding to "caller identity" is likewise process-scoped, so it cannot
+  distinguish two HTTP callers.
+
+Deploy HTTP only where every authorized caller is entitled to the same view,
+or give each caller its own listener and token.
+
+## Response size
+
+Each tool result is transmitted twice: once as structured content and once as
+a pretty-printed text block (the copy the model reads). `security.max_response_bytes`
+bounds the envelope our code builds, so the bytes on the wire are roughly 2.7x
+that value for a large result. Size the cap accordingly.
 
 Opaque cursors: HMAC-signed, bound to caller identity + connection id +
 operation kind + policy fingerprint + expiry (15 min). Cross-identity or

@@ -94,6 +94,13 @@ class ClickHouseConnector(DatabaseConnector):
             kw["ca_cert"] = cfg.tls.ca_file
             if cfg.tls.client_cert_file:
                 kw["client_cert"] = cfg.tls.client_cert_file
+                if self.connection.password:
+                    # clickhouse-connect skips Basic auth entirely when a client
+                    # certificate is present and tls_mode is unset (mutual-TLS
+                    # branch), so a configured password would never be sent.
+                    # Asking for 'strict' keeps the certificate for transport
+                    # and still sends the credentials.
+                    kw["tls_mode"] = "strict"
             if cfg.tls.client_key_file:
                 kw["client_cert_key"] = cfg.tls.client_key_file
         return self._module.get_client(**kw)

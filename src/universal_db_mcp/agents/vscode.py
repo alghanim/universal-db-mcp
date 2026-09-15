@@ -373,7 +373,11 @@ def _apply_target(
                 _fail_closed_block(target),
                 None,
             )
-        servers = data[SERVERS_KEY]
+        # An mcp.json without a "servers" key is INSTALLED_UNCONFIGURED, not an
+        # error: {} , a file carrying only "inputs", or one copied from another
+        # client all reach here and used to raise KeyError, which the CLI
+        # reported as a fail-closed write blaming the user's file.
+        servers = data.get(SERVERS_KEY) or {}
         backup = backup_path(target)
         shutil.copy2(target, backup)
         merged_servers = dict(servers)

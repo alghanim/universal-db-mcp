@@ -20,6 +20,7 @@ from typing import Any
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.connectors.base import (
     ColumnInfo,
+    ConnectorError,
     DatabaseConnector,
     HealthInfo,
     KeyInfo,
@@ -138,6 +139,11 @@ class MySQLConnector(DatabaseConnector):
             "cursorclass": self._module.cursors.SSCursor,  # streaming; bounded fetch below
             "autocommit": True,  # reads only; no transaction state to leak
         }
+        if socket_path := cfg.options.get("unix_socket"):
+            # A co-located server with no TCP listener: PyMySQL ignores host
+            # entirely when unix_socket is given, so do not send a bogus one.
+            kw.pop("host", None)
+            kw["unix_socket"] = socket_path
         if self.connection.username:
             kw["user"] = self.connection.username.value
         if self.connection.password:
@@ -151,7 +157,21 @@ class MySQLConnector(DatabaseConnector):
                 kw["ssl"]["cert"] = cfg.tls.client_cert_file
             if cfg.tls.client_key_file:
                 kw["ssl"]["key"] = cfg.tls.client_key_file
-        return self._module.connect(**kw)
+        try:
+            return self._module.connect(**kw)
+        except AttributeError as exc:
+            # PyMySQL dispatches mysql_old_password (pre-4.1 hashes, removed in
+            # MySQL 5.7.5) to a helper it no longer ships, so the driver raises
+            # AttributeError and the operator sees what looks like our internal
+            # defect rather than an unsupported authentication plugin.
+            if "scramble_old_password" in str(exc):
+                raise ConnectorError(
+                    "the MySQL account uses the legacy mysql_old_password authentication plugin, "
+                    "which this client cannot perform. Have the DBA move the account to "
+                    "mysql_native_password or caching_sha2_password "
+                    "(ALTER USER ... IDENTIFIED WITH caching_sha2_password BY '<password>')"
+                ) from exc
+            raise
 
     # PyMySQL has no safe out-of-band cancel; the executor reports this
     # truthfully and discards the connection on timeout.

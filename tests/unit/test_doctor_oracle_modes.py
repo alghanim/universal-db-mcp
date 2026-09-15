@@ -67,3 +67,49 @@ def test_tns_alias_with_tnsnames_file_passes(tmp_path: Path) -> None:
     cfg = _config(tmp_path, f"      tns_alias: PRODDB\n      tns_admin: {tns}\n")
     check = _checks(run_doctor(cfg), "connection-o-oracle-tnsnames")[0]
     assert check["status"] == "ok", check
+
+
+# ------------------------------------------------- wallet contents, not just the directory
+# Thin mode reads a PEM wallet (ewallet.pem); an orapki wallet directory
+# (cwallet.sso / ewallet.p12) satisfied the old directory-exists check and then
+# failed at connect time with a raw driver error - doctor reported green for a
+# connection that could never work.
+
+
+def _tls_config(tmp_path: Path, wallet: Path, thick: bool = False) -> str:
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x", encoding="utf-8")
+    p = tmp_path / "tls.yaml"
+    p.write_text(
+        "connections:\n  o:\n    type: oracle\n    host: h\n    database: svc\n"
+        f"    tls:\n      enabled: true\n      verify_server: true\n      ca_file: {ca}\n"
+        f"    options:\n      wallet_location: {wallet}\n"
+        + ("      thick_mode: true\n" if thick else ""),
+        encoding="utf-8",
+    )
+    return str(p)
+
+
+def test_orapki_wallet_without_pem_is_fatal_in_thin_mode(tmp_path: Path) -> None:
+    wallet = tmp_path / "wallet"
+    wallet.mkdir()
+    (wallet / "cwallet.sso").write_bytes(b"\x00")
+    check = _checks(run_doctor(_tls_config(tmp_path, wallet)), "connection-o-oracle-wallet")[0]
+    assert check["status"] == "fatal", check
+    assert "ewallet.pem" in str(check["detail"])
+
+
+def test_pem_wallet_passes(tmp_path: Path) -> None:
+    wallet = tmp_path / "wallet"
+    wallet.mkdir()
+    (wallet / "ewallet.pem").write_text("x", encoding="utf-8")
+    check = _checks(run_doctor(_tls_config(tmp_path, wallet)), "connection-o-oracle-wallet")[0]
+    assert check["status"] == "ok", check
+
+
+def test_thick_mode_accepts_an_orapki_wallet(tmp_path: Path) -> None:
+    wallet = tmp_path / "wallet"
+    wallet.mkdir()
+    (wallet / "cwallet.sso").write_bytes(b"\x00")
+    check = _checks(run_doctor(_tls_config(tmp_path, wallet, thick=True)), "connection-o-oracle-wallet")[0]
+    assert check["status"] == "ok", check
