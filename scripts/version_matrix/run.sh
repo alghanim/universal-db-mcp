@@ -10,7 +10,12 @@ EV="$PROJECT/test-evidence/version-matrix"
 mkdir -p "$EV"
 PW="VmProbe_2026x"
 PWFILE="$(mktemp)"; printf '%s\n' "$PW" > "$PWFILE"; chmod 600 "$PWFILE"
-trap 'rm -f "$PWFILE"' EXIT
+STARTED=()
+cleanup() {
+  rm -f "$PWFILE"
+  for c in ${STARTED[@]+"${STARTED[@]}"}; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+}
+trap cleanup EXIT INT TERM
 
 # engine|image|container port|host port|platform flag|readiness command (runs inside container)|env...
 MATRIX_LIGHT=(
@@ -55,6 +60,7 @@ run_one() {
   local env_args=()
   for kv in $envs; do env_args+=(-e "$kv"); done
   # shellcheck disable=SC2086
+  STARTED+=("$name")
   if ! docker run -d --name "$name" $platform "${env_args[@]}" -p "127.0.0.1:$hport:$cport" "$image" >/dev/null 2>"$EV/$name.start.err"; then
     echo "   start FAILED: $(tail -c 200 "$EV/$name.start.err")"
     printf '{"label":"%s","engine":"%s","status":"not_run","reason":"container start failed"}\n' "$label" "$engine" > "$out"
@@ -68,8 +74,7 @@ run_one() {
   # temporary instance and the real one drops the probe's connection
   # ("Lost connection ... during query", seen on mysql:5.7). Require the
   # readiness command to succeed on three consecutive checks 5 s apart.
-  local streak=0 need=1
-  [ "$engine" = "mysql" ] && need=3
+  local streak=0 need=3
   while [ "$waited" -lt "$max_wait" ]; do
     if docker exec "$name" sh -c "$ready" >/dev/null 2>&1; then
       streak=$((streak + 1))
@@ -102,18 +107,4 @@ for sel in "${selected[@]}"; do
     *) for s in "${MATRIX_LIGHT[@]}" "${MATRIX_HEAVY[@]}"; do [[ "$s" == "$sel|"* ]] && run_one "$s"; done ;;
   esac
 done
-"$PY" - "$EV" <<'PY'
-import json, sys, pathlib
-ev = pathlib.Path(sys.argv[1])
-rows = []
-for f in sorted(ev.glob("*.json")):
-    d = json.loads(f.read_text())
-    if "summary" in d:
-        rows.append((d["label"], str(d.get("server_version") or "")[:30], d["summary"]["passed"], ",".join(d["summary"]["failed"]) or "-"))
-    else:
-        rows.append((d.get("label", f.name), "", 0, d.get("reason", "not_run")))
-w = max(len(r[0]) for r in rows) if rows else 10
-print(f"{'image':<{w}}  {'server':<30}  passed  failed")
-for r in rows:
-    print(f"{r[0]:<{w}}  {r[1]:<30}  {r[2]:>6}  {r[3]}")
-PY
+"$PY" "$HERE/summarize.py"

@@ -162,7 +162,8 @@ def test_doctor_reports_the_resolved_session_profile_per_connection(tmp_path: Pa
         "connections:\n"
         "  fin:\n    type: db2\n    host: h\n    database: d\n"
         "  rep:\n    type: postgres\n    host: h\n    database: d\n    username_env: U\n"
-        "  keep:\n    type: db2\n    host: h\n    database: d\n    session:\n      isolation: cs\n      enforce_read_only: false\n",
+        "  keep:\n    type: db2\n    host: h\n    database: d\n"
+        "    session:\n      isolation: cs\n      enforce_read_only: false\n",
         encoding="utf-8",
     )
     report = run_doctor(str(p))

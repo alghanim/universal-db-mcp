@@ -1,0 +1,168 @@
+{
+  "label": "icr.io/db2_community/db2:11.5.9.0",
+  "engine": "db2",
+  "probe_rev": "762a649",
+  "started_utc": "2026-09-16T19:55:23Z",
+  "checks": [
+    {
+      "check": "seed",
+      "status": "passed",
+      "ms": 12635,
+      "detail": "seeded"
+    },
+    {
+      "check": "health_check",
+      "status": "passed",
+      "ms": 349,
+      "detail": "DB2 v11.5.9.0"
+    },
+    {
+      "check": "list_schemas",
+      "status": "passed",
+      "ms": 18,
+      "detail": "VM"
+    },
+    {
+      "check": "list_tables",
+      "status": "passed",
+      "ms": 81,
+      "detail": "[TableSummary(schema='VM', name='CUSTOMERS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='VM', name='ORDERS', kind='table', row_estimate=None, row_est"
+    },
+    {
+      "check": "list_tables_has_seed",
+      "status": "passed",
+      "ms": 0,
+      "detail": "CUSTOMERS"
+    },
+    {
+      "check": "list_columns",
+      "status": "passed",
+      "ms": 28,
+      "detail": "[ColumnInfo(schema='VM', table='CUSTOMERS', name='ID', data_type='INTEGER', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='VM', table='CUSTOMERS', name='EMAIL', data_type='"
+    },
+    {
+      "check": "list_columns_count",
+      "status": "passed",
+      "ms": 0,
+      "detail": "{'columns': 6, 'expected': 6}"
+    },
+    {
+      "check": "list_all_columns",
+      "status": "passed",
+      "ms": 12,
+      "detail": "9"
+    },
+    {
+      "check": "list_indexes",
+      "status": "passed",
+      "ms": 32,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='reg', schema='VM', table='ORDERS'), IndexInfo(name='SQL260916195534680', columns=['ID"
+    },
+    {
+      "check": "index_on_fk_visible",
+      "status": "passed",
+      "ms": 0,
+      "detail": "IX_ORDERS_CUSTOMER"
+    },
+    {
+      "check": "primary_key_visible",
+      "status": "passed",
+      "ms": 5,
+      "detail": "SQL260916195534640"
+    },
+    {
+      "check": "composite_unique_index",
+      "status": "passed",
+      "ms": 0,
+      "detail": "UX_CUSTOMERS_REGION_EMAIL"
+    },
+    {
+      "check": "get_foreign_keys",
+      "status": "passed",
+      "ms": 34,
+      "detail": "CUSTOMERS"
+    },
+    {
+      "check": "list_views",
+      "status": "passed",
+      "ms": 13,
+      "detail": "V_ORDERS"
+    },
+    {
+      "check": "list_routines",
+      "status": "passed",
+      "ms": 68,
+      "detail": "F_ONE"
+    },
+    {
+      "check": "get_statistics",
+      "status": "passed",
+      "ms": 22,
+      "detail": "catalog_estimate(SYSCAT.TABLES.CARD)"
+    },
+    {
+      "check": "execute_query_count",
+      "status": "passed",
+      "ms": 21,
+      "detail": "300"
+    },
+    {
+      "check": "sample_query",
+      "status": "passed",
+      "ms": 15,
+      "detail": "200"
+    },
+    {
+      "check": "profile_aggregate",
+      "status": "passed",
+      "ms": 22,
+      "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
+    },
+    {
+      "check": "top_values",
+      "status": "passed",
+      "ms": 14,
+      "detail": "[['south', 67], ['north', 66]]"
+    },
+    {
+      "check": "value_search_like",
+      "status": "passed",
+      "ms": 13,
+      "detail": "[12, 'user12@example.com', 'north']"
+    },
+    {
+      "check": "explain",
+      "status": "skipped",
+      "ms": 0,
+      "detail": "unsupported by design: Db2 EXPLAIN requires administrator-provisioned explain tables; not provisioned automatically in this build"
+    }
+  ],
+  "server_version": "DB2 v11.5.9.0",
+  "session": {
+    "engine": "db2",
+    "isolation": "ur",
+    "lock_timeout_seconds": 5.0,
+    "statement_timeout_seconds": 60.0,
+    "application_name": "udbmcp:vm",
+    "read_only_requested": true,
+    "server_read_only_available": false,
+    "applied": [
+      "isolation=ur",
+      "lock_timeout=5s"
+    ],
+    "skipped": [],
+    "read_only_enforced": false,
+    "read_only_verified": null,
+    "server_reports": {
+      "isolation": "ur",
+      "lock_timeout_seconds": "5",
+      "application_name": "udbmcp:vm"
+    }
+  },
+  "healthy": true,
+  "finished_utc": "2026-09-16T19:55:37Z",
+  "summary": {
+    "passed": 21,
+    "failed": []
+  }
+}

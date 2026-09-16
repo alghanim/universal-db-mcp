@@ -13,6 +13,7 @@ import dataclasses
 import functools
 import getpass
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -38,6 +39,7 @@ from universal_db_mcp.connectors.base import (
     ConnectorError,
     DatabaseConnector,
     DriverUnavailableError,
+    KeyInfo,
     ObjectNotFound,
     QuerySpec,
 )
@@ -74,10 +76,9 @@ _SEARCH_CAP = 25
 _DISCOVERY_MAX_SCHEMAS = 20
 _PROFILE_MAX_COLUMNS = 60
 _PROFILE_DEFAULT_SAMPLE = 10_000
-_PROFILE_MAX_SAMPLE = 200_000
 _PROFILE_MAX_TOP_COLUMNS = 20
 _SEARCH_MAX_SELECT = 8
-_INFER_MAX_TABLES = 500
+_DISCOVERY_INFER_MAX_TABLES = 500
 _HISTORY_CAP = 200
 _INFER_MAX_TABLES = 50  # bounds metadata traversal for inference
 _META_TIMEOUT = 15.0
@@ -1336,6 +1337,7 @@ def build_server(app: AppContext) -> MCPServer:
                     if ((k.source_schema or sch or "").lower(), (k.source_table or "").lower()) == key
                 ]
                 pk = next((i.columns for i in idx if i.primary), None)
+                fk_data = [_redact_foreign_target(policy, k) for k in fks]
                 out_tables.append({
                     "schema": sch,
                     "name": t.name,
@@ -1358,7 +1360,7 @@ def build_server(app: AppContext) -> MCPServer:
                         for c in cols
                     ],
                     "indexes": [dataclasses.asdict(i) for i in idx],
-                    "foreign_keys": [dataclasses.asdict(k) for k in fks],
+                    "foreign_keys": fk_data,
                 })
             st["row_count"] = len(out_tables)
             return _envelope(
@@ -1402,9 +1404,20 @@ def build_server(app: AppContext) -> MCPServer:
                     raise ToolFailure(ErrorCategory.VALIDATION, f"unknown columns: {bad}")
                 all_cols = [c for c in all_cols if c.name in set(columns)]
             all_cols = all_cols[:_PROFILE_MAX_COLUMNS]
-            requested = _PROFILE_DEFAULT_SAMPLE if sample_rows is None else int(sample_rows)
-            if requested < 1 or requested > _PROFILE_MAX_SAMPLE:
-                raise ToolFailure(ErrorCategory.VALIDATION, f"sample_rows must be 1-{_PROFILE_MAX_SAMPLE}")
+            cap = int(policy.profile_max_sample_rows)
+            requested = min(_PROFILE_DEFAULT_SAMPLE, cap) if sample_rows is None else int(sample_rows)
+            if requested < 1 or requested > cap:
+                raise ToolFailure(
+                    ErrorCategory.VALIDATION,
+                    f"sample_rows must be 1-{cap} (security.profile_max_sample_rows)",
+                )
+            # One call issues up to 1 + top-values statements; all of them share
+            # one wall-clock budget so a wide table cannot turn into twenty
+            # near-timeout scans (security.discovery_time_budget_seconds).
+            deadline = time.monotonic() + float(policy.discovery_time_budget_seconds)
+
+            def _remaining() -> float:
+                return min(policy.clamp_timeout(None), max(1.0, deadline - time.monotonic()))
             omit = policy.mask_action == "omit"
             sensitive = {c.name for c in all_cols if _sensitive(policy, c.name)}
             if omit:
@@ -1427,7 +1440,7 @@ def build_server(app: AppContext) -> MCPServer:
                 max_rows=1,
                 max_response_bytes=policy.max_response_bytes,
                 max_cell_bytes=policy.max_cell_bytes,
-                timeout_seconds=policy.clamp_timeout(None),
+                timeout_seconds=_remaining(),
             )
             st["connector"] = connector
             outcome = await run_query(app, connection_id, spec, f"profile of '{connection_id}'")
@@ -1439,13 +1452,18 @@ def build_server(app: AppContext) -> MCPServer:
                     prof = profiles[c.name]
                     if not wants_top_values(prof) or top_done >= _PROFILE_MAX_TOP_COLUMNS:
                         continue
+                    if time.monotonic() >= deadline:
+                        st["warnings"].append(
+                            "discovery time budget exhausted before every low-cardinality column got top values"
+                        )
+                        break
                     tv_spec = QuerySpec(
                         sql=connector.build_top_values_query(sample_sql, c.name, TOP_VALUES),
                         parameters=None,
                         max_rows=TOP_VALUES,
                         max_response_bytes=policy.max_response_bytes,
                         max_cell_bytes=policy.max_cell_bytes,
-                        timeout_seconds=policy.clamp_timeout(None),
+                        timeout_seconds=_remaining(),
                     )
                     tv = await run_query(app, connection_id, tv_spec, f"top values on '{connection_id}'")
                     prof.top_values = [{"value": r[0], "count": r[1]} for r in tv.rows]
@@ -1525,6 +1543,8 @@ def build_server(app: AppContext) -> MCPServer:
                 numeric = int(query) if query.lstrip("-").isdigit() else float(query)
             except ValueError:
                 numeric = None
+            if isinstance(numeric, float) and not math.isfinite(numeric):
+                numeric = None  # nan/inf never match a column; keep the string predicates only
             needle = query.lower()
             deadline = time.monotonic() + budget
             hits: list[dict[str, Any]] = []
@@ -1664,6 +1684,7 @@ def build_server(app: AppContext) -> MCPServer:
             wanted = {s.lower() for s in schemas} if schemas else None
             facts: list[TableFacts] = []
             warnings: list[str] = []
+            policies: dict[str, EffectivePolicy] = {}
             for cid in conn_ids:
                 try:
                     connector, policy = _require_engine(app, cid)
@@ -1673,14 +1694,17 @@ def build_server(app: AppContext) -> MCPServer:
                         raise
                     warnings.append(f"connection '{cid}' skipped: {scrub_exception(exc)}")
                     continue
+                policies[cid] = policy
                 tables = [t for t in tables if t.kind == "table"]
                 if wanted is not None:
                     tables = [t for t in tables if (t.schema or "").lower() in wanted]
                 elif not include_system:
                     tables = [t for t in tables if not is_system_object(policy.engine, t.schema, t.name)]
-                if len(facts) + len(tables) > _INFER_MAX_TABLES:
-                    warnings.append(f"connection '{cid}': table limit {_INFER_MAX_TABLES} reached; narrow with schemas")
-                    tables = tables[: max(0, _INFER_MAX_TABLES - len(facts))]
+                if len(facts) + len(tables) > _DISCOVERY_INFER_MAX_TABLES:
+                    warnings.append(
+                        f"connection '{cid}': table limit {_DISCOVERY_INFER_MAX_TABLES} reached; narrow with schemas"
+                    )
+                    tables = tables[: max(0, _DISCOVERY_INFER_MAX_TABLES - len(facts))]
                 per_schema: dict[str | None, tuple[list[Any], list[Any], list[Any]]] = {}
                 for sch in sorted({t.schema for t in tables}, key=lambda x: x or ""):
                     try:
@@ -1701,6 +1725,13 @@ def build_server(app: AppContext) -> MCPServer:
                         foreign_keys=[k for k in fks if (k.source_table or "").lower() == key],
                     ))
             rels = infer_relationships(facts, cross_connection=cross_connection)
+            rels = [
+                r for r in rels
+                if r.target.connection not in policies
+                or r.target.schema is None
+                or policies[r.target.connection].schema_allowed(r.target.schema)
+                or policies[r.target.connection].system_schema_allowed(r.target.schema)
+            ]
             st["row_count"] = len(rels)
             if warnings:
                 st["warnings"].extend(warnings)
@@ -1726,6 +1757,19 @@ def build_server(app: AppContext) -> MCPServer:
 
 
 # ---------------------------------------------------------------- shared utils
+
+
+
+def _redact_foreign_target(policy: EffectivePolicy, key: KeyInfo) -> dict[str, Any]:
+    """A permitted table's foreign key may point at a schema the allowlist
+    hides; the key is reported but the hidden target is not named."""
+    data = dataclasses.asdict(key)
+    ref_schema = key.ref_schema
+    if ref_schema and not (policy.schema_allowed(ref_schema) or policy.system_schema_allowed(ref_schema)):
+        data["ref_schema"] = "<not permitted>"
+        data["ref_table"] = "<not permitted>"
+        data["ref_columns"] = []
+    return data
 
 
 async def _resolve_object(

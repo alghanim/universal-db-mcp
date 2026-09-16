@@ -309,3 +309,45 @@ def test_profile_is_a_plain_report(tmp_path: Path) -> None:
     report = profile.as_dict()
     assert report["isolation"] == "ur"
     assert "application_name" in report
+
+
+# ------------------------------------------------- fail-closed on the other enforced engines
+@pytest.mark.parametrize("engine,module_name", [("postgres", "psycopg"), ("mysql", "pymysql")])
+def test_read_only_refusal_fails_closed(
+    engine: str, module_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Rec(_Recorder):
+        def execute(self, sql: str, *_a: Any, **_k: Any) -> _Rec:
+            if "READ ONLY" in sql.upper() or "READ_ONLY" in sql.upper():
+                raise RuntimeError("permission denied")
+            return super().execute(sql)  # type: ignore[return-value]
+
+    rec = _Rec()
+    fake = types.SimpleNamespace(connect=lambda **kw: rec, cursors=types.SimpleNamespace(SSCursor=object))
+    conn = _connector(engine, tmp_path, monkeypatch, fake_module=fake, module_name=module_name)
+    with pytest.raises(ConnectorError, match="read-only"):
+        conn._connect()
+
+
+def test_mssql_isolation_refusal_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Rec(_Recorder):
+        def execute(self, sql: str, *_a: Any, **_k: Any) -> _Rec:
+            if "ISOLATION" in sql.upper():
+                raise RuntimeError("cannot set")
+            return super().execute(sql)  # type: ignore[return-value]
+
+    rec = _Rec()
+    fake = types.SimpleNamespace(connect=lambda cs, **kw: rec, drivers=lambda: ["ODBC Driver 18 for SQL Server"])
+    conn = _connector("mssql", tmp_path, monkeypatch, fake_module=fake, module_name="pyodbc")
+    with pytest.raises(ConnectorError, match="isolation"):
+        conn._connect()
+
+
+def test_read_only_verified_reflects_the_server_readback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = _Recorder(readback={"row": ("off", "1min", "5s", "udbmcp:prod_postgres", "read committed")})
+    fake = types.SimpleNamespace(connect=lambda **kw: rec)
+    conn = _connector("postgres", tmp_path, monkeypatch, fake_module=fake, module_name="psycopg")
+    health = conn.health_check()
+    assert health.session is not None
+    assert health.session["read_only_enforced"] is True, "the SET was accepted"
+    assert health.session["read_only_verified"] is False, "but the server says off: reported, not hidden"

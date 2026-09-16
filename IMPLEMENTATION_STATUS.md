@@ -1,6 +1,6 @@
 # Implementation status (honest ledger)
 
-Last updated: 2026-09-12 (native-packages §1d records the honest
+Last updated: 2026-09-16 (native-packages §1d records the honest
 per-platform status of the .deb / .pkg / .msi packages derived from the
 signed offline bundle: the Ubuntu .deb no-network gate was re-run and
 **PASSED** end-to-end (latest recorded run 2026-09-12T12:28:29Z, 29/29
@@ -433,12 +433,11 @@ Known and NOT fixed here, now documented rather than implied away:
   recorded run).
 - **Gate C round 2:** the DB-side permission-denial proof is **passed**
   for PostgreSQL, and Oracle + SQL Server round-trips over themed fixture
-  data are **passed** through the real connectors. IBM Db2 remains
-  `blocked` on this staging host: the fixture server is verified up to
-  seeding (local + TCP auth via its own clidriver), but the pinned
-  pinned client cannot complete remote plaintext password authentication
-  (documented in docs/driver-matrix.md). The full metadata
-  battery per engine remains `blocked` on fixtures.
+  data are **passed** through the real connectors. IBM Db2 was `blocked`
+  in that run; the cause was the connector never sending credentials,
+  fixed 2026-09-15 (section 3), and Db2 11.5.8/11.5.9 now pass the version
+  matrix (section 3d). The full metadata battery per engine is covered by
+  the version matrix's probed subset, not by Gate C.
 
 ## 5. Assumptions recorded
 
@@ -462,7 +461,6 @@ bash scripts/test_isolated_integrations.sh  # Gate C (pulls fixtures on staging)
 ```
 
 A release is air-gap ready for the profile `linux-x86_64-ubuntu24.04-cp312`
-with connector set {sqlite, postgres, mysql, clickhouse, oracle, mssql} per
-the evidence above (Gate C round-trips passed for all six). The Db2
-connector is code-complete with its live client round-trip `blocked` on
-this staging host (see §3).
+with connector set {sqlite, postgres, mysql, clickhouse, oracle, mssql, db2}
+per the evidence above (Gate C round-trips passed for six; Db2 verified by
+the 2026-09-15 live run and the version matrix, sections 3 and 3d).

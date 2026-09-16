@@ -35,6 +35,7 @@ are quoted as the driver reports them.
 | PostgreSQL Kerberos-only site cannot connect | GSSAPI options were unreachable. | `options.gssencmode: require` and `options.krbsrvname`. |
 | `connections: <engine> needs username_env or username_file` | Omitting the username does not send "no credential": PostgreSQL and MySQL send the service account's OS user, ClickHouse sends `default`. | Set the username, or `options.os_authentication: true` to choose the implicit identity deliberately. |
 | SQLite `file is not a database` | Often an encrypted database (SQLCipher/SEE), which the standard-library driver cannot open. | Decrypt it, or use a build with an encryption extension. Not shipped here. |
+| `CONNECTION_ERROR: could not apply the session read-only mode / isolation ... on connection '<id>'` | The session safety profile is fail-closed for read-only (PostgreSQL, MySQL) and isolation (Db2, SQL Server) and the server refused the SET. | Check the server version (MySQL < 5.6.5 has no READ ONLY transactions) and any pooler in between; opt out per connection with `session.enforce_read_only: false` or `session.isolation: cs`/`read_committed`. See `docs/offline-upgrade-rollback.md`. |
 | Every `db_*` call fails `CONFIG_ERROR: ... requires TLS` right after adding a connection | `security.require_remote_tls` is on and the connection has no `tls:` block. | Add `tls.enabled` with a `ca_file`. `udbmcp add-connection --tls-ca-file <path>` does this, and the wizard now warns when the policy would refuse. |
 
 ## Common failures

@@ -6,7 +6,7 @@ Audit 2026-09-15:
   the `except` fallback to `repr()`. Frozenset repr order follows per-process
   string hashing, so the metadata cache key changed in every process and the
   on-disk cache could never produce a hit - it only ever grew.
-* No tool carried annotations, so a spec-conformant client must treat all 20
+* No tool carried annotations, so a spec-conformant client must treat all 25
   read-only tools as destructive (readOnlyHint defaults false, destructiveHint
   defaults true).
 * `udbmcp version` printed "mcp-sdk unknown": the package defines no
@@ -189,3 +189,21 @@ def test_doctor_does_not_claim_safe_permissions_it_never_checked(
     detail = str(checks[0]["detail"]).lower()
     assert "safe permissions" not in detail, detail
     assert "not verified" in detail or "windows" in detail, detail
+
+
+EXPECTED_TOOLS = {
+    "db_list_connections", "db_test_connection", "db_get_capabilities", "db_list_catalogs",
+    "db_list_databases", "db_list_schemas", "db_list_tables", "db_get_table", "db_list_columns",
+    "db_list_views", "db_list_synonyms", "db_list_routines", "db_search_metadata",
+    "db_get_relationships", "db_get_statistics", "db_validate_query", "db_query", "db_sample_table",
+    "db_explain", "db_get_query_history",
+    "db_list_indexes", "db_get_catalog", "db_profile_table", "db_search_values", "db_infer_relationships",
+}
+
+
+def test_exactly_the_25_documented_tools_are_registered(app_and_server: tuple[Any, Any]) -> None:
+    """The tool surface is a contract (BUILD spec section 8 plus its
+    2026-09-16 addendum); an accidental addition or loss must fail loudly."""
+    _app, server = app_and_server
+    names = {t.name for t in asyncio.run(server.list_tools())}
+    assert names == EXPECTED_TOOLS, sorted(names ^ EXPECTED_TOOLS)

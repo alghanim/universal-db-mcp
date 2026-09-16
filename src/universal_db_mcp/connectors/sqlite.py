@@ -139,6 +139,8 @@ class SQLiteConnector(DatabaseConnector):
         # because the authorizer denies PRAGMA to everything that follows.
         self._session_reset()
         conn.execute("PRAGMA query_only = ON")
+        qo = conn.execute("PRAGMA query_only").fetchone()
+        self._last_query_only = str(qo[0]) if qo else "?"
         self._session_applied("read_only")
         lock = self.session_profile.lock_timeout_seconds
         if lock is not None:
@@ -228,7 +230,7 @@ class SQLiteConnector(DatabaseConnector):
         try:
             with self._open() as conn:
                 row = conn.execute("SELECT sqlite_version()").fetchone()
-            session = self.session_report({"uri_mode": "ro", "query_only": "on"})
+            session = self.session_report({"uri_mode": "ro", "query_only": getattr(self, "_last_query_only", "?")})
             return HealthInfo(
                 healthy=True,
                 server_version=row[0] if row else sqlite3.sqlite_version,

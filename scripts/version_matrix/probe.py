@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Version-matrix probe: exercise every connector capability against ONE
-server and emit a JSON record of what passed, failed or was skipped.
+"""Version-matrix probe: exercise the connector's metadata, query and
+discovery subset against ONE server and emit a JSON record of what passed,
+failed or was skipped. Not probed: capabilities(), get_table(),
+list_synonyms(), list_catalogs(), cancel, explain(analyze), pagination,
+masking, the SQL guard (the probe bypasses default-deny to reach its own
+seed), TLS, and the session fail-closed path.
 
 Runs on the staging machine against a container started by run.sh. Seeds a
 small themed schema with the engine's ADMIN account through the raw driver
@@ -40,6 +44,7 @@ SEEDS: dict[str, list[str]] = {
         "CREATE TABLE vm.customers (id integer PRIMARY KEY, email varchar(200), region varchar(50), note text, created timestamp, balance numeric(12,2))",
         "CREATE TABLE vm.orders (id integer PRIMARY KEY, customer_id integer REFERENCES vm.customers(id), total numeric(12,2))",
         "CREATE INDEX ix_orders_customer ON vm.orders(customer_id)",
+        "CREATE UNIQUE INDEX ux_customers_region_email ON vm.customers(region, email)",
         "CREATE VIEW vm.v_orders AS SELECT o.id, c.email, o.total FROM vm.orders o JOIN vm.customers c ON c.id = o.customer_id",
         "CREATE FUNCTION vm.f_one() RETURNS integer AS 'SELECT 1' LANGUAGE sql",
         "INSERT INTO vm.customers SELECT g, 'user' || g || '@example.com', CASE WHEN g % 3 = 0 THEN 'north' WHEN g % 3 = 1 THEN 'south' ELSE NULL END, repeat('x', g % 40), now(), g * 1.5 FROM generate_series(1, 300) g",
@@ -50,6 +55,7 @@ SEEDS: dict[str, list[str]] = {
         "CREATE TABLE vm.customers (id int PRIMARY KEY, email varchar(200), region varchar(50), note text, created datetime, balance decimal(12,2))",
         "CREATE TABLE vm.orders (id int PRIMARY KEY, customer_id int, total decimal(12,2), CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES vm.customers(id))",
         "CREATE INDEX ix_orders_customer ON vm.orders(customer_id)",
+        "CREATE UNIQUE INDEX ux_customers_region_email ON vm.customers(region, email)",
         "CREATE VIEW vm.v_orders AS SELECT o.id, c.email, o.total FROM vm.orders o JOIN vm.customers c ON c.id = o.customer_id",
         "@rows",
     ],
@@ -65,6 +71,7 @@ SEEDS: dict[str, list[str]] = {
         "CREATE TABLE vm_customers (id NUMBER(10) PRIMARY KEY, email VARCHAR2(200), region VARCHAR2(50), note CLOB, created TIMESTAMP, balance NUMBER(12,2))",
         "CREATE TABLE vm_orders (id NUMBER(10) PRIMARY KEY, customer_id NUMBER(10) REFERENCES vm_customers(id), total NUMBER(12,2))",
         "CREATE INDEX ix_orders_customer ON vm_orders(customer_id)",
+        "CREATE UNIQUE INDEX ux_customers_region_email ON vm_customers(region, email)",
         "CREATE VIEW vm_v_orders AS SELECT o.id, c.email, o.total FROM vm_orders o JOIN vm_customers c ON c.id = o.customer_id",
         "CREATE FUNCTION vm_f_one RETURN NUMBER IS BEGIN RETURN 1; END;",
         "INSERT INTO vm_customers SELECT level, 'user' || level || '@example.com', CASE WHEN MOD(level,3)=0 THEN 'north' WHEN MOD(level,3)=1 THEN 'south' ELSE NULL END, RPAD('x', MOD(level,40)+1, 'x'), SYSTIMESTAMP, level * 1.5 FROM dual CONNECT BY level <= 300",
@@ -77,6 +84,7 @@ SEEDS: dict[str, list[str]] = {
         "CREATE TABLE dbo.customers (id int PRIMARY KEY, email nvarchar(200), region nvarchar(50), note nvarchar(max), created datetime2, balance decimal(12,2))",
         "CREATE TABLE dbo.orders (id int PRIMARY KEY, customer_id int REFERENCES dbo.customers(id), total decimal(12,2))",
         "CREATE INDEX ix_orders_customer ON dbo.orders(customer_id)",
+        "CREATE UNIQUE INDEX ux_customers_region_email ON dbo.customers(region, email)",
         "CREATE VIEW dbo.v_orders AS SELECT o.id, c.email, o.total FROM dbo.orders o JOIN dbo.customers c ON c.id = o.customer_id",
         "CREATE FUNCTION dbo.f_one() RETURNS int AS BEGIN RETURN 1 END",
         "@rows",
@@ -86,6 +94,7 @@ SEEDS: dict[str, list[str]] = {
         "CREATE TABLE VM.CUSTOMERS (ID INTEGER NOT NULL PRIMARY KEY, EMAIL VARCHAR(200), REGION VARCHAR(50), NOTE CLOB(1M), CREATED TIMESTAMP, BALANCE DECIMAL(12,2))",
         "CREATE TABLE VM.ORDERS (ID INTEGER NOT NULL PRIMARY KEY, CUSTOMER_ID INTEGER REFERENCES VM.CUSTOMERS(ID), TOTAL DECIMAL(12,2))",
         "CREATE INDEX VM.IX_ORDERS_CUSTOMER ON VM.ORDERS(CUSTOMER_ID)",
+        "CREATE UNIQUE INDEX VM.UX_CUSTOMERS_REGION_EMAIL ON VM.CUSTOMERS(REGION, EMAIL)",
         "CREATE VIEW VM.V_ORDERS AS SELECT O.ID, C.EMAIL, O.TOTAL FROM VM.ORDERS O JOIN VM.CUSTOMERS C ON C.ID = O.CUSTOMER_ID",
         "CREATE FUNCTION VM.F_ONE() RETURNS INTEGER LANGUAGE SQL RETURN 1",
         "@rows",
@@ -214,7 +223,15 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
     args = ap.parse_args()
     engine = args.engine
     password = Path(args.password_file).read_text(encoding="utf-8").strip()
-    record: dict[str, Any] = {"label": args.label, "engine": engine, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checks": []}
+    try:
+        import subprocess
+        probe_rev = subprocess.run(  # noqa: S603, S607 - staging-only evidence stamp
+            ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False
+        ).stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001
+        probe_rev = "unknown"
+    record: dict[str, Any] = {"label": args.label, "engine": engine, "probe_rev": probe_rev,
+                              "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checks": []}
 
     def check(name: str, fn: Any) -> Any:
         t0 = time.monotonic()
@@ -236,7 +253,21 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
             return None
 
     if not args.no_seed:
-        check("seed", lambda: seed(engine, args.host, args.port, args.database, args.user, password))
+        # Some images report ready a little before their admin password is
+        # usable (seen on gvenzl/oracle-xe:21 as ORA-01017 while the very
+        # next connection succeeded): retry the seed for up to 90 s.
+        def _seed_with_retry() -> str:
+            last: Exception | None = None
+            for _ in range(9):
+                try:
+                    return seed(engine, args.host, args.port, args.database, args.user, password)
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    time.sleep(10)
+            assert last is not None
+            raise last
+
+        check("seed", _seed_with_retry)
 
     os.environ["VM_USER"] = args.user
     body: dict[str, Any] = {"type": engine, "host": args.host, "port": args.port, "database": args.database,
@@ -252,37 +283,61 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
     t_customers = {"oracle": "VM_CUSTOMERS", "db2": "CUSTOMERS"}.get(engine, "customers")
     t_orders = {"oracle": "VM_ORDERS", "db2": "ORDERS"}.get(engine, "orders")
 
-    health = check("health_check", lambda: conn.health_check())
-    if health is not None:
-        record["server_version"] = health.server_version
-        record["session"] = health.session
-        if not health.healthy:
-            record["checks"].append({"check": "health_healthy", "status": "failed", "detail": health.detail})
-            record["healthy"] = False
-        else:
-            record["healthy"] = True
-    check("list_schemas", lambda: len(conn.list_schemas(None, None)))
+    def _health() -> Any:
+        h = conn.health_check()
+        record["server_version"] = h.server_version
+        record["session"] = h.session
+        if not h.healthy:
+            raise AssertionError(f"unhealthy: {h.detail}")
+        return h.server_version
+
+    record["healthy"] = check("health_check", _health) is not None
+    check("list_schemas", lambda: [x for x in conn.list_schemas(None, None) if x.lower() == schema.lower()][0])
     tables = check("list_tables", lambda: conn.list_tables(schema, {"table", "view"}, None)) or []
     check("list_tables_has_seed", lambda: [t.name for t in tables if t.name.lower() == t_customers.lower()][0])
     cols = check("list_columns", lambda: conn.list_columns(schema, t_customers)) or []
     check("list_columns_count", lambda: {"columns": len(cols), "expected": 6} if len(cols) == 6 else (_ for _ in ()).throw(AssertionError(f"{len(cols)} columns")))
-    check("list_all_columns", lambda: len(conn.list_all_columns(schema)))
+    def _bulk() -> int:
+        n = len([c for c in conn.list_all_columns(schema) if c.table.lower() in (t_customers.lower(), t_orders.lower())])
+        assert n == 9, f"{n} columns across the two seeded tables, expected 9"
+        return n
+    check("list_all_columns", _bulk)
     idx = check("list_indexes", lambda: conn.list_indexes(schema, t_orders)) or []
     check("index_on_fk_visible", lambda: [i.name for i in idx if any(c.lower() == "customer_id" for c in i.columns)][0])
+    cidx = conn.list_indexes(schema, t_customers) if engine != "clickhouse" else []
     check("primary_key_visible", lambda: [i.name for i in conn.list_indexes(schema, t_customers) if i.primary][0])
+    if engine == "clickhouse":
+        record["checks"].append({"check": "composite_unique_index", "status": "skipped", "ms": 0,
+                                 "detail": "ClickHouse has no unique indexes"})
+    else:
+        check("composite_unique_index", lambda: [i.name for i in cidx if i.unique and not i.primary
+                                                  and [c.lower() for c in i.columns] == ["region", "email"]][0])
     if engine == "clickhouse":
         record["checks"].append({"check": "get_foreign_keys", "status": "skipped", "ms": 0,
                                  "detail": "ClickHouse has no foreign keys; the connector reports none"})
     else:
         check("get_foreign_keys", lambda: [k.ref_table for k in conn.get_foreign_keys(schema, t_orders)][0])
-    check("list_views", lambda: [v.name for v in conn.list_views(schema)][0])
-    check("list_routines", lambda: len(conn.list_routines(schema)))
-    check("get_statistics", lambda: conn.get_statistics(schema, t_customers))
+    check("list_views", lambda: [v.name for v in conn.list_views(schema) if "orders" in v.name.lower()][0])
+    seed_note = next((c["detail"] for c in record["checks"] if c["check"] == "seed"), "") or ""
+    if engine == "clickhouse" or "routine skipped" in seed_note:
+        record["checks"].append({"check": "list_routines", "status": "skipped", "ms": 0,
+                                 "detail": "no routine seeded on this engine/version"})
+    else:
+        check("list_routines", lambda: [r.name for r in conn.list_routines(schema) if "one" in r.name.lower()][0])
+    check("get_statistics", lambda: conn.get_statistics(schema, t_customers)["row_estimate_source"])
     q = conn.quote_identifier
     qualified = f"{q(schema)}.{q(t_customers)}"
-    check("execute_query_count", lambda: conn.execute_query(QuerySpec(sql=f"SELECT COUNT(*) FROM {qualified}", max_rows=5)).rows[0][0])
+    def _count() -> int:
+        n = int(conn.execute_query(QuerySpec(sql=f"SELECT COUNT(*) FROM {qualified}", max_rows=5)).rows[0][0])  # noqa: S608
+        assert n == 300, f"COUNT(*) = {n}, expected 300"
+        return n
+    check("execute_query_count", _count)
     sample_sql = conn.build_sample_query(schema, t_customers, [c.name for c in cols], 200)
-    check("sample_query", lambda: len(conn.execute_query(QuerySpec(sql=sample_sql, max_rows=200)).rows))
+    def _sample() -> int:
+        n = len(conn.execute_query(QuerySpec(sql=sample_sql, max_rows=200)).rows)
+        assert n == 200, f"sample returned {n} rows, expected 200"
+        return n
+    check("sample_query", _sample)
     select_list, layout = aggregate_select_list(cols, engine, conn.quote_identifier, conn.length_function())
     def _profile() -> Any:
         out = conn.execute_query(QuerySpec(sql=f"SELECT {select_list} FROM ({sample_sql}) s", max_rows=1))
@@ -292,13 +347,21 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
         return {"rows": total, "region_distinct": region.distinct, "region_null_ratio": region.null_ratio}
     check("profile_aggregate", _profile)
     region_col = next((c.name for c in cols if c.name.lower() == "region"), "region")
-    check("top_values", lambda: conn.execute_query(QuerySpec(sql=conn.build_top_values_query(sample_sql, region_col, 3), max_rows=3)).rows)
+    def _top() -> Any:
+        rows = conn.execute_query(QuerySpec(sql=conn.build_top_values_query(sample_sql, region_col, 3), max_rows=3)).rows
+        assert sorted(str(r[0]) for r in rows) == ["north", "south"], rows
+        return rows
+    check("top_values", _top)
     email_col = next((c.name for c in cols if c.name.lower() == "email"), "email")
     where = f"LOWER({q(email_col)}) LIKE {conn.placeholder(1)}"
     check("value_search_like", lambda: conn.execute_query(QuerySpec(
         sql=conn.build_search_query(schema, t_customers, [c.name for c in cols[:3]], where, 5),
         parameters=conn.pack_parameters(["%user12%"]), max_rows=5)).rows[0])
-    check("explain", lambda: conn.explain(f"SELECT * FROM {qualified}", False))
+    def _explain() -> Any:
+        plan = conn.explain(f"SELECT * FROM {qualified}", False)  # noqa: S608
+        assert isinstance(plan, dict) and plan, "explain returned no plan"
+        return list(plan)[:3]
+    check("explain", _explain)
     record["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     failed = [c["check"] for c in record["checks"] if c["status"] == "failed"]
     record["summary"] = {"passed": sum(1 for c in record["checks"] if c["status"] == "passed"), "failed": failed}

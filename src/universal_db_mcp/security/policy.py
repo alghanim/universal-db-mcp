@@ -32,6 +32,8 @@ class EffectivePolicy:
     default_deny_objects: bool
     allowed_system_schemas: frozenset[str]
     sample_limit: int
+    profile_max_sample_rows: int
+    discovery_time_budget_seconds: float
     require_tls: bool
     audit_sql_text: bool
     audit_parameter_values: bool
@@ -61,6 +63,8 @@ class EffectivePolicy:
             default_deny_objects=security.default_deny_objects,
             allowed_system_schemas=frozenset(s.lower() for s in security.allowed_system_schemas),
             sample_limit=security.sample_limit,
+            profile_max_sample_rows=security.profile_max_sample_rows,
+            discovery_time_budget_seconds=security.discovery_time_budget_seconds,
             require_tls=require_tls,
             audit_sql_text=security.audit_sql_text,
             audit_parameter_values=security.audit_parameter_values,

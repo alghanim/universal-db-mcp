@@ -35,8 +35,10 @@ Notes:
   `docs/oracle-connect-modes.md`. The Instant Client is Oracle-licensed and
   administrator-supplied, never shipped in our artifacts, and
   `init_oracle_client()` is process-global so the config refuses mixing thick
-  and thin oracle connections. Live thick-mode round trip: `not_run` (no Instant
-  Client on the staging host).
+  and thin oracle connections. Live thick-mode round trip: **passed** against
+  an Oracle 18c account carrying only the 10G verifier and against Oracle
+  11.2 (`test-evidence/oracle-thick-mode/`), with the administrator-supplied
+  Instant Client loaded in a no-network container.
 - **Db2 for z/OS and Db2 for i are not implemented**; catalog SQL, licensing,
   and binding requirements differ.
 - **Db2 status (root cause corrected 2026-09-15):** Gate C and every
@@ -77,18 +79,19 @@ Notes:
 
 ## Server version floors (pinned drivers, 2026-09-15 audit)
 
-The driver, not our SQL, is usually the binding constraint. Nothing below was
-run against an old server: our fixtures pin the newest release of each engine,
-so these are documented floors, not tested ones.
+The driver, not our SQL, is usually the binding constraint. The "tested" column
+comes from `test-evidence/version-matrix/` (the exact per-image results, with
+the probe revision, are in the ledger's matrix table); everything else is a
+documented floor, not a tested one.
 
-| Engine | Floor | Source of the limit |
-|---|---|---|
-| PostgreSQL | 10 | psycopg 3 supports 10-18. `pg_proc.prokind` is 11+, so `db_list_routines` falls back to a pre-11 query. |
-| MySQL / MariaDB | MySQL 5.7, MariaDB 10.3 | PyMySQL's stated range. Our catalog SQL uses `information_schema` only and is portable across it. |
-| ClickHouse | actively supported releases | clickhouse-connect 1.7.0 removed its compatibility branches for servers older than 25.8; older servers may work but are outside the driver's support. |
-| Oracle | Thin 12.1, Thick 11.2 | python-oracledb. Sampling uses `ROWNUM`, not the 12c-only `FETCH FIRST`, so the Thick-mode floor is genuinely reachable. |
-| SQL Server | 2017 | Microsoft lists only 2017/2019/2022/2025 for ODBC Driver 18. Our catalog SQL itself is portable back to 2012. |
-| **IBM Db2 LUW** | **11.1** | ibm_db 3.2.7+ bundles clidriver 12.1, which supports LUW 12.1/11.5/11.1 and **drops 10.5**. A 10.5 server is not reachable with this pin. |
+| Engine | Documented floor | Tested (version matrix) | Source of the limit |
+|---|---|---|---|
+| PostgreSQL | 10 | 12, 13, 14, 15, 16, 17 | psycopg 3 supports 10-18. `pg_proc.prokind` is 11+, so `db_list_routines` falls back to a pre-11 query. |
+| MySQL / MariaDB | MySQL 5.7, MariaDB 10.3 | MySQL 5.7, 8.0, 8.4; MariaDB 10.6, 11.4 | PyMySQL's stated range. Our catalog SQL uses `information_schema` only. |
+| ClickHouse | actively supported releases | 23.8, 24.3, 24.8, 25.3 | clickhouse-connect 1.7.0 removed compatibility branches for servers older than 25.8; the tested older servers pass the probed subset. |
+| Oracle | Thin 12.1, Thick 11.2 | Thin: 18.4, 21.3, 23; Thin on 11.2 fails as documented (DPY-3010); Thick: see the ledger table | python-oracledb. Sampling uses `ROWNUM`, not the 12c-only `FETCH FIRST`. |
+| SQL Server | 2017 | 2017, 2019, 2022 | Microsoft lists only 2017/2019/2022/2025 for ODBC Driver 18. |
+| **IBM Db2 LUW** | **11.1** | 11.5.8, 11.5.9 (11.1: `not_run`) | ibm_db 3.2.7+ bundles clidriver 12.1, which supports LUW 12.1/11.5/11.1 and **drops 10.5**. |
 
 Least-privilege accounts also hit catalog-visibility rules that are not
 connection errors:
@@ -120,14 +123,14 @@ integration status in the table above is unaffected.
 | clickhouse-connect | yes | yes | yes | none |
 | oracle (oracledb, Thin + opt-in Thick) | yes | yes | yes | thick mode: Instant Client (admin-supplied, not shipped) |
 | mssql (pyodbc) | yes (+ .deb closure) | yes | yes | msodbcsql18: .deb shipped in bundle / MSI admin-supplied on Windows / .pkg admin-supplied on macOS |
-| db2 (ibm-db) | yes | yes | **yes** (`macosx_14_0_arm64`) | clidriver bundled in wheel; round-trip unverified on ALL platforms |
+| db2 (ibm-db) | yes | yes | **yes** (`macosx_14_0_arm64`) | clidriver bundled in wheel; round-trip passed on Db2 11.5.8/11.5.9 (version matrix) and the local 11.5.9 fixture |
 
 Notes on this table:
 
 - **ibm-db on macOS arm64:** the 3.2.9 release ships a `macosx_14_0_arm64`
   wheel, so the connector rides in the macOS wheelhouse. This corrects an
   earlier assumption that Db2 was Linux/Windows-only. The runtime round-trip
-  (Gate C) remains `blocked`/unverified on **all** platforms — including
+  (Gate C) resolved 2026-09-15 (credentials were never sent); see the Db2 status note above
   Linux amd64 — per the Db2 note above; arm64 availability does not change
   that.
 - **msodbcsql18 is an OS-level driver, not a Python wheel.** The bundle

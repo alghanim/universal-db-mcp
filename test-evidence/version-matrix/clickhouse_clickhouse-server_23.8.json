@@ -1,30 +1,30 @@
 {
   "label": "clickhouse/clickhouse-server:23.8",
   "engine": "clickhouse",
-  "started_utc": "2026-09-16T19:29:14Z",
+  "started_utc": "2026-09-16T19:42:51Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 112,
+      "ms": 134,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 5,
-      "detail": "HealthInfo(healthy=True, server_version='23.8.16.16', latency_ms=5, detail=None, checked_at=1789586954.572402, session={'engine': 'clickhouse', 'isolation': None, 'lock_timeout_seconds': 5.0, 'stateme"
+      "ms": 8,
+      "detail": "HealthInfo(healthy=True, server_version='23.8.16.16', latency_ms=8, detail=None, checked_at=1789587771.6949708, session={'engine': 'clickhouse', 'isolation': None, 'lock_timeout_seconds': 5.0, 'statem"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 3,
+      "ms": 8,
       "detail": "5"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 4,
+      "ms": 5,
       "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(system.tables.total_rows)', comment=None), TableSummary(schema='vm', name='orders', k"
     },
     {
@@ -36,7 +36,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='vm', table='customers', name='email', data_type='S"
     },
     {
@@ -48,13 +48,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "12"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 2,
+      "ms": 4,
       "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
     },
     {
@@ -66,19 +66,19 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 2,
+      "ms": 4,
       "detail": "(sorting key)"
     },
     {
       "check": "get_foreign_keys",
-      "status": "failed",
+      "status": "skipped",
       "ms": 0,
-      "detail": "IndexError: list index out of range"
+      "detail": "ClickHouse has no foreign keys; the connector reports none"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "v_orders"
     },
     {
@@ -90,31 +90,31 @@
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': 300, 'row_estimate_source': 'catalog_estimate(system.tables)', 'total_bytes': '4.86 KiB'}"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 4,
+      "ms": 7,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 4,
+      "ms": 9,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 6,
+      "ms": 9,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 4,
+      "ms": 6,
       "detail": "[['north', 67], ['south', 67]]"
     },
     {
@@ -151,11 +151,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T19:29:14Z",
+  "finished_utc": "2026-09-16T19:42:51Z",
   "summary": {
     "passed": 20,
-    "failed": [
-      "get_foreign_keys"
-    ]
+    "failed": []
   }
 }

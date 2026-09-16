@@ -39,3 +39,11 @@ on any unapproved outbound attempt even if the firewall blocked it.
 
 Each gate run must write JSON into `test-evidence/<gate>/` — no claims
 without a recorded run.
+
+## Discovery, session safety and version matrix (added 2026-09-16)
+
+| Run | Command | Pass criterion | Evidence |
+|---|---|---|---|
+| Session safety | `test-evidence/session-safety/results.txt` is produced by the probe script recorded in it, against the local fixtures | every engine `healthy=True` with a `server_reports` block; PostgreSQL, MySQL and ClickHouse refuse `CREATE TABLE`; a Db2 `db_query` reads back `UR` | `test-evidence/session-safety/` |
+| Discovery tools | live run of `db_get_catalog`, `db_list_indexes`, `db_profile_table`, `db_infer_relationships`, `db_search_values` through `build_server` against the local fixtures | no tool raises on any fixture engine; search completes within its budget | `test-evidence/discovery-tools/` |
+| Version matrix | `scripts/version_matrix/run.sh light|heavy`, `run_mssql.sh`, `run_oracle_thick.sh`; table via `summarize.py` | per image: every check `passed` or `skipped` with a stated design reason; any `failed` is recorded as such in the ledger, never as `not_run` | `test-evidence/version-matrix/*.json` (`probe_rev` names the probe revision) |

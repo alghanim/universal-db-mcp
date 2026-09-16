@@ -62,15 +62,38 @@ says otherwise. Read this before upgrading a production site.
 | ClickHouse | `readonly=1` on every request | no (server rejects writes and `SETTINGS` overrides instead) |
 | all | lock-wait ceiling 5 s; statement ceiling = `security.hard_query_timeout_seconds`; a named session | no (best-effort, recorded as `skipped`) |
 
-What can turn a working connection into a refused one:
+What changes for an existing deployment, precisely:
 
-- a MySQL/MariaDB account that cannot run `SET SESSION TRANSACTION READ ONLY`
-  (older than MySQL 5.6.5 / MariaDB 10.0);
-- a PostgreSQL role whose `default_transaction_read_only` was pinned with
-  `ALTER ROLE ... SET` (the session `SET` is still accepted, but verify);
-- a Db2 account that cannot change `CURRENT ISOLATION`, or a Db2 for z/OS or
-  i target (not supported by this build anyway);
-- a SQL Server database that disallows `READ UNCOMMITTED` through policy.
+1. **Scope.** Every connection with `read_only: true` (the default) gets the
+   profile with no config change.
+2. **Fail-closed settings.** PostgreSQL and MySQL/MariaDB server-side
+   read-only, and Db2/SQL Server isolation. A refusal surfaces as
+   `CONNECTION_ERROR: could not apply the session <setting> on connection
+   '<id>' ...; refusing to run at the server's default level`. None of these
+   statements needs a privilege on a supported version; the realistic
+   refusals are a MySQL older than 5.6.5 or MariaDB older than 10.0 (no
+   `READ ONLY` transactions) and a proxy that rejects session `SET`s.
+3. **Semantics.** Db2 `UR` and SQL Server `READ UNCOMMITTED` return rows
+   other transactions have not committed. Consumers who need committed reads
+   (finance reconciliation, audit) must set `session.isolation: cs` /
+   `read_committed` and accept the locking that comes with it.
+4. **New server-side timeouts.** Statements are now cancelled by the server
+   at `security.hard_query_timeout_seconds` (`statement_timeout`,
+   `max_execution_time` / `max_statement_time`, `QUERYTIMEOUT`,
+   `call_timeout`, the ODBC query timeout), and a 5 s lock ceiling means a
+   PostgreSQL `SELECT` queued behind an `ACCESS EXCLUSIVE` lock (an `ALTER`,
+   a `VACUUM FULL`) errors instead of waiting.
+5. **Connection poolers.** Behind PgBouncer in transaction/statement mode or
+   ProxySQL multiplexing, a session `SET` lands on one backend while later
+   statements run on another: the profile reports `read_only_enforced: true`
+   but is not in effect. Use session pooling, or point the server at the
+   database directly.
+6. **Read-back gaps.** MariaDB 10.6 and older cannot read back the
+   read-only or isolation variables (`read_only_verified: null`).
+7. **Session identity.** Sessions now appear as `udbmcp:<connection id>` in
+   `pg_stat_activity`, `v$session`, `sys.dm_exec_sessions` and Db2
+   `LIST APPLICATIONS`; monitoring allowlists may need the new name.
+8. **Tool output.** `db_test_connection` gained a `session` block.
 
 Before upgrading, run the new build's `udbmcp doctor` against the current
 config: it prints the resolved profile per connection (`session-<id>`

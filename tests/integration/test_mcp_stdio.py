@@ -38,6 +38,11 @@ EXPECTED_TOOLS = {
     "db_sample_table",
     "db_explain",
     "db_get_query_history",
+    "db_list_indexes",
+    "db_get_catalog",
+    "db_profile_table",
+    "db_search_values",
+    "db_infer_relationships",
 }
 
 

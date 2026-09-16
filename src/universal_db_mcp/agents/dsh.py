@@ -86,7 +86,7 @@ _PLAIN_SCALAR_SAFE = re.compile(r"[A-Za-z0-9_@/.\- ]+")
 
 _REGISTRATION_BLOCK_TEMPLATE = (
     "# Universal Database MCP server (air-gapped local build), registered by\n"
-    "# 'universal_db_mcp configure-agents'. Its 20 tools appear to the model as\n"
+    "# 'universal_db_mcp configure-agents'. Its 25 tools appear to the model as\n"
     "# mcp__udb__<tool_name>.\n"
     "- insert:\n"
     "    - id: mcp-universal-db\n"

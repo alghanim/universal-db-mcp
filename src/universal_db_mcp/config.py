@@ -383,6 +383,12 @@ class SecurityConfig(StrictModel):
     default_deny_objects: bool = True
     allowed_system_schemas: list[str] = Field(default_factory=lambda: ["information_schema"])
     sample_limit: int = Field(default=20, gt=0)
+    # Discovery ceilings (db_profile_table / db_search_values): rows a profile
+    # may scan, and the wall-clock budget one discovery call may spend across
+    # all the statements it issues. Every statement is also bounded by the
+    # query timeout above.
+    profile_max_sample_rows: int = Field(default=50_000, ge=100, le=1_000_000)
+    discovery_time_budget_seconds: float = Field(default=60.0, ge=5, le=900)
     audit_sql_text: bool = False
     audit_parameter_values: bool = False
     audit_result_rows: bool = False

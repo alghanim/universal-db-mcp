@@ -37,7 +37,10 @@ scripts/install_offline.sh out/bundle/universal-db-mcp-*/ /opt/universal-db-mcp
 | --- | --- |
 | `docs/architecture.md` | components, data flow, process boundaries |
 | `docs/security.md` | threat model, policy, secrets, TLS |
-| `docs/tools.md` | MCP tool contract and value representations |
+| `docs/tools.md` | MCP tool contract (25 `db_*` tools incl. discovery for federated ETL/docs/optimization) |
+| `docs/session-safety.md` | what every connection does to the server session so agent reads cannot hurt production (Db2 UR, server-side read-only, ceilings) |
+| `docs/oracle-connect-modes.md` | Oracle thick mode (legacy password verifiers), SID and TNS alias connections, TLS |
+| `docs/db2-tls-setup.md` | Db2 TLS enablement runbook |
 | `docs/driver-matrix.md` | per-engine driver/native-dep/test-status matrix |
 | `docs/offline-build.md` | Stage A: bundle preparation on the staging machine |
 | `docs/offline-deployment.md` | Stage B: install inside the air gap |
@@ -47,3 +50,4 @@ scripts/install_offline.sh out/bundle/universal-db-mcp-*/ /opt/universal-db-mcp
 | `docs/adding-connectors.md` | how to add an engine adapter |
 | `docs/troubleshooting.md` | common failures and doctor output |
 | `IMPLEMENTATION_STATUS.md` | honest implemented/tested/blocked ledger |
+| `scripts/version_matrix/` | per-server-version compatibility runs; results in `test-evidence/version-matrix/` |

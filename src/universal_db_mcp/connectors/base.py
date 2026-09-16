@@ -191,11 +191,22 @@ class DatabaseConnector(ABC):
         report = self.session_profile.as_dict()
         report["applied"] = list(self.session_status["applied"])
         report["skipped"] = list(self.session_status["skipped"])
+        # enforced: the engine has a session switch and the SET was accepted.
         report["read_only_enforced"] = bool(
             self.session_profile.enforce_read_only
             and self.session_profile.server_read_only_available
             and any(a.startswith("read_only") for a in self.session_status["applied"])
         )
+        # verified: the SERVER read back a read-only value (True/False), or
+        # None when it offers nothing to read back (e.g. MariaDB <= 10.6).
+        verified: bool | None = None
+        if readback and "read_only" in readback:
+            verified = str(readback["read_only"]).strip().lower() in ("on", "1", "true", "yes")
+        elif readback and "readonly" in readback:
+            verified = str(readback["readonly"]).strip() == "1"
+        elif readback and "query_only" in readback:
+            verified = str(readback["query_only"]).strip() in ("1", "on")
+        report["read_only_verified"] = verified
         if readback:
             report["server_reports"] = readback
         return report

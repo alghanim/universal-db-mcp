@@ -174,3 +174,52 @@ def test_test_connection_reports_the_session_profile(server: Any) -> None:
     assert data["healthy"] is True
     assert data["session"]["read_only_enforced"] is True
     assert "read_only" in data["session"]["applied"]
+
+
+# ------------------------------------------------- security review follow-ups (2026-09-16)
+def test_profile_sample_is_capped_by_policy(tmp_path: Path) -> None:
+    db = tmp_path / "shop2.db"
+    _seed(db)
+    cfg = tmp_path / "c2.yaml"
+    cfg.write_text(
+        "application:\n  transport: stdio\n"
+        f"  audit_path: {tmp_path / 'a.jsonl'}\n  metadata_cache_path: {tmp_path / 'm.sqlite'}\n"
+        "security:\n  profile_max_sample_rows: 100\n  discovery_time_budget_seconds: 5\n"
+        f"connections:\n  shop:\n    type: sqlite\n    database: {db}\n",
+        encoding="utf-8",
+    )
+    app_cfg, resolved = load_resolved(cfg)
+    srv = build_server(AppContext(app_cfg, resolved))
+    data = _call(srv, "db_profile_table", {"connection_id": "shop", "object_name": "customers"})["data"]
+    assert data["sample"]["rows"] == 100, "the default sample must respect security.profile_max_sample_rows"
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    with pytest.raises(ToolError, match="profile_max_sample_rows"):
+        _call(srv, "db_profile_table", {"connection_id": "shop", "object_name": "customers", "sample_rows": 5000})
+
+
+def test_non_finite_numeric_query_is_harmless(server: Any) -> None:
+    for q in ("inf", "nan", "1e400"):
+        data = _call(server, "db_search_values", {"query": q, "match": "exact"})["data"]
+        assert data["hits"] == []
+
+
+def test_foreign_key_targets_outside_the_allowlist_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    from universal_db_mcp.config import ConnectionConfig, ResolvedConnection, SecurityConfig
+
+    monkeypatch.setenv("U", "app_ro")
+    from universal_db_mcp.connectors.base import KeyInfo
+    from universal_db_mcp.security.policy import EffectivePolicy
+    from universal_db_mcp.server import _redact_foreign_target
+
+    cfg = ConnectionConfig.model_validate(
+        {"type": "postgres", "host": "h", "database": "d", "username_env": "U", "allowed_schemas": ["app"]}
+    )
+    policy = EffectivePolicy.build(SecurityConfig(), ResolvedConnection("c", cfg))
+    hidden = KeyInfo(kind="foreign_key", name="fk", columns=["customer_id"], ref_schema="secret",
+                     ref_table="customers", ref_columns=["id"])
+    visible = KeyInfo(kind="foreign_key", name="fk2", columns=["order_id"], ref_schema="app",
+                      ref_table="orders", ref_columns=["id"])
+    assert _redact_foreign_target(policy, hidden)["ref_table"] == "<not permitted>"
+    assert _redact_foreign_target(policy, hidden)["columns"] == ["customer_id"]
+    assert _redact_foreign_target(policy, visible)["ref_table"] == "orders"

@@ -144,7 +144,9 @@ def _session_check(name: str, conn: ConnectionConfig) -> dict[str, Any]:
     else:
         parts.append("read-only=SQL guard only")
     parts.append(
-        f"lock_timeout={s.lock_timeout_seconds}s" if s.lock_timeout_seconds is not None else "lock_timeout=server default"
+        f"lock_timeout={s.lock_timeout_seconds}s"
+        if s.lock_timeout_seconds is not None
+        else "lock_timeout=server default"
     )
     parts.append("statement_timeout=policy" if s.statement_timeout_from_policy else "statement_timeout=none")
     enforced = [x for x in (isolation if conn.type in ("db2", "mssql") else None,

@@ -78,9 +78,17 @@ without hand-written queries, then document or extract from them:
 5. `db_list_indexes` supports the optimization pass directly.
 
 What they never do: read table data for the catalog or inference tools,
-return values of columns matching `security.mask_columns`, search or profile
-system catalogs unless asked (`include_system`), or run outside the policy's
-row, byte and time ceilings.
+return values of columns matching `security.mask_columns`, search or infer
+across system catalogs unless asked (`include_system` on `db_search_values`
+and `db_infer_relationships`; profiling takes one named object), or run
+outside the policy's row, byte and time ceilings
+(`security.profile_max_sample_rows`, `security.discovery_time_budget_seconds`
+and the query timeout). Evidence status: the findings rules are unit-tested
+on a seeded SQLite database; in the live fixture run
+(`test-evidence/discovery-tools/`) only ClickHouse held enough rows for the
+data-driven rules to fire, and the cross-connection inference produced
+same-connection relationships because the fixtures share no keys (the
+cross-connection path is unit-tested).
 
 ## Value representation
 

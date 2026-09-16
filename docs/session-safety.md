@@ -7,25 +7,33 @@ It exists because an agent that forgets `WITH UR` on Db2, or that runs a long
 scan under READ COMMITTED on SQL Server, can hold locks on production tables
 and queue behind writers. The profile makes that impossible to forget.
 
-`db_test_connection` reads the profile back from the server and reports it,
-so the protection is verified on every check rather than assumed.
+`db_test_connection` applies the profile, then reads back what the server
+reports and returns both. Two flags summarize it: `read_only_enforced` means
+the engine has a session-wide switch and the SET was accepted;
+`read_only_verified` is what the server itself answered (true/false), or
+null when the server offers nothing to read back (MariaDB 10.6 and older
+expose neither the read-only nor the isolation variable). The read-back is
+reported for the operator to compare; the server does not re-check it.
 
 ## What is applied, per engine
 
 | Engine | Isolation (read-only default) | Server-side read-only | Lock-wait ceiling | Statement ceiling | Session identity |
 |---|---|---|---|---|---|
-| **Db2** | `UR` via `SET CURRENT ISOLATION` (**enforced**) | none exists; the SQL guard enforces | `SET CURRENT LOCK TIMEOUT` | CLI `QUERYTIMEOUT` | `CLIENTAPPLNAME` (`LIST APPLICATIONS`, `MON_GET_CONNECTION`) |
+| **Db2** | `UR` via `SET CURRENT ISOLATION` (**enforced**) | none exists; the SQL guard enforces | `SET CURRENT LOCK TIMEOUT` | CLI `QUERYTIMEOUT` DSN keyword (not listed under `applied`, not read back) | `CLIENTAPPLNAME` (`LIST APPLICATIONS`, `MON_GET_CONNECTION`) |
 | **SQL Server** | `READ UNCOMMITTED` via `SET TRANSACTION ISOLATION LEVEL` (**enforced**) | none exists; the SQL guard enforces | `SET LOCK_TIMEOUT` | driver query timeout | `APP=` (`sys.dm_exec_sessions.program_name`) |
 | **PostgreSQL** | server default (readers never block writers) | `SET default_transaction_read_only = on` (**enforced**) | `SET lock_timeout` | `SET statement_timeout` | `application_name` (`pg_stat_activity`) |
 | **MySQL / MariaDB** | server default (InnoDB consistent reads) | `SET SESSION TRANSACTION READ ONLY` (**enforced**) | `innodb_lock_wait_timeout`, `lock_wait_timeout` | `max_execution_time` (MariaDB: `max_statement_time`) | `program_name` connection attribute |
 | **Oracle** | server default (readers never block writers) | none exists; the SQL guard enforces | not applicable | driver `call_timeout` | `module`, `action`, `client_identifier` (`v$session`) |
-| **ClickHouse** | not applicable | `readonly=1` on every request (**enforced**) | not applicable | `max_execution_time` | `client_name` (`system.query_log`) |
+| **ClickHouse** | not applicable | `readonly=1` sent with every request (applied, read back as `readonly=1`; there is no connect-time refusal path) | not applicable | `max_execution_time` | `client_name` (`system.query_log`) |
 | **SQLite** | not applicable | read-only URI + `PRAGMA query_only` (**enforced**) | `PRAGMA busy_timeout` | policy cancel | not applicable |
 
 **Enforced** means a server that refuses the setting fails the connection
-with a clear message instead of silently running at the default level. The
-ceilings and the identity are best-effort: an old server that lacks a
-variable is recorded under `skipped` in the `db_test_connection` report.
+with a clear message instead of silently running at the default level. That
+also means an upgrade can turn a previously working connection into a
+refused one; `docs/offline-upgrade-rollback.md` lists the cases and the
+per-connection opt-outs. The ceilings and the identity are best-effort: an
+old server that lacks a variable is recorded under `skipped` in the
+`db_test_connection` report.
 
 ## The Db2 and SQL Server trade-off
 
@@ -103,8 +111,14 @@ false by design, and the SQL guard is the write enforcement.
 
 ## Evidence
 
-`test-evidence/session-safety/` records the live read-back on PostgreSQL 17,
-MySQL 9.7, ClickHouse 26, Oracle 23ai and Db2 11.5.9, including the
-server-side refusal of a `CREATE TABLE` on the engines that enforce
-read-only. SQL Server is covered by the version matrix
-(`test-evidence/version-matrix/`).
+`test-evidence/session-safety/results.txt` records the live read-back on
+PostgreSQL 17, MySQL 9.7, ClickHouse 26, Oracle Database Free 23.26 (its
+banner reads "Oracle AI Database 26ai Free") and Db2 11.5.9, plus the
+server-side refusal of a `CREATE TABLE` on PostgreSQL, MySQL and ClickHouse
+(SQLite's read-only is the `mode=ro` URI plus `PRAGMA query_only`, read
+back, with no separate refusal probe). SQL Server evidence is the
+`session` block of `test-evidence/version-matrix/mcr.microsoft.com_mssql_server_{2017,2019,2022}-latest.json`:
+isolation `read_uncommitted`, lock timeout and application name read back
+from `sys.dm_exec_sessions`. Not evidenced anywhere: a write refusal on SQL
+Server (none exists at session level) and a live fail-closed negative
+(unit-tested with driver fakes for PostgreSQL, MySQL, SQL Server and Db2).
