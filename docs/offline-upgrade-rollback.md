@@ -59,7 +59,7 @@ says otherwise. Read this before upgrading a production site.
 | SQL Server (read-only connections) | `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` | yes |
 | PostgreSQL | `SET default_transaction_read_only = on` | yes |
 | MySQL / MariaDB | `SET SESSION TRANSACTION READ ONLY` | yes |
-| ClickHouse | `readonly=1` on every request | no (server rejects writes and `SETTINGS` overrides instead) |
+| ClickHouse | `readonly=1` pinned on the client after reading the account's server profile; accounts already at `readonly=1`/`2` keep their stricter profile | yes, only when a writable account refuses the setting (never for read-only profiles) |
 | all | lock-wait ceiling 5 s; statement ceiling = `security.hard_query_timeout_seconds`; a named session | no (best-effort, recorded as `skipped`) |
 
 What changes for an existing deployment, precisely:
@@ -115,6 +115,27 @@ connections:
 
 The SQL guard remains the write enforcement in every configuration; these
 settings only change what the server session does around it.
+
+Other behavior changes in the same release (2026-09-16):
+
+- **Db2 `WITH RS` / `WITH RR` are refused** on read-only connections
+  (`POLICY_VIOLATION`): both hold locks for the statement, which is exactly
+  what the `UR` session exists to prevent. `WITH UR`, `WITH CS`,
+  `FOR READ ONLY`/`FOR FETCH ONLY` and `OPTIMIZE FOR n ROWS` are accepted
+  and stripped before the guard parses the statement.
+- **Whole-connection `db_get_catalog` and `db_list_indexes` hide system
+  catalogs** (Oracle dictionary views and `SYS*` owners, Db2 `SYSCAT`/`SYSIBM`,
+  `pg_catalog`, `information_schema`, ClickHouse `system`, ...) unless
+  `include_system: true` or a system schema is named explicitly. A tool
+  consumer that relied on those objects appearing in the first page must
+  now ask for them.
+- **`object_name` accepts `schema.table`** everywhere (a relaxation: those
+  names were denied before). A three-part `db.schema.table` name and a
+  `schema` argument that disagrees with the qualified name are validation
+  errors.
+- **`lock_timeout_seconds` reads back `null` on Oracle and ClickHouse**,
+  where no session-level lock-wait ceiling exists; previously the configured
+  number was echoed although nothing enforced it.
 
 ## Rollback
 

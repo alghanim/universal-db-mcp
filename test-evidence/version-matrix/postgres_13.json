@@ -1,7 +1,8 @@
 {
   "label": "postgres:13",
   "engine": "postgres",
-  "started_utc": "2026-09-16T19:25:25Z",
+  "probe_rev": "5d8ec4e",
+  "started_utc": "2026-09-16T20:32:52Z",
   "checks": [
     {
       "check": "seed",
@@ -13,13 +14,13 @@
       "check": "health_check",
       "status": "passed",
       "ms": 4,
-      "detail": "HealthInfo(healthy=True, server_version='PostgreSQL 13.23 (Debian 13.23-1.pgdg13+', latency_ms=4, detail=None, checked_at=1789586726.02443, session={'engine': 'postgres', 'isolation': None, 'lock_time"
+      "detail": "PostgreSQL 13.23 (Debian 13.23-1.pgdg13+"
     },
     {
       "check": "list_schemas",
       "status": "passed",
       "ms": 3,
-      "detail": "5"
+      "detail": "vm"
     },
     {
       "check": "list_tables",
@@ -49,7 +50,7 @@
       "check": "list_all_columns",
       "status": "passed",
       "ms": 1,
-      "detail": "12"
+      "detail": "9"
     },
     {
       "check": "list_indexes",
@@ -66,8 +67,14 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 0,
+      "ms": 1,
       "detail": "customers_pkey"
+    },
+    {
+      "check": "composite_unique_index",
+      "status": "passed",
+      "ms": 0,
+      "detail": "ux_customers_region_email"
     },
     {
       "check": "get_foreign_keys",
@@ -78,20 +85,20 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 0,
+      "ms": 1,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
       "status": "passed",
       "ms": 3,
-      "detail": "1"
+      "detail": "f_one"
     },
     {
       "check": "get_statistics",
       "status": "passed",
       "ms": 11,
-      "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': 0, 'row_estimate_source': 'catalog_estimate(pg_class.reltuples / pg_stat_user_tables)', 'last_analyze': None, 'note': 'estimates; freshness depen"
+      "detail": "catalog_estimate(pg_class.reltuples / pg_stat_user_tables)"
     },
     {
       "check": "execute_query_count",
@@ -120,14 +127,14 @@
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 4,
+      "ms": 3,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
       "ms": 2,
-      "detail": "{'raw': 'Seq Scan on customers  (cost=0.00..11.30 rows=130 width=596)'}"
+      "detail": "['raw']"
     }
   ],
   "server_version": "PostgreSQL 13.23 (Debian 13.23-1.pgdg13+",
@@ -146,6 +153,7 @@
     ],
     "skipped": [],
     "read_only_enforced": true,
+    "read_only_verified": true,
     "server_reports": {
       "read_only": "on",
       "statement_timeout": "1min",
@@ -155,9 +163,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T19:25:26Z",
+  "finished_utc": "2026-09-16T20:32:52Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }

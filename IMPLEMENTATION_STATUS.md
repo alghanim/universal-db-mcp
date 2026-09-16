@@ -395,6 +395,28 @@ Known and NOT fixed here, now documented rather than implied away:
   four engines in ~4 s. Two defects found and fixed by that live run:
   ClickHouse rejects `lower()`/`length()` on UUID and Enum (now cast), and
   system catalogs were being searched (now excluded by default).
+- **Correctness pass (2026-09-16, commit 5d8ec4e)**: an adversarial review
+  of the two batches above produced 20 findings, all applied and pinned by
+  `tests/unit/test_correctness_review_2026_09.py`; the regenerated live
+  evidence (`scripts/live_evidence.py`, now the recorded generator for
+  `test-evidence/session-safety/` and `test-evidence/discovery-tools/`)
+  then exposed five more defects that only real servers show, all fixed:
+  `schema.table` object names were denied on every engine ("qualify it
+  with an allowed schema" for an already qualified name), Db2 `SUBSTR`
+  raised SQL0138N on values shorter than the cut, ClickHouse rejected
+  `substring` on an Enum, Oracle rejected `COUNT(clob)`, and PostgreSQL's
+  `reltuples = -1` (never analyzed) was reported as a size. Whole-connection
+  catalog and index listings now hide system catalogs unless
+  `include_system` (an Oracle page was 50 dictionary views). ClickHouse
+  accounts whose server profile is already read-only are kept and reported
+  instead of failing every query with "cannot modify readonly". The Db2
+  guard refuses `WITH RS`/`WITH RR` (statement-scoped locks) and accepts
+  `WITH UR`/`WITH CS`. Evidence status of the session file after this pass:
+  five engines healthy with read-back, PostgreSQL/MySQL/ClickHouse refuse a
+  `CREATE TABLE` sent straight to the connector, Db2 reads back `UR` and a
+  lock timeout of 5 from its own connection and accepts a statement ending
+  in `WITH UR`; SQL Server is `healthy=False` natively (no ODBC driver on
+  the staging Mac) and proven only by the container matrix.
 - **Version matrix** (`scripts/version_matrix/`, evidence in
   `test-evidence/version-matrix/`): a probe that seeds a themed schema on
   any server version and drives every connector capability. Results so far:
