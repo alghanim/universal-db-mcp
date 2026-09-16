@@ -7,6 +7,7 @@ executor (worker threads + deadlines), never on the MCP event loop.
 
 from __future__ import annotations
 
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -165,12 +166,22 @@ class DatabaseConnector(ABC):
         # connecting; the outcome is recorded here and read back for
         # db_test_connection.
         self.session_profile: SessionProfile = resolve_session(connection, policy)
-        self.session_status: dict[str, list[str]] = {"applied": [], "skipped": []}
+        # Per-thread: a metadata connect on one thread must not interleave
+        # its applied/skipped lists with a health check on another.
+        self._session_tls = threading.local()
 
     # ---- session profile bookkeeping --------------------------------------
 
+    @property
+    def session_status(self) -> dict[str, list[str]]:
+        status = getattr(self._session_tls, "status", None)
+        if status is None:
+            status = {"applied": [], "skipped": []}
+            self._session_tls.status = status
+        return status
+
     def _session_reset(self) -> None:
-        self.session_status = {"applied": [], "skipped": []}
+        self._session_tls.status = {"applied": [], "skipped": []}
 
     def _session_applied(self, what: str) -> None:
         self.session_status["applied"].append(what)
@@ -203,7 +214,7 @@ class DatabaseConnector(ABC):
         if readback and "read_only" in readback:
             verified = str(readback["read_only"]).strip().lower() in ("on", "1", "true", "yes")
         elif readback and "readonly" in readback:
-            verified = str(readback["readonly"]).strip() == "1"
+            verified = str(readback["readonly"]).strip() in ("1", "2")  # 2 = server profile, stricter
         elif readback and "query_only" in readback:
             verified = str(readback["query_only"]).strip() in ("1", "on")
         report["read_only_verified"] = verified
@@ -285,9 +296,20 @@ class DatabaseConnector(ABC):
             out.extend(self.list_columns(t.schema, t.name))
         return out
 
-    def length_function(self) -> str:
-        """SQL function returning a string's character length."""
-        return "LENGTH"
+    def length_expression(self, quoted_column: str) -> str:
+        """Character (not byte) length of a string column."""
+        return f"LENGTH({quoted_column})"
+
+    def substring_expression(self, quoted_column: str, chars: int) -> str:
+        """The first ``chars`` characters of a string column."""
+        return f"SUBSTR({quoted_column}, 1, {int(chars)})"
+
+    def escape_like(self, needle: str) -> str:
+        """Make %, _ and the escape character literal in a LIKE value."""
+        return needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def like_predicate(self, expression: str, placeholder: str) -> str:
+        return f"{expression} LIKE {placeholder} ESCAPE '\\'"
 
     def text_expression(self, quoted_column: str, portable_name: str) -> str:
         """``quoted_column`` as something LOWER()/LIKE accept. Plain strings

@@ -4432,6 +4432,9 @@ class _CHFakeClient:
         self.params: dict = {}
         self._state = state
 
+    def set_client_setting(self, name: str, value: object) -> None:
+        self.params[name] = value
+
     def query(self, sql: str, parameters: object = None) -> _CHFakeResult:
         self._state["queries"].append((sql, parameters))
         self._state["query_id_seen"] = self.params.get("query_id")
@@ -6640,6 +6643,9 @@ def test_clickhouse_cell_truncation_sets_flag_and_names_column(monkeypatch) -> N
         def __init__(self) -> None:
             self.params: dict = {}
 
+        def set_client_setting(self, name: str, value: object) -> None:
+            self.params[name] = value
+
         def query(self, sql: str, parameters: object = None) -> _Res:
             return _Res([["x" * 20000]], ["big_text"])
 
@@ -6673,6 +6679,9 @@ async def test_db_query_envelope_reports_cell_truncation(tmp_path, monkeypatch) 
     class _Client:
         def __init__(self) -> None:
             self.params: dict = {}
+
+        def set_client_setting(self, name: str, value: object) -> None:
+            self.params[name] = value
 
         def query(self, sql: str, parameters: object = None) -> _Res:
             if sql.startswith("SELECT database, name, engine"):

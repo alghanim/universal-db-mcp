@@ -60,12 +60,20 @@ def portable_type(engine: str, data_type: str | None) -> PortableType:  # noqa: 
     p1 = params[0] if params else None
     p2 = params[1] if len(params) > 1 else None
 
-    # ClickHouse wraps everything: Nullable(T), LowCardinality(T)
+    # MySQL spells modifiers after the type: "int unsigned", "bigint unsigned zerofill"
+    if engine == "mysql":
+        for mod in (" unsigned", " zerofill"):
+            base = base.replace(mod, "")
+    # ClickHouse wraps everything, in either order: LowCardinality(Nullable(T))
     if engine == "clickhouse":
         inner = low
-        for wrapper in ("nullable(", "lowcardinality("):
-            while inner.startswith(wrapper):
-                inner = inner[len(wrapper):-1]
+        changed = True
+        while changed:
+            changed = False
+            for wrapper in ("nullable(", "lowcardinality("):
+                if inner.startswith(wrapper) and inner.endswith(")"):
+                    inner = inner[len(wrapper):-1]
+                    changed = True
         base = inner.split("(", 1)[0].strip()
         inner_match = _PARAMS.search(inner)
         params = _ints(inner_match.group(1)) if inner_match else []
@@ -101,7 +109,8 @@ def portable_type(engine: str, data_type: str | None) -> PortableType:  # noqa: 
             # string-like for comparisons, but length()/lower() reject it unless cast
             return PortableType("enum", "string")
         if base.startswith("ipv"):
-            return PortableType("string", "string")
+            # comparable as text only through toString(); lower()/length() reject it
+            return PortableType("inet", "string")
         return PortableType("other", "opaque")
 
     # integers
@@ -131,7 +140,10 @@ def portable_type(engine: str, data_type: str | None) -> PortableType:  # noqa: 
         # Oracle/Db2 large objects: string-like for the ETL vocabulary, but
         # DISTINCT/MIN/MAX and LOWER() reject them, so never aggregated or searched
         return PortableType("text", "lob")
-    if base in ("text", "ntext", "mediumtext", "longtext", "tinytext"):
+    if engine == "mssql" and base in ("text", "ntext"):
+        # legacy SQL Server LOB types: MIN/MAX/LEN/LOWER all reject them
+        return PortableType("text", "lob")
+    if base in ("text", "mediumtext", "longtext", "tinytext"):
         return PortableType("text", "string")
     if base in ("enum", "set"):
         return PortableType("string", "string")
@@ -156,8 +168,10 @@ def portable_type(engine: str, data_type: str | None) -> PortableType:  # noqa: 
         return PortableType("timestamp", "temporal")
     if base.startswith("timestamp"):
         return PortableType("timestamp", "temporal")
-    if base.startswith("interval") or base == "year":
-        return PortableType("other", "string")
+    if base.startswith("interval"):
+        return PortableType("other", "opaque")  # LENGTH()/LOWER() do not exist for it
+    if base == "year":
+        return PortableType("integer", "numeric")
     # binary and large objects
     if base in ("bytea", "blob", "mediumblob", "longblob", "tinyblob", "binary", "varbinary", "image", "raw",
                 "long raw", "bfile", "varbinary(max)"):

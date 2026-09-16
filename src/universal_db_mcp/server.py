@@ -1263,7 +1263,11 @@ def build_server(app: AppContext) -> MCPServer:
         return any(p.search(name) for p in policy.sensitive_patterns)
 
     async def _permitted_tables(
-        app_: AppContext, connector: DatabaseConnector, policy: EffectivePolicy, schema: str | None
+        app_: AppContext,
+        connector: DatabaseConnector,
+        policy: EffectivePolicy,
+        schema: str | None,
+        include_system: bool = True,
     ) -> list[Any]:
         tables = await app_.tables_for(policy, connector)
         if schema is not None:
@@ -1272,10 +1276,18 @@ def build_server(app: AppContext) -> MCPServer:
                     ErrorCategory.AUTHZ, f"schema '{schema}' is not permitted on connection '{policy.connection_id}'"
                 )
             tables = [t for t in tables if (t.schema or "").lower() == schema.lower()]
+        elif not include_system:
+            # A whole-connection listing is for the agent's own tables; Oracle's
+            # dictionary views and Db2's SYSCAT would otherwise fill the first
+            # pages (an explicitly named schema is always honoured)
+            tables = [t for t in tables if not is_system_object(policy.engine, t.schema, t.name)]
         return tables
 
     async def db_list_indexes(
-        connection_id: str, object_name: str | None = None, schema: str | None = None
+        connection_id: str,
+        object_name: str | None = None,
+        schema: str | None = None,
+        include_system: bool = False,
     ) -> dict[str, Any]:
         async with tool_span(app, "db_list_indexes", connection_id) as st:
             connector, policy = _require_engine(app, connection_id)
@@ -1283,9 +1295,15 @@ def build_server(app: AppContext) -> MCPServer:
                 schema2, name = await _resolve_object(app, connector, policy, schema, object_name)
                 indexes = await run_meta(app, connection_id, lambda c: c.list_indexes(schema2, name))
             else:
-                tables = await _permitted_tables(app, connector, policy, schema)
+                tables = await _permitted_tables(app, connector, policy, schema, include_system)
                 permitted = {((t.schema or "").lower(), t.name.lower()) for t in tables}
-                schemas = sorted({t.schema for t in tables if t.schema})[:_DISCOVERY_MAX_SCHEMAS]
+                all_schemas = sorted({t.schema for t in tables if t.schema})
+                schemas = all_schemas[:_DISCOVERY_MAX_SCHEMAS]
+                if len(all_schemas) > _DISCOVERY_MAX_SCHEMAS:
+                    st["warnings"].append(
+                        f"only the first {_DISCOVERY_MAX_SCHEMAS} of {len(all_schemas)} schemas were listed; "
+                        "pass schema to see the rest"
+                    )
                 indexes = []
                 for sch in schemas:
                     found = await run_meta(app, connection_id, _meta_call("list_indexes", sch, None))
@@ -1305,16 +1323,18 @@ def build_server(app: AppContext) -> MCPServer:
         connection_id: str,
         schema: str | None = None,
         include_indexes: bool = True,
+        include_system: bool = False,
         cursor: str | None = None,
         page_size: int = 50,
     ) -> dict[str, Any]:
         async with tool_span(app, "db_get_catalog", connection_id) as st:
             connector, policy = _require_engine(app, connection_id)
             size = max(1, min(int(page_size), 200))
-            tables = await _permitted_tables(app, connector, policy, schema)
+            tables = await _permitted_tables(app, connector, policy, schema, include_system)
             tables = sorted(tables, key=lambda t: ((t.schema or "").lower(), t.name.lower()))
             page, next_cursor = _page(
-                app, tables, cursor, kind="catalog", connection_id=connection_id, policy=policy, page_size=size
+                app, tables, cursor, kind=f"catalog:{schema or '*'}:{int(include_indexes)}:{int(include_system)}",
+                connection_id=connection_id, policy=policy, page_size=size,
             )
             by_schema: dict[str | None, dict[str, Any]] = {}
             for sch in sorted({t.schema for t in page}, key=lambda x: x or ""):
@@ -1427,7 +1447,8 @@ def build_server(app: AppContext) -> MCPServer:
             null_only = [c for c in all_cols if c.name in sensitive]
             sample_sql = connector.build_sample_query(schema2, name, [c.name for c in all_cols], requested)
             select_list, layout = aggregate_select_list(
-                profiled, policy.engine, connector.quote_identifier, connector.length_function()
+                profiled, policy.engine, connector.quote_identifier,
+                connector.length_expression, connector.substring_expression,
             )
             for c in null_only:
                 select_list += f", COUNT({connector.quote_identifier(c.name)})"
@@ -1444,7 +1465,15 @@ def build_server(app: AppContext) -> MCPServer:
             )
             st["connector"] = connector
             outcome = await run_query(app, connection_id, spec, f"profile of '{connection_id}'")
-            row = outcome.rows[0] if outcome.rows else []
+            if outcome.truncated or not outcome.rows:
+                # an aggregate row cut by the byte ceiling would silently become
+                # a profile full of None with a clean warning list
+                raise ToolFailure(
+                    ErrorCategory.LIMIT,
+                    "the profile's aggregate row exceeds security.max_response_bytes; profile fewer "
+                    "columns (the columns argument) or raise the ceiling",
+                )
+            row = outcome.rows[0]
             total, profiles = build_profiles(all_cols, policy.engine, layout, row)
             top_done = 0
             if include_top_values:
@@ -1485,6 +1514,11 @@ def build_server(app: AppContext) -> MCPServer:
                     + ", ".join(sorted(sensitive))
                 )
             st["row_count"] = total
+            if total == 0:
+                st["warnings"].append(
+                    "the sample returned no rows (empty table, or the account cannot read it): "
+                    "column measures are absent and only metadata findings apply"
+                )
             return _envelope(
                 st, connection_id, policy.engine,
                 {
@@ -1533,6 +1567,8 @@ def build_server(app: AppContext) -> MCPServer:
             table_cap = max(1, min(int(max_tables), 500))
             budget = max(1.0, min(float(time_budget_seconds), 300.0))
             per_table_timeout = max(1.0, min(float(per_table_timeout_seconds), 120.0))
+            byte_ceiling: int | None = None
+            hit_bytes = 0
             conn_ids = list(connections) if connections is not None else sorted(app.resolved.keys())
             for cid in conn_ids:
                 if cid not in app.resolved:
@@ -1558,11 +1594,18 @@ def build_server(app: AppContext) -> MCPServer:
                 try:
                     connector, policy = _require_engine(app, cid)
                     tables = await app.tables_for(policy, connector)
-                except (ToolFailure, ConnectorError, DriverUnavailableError) as exc:
+                except Exception as exc:  # noqa: BLE001 - one dead connection must not end the search
                     if connections is not None and len(conn_ids) == 1:
                         raise
                     warnings.append(f"connection '{cid}' skipped: {scrub_exception(exc)}")
                     continue
+                # the policy's discovery budget and byte ceiling bind the whole search
+                budget = min(budget, float(policy.discovery_time_budget_seconds))
+                deadline = min(deadline, time.monotonic() + budget)
+                byte_ceiling = (
+                    policy.max_response_bytes if byte_ceiling is None
+                    else min(byte_ceiling, policy.max_response_bytes)
+                )
                 tables = [t for t in tables if t.kind == "table"]
                 if wanted_schemas is not None:
                     tables = [t for t in tables if (t.schema or "").lower() in wanted_schemas]
@@ -1593,12 +1636,15 @@ def build_server(app: AppContext) -> MCPServer:
                         pt = portable_type(policy.engine, c.data_type)
                         q = connector.quote_identifier(c.name)
                         if pt.kind == "string":
-                            params.append(
-                                needle if match == "exact" else (f"{needle}%" if match == "prefix" else f"%{needle}%")
-                            )
-                            op = "=" if match == "exact" else "LIKE"
-                            expr = connector.text_expression(q, pt.name)
-                            preds.append(f"LOWER({expr}) {op} {connector.placeholder(len(params))}")
+                            expr = f"LOWER({connector.text_expression(q, pt.name)})"
+                            if match == "exact":
+                                params.append(needle)
+                                preds.append(f"{expr} = {connector.placeholder(len(params))}")
+                            else:
+                                # %, _ (and [ on SQL Server) in the query are DATA, not wildcards
+                                escaped = connector.escape_like(needle)
+                                params.append(f"{escaped}%" if match == "prefix" else f"%{escaped}%")
+                                preds.append(connector.like_predicate(expr, connector.placeholder(len(params))))
                             matched_cols.append(c.name)
                         elif pt.kind == "numeric" and numeric is not None and match == "exact":
                             params.append(numeric)
@@ -1632,16 +1678,24 @@ def build_server(app: AppContext) -> MCPServer:
                     for row in rows:
                         where = [
                             n for n, v in zip(names, row, strict=False)
-                            if n in matched_cols and v is not None and (
-                                (needle in str(v).lower())
-                                if match != "exact"
-                                else (str(v).lower() == needle or v == numeric)
-                            )
+                            if n in matched_cols and v is not None and _value_matches(v, needle, numeric, match)
                         ]
-                        hits.append({
+                        if not where:
+                            continue  # the server matched on a masked or unlisted column; not a hit we can show
+                        hit = {
                             "connection": cid, "schema": t.schema, "table": t.name,
                             "matched_columns": where, "row": dict(zip(names, row, strict=False)),
-                        })
+                        }
+                        hit_bytes += len(json.dumps(hit, default=str))
+                        if byte_ceiling is not None and hit_bytes > byte_ceiling:
+                            warnings.append(
+                                "response byte ceiling reached (security.max_response_bytes); results are partial"
+                            )
+                            exhausted = True
+                            break
+                        hits.append(hit)
+                    if exhausted:
+                        break
             st["row_count"] = len(hits)
             if exhausted:
                 warnings.append(f"time budget of {budget:.0f}s exhausted; results are partial")
@@ -1689,7 +1743,7 @@ def build_server(app: AppContext) -> MCPServer:
                 try:
                     connector, policy = _require_engine(app, cid)
                     tables = await app.tables_for(policy, connector)
-                except (ToolFailure, ConnectorError, DriverUnavailableError) as exc:
+                except Exception as exc:  # noqa: BLE001 - one dead connection must not end inference
                     if connections is not None and len(conn_ids) == 1:
                         raise
                     warnings.append(f"connection '{cid}' skipped: {scrub_exception(exc)}")
@@ -1760,6 +1814,26 @@ def build_server(app: AppContext) -> MCPServer:
 
 
 
+
+def _value_matches(value: Any, needle: str, numeric: int | float | None, match: str) -> bool:
+    """Python-side confirmation that a returned cell really contains the
+    query (the server predicate may have matched on a column we do not
+    show, and LIKE wildcards are escaped so only literal text counts)."""
+    text = str(value).lower()
+    if match == "prefix":
+        return text.startswith(needle)
+    if match == "contains":
+        return needle in text
+    if text == needle:
+        return True
+    if numeric is not None:
+        try:
+            return float(value) == float(numeric)
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
 def _redact_foreign_target(policy: EffectivePolicy, key: KeyInfo) -> dict[str, Any]:
     """A permitted table's foreign key may point at a schema the allowlist
     hides; the key is reported but the hidden target is not named."""
@@ -1770,6 +1844,41 @@ def _redact_foreign_target(policy: EffectivePolicy, key: KeyInfo) -> dict[str, A
         data["ref_table"] = "<not permitted>"
         data["ref_columns"] = []
     return data
+
+
+
+def _unquote_identifier(part: str) -> str:
+    part = part.strip()
+    quoted = len(part) >= 2 and (
+        (part[0] == part[-1] and part[0] in ('"', '`')) or (part[0] == "[" and part[-1] == "]")
+    )
+    if quoted:
+        return part[1:-1]
+    return part
+
+
+def _split_qualified_name(schema: str | None, object_name: str) -> tuple[str | None, str]:
+    """Accept ``schema.table`` (optionally quoted parts) in ``object_name``.
+
+    A three-part name is refused: the database is fixed by the connection,
+    so ``db.schema.table`` cannot be honoured and must not be silently
+    reinterpreted. When both the ``schema`` argument and a qualified name are
+    given they have to agree."""
+    parts = object_name.split(".") if "." in object_name else [object_name]
+    if len(parts) == 1:
+        return schema, _unquote_identifier(object_name)
+    if len(parts) != 2 or not all(p.strip() for p in parts):
+        raise ToolFailure(
+            ErrorCategory.VALIDATION,
+            f"object name '{object_name}' must be 'table' or 'schema.table' (the database is fixed by the connection)",
+        )
+    qualified_schema, name = _unquote_identifier(parts[0]), _unquote_identifier(parts[1])
+    if schema is not None and schema.lower() != qualified_schema.lower():
+        raise ToolFailure(
+            ErrorCategory.VALIDATION,
+            f"schema argument '{schema}' disagrees with the qualified name '{object_name}'",
+        )
+    return qualified_schema, name
 
 
 async def _resolve_object(
@@ -1786,6 +1895,9 @@ async def _resolve_object(
     a match: connector catalog SQL and sample queries quote identifiers
     verbatim, so the caller's casing would silently miss on case-sensitive
     engines (Oracle, Db2, Postgres quoted identifiers)."""
+    # "schema.table" is how agents (and the catalog tool's own output) spell
+    # an object; it must mean the same as schema="schema", object_name="table"
+    schema, object_name = _split_qualified_name(schema, object_name)
     if schema is None:
         if not policy.default_deny_objects:
             return schema, object_name

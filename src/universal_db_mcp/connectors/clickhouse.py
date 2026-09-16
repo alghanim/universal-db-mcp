@@ -41,6 +41,28 @@ from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
 
 
+def _split_key_expressions(key: str) -> list[str]:
+    """Split a ClickHouse sorting/primary key on top-level commas only:
+    "toYYYYMM(ts), tuple(a, b), id" -> 3 expressions, not 4."""
+    out: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in key:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return [c for c in out if c]
+
+
 class ClickHouseConnector(DatabaseConnector):
     engine = "clickhouse"
 
@@ -57,8 +79,7 @@ class ClickHouseConnector(DatabaseConnector):
         self._session_reset()
         settings: dict[str, Any] = {}
         if prof.enforce_read_only:
-            settings["readonly"] = 1
-            self._session_applied("read_only")
+            settings["readonly"] = 1  # applied/skipped is decided against the server profile
         if prof.statement_timeout_seconds:
             settings["max_execution_time"] = int(math.ceil(prof.statement_timeout_seconds))
             self._session_applied(f"max_execution_time={settings['max_execution_time']}s")
@@ -112,8 +133,8 @@ class ClickHouseConnector(DatabaseConnector):
             # policy ceiling server-side. client_name is what shows up in
             # system.query_log / system.processes.
             "client_name": self.session_profile.application_name,
-            "settings": self._session_settings(),
         }
+        wanted = self._session_settings()
         if self.connection.username:
             kw["username"] = self.connection.username.value
         if self.connection.password:
@@ -133,7 +154,42 @@ class ClickHouseConnector(DatabaseConnector):
                     kw["tls_mode"] = "strict"
             if cfg.tls.client_key_file:
                 kw["client_cert_key"] = cfg.tls.client_key_file
-        return self._module.get_client(**kw)
+        client = self._module.get_client(**kw)
+        self._apply_session_settings(client, wanted)
+        return client
+
+    def _apply_session_settings(self, client: Any, wanted: dict[str, Any]) -> None:
+        """Pin the session profile on the client AFTER looking at the server
+        profile the account already carries.
+
+        readonly=1 forbids changing any setting and readonly=2 forbids
+        changing readonly itself, so sending our own readonly=1 to such an
+        account would fail every query. A profile that is already read-only
+        is stronger than ours: keep it and report it verbatim.
+        """
+        server = getattr(client, "server_settings", None) or {}
+        ro = server.get("readonly")
+        ro_value = str(getattr(ro, "value", ro if ro is not None else "0")).strip()
+        for name, value in wanted.items():
+            if name == "readonly" and ro_value not in ("", "0"):
+                self._session_applied(f"read_only (server profile readonly={ro_value})")
+                continue
+            if name == "readonly":
+                try:
+                    client.set_client_setting(name, value)
+                    self._session_applied("read_only")
+                except Exception as exc:  # noqa: BLE001 - the promise did not take: fail closed
+                    raise self._session_required("read-only mode", exc) from exc
+                continue
+            if name != "readonly" and ro_value == "1":
+                # readonly=1 rejects every SET; the server's own ceilings apply
+                self._session_skipped(name, RuntimeError(f"server profile readonly={ro_value} rejects SET"))
+                continue
+            try:
+                client.set_client_setting(name, value)
+            except Exception as exc:  # noqa: BLE001 - reported, and fail-closed below
+                self._session_skipped(name, exc)
+
 
     def cancel_current(self) -> bool:
         """Best-effort server-side cancel via ``KILL QUERY`` on a separate
@@ -294,12 +350,19 @@ class ClickHouseConnector(DatabaseConnector):
             for i, r in enumerate(rows)
         ]
 
-    def length_function(self) -> str:
-        return "length"
+    def length_expression(self, quoted_column: str) -> str:
+        return f"lengthUTF8({quoted_column})"
+
+    def substring_expression(self, quoted_column: str, chars: int) -> str:
+        return f"substringUTF8({quoted_column}, 1, {int(chars)})"
+
+    def like_predicate(self, expression: str, placeholder: str) -> str:
+        # ClickHouse LIKE has no ESCAPE clause; backslash is its escape already
+        return f"{expression} LIKE {placeholder}"
 
     def text_expression(self, quoted_column: str, portable_name: str) -> str:
         # lower()/like reject UUID and Enum arguments; toString() is cheap
-        return f"toString({quoted_column})" if portable_name in ("uuid", "enum") else quoted_column
+        return f"toString({quoted_column})" if portable_name in ("uuid", "enum", "inet") else quoted_column
 
     def placeholder(self, index: int) -> str:
         return f"%(p{index})s"
@@ -338,7 +401,7 @@ class ClickHouseConnector(DatabaseConnector):
             for tname, sorting, primary, engine in client.query(sql, parameters=params).result_rows:
                 key = primary or sorting
                 if key:
-                    out.append(IndexInfo(name="(sorting key)", columns=[c.strip() for c in str(key).split(",")],
+                    out.append(IndexInfo(name="(sorting key)", columns=_split_key_expressions(str(key)),
                                          unique=False, primary=True, kind="sorting_key",
                                          definition=f"{engine} ORDER BY ({sorting})", schema=db, table=tname))
             sql = (

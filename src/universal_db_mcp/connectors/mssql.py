@@ -68,6 +68,19 @@ def _mssql_server_value(cfg: Any) -> str:
     return f"{host},{cfg.port or 1433}"
 
 
+
+def _mssql_type(data_type: Any, char_len: Any, precision: Any, scale: Any) -> str:
+    """Fold the declared length/precision back into the type name:
+    nvarchar(200), nvarchar(max), decimal(12,2)."""
+    base = str(data_type or "")
+    low = base.lower()
+    if low in ("varchar", "nvarchar", "char", "nchar", "varbinary", "binary") and char_len:
+        return f"{base}(max)" if int(char_len) < 0 else f"{base}({int(char_len)})"
+    if low in ("decimal", "numeric") and precision:
+        return f"{base}({int(precision)},{int(scale or 0)})"
+    return base
+
+
 class MssqlConnector(DatabaseConnector):
     engine = "mssql"
 
@@ -414,7 +427,8 @@ class MssqlConnector(DatabaseConnector):
 
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
         sql = (
-            "SELECT column_name, data_type, is_nullable, column_default, ordinal_position "
+            "SELECT column_name, data_type, is_nullable, column_default, ordinal_position, "
+            "character_maximum_length, numeric_precision, numeric_scale "
             "FROM information_schema.columns WHERE table_schema = ? AND table_name = ? "
             "ORDER BY ordinal_position"
         )
@@ -431,7 +445,7 @@ class MssqlConnector(DatabaseConnector):
                 schema=schema,
                 table=table,
                 name=r[0],
-                data_type=r[1],
+                data_type=_mssql_type(r[1], r[5], r[6], r[7]),
                 nullable=r[2] == "YES",
                 default=r[3],
                 ordinal=r[4],
@@ -439,8 +453,15 @@ class MssqlConnector(DatabaseConnector):
             for r in rows
         ]
 
-    def length_function(self) -> str:
-        return "LEN"
+    def length_expression(self, quoted_column: str) -> str:
+        return f"LEN({quoted_column})"
+
+    def substring_expression(self, quoted_column: str, chars: int) -> str:
+        return f"SUBSTRING({quoted_column}, 1, {int(chars)})"
+
+    def escape_like(self, needle: str) -> str:
+        # T-SQL LIKE also treats [ as a wildcard-class opener
+        return super().escape_like(needle).replace("[", "\\[")
 
     def text_expression(self, quoted_column: str, portable_name: str) -> str:
         return f"CAST({quoted_column} AS varchar(64))" if portable_name == "uuid" else quoted_column
@@ -465,7 +486,8 @@ class MssqlConnector(DatabaseConnector):
 
     def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
         sql = (
-            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position "
+            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position, "
+            "character_maximum_length, numeric_precision, numeric_scale "
             "FROM information_schema.columns WHERE table_schema = ? ORDER BY table_name, ordinal_position"
         )
         with translated_driver_errors():
@@ -477,8 +499,8 @@ class MssqlConnector(DatabaseConnector):
             finally:
                 conn.close()
         return [
-            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=r[2], nullable=r[3] == "YES",
-                       default=r[4], ordinal=r[5])
+            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=_mssql_type(r[2], r[6], r[7], r[8]),
+                       nullable=r[3] == "YES", default=r[4], ordinal=r[5])
             for r in rows
         ]
 

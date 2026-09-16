@@ -72,6 +72,19 @@ def _s(value: Any) -> Any:
     return value.rstrip() if isinstance(value, str) else value
 
 
+
+def _db2_type(typename: str, length: Any, scale: Any) -> str:
+    """SYSCAT.COLUMNS.TYPENAME with LENGTH/SCALE folded back in for the
+    parameterised types only: VARCHAR(200), DECIMAL(12,2). INTEGER's LENGTH
+    is its byte width and stays out."""
+    up = typename.upper()
+    if up in ("CHARACTER", "CHAR", "VARCHAR", "GRAPHIC", "VARGRAPHIC", "BINARY", "VARBINARY") and length:
+        return f"{typename}({int(length)})"
+    if up in ("DECIMAL", "NUMERIC") and length:
+        return f"{typename}({int(length)},{int(scale or 0)})"
+    return typename
+
+
 class Db2Connector(DatabaseConnector):
     engine = "db2"
 
@@ -372,7 +385,7 @@ class Db2Connector(DatabaseConnector):
         conn = self._connect()
         try:
             sql = (
-                "SELECT COLNAME, TYPENAME, NULLS, DEFAULT, COLNO FROM SYSCAT.COLUMNS "
+                "SELECT COLNAME, TYPENAME, NULLS, DEFAULT, COLNO, LENGTH, SCALE FROM SYSCAT.COLUMNS "
                 "WHERE TABSCHEMA = ? AND TABNAME = ? ORDER BY COLNO"
             )
             stmt = self._module.prepare(conn, sql)
@@ -385,7 +398,7 @@ class Db2Connector(DatabaseConnector):
                     schema=schema,
                     table=table,
                     name=_s(r[0]),
-                    data_type=_s(r[1]),
+                    data_type=_db2_type(_s(r[1]), r[5] if len(r) > 5 else None, r[6] if len(r) > 6 else None),
                     nullable=r[2] == "Y",
                     default=r[3],
                     ordinal=r[4],
@@ -394,6 +407,19 @@ class Db2Connector(DatabaseConnector):
             ]
         finally:
             self._module.close(conn)
+
+    def length_expression(self, quoted_column: str) -> str:
+        return f"CHARACTER_LENGTH({quoted_column}, CODEUNITS32)"  # LENGTH() is bytes on Db2
+
+    def substring_expression(self, quoted_column: str, chars: int) -> str:
+        # Db2 raises SQL0138N when SUBSTR asks for more than the value holds
+        # (every other engine just returns the shorter string), so the length
+        # argument is clamped per row.
+        n = int(chars)
+        return (
+            f"SUBSTR({quoted_column}, 1, CASE WHEN LENGTH({quoted_column}) < {n} "
+            f"THEN LENGTH({quoted_column}) ELSE {n} END)"
+        )
 
     def build_search_query(
         self, schema: str | None, table: str, select_columns: list[str], where_sql: str, limit: int
@@ -418,14 +444,15 @@ class Db2Connector(DatabaseConnector):
         conn = self._connect()
         try:
             sql = (
-                "SELECT TABNAME, COLNAME, TYPENAME, NULLS, DEFAULT, COLNO FROM SYSCAT.COLUMNS "
+                "SELECT TABNAME, COLNAME, TYPENAME, NULLS, DEFAULT, COLNO, LENGTH, SCALE FROM SYSCAT.COLUMNS "
                 "WHERE TABSCHEMA = ? ORDER BY TABNAME, COLNO"
             )
             stmt = self._module.prepare(conn, sql)
             self._module.execute(stmt, (schema,))
             rows = self._fetch_all(stmt)
             return [
-                ColumnInfo(schema=schema, table=_s(r[0]), name=_s(r[1]), data_type=_s(r[2]),
+                ColumnInfo(schema=schema, table=_s(r[0]), name=_s(r[1]),
+                           data_type=_db2_type(_s(r[2]), r[6] if len(r) > 6 else None, r[7] if len(r) > 7 else None),
                            nullable=r[3] == "Y", default=r[4], ordinal=r[5])
                 for r in rows
             ]

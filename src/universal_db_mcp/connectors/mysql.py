@@ -222,22 +222,22 @@ class MySQLConnector(DatabaseConnector):
     def _session_readback(self, conn: Any) -> dict[str, Any]:
         out: dict[str, Any] = {}
         with conn.cursor() as cur:
-            for key, expr in (
-                ("read_only", "@@session.transaction_read_only"),
-                ("isolation", "@@session.transaction_isolation"),
-                ("statement_timeout_ms", "@@session.max_execution_time"),
-                ("innodb_lock_wait_timeout", "@@session.innodb_lock_wait_timeout"),
+            for key, exprs in (
+                ("read_only", ("@@session.transaction_read_only", "@@session.tx_read_only")),
+                ("isolation", ("@@session.transaction_isolation", "@@session.tx_isolation")),
+                ("statement_timeout_ms", ("@@session.max_execution_time",)),
+                ("statement_timeout_s", ("@@session.max_statement_time",)),  # MariaDB
+                ("innodb_lock_wait_timeout", ("@@session.innodb_lock_wait_timeout",)),
             ):
-                try:
-                    cur.execute(f"SELECT {expr}")
-                    # The connector's cursor class streams (SSCursor); drain the
-                    # single-row result so the next execute does not trip the
-                    # driver's "unbuffered result left incomplete" warning.
-                    rows = cur.fetchall()
-                    if rows:
-                        out[key] = str(rows[0][0])
-                except Exception:  # noqa: BLE001, S112 - older servers lack some of these
-                    continue
+                for expr in exprs:
+                    try:
+                        cur.execute(f"SELECT {expr}")
+                        rows = cur.fetchall()
+                        if rows:
+                            out[key] = str(rows[0][0])
+                            break
+                    except Exception:  # noqa: BLE001, S112 - the other spelling may exist
+                        continue
         return out
 
     # PyMySQL has no safe out-of-band cancel; the executor reports this
@@ -363,7 +363,7 @@ class MySQLConnector(DatabaseConnector):
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
         schema = schema or self.connection.config.database or ""
         sql = (
-            "SELECT column_name, data_type, is_nullable, column_default, ordinal_position "
+            "SELECT column_name, column_type, is_nullable, column_default, ordinal_position "
             "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
             "ORDER BY ordinal_position"
         )
@@ -387,10 +387,13 @@ class MySQLConnector(DatabaseConnector):
     def placeholder(self, index: int) -> str:
         return "%s"
 
+    def length_expression(self, quoted_column: str) -> str:
+        return f"CHAR_LENGTH({quoted_column})"  # LENGTH() is bytes on MySQL
+
     def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
         schema = schema or self.connection.config.database or ""
         sql = (
-            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position "
+            "SELECT table_name, column_name, column_type, is_nullable, column_default, ordinal_position "
             "FROM information_schema.columns WHERE table_schema = %s ORDER BY table_name, ordinal_position"
         )
         with translated_driver_errors():
@@ -468,7 +471,8 @@ class MySQLConnector(DatabaseConnector):
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
         sql = (
             "SELECT constraint_name, table_schema, table_name, referenced_table_name, "
-            "column_name, referenced_column_name FROM information_schema.key_column_usage "
+            "column_name, referenced_column_name, referenced_table_schema "
+            "FROM information_schema.key_column_usage "
             "WHERE referenced_table_name IS NOT NULL"
         )
         params: list[Any] = []
@@ -483,7 +487,7 @@ class MySQLConnector(DatabaseConnector):
                 cur.execute(sql, params or None)
                 rows = cur.fetchall()
         merged: dict[str, KeyInfo] = {}
-        for name, tschema, tname, rname, col, rcol in rows:
+        for name, tschema, tname, rname, col, rcol, rschema in rows:
             k = merged.get(name)
             if k:
                 k.columns.append(col)
@@ -493,7 +497,7 @@ class MySQLConnector(DatabaseConnector):
                     kind="foreign_key",
                     name=name,
                     columns=[col],
-                    ref_schema=tschema,
+                    ref_schema=rschema or tschema,
                     ref_table=rname,
                     ref_columns=[rcol],
                     source_schema=tschema,

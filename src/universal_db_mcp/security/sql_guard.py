@@ -364,10 +364,14 @@ _DB2_READ_TAIL = re.compile(
     r"\s+(?:"
     r"FOR\s+(?:READ|FETCH)\s+ONLY"
     r"|OPTIMIZE\s+FOR\s+\d+\s+ROWS?"
-    r"|WITH\s+(?:UR|CS|RS|RR)"
+    r"|WITH\s+(?:UR|CS)"
     r")\s*$",
     re.IGNORECASE,
 )
+# RS/RR take and KEEP row or table locks for the statement: on a read-only
+# connection they would let the agent opt out of the session profile's UR
+# (the "never hold locks on production" promise), so they are refused.
+_DB2_LOCKING_ISOLATION = re.compile(r"\bWITH\s+(?:RS|RR)\s*$", re.IGNORECASE)
 # `USE AND KEEP <mode> LOCKS` takes real locks (SHARE/UPDATE/EXCLUSIVE) and is
 # not a read-only hint, so it is never stripped and never allowed.
 _DB2_LOCK_TAIL = re.compile(r"\bUSE\s+AND\s+KEEP\s+\w+\s+LOCKS?\b", re.IGNORECASE)
@@ -399,6 +403,11 @@ class SqlGuard:
             raise _deny(
                 "Db2 locking clause 'USE AND KEEP ... LOCKS' is not permitted on a read-only "
                 "connection; use the isolation clause alone (for example WITH UR)"
+            )
+        if _DB2_LOCKING_ISOLATION.search(sql.rstrip()):
+            raise _deny(
+                "Db2 isolation clause WITH RS/RR holds locks for the statement and is not permitted "
+                "on a read-only connection (the session runs at UR by default; WITH UR/CS are accepted)"
             )
         for _ in range(4):  # FOR READ ONLY + OPTIMIZE FOR n ROWS + WITH UR can combine
             trimmed = _DB2_READ_TAIL.sub("", sql, count=1).rstrip()

@@ -178,7 +178,9 @@ class _FakeClickhouse:
 
     def get_client(self, **kwargs: Any) -> Any:
         self.kwargs.append(kwargs)
-        return types.SimpleNamespace(command=lambda *_a, **_k: "ok", close=lambda: None)
+        return types.SimpleNamespace(
+            command=lambda *_a, **_k: "ok", close=lambda: None, set_client_setting=lambda *_a: None
+        )
 
 
 def test_clickhouse_password_with_client_cert_forces_basic_auth(

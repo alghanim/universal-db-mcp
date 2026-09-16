@@ -186,6 +186,19 @@ def _enable_thick_mode(module: Any, lib_dir: str | None, tns_admin: str | None) 
         _THICK_STATE.initialized = True
 
 
+
+def _oracle_type(data_type: Any, char_len: Any, precision: Any, scale: Any) -> str:
+    """VARCHAR2(200), NUMBER(12,2), NUMBER(10); NUMBER with no precision stays
+    bare (an unconstrained float), as do TIMESTAMP(6) and friends."""
+    base = str(data_type or "")
+    up = base.upper()
+    if up in ("VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "RAW") and char_len:
+        return f"{base}({int(char_len)})"
+    if up == "NUMBER" and precision is not None:
+        return f"{base}({int(precision)},{int(scale)})" if scale else f"{base}({int(precision)})"
+    return base
+
+
 class OracleConnector(DatabaseConnector):
     engine = "oracle"
 
@@ -492,7 +505,8 @@ class OracleConnector(DatabaseConnector):
 
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
         sql = (
-            "SELECT column_name, data_type, nullable, data_default, column_id "
+            "SELECT column_name, data_type, nullable, data_default, column_id, "
+            "char_length, data_precision, data_scale "
             "FROM all_tab_columns WHERE owner = :1 AND table_name = :2 ORDER BY column_id"
         )
         with translated_driver_errors():
@@ -505,7 +519,7 @@ class OracleConnector(DatabaseConnector):
                 schema=schema,
                 table=table,
                 name=r[0],
-                data_type=r[1],
+                data_type=_oracle_type(r[1], r[5], r[6], r[7]),
                 nullable=r[2] == "Y",
                 default=r[3],
                 ordinal=r[4],
@@ -537,7 +551,8 @@ class OracleConnector(DatabaseConnector):
 
     def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
         sql = (
-            "SELECT table_name, column_name, data_type, nullable, data_default, column_id "
+            "SELECT table_name, column_name, data_type, nullable, data_default, column_id, "
+            "char_length, data_precision, data_scale "
             "FROM all_tab_columns WHERE owner = :1 ORDER BY table_name, column_id"
         )
         with translated_driver_errors():
@@ -546,8 +561,8 @@ class OracleConnector(DatabaseConnector):
                 cur.execute(sql, [schema])
                 rows = cur.fetchall()
         return [
-            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=r[2], nullable=r[3] == "Y",
-                       default=r[4], ordinal=r[5])
+            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=_oracle_type(r[2], r[6], r[7], r[8]),
+                       nullable=r[3] == "Y", default=r[4], ordinal=r[5])
             for r in rows
         ]
 

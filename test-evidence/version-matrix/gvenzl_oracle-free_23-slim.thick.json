@@ -1,32 +1,32 @@
 {
-  "label": "gvenzl/oracle-xe:21.3.0-slim",
+  "label": "gvenzl/oracle-free:23-slim (thick)",
   "engine": "oracle",
-  "probe_rev": "2a935ea",
-  "started_utc": "2026-09-16T20:00:48Z",
+  "probe_rev": "unknown",
+  "started_utc": "2026-09-16T20:11:15Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 3025,
+      "ms": 400,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 582,
-      "detail": "Oracle Database 21c Express Edition Release 21.0.0.0.0 - Pro"
+      "ms": 36,
+      "detail": "Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, "
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 472,
+      "ms": 21,
       "detail": "SYSTEM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 594,
-      "detail": "[TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENTS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENT_PRIVS', kind"
+      "ms": 142,
+      "detail": "[TableSummary(schema='SYSTEM', name='AQ$_SCHEDULES', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='HELP', kind='table', row_estimate=Non"
     },
     {
       "check": "list_tables_has_seed",
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 39,
-      "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EMAIL'"
+      "ms": 24,
+      "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EM"
     },
     {
       "check": "list_columns_count",
@@ -49,14 +49,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 73,
+      "ms": 60,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 1112,
-      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C008302', columns=["
+      "ms": 777,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C008649', columns=["
     },
     {
       "check": "index_on_fk_visible",
@@ -67,8 +67,8 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 2,
-      "detail": "SYS_C008301"
+      "ms": 1,
+      "detail": "SYS_C008648"
     },
     {
       "check": "composite_unique_index",
@@ -79,55 +79,55 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 1832,
+      "ms": 1021,
       "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 25,
+      "ms": 15,
       "detail": "VM_V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 59,
+      "ms": 28,
       "detail": "VM_F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 118,
+      "ms": 54,
       "detail": "catalog_estimate(all_tables.num_rows)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 513,
+      "ms": 43,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 545,
+      "ms": 39,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "failed",
-      "ms": 342,
-      "detail": "ConnectorError: DatabaseError: ORA-00932: inconsistent datatypes: expected - got CLOB Help: https://docs.oracle.com/error-help/db/ora-00932/"
+      "ms": 18,
+      "detail": "ConnectorError: DatabaseError: ORA-22849: Type CLOB is not supported for this function or operator."
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 470,
+      "ms": 18,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 462,
+      "ms": 17,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
@@ -137,11 +137,11 @@
       "detail": "unsupported by design: Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build"
     }
   ],
-  "server_version": "Oracle Database 21c Express Edition Release 21.0.0.0.0 - Pro",
+  "server_version": "Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, ",
   "session": {
     "engine": "oracle",
     "isolation": null,
-    "lock_timeout_seconds": 5.0,
+    "lock_timeout_seconds": null,
     "statement_timeout_seconds": 60.0,
     "application_name": "udbmcp:vm",
     "read_only_requested": true,
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:00:58Z",
+  "finished_utc": "2026-09-16T20:11:18Z",
   "summary": {
     "passed": 20,
     "failed": [

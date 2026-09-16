@@ -18,7 +18,7 @@ def _col(name: str, dtype: str, nullable: bool = True) -> ColumnInfo:
 
 def test_select_list_aggregates_only_safe_kinds() -> None:
     cols = [_col("id", "integer"), _col("note", "varchar(4000)"), _col("doc", "jsonb"), _col("img", "bytea")]
-    select, layout = aggregate_select_list(cols, "postgres", lambda n: f'"{n}"', "LENGTH")
+    select, layout = aggregate_select_list(cols, "postgres", lambda n: f'"{n}"', lambda q: f"LENGTH({q})")
     assert select.startswith("COUNT(*)")
     assert 'COUNT(DISTINCT "id")' in select and 'MAX(LENGTH("note"))' in select
     assert 'DISTINCT "doc"' not in select and 'MIN("img")' not in select, "json/binary get COUNT only"
@@ -28,7 +28,7 @@ def test_select_list_aggregates_only_safe_kinds() -> None:
 
 def test_profiles_are_rebuilt_from_the_single_row() -> None:
     cols = [_col("id", "integer", nullable=False), _col("note", "varchar(4000)")]
-    select, layout = aggregate_select_list(cols, "postgres", lambda n: n, "LENGTH")
+    select, layout = aggregate_select_list(cols, "postgres", lambda n: n, lambda q: f"LENGTH({q})")
     #            count, id:non_null, distinct, min, max, note:non_null, distinct, min, max, max_length
     row = (1000, 1000, 1000, 1, 1000, 900, 12, "a", "z", 17)
     total, profiles = build_profiles(cols, "postgres", layout, row)
@@ -40,13 +40,13 @@ def test_profiles_are_rebuilt_from_the_single_row() -> None:
 
 def test_findings_flag_missing_pk_fk_without_index_and_oversized_strings() -> None:
     cols = [_col("customer_id", "bigint", nullable=True), _col("note", "varchar(4000)")]
-    select, layout = aggregate_select_list(cols, "postgres", lambda n: n, "LENGTH")
+    select, layout = aggregate_select_list(cols, "postgres", lambda n: n, lambda q: f"LENGTH({q})")
     row = (5000, 5000, 4000, 1, 90000, 5000, 3, "a", "c", 20)
     _, profiles = build_profiles(cols, "postgres", layout, row)
     findings = findings_for_table(
         sample_size=5000, row_estimate=1_000_000, columns=cols, profiles=profiles, indexes=[],
         foreign_keys=[KeyInfo(kind="foreign_key", name="fk_c", columns=["customer_id"], ref_table="customers")],
-        stats={"row_estimate_source": "catalog_estimate", "stats_time": None},
+        stats={"row_estimate_source": "catalog_estimate", "last_analyze": None},
     )
     codes = {f.code for f in findings}
     assert {"no_primary_key", "foreign_key_without_index", "oversized_string", "nullable_never_null",
@@ -56,7 +56,7 @@ def test_findings_flag_missing_pk_fk_without_index_and_oversized_strings() -> No
 
 def test_small_samples_do_not_produce_data_findings() -> None:
     cols = [_col("x", "integer")]
-    select, layout = aggregate_select_list(cols, "postgres", lambda n: n, "LENGTH")
+    select, layout = aggregate_select_list(cols, "postgres", lambda n: n, lambda q: f"LENGTH({q})")
     _, profiles = build_profiles(cols, "postgres", layout, (5, 5, 5, 1, 5))
     findings = findings_for_table(sample_size=5, row_estimate=5, columns=cols, profiles=profiles,
                                   indexes=[IndexInfo(name="pk", columns=["x"], unique=True, primary=True)],
@@ -98,3 +98,46 @@ def test_generic_key_names_are_not_matched() -> None:
     a = _facts("x", "a", [("id", "integer"), ("name", "text")], "id")
     b = _facts("x", "b", [("id", "integer"), ("name", "text")], "id")
     assert infer_relationships([a, b]) == []
+
+
+def test_boolean_uuid_and_inet_are_not_min_maxed_and_strings_are_cut() -> None:
+    cols = [_col("active", "boolean"), _col("uid", "uuid"), _col("note", "text")]
+    select, layout = aggregate_select_list(
+        cols, "postgres", lambda n: n, lambda q: f"LENGTH({q})", lambda q, n: f"SUBSTR({q}, 1, {n})"
+    )
+    assert "MIN(active)" not in select and "MIN(uid)" not in select
+    assert "COUNT(DISTINCT active)" in select
+    assert "MIN(SUBSTR(note, 1, 200))" in select
+    assert "LENGTH(uid)" not in select
+
+
+def test_statistics_missing_only_fires_when_the_engine_reports_a_stats_key() -> None:
+    cols = [_col("x", "integer")]
+    _, layout = aggregate_select_list(cols, "clickhouse", lambda n: n, lambda q: f"length({q})")
+    _, profiles = build_profiles(cols, "clickhouse", layout, (500, 500, 5, 1, 5))
+    idx = [IndexInfo(name="pk", columns=["x"], unique=True, primary=True)]
+    none = findings_for_table(sample_size=500, row_estimate=500, columns=cols, profiles=profiles, indexes=idx,
+                              foreign_keys=[], stats={"row_estimate_source": "exact"})
+    assert "statistics_missing" not in {f.code for f in none}
+    empty = findings_for_table(sample_size=500, row_estimate=500, columns=cols, profiles=profiles, indexes=idx,
+                               foreign_keys=[], stats={"row_estimate_source": "catalog", "last_analyzed": None})
+    assert "statistics_missing" in {f.code for f in empty}
+
+
+def test_lob_columns_are_counted_through_is_not_null() -> None:
+    """Oracle: COUNT(clob) is ORA-00932 on 18c/21c and ORA-22849 on 23ai
+    (version matrix, 2026-09-16); only the NULL test is legal on LOBs."""
+    cols = [_col("note", "CLOB")]
+    select, layout = aggregate_select_list(cols, "oracle", lambda n: n, lambda q: f"LENGTH({q})")
+    assert "COUNT(note)" not in select
+    assert "COUNT(CASE WHEN note IS NOT NULL THEN 1 END)" in select
+    assert layout == [("*", "count"), ("note", "non_null")]
+
+
+def test_enum_min_max_is_taken_on_the_raw_column() -> None:
+    """ClickHouse: substringUTF8(Enum8) is illegal (live run 2026-09-16)."""
+    cols = [_col("direction", "Enum8('outgoing' = 1, 'incoming' = 2)")]
+    select, _layout = aggregate_select_list(
+        cols, "clickhouse", lambda n: n, lambda q: f"lengthUTF8({q})", lambda q, n: f"substringUTF8({q}, 1, {n})"
+    )
+    assert "MIN(direction)" in select and "substringUTF8" not in select

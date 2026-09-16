@@ -42,10 +42,10 @@ stable category:
 | `db_sample_table` | default 20 rows; masking/omission policy applied |
 | `db_explain` | non-executing plans only |
 | `db_get_query_history` | process-scoped, fingerprints only (see the identity note below) |
-| `db_list_indexes` | indexes + primary keys of one object or a whole schema; ClickHouse reports sorting keys and skipping indices |
-| `db_get_catalog` | one-call paged catalog snapshot: columns with portable types, primary/foreign keys, indexes, row estimates, sensitivity hints; no data read |
-| `db_profile_table` | bounded data profile over the connector's sample (null ratio, distinct, min/max, lengths, top values) + evidence-backed findings; sensitive columns return counts only |
-| `db_search_values` | a value searched across permitted tables of many connections without SQL; per-table hits, time budget, per-table timeout, system schemas and sensitive columns excluded |
+| `db_list_indexes` | indexes + primary keys of one object or a whole schema; ClickHouse reports sorting keys and skipping indices; system catalogs excluded unless `include_system` or a system schema is named |
+| `db_get_catalog` | one-call paged catalog snapshot: columns with declared and portable types, primary/foreign keys, indexes, row estimates, sensitivity hints; no data read; system catalogs (Oracle dictionary views, Db2 SYSCAT, pg_catalog, ...) excluded unless `include_system` or a system schema is named |
+| `db_profile_table` | `object_name` accepts `table` or `schema.table` (every tool that names an object does); bounded data profile over the connector's sample (null ratio, distinct, min/max cut to 200 characters, character lengths, top values) + evidence-backed findings; sensitive columns return counts only; a profile whose aggregate row exceeds `security.max_response_bytes` is a `LIMIT` error, never a silent row of nulls |
+| `db_search_values` | a value searched across permitted tables of many connections without SQL; the query is literal text (`%`, `_` and `[` are escaped, never wildcards); per-table hits, time budget clamped to the policy, per-table timeout, response byte ceiling, system schemas and sensitive columns excluded; one unreachable connection is a warning, not a failure |
 | `db_infer_relationships` | declared foreign keys + inferred join candidates (name/type match, `<table>_id` convention) within and across connections, metadata only |
 
 ## Discovery tools for federated work (ETL, documentation, optimization)
@@ -57,8 +57,11 @@ without hand-written queries, then document or extract from them:
    in one portable vocabulary (`portable_type`: integer, bigint, decimal,
    float, boolean, string, text, date, time, timestamp, timestamptz, binary,
    json, uuid, enum, other) and a `kind` that says what may be aggregated
-   (`lob` marks Oracle/Db2 large objects, which are counted but never
-   aggregated or searched).
+   (`lob` marks Oracle/Db2/SQL Server large objects, which are counted
+   through `IS NOT NULL` but never aggregated or searched). Declared sizes
+   are part of the type on every engine (`varchar(200)`, `NUMBER(12,2)`,
+   `nvarchar(max)`), so the oversized-string and integer-range findings
+   compare against what the schema really declares.
    An ETL layer creates targets from this; a documentation pass renders it.
 2. `db_infer_relationships` across connections proposes joins between
    databases that share keys (a `customer_id` in the CRM and the ERP), with a

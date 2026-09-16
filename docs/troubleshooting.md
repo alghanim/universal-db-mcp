@@ -52,6 +52,9 @@ are quoted as the driver reports them.
 | doctor: secret file unsafe permissions | group/world bits on password file | `chmod 600 /run/secrets/<file>` |
 | Db2: bundled clidriver missing on import | wrong-profile wheel installed | reinstall from this bundle's wheelhouse; verify profile matches (linux-x86_64-cp312) |
 | SQL Server: ODBC Driver not installed | admin-supplied OS package absent | install from bundle `os-packages/` after EULA acceptance |
+| `could not apply the session read-only mode ... refusing to run at the server's default level` | the server refused the read-only setting the profile requires (MySQL `SET SESSION TRANSACTION READ ONLY`, PostgreSQL `default_transaction_read_only`, ClickHouse `readonly`) | fix the account or, if the server truly cannot support it, set `connections.<id>.session.enforce_read_only: false` and rely on the SQL guard alone (documented risk) |
+| Db2: `WITH RS` / `WITH RR` refused | those isolation clauses hold locks for the statement; the session runs at `UR` for exactly that reason | end the statement in `WITH UR` (or `WITH CS`), or drop the clause |
+| ClickHouse: `Cannot modify 'readonly' setting in readonly mode` (old builds) | the account's server profile is already `readonly=1/2` | fixed: the client reads `server_settings` first and keeps the stricter profile; `db_test_connection` reports `read_only (server profile readonly=N)` |
 
 ## Log locations
 

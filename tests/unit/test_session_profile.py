@@ -351,3 +351,9 @@ def test_read_only_verified_reflects_the_server_readback(tmp_path: Path, monkeyp
     assert health.session is not None
     assert health.session["read_only_enforced"] is True, "the SET was accepted"
     assert health.session["read_only_verified"] is False, "but the server says off: reported, not hidden"
+
+
+def test_engines_without_a_lock_ceiling_report_none(tmp_path: Path) -> None:
+    for engine in ("oracle", "clickhouse"):
+        conn = _resolved(engine, tmp_path)
+        assert resolve_session(conn, EffectivePolicy.build(SecurityConfig(), conn)).lock_timeout_seconds is None

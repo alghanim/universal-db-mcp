@@ -145,11 +145,25 @@ def test_top_values_query_uses_each_engines_limit_syntax(engine: str, expected: 
     assert "IS NOT NULL" in sql and "GROUP BY" in sql
 
 
-def test_length_function_per_engine(tmp_path: Path) -> None:
+def test_length_substring_and_like_builders_per_engine(tmp_path: Path) -> None:
+    """Character (not byte) length everywhere; LIKE wildcards in the query
+    text are escaped so '100%' finds the literal string."""
     from universal_db_mcp.connectors import registry
-    fns = {}
+    conns = {}
     for engine in ("postgres", "mysql", "mssql", "oracle", "db2", "clickhouse", "sqlite"):
         r = _resolved(engine, tmp_path)
-        fns[engine] = registry.build_connector(r, EffectivePolicy.build(SecurityConfig(), r)).length_function()
-    assert fns["mssql"] == "LEN" and fns["clickhouse"] == "length"
-    assert all(v == "LENGTH" for k, v in fns.items() if k not in ("mssql", "clickhouse"))
+        conns[engine] = registry.build_connector(r, EffectivePolicy.build(SecurityConfig(), r))
+    assert conns["mssql"].length_expression("c") == "LEN(c)"
+    assert conns["mysql"].length_expression("c") == "CHAR_LENGTH(c)"
+    assert conns["db2"].length_expression("c") == "CHARACTER_LENGTH(c, CODEUNITS32)"
+    assert conns["clickhouse"].length_expression("c") == "lengthUTF8(c)"
+    assert conns["postgres"].length_expression("c") == "LENGTH(c)"
+    assert conns["mssql"].substring_expression("c", 200) == "SUBSTRING(c, 1, 200)"
+    assert conns["oracle"].substring_expression("c", 200) == "SUBSTR(c, 1, 200)"
+    assert conns["db2"].substring_expression("c", 200) == (
+        "SUBSTR(c, 1, CASE WHEN LENGTH(c) < 200 THEN LENGTH(c) ELSE 200 END)"
+    )  # Db2 raises SQL0138N when the length argument exceeds the value
+    assert conns["postgres"].escape_like("100%_x\\y") == "100\\%\\_x\\\\y"
+    assert conns["mssql"].escape_like("a[b]%") == "a\\[b]\\%"
+    assert conns["postgres"].like_predicate("LOWER(c)", "%s") == "LOWER(c) LIKE %s ESCAPE '\\'"
+    assert conns["clickhouse"].like_predicate("lower(c)", "%(p1)s") == "lower(c) LIKE %(p1)s"

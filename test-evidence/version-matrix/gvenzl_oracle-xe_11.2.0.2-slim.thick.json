@@ -1,44 +1,44 @@
 {
-  "label": "mcr.microsoft.com/mssql/server:2017-latest",
-  "engine": "mssql",
+  "label": "gvenzl/oracle-xe:11.2.0.2-slim (thick)",
+  "engine": "oracle",
   "probe_rev": "unknown",
-  "started_utc": "2026-09-16T20:01:42Z",
+  "started_utc": "2026-09-16T20:22:35Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 1186,
+      "ms": 677,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 32,
-      "detail": "Microsoft SQL Server 2017 (RTM-CU31-GDR) (KB5122774) - 14.0."
+      "ms": 232,
+      "detail": "Oracle Database 11g Express Edition Release 11.2.0.2.0 - 64b"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 4,
-      "detail": "dbo"
+      "ms": 261,
+      "detail": "SYSTEM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 36,
-      "detail": "[TableSummary(schema='dbo', name='customers', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='dbo', name='orders', kind='table', row_estimate=None, row_e"
+      "ms": 407,
+      "detail": "[TableSummary(schema='SYSTEM', name='AQ$DEF$_AQCALL', kind='view', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='AQ$DEF$_AQERROR', kind='view', row_es"
     },
     {
       "check": "list_tables_has_seed",
       "status": "passed",
       "ms": 0,
-      "detail": "customers"
+      "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 38,
-      "detail": "[ColumnInfo(schema='dbo', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='dbo', table='customers', name='email', data_type='nv"
+      "ms": 20,
+      "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EM"
     },
     {
       "check": "list_columns_count",
@@ -49,123 +49,119 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 19,
+      "ms": 418,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 76,
-      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83F081"
+      "ms": 381,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C006988', columns=["
     },
     {
       "check": "index_on_fk_visible",
       "status": "passed",
       "ms": 0,
-      "detail": "ix_orders_customer"
+      "detail": "IX_ORDERS_CUSTOMER"
     },
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 1,
-      "detail": "PK__customer__3213E83F46E782F6"
+      "ms": 260,
+      "detail": "SYS_C006987"
     },
     {
       "check": "composite_unique_index",
       "status": "passed",
       "ms": 0,
-      "detail": "ux_customers_region_email"
+      "detail": "UX_CUSTOMERS_REGION_EMAIL"
     },
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 23,
-      "detail": "customers"
+      "ms": 1872,
+      "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 4,
-      "detail": "v_orders"
+      "ms": 90,
+      "detail": "VM_V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 8,
-      "detail": "f_one"
+      "ms": 69,
+      "detail": "VM_F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 43,
-      "detail": "catalog_estimate(sys.partitions)"
+      "ms": 7,
+      "detail": "catalog_estimate(all_tables.num_rows)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 3,
+      "ms": 209,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 9,
+      "ms": 220,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 29,
+      "ms": 210,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
-      "status": "failed",
-      "ms": 4,
-      "detail": "AssertionError: [['north', 100]]"
+      "status": "passed",
+      "ms": 237,
+      "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 3,
-      "detail": "[122, 'user122@example.com', None]"
+      "ms": 218,
+      "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "skipped",
       "ms": 0,
-      "detail": "unsupported by design: T-SQL plan capture requires SET SHOWPLAN_XML in a separate batch; not implemented in this build"
+      "detail": "unsupported by design: Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build"
     }
   ],
-  "server_version": "Microsoft SQL Server 2017 (RTM-CU31-GDR) (KB5122774) - 14.0.",
+  "server_version": "Oracle Database 11g Express Edition Release 11.2.0.2.0 - 64b",
   "session": {
-    "engine": "mssql",
-    "isolation": "read_uncommitted",
-    "lock_timeout_seconds": 5.0,
+    "engine": "oracle",
+    "isolation": null,
+    "lock_timeout_seconds": null,
     "statement_timeout_seconds": 60.0,
     "application_name": "udbmcp:vm",
     "read_only_requested": true,
     "server_read_only_available": false,
     "applied": [
-      "statement_timeout=60s",
-      "isolation=read_uncommitted",
-      "lock_timeout=5000ms"
+      "client_identifier=udbmcp:vm",
+      "call_timeout=60000ms"
     ],
     "skipped": [],
     "read_only_enforced": false,
     "read_only_verified": null,
     "server_reports": {
-      "isolation": "read_uncommitted",
-      "application_name": "udbmcp:vm",
-      "lock_timeout_ms": "5000"
+      "module": "udbmcp",
+      "client_identifier": "udbmcp:vm"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:01:43Z",
+  "finished_utc": "2026-09-16T20:22:41Z",
   "summary": {
-    "passed": 20,
-    "failed": [
-      "top_values"
-    ]
+    "passed": 21,
+    "failed": []
   }
 }

@@ -338,7 +338,9 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
         assert n == 200, f"sample returned {n} rows, expected 200"
         return n
     check("sample_query", _sample)
-    select_list, layout = aggregate_select_list(cols, engine, conn.quote_identifier, conn.length_function())
+    select_list, layout = aggregate_select_list(
+        cols, engine, conn.quote_identifier, conn.length_expression, conn.substring_expression
+    )
     def _profile() -> Any:
         out = conn.execute_query(QuerySpec(sql=f"SELECT {select_list} FROM ({sample_sql}) s", max_rows=1))
         total, profiles = build_profiles(cols, engine, layout, out.rows[0])
@@ -349,7 +351,11 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
     region_col = next((c.name for c in cols if c.name.lower() == "region"), "region")
     def _top() -> Any:
         rows = conn.execute_query(QuerySpec(sql=conn.build_top_values_query(sample_sql, region_col, 3), max_rows=3)).rows
-        assert sorted(str(r[0]) for r in rows) == ["north", "south"], rows
+        values = {str(r[0]) for r in rows}
+        # an unordered TOP/LIMIT sample is allocation-order on SQL Server heaps
+        # (2017/2019 returned only one region from a 200-row sample), so assert
+        # membership and shape, not the exact pair
+        assert rows and values <= {"north", "south"} and all(int(r[1]) > 0 for r in rows), rows
         return rows
     check("top_values", _top)
     email_col = next((c.name for c in cols if c.name.lower() == "email"), "email")

@@ -41,6 +41,19 @@ from universal_db_mcp.security.redact import scrub_exception
 from universal_db_mcp.security.sql_guard import translate_paramstyle
 
 
+def _pg_type(data_type: Any, char_len: Any, precision: Any, scale: Any) -> str:
+    """information_schema.data_type with the declared length/precision folded
+    back in ("character varying(200)", "numeric(12,2)"), so the profiler's
+    oversized_string / integer_range findings have something to compare."""
+    base = str(data_type or "")
+    low = base.lower()
+    if low in ("character varying", "character", "varchar", "char", "bpchar", "bit", "bit varying") and char_len:
+        return f"{base}({int(char_len)})"
+    if low in ("numeric", "decimal") and precision:
+        return f"{base}({int(precision)},{int(scale or 0)})"
+    return base
+
+
 class PostgresConnector(DatabaseConnector):
     engine = "postgres"
 
@@ -163,7 +176,7 @@ class PostgresConnector(DatabaseConnector):
                 except Exception as exc:  # noqa: BLE001
                     self._session_skipped("statement_timeout", exc)
             if prof.lock_timeout_seconds is not None:
-                ms = int(math.ceil(prof.lock_timeout_seconds * 1000))
+                ms = max(1, int(math.ceil(prof.lock_timeout_seconds * 1000)))  # 0 would DISABLE the ceiling
                 try:
                     conn.execute(f"SET lock_timeout = '{ms}ms'")
                     self._session_applied(f"lock_timeout={ms}ms")
@@ -304,7 +317,8 @@ class PostgresConnector(DatabaseConnector):
         if not types:
             return []
         sql = (
-            "SELECT n.nspname, c.relname, c.relkind, GREATEST(c.reltuples, 0)::bigint "
+            "SELECT n.nspname, c.relname, c.relkind, "
+            "CASE WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END "
             "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE c.relkind = ANY(%s) AND n.nspname NOT IN "
             "('pg_toast','pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_temp%%'"
@@ -333,7 +347,8 @@ class PostgresConnector(DatabaseConnector):
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
         schema = schema or "public"
         sql = (
-            "SELECT column_name, data_type, is_nullable, column_default, ordinal_position "
+            "SELECT column_name, data_type, is_nullable, column_default, ordinal_position, "
+            "character_maximum_length, numeric_precision, numeric_scale "
             "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
             "ORDER BY ordinal_position"
         )
@@ -344,7 +359,7 @@ class PostgresConnector(DatabaseConnector):
                 schema=schema,
                 table=table,
                 name=r[0],
-                data_type=r[1],
+                data_type=_pg_type(r[1], r[5], r[6], r[7]),
                 nullable=r[2] == "YES",
                 default=r[3],
                 ordinal=r[4],
@@ -403,14 +418,15 @@ class PostgresConnector(DatabaseConnector):
     def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
         schema = schema or "public"
         sql = (
-            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position "
+            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position, "
+            "character_maximum_length, numeric_precision, numeric_scale "
             "FROM information_schema.columns WHERE table_schema = %s ORDER BY table_name, ordinal_position"
         )
         with self._shared_meta_conn() as conn:
             rows = conn.execute(sql, (schema,)).fetchall()
         return [
-            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=r[2], nullable=r[3] == "YES",
-                       default=r[4], ordinal=r[5])
+            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=_pg_type(r[2], r[6], r[7], r[8]),
+                       nullable=r[3] == "YES", default=r[4], ordinal=r[5])
             for r in rows
         ]
 
@@ -501,7 +517,7 @@ class PostgresConnector(DatabaseConnector):
         schema = schema or "public"
         with self._shared_meta_conn() as conn:
             row = conn.execute(
-                "SELECT c.reltuples::bigint, s.n_live_tup, s.last_analyze "
+                "SELECT CASE WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END, s.n_live_tup, s.last_analyze "
                 "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid "
                 "WHERE n.nspname = %s AND c.relname = %s",

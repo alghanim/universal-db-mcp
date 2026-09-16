@@ -363,7 +363,8 @@ class SQLiteConnector(DatabaseConnector):
             )
             for r in rows
         ]
-        return [c for c, r in zip(cols, rows, strict=True) if r[5] > 0]
+        keyed = [(r[5], c) for c, r in zip(cols, rows, strict=True) if r[5] > 0]
+        return [c for _pos, c in sorted(keyed, key=lambda kc: kc[0])]  # pk column order, not table order
 
     def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
         with self._open() as conn:

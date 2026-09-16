@@ -20,8 +20,16 @@ from universal_db_mcp.connectors.base import ColumnInfo, IndexInfo, KeyInfo
 from universal_db_mcp.discovery.types import PortableType, portable_type
 
 AGGREGATABLE_KINDS = ("numeric", "string", "temporal", "boolean")
+# Portable names whose MIN/MAX (or LENGTH) the engines reject: PostgreSQL has
+# no min(boolean)/min(uuid), ClickHouse no length(IPv4)/lower(IPv4).
+NO_MINMAX = ("boolean", "uuid", "inet")
+NO_LENGTH = ("enum", "uuid", "inet")
 LOW_CARDINALITY_MAX = 50  # distinct values at or below this get top-values
 TOP_VALUES = 5
+STRING_MINMAX_CHARS = 200  # MIN/MAX of strings are cut server-side so the aggregate row stays small
+# get_statistics reports the last statistics collection under an engine-specific key;
+# engines with no such notion (ClickHouse, SQLite) never get the finding.
+STATS_TIME_KEYS = ("stats_time", "last_analyze", "last_analyzed", "last_update")
 
 
 @dataclasses.dataclass
@@ -59,30 +67,48 @@ class ColumnProfile:
 
 
 def aggregate_select_list(
-    columns: list[ColumnInfo], engine: str, quote: Any, length_fn: str
+    columns: list[ColumnInfo],
+    engine: str,
+    quote: Any,
+    length_expr: Any,
+    substring_expr: Any | None = None,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Return (select list, [(column, measure), ...]) in output order.
 
-    ``COUNT(*)`` comes first; each aggregatable column contributes COUNT,
-    COUNT(DISTINCT), MIN and MAX; string columns add MAX(LENGTH); every other
-    column contributes COUNT only.
+    ``COUNT(*)`` comes first; each aggregatable column contributes COUNT and
+    COUNT(DISTINCT); MIN/MAX are added unless the engines reject them for
+    that portable name; string columns add MAX(length) and have their
+    MIN/MAX cut to STRING_MINMAX_CHARS server-side; every other column
+    contributes COUNT only. ``length_expr(q)`` and ``substring_expr(q, n)``
+    are the connector's engine-specific builders.
     """
     parts = ["COUNT(*)"]
     layout: list[tuple[str, str]] = [("*", "count")]
     for col in columns:
         q = quote(col.name)
         pt = portable_type(engine, col.data_type)
-        parts.append(f"COUNT({q})")
+        if pt.kind == "lob":
+            # Oracle raises ORA-00932/ORA-22849 for COUNT(clob); IS NULL is
+            # legal on every engine's large-object types
+            parts.append(f"COUNT(CASE WHEN {q} IS NOT NULL THEN 1 END)")
+        else:
+            parts.append(f"COUNT({q})")
         layout.append((col.name, "non_null"))
         if pt.kind in AGGREGATABLE_KINDS:
             parts.append(f"COUNT(DISTINCT {q})")
             layout.append((col.name, "distinct"))
-            parts.append(f"MIN({q})")
-            layout.append((col.name, "min"))
-            parts.append(f"MAX({q})")
-            layout.append((col.name, "max"))
-            if pt.kind == "string" and pt.name not in ("enum", "uuid"):
-                parts.append(f"MAX({length_fn}({q}))")
+            if pt.name not in NO_MINMAX:
+                # enums are orderable but ClickHouse's substring rejects them (live run 2026-09-16)
+                if pt.kind == "string" and pt.name not in NO_LENGTH and substring_expr is not None:
+                    target = substring_expr(q, STRING_MINMAX_CHARS)
+                else:
+                    target = q
+                parts.append(f"MIN({target})")
+                layout.append((col.name, "min"))
+                parts.append(f"MAX({target})")
+                layout.append((col.name, "max"))
+            if pt.kind == "string" and pt.name not in NO_LENGTH:
+                parts.append(f"MAX({length_expr(q)})")
                 layout.append((col.name, "max_length"))
     return ", ".join(parts), layout
 
@@ -172,11 +198,14 @@ def findings_for_table(  # noqa: PLR0912 - a rule table
                 f"foreign key {fk.name or ''} on ({', '.join(fk.columns)}) has no index whose leading column matches",
                 "add an index on the foreign key columns; joins and parent deletes scan the table otherwise",
             ))
-    if stats and stats.get("stats_time") is None and stats.get("row_estimate_source", "").startswith("catalog"):
-        out.append(Finding(
-            "statistics_missing", "low", None, "the catalog carries no statistics timestamp",
-            "run the engine's statistics collection so the optimizer has cardinalities",
-        ))
+    if stats:
+        present = [k for k in STATS_TIME_KEYS if k in stats]
+        if present and all(stats.get(k) is None for k in present):
+            out.append(Finding(
+                "statistics_missing", "low", None,
+                f"the catalog reports no statistics collection time ({present[0]} is empty)",
+                "run the engine's statistics collection so the optimizer has cardinalities",
+            ))
     meaningful = sample_size >= 100
     for col in columns:
         prof = profiles.get(col.name)

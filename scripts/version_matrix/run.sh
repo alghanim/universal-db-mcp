@@ -36,7 +36,6 @@ MATRIX_LIGHT=(
   "clickhouse|clickhouse/clickhouse-server:25.3|8123|55253||clickhouse-client -q 'SELECT 1'|CLICKHOUSE_PASSWORD=$PW"
 )
 MATRIX_HEAVY=(
-  "oracle|gvenzl/oracle-xe:11.2.0.2-slim|1521|55111|--platform linux/amd64|healthcheck.sh|ORACLE_PASSWORD=$PW"
   "oracle|gvenzl/oracle-xe:18.4.0-slim|1521|55118|--platform linux/amd64|healthcheck.sh|ORACLE_PASSWORD=$PW"
   "oracle|gvenzl/oracle-xe:21.3.0-slim|1521|55121|--platform linux/amd64|healthcheck.sh|ORACLE_PASSWORD=$PW"
   "oracle|gvenzl/oracle-free:23-slim|1521|55123||healthcheck.sh|ORACLE_PASSWORD=$PW"

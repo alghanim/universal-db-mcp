@@ -223,3 +223,44 @@ def test_foreign_key_targets_outside_the_allowlist_are_redacted(monkeypatch: pyt
     assert _redact_foreign_target(policy, hidden)["ref_table"] == "<not permitted>"
     assert _redact_foreign_target(policy, hidden)["columns"] == ["customer_id"]
     assert _redact_foreign_target(policy, visible)["ref_table"] == "orders"
+
+
+def test_catalog_and_index_listing_hide_system_catalogs_unless_asked(server: Any, monkeypatch: Any) -> None:
+    """Live run 2026-09-16: an Oracle catalog page was 50 dictionary views
+    (ALL_*, SYS) and a Db2 page was SYSCAT before the user's own tables."""
+    from universal_db_mcp.connectors.base import TableSummary
+    from universal_db_mcp.server import AppContext
+
+    real = AppContext.tables_for
+
+    async def with_system(self: Any, policy: Any, connector: Any) -> list[Any]:
+        rows = await real(self, policy, connector)
+        return [*rows, TableSummary(schema=None, name="sqlite_stat1", kind="table")]
+
+    monkeypatch.setattr(AppContext, "tables_for", with_system)
+    names = {t["name"] for t in _call(server, "db_get_catalog", {"connection_id": "shop"})["data"]["tables"]}
+    assert "sqlite_stat1" not in names and "orders" in names
+    names = {
+        t["name"]
+        for t in _call(server, "db_get_catalog", {"connection_id": "shop", "include_system": True})["data"]["tables"]
+    }
+    assert "sqlite_stat1" in names
+
+
+@pytest.mark.parametrize("spelling", ["main.orders", '"main"."orders"', "orders"])
+def test_qualified_object_names_resolve_like_the_catalog_spells_them(server: Any, spelling: str) -> None:
+    """Live run 2026-09-16: 'ocean.buoys' (the catalog's own spelling) was
+    denied with "qualify it with an allowed schema" on every engine because
+    the dotted name was matched as one table name."""
+    env = _call(server, "db_profile_table", {"connection_id": "shop", "object_name": spelling, "sample_rows": 5})
+    data = env["data"]
+    assert (data["schema"], data["name"]) == ("main", "orders")
+
+
+def test_three_part_and_disagreeing_object_names_are_refused(server: Any) -> None:
+    with pytest.raises(Exception, match="schema.table"):
+        _call(server, "db_profile_table", {"connection_id": "shop", "object_name": "db.main.orders"})
+    with pytest.raises(Exception, match="disagrees"):
+        _call(server, "db_profile_table", {"connection_id": "shop", "object_name": "main.orders", "schema": "other"})
+    with pytest.raises(Exception, match="not a permitted object"):
+        _call(server, "db_profile_table", {"connection_id": "shop", "object_name": "nope.orders"})

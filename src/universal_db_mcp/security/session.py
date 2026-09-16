@@ -70,11 +70,14 @@ def resolve_session(connection: ResolvedConnection, policy: EffectivePolicy) -> 
     # A connection id is free text in the config; the DSN keywords it lands
     # in are not.
     name = _UNSAFE.sub("_", name)[:64]
+    lock_timeout = s.lock_timeout_seconds
+    if engine in ("oracle", "clickhouse"):
+        lock_timeout = None  # no session-level lock-wait ceiling exists on these engines
     return SessionProfile(
         engine=engine,
         connection_id=connection.name,
         isolation=isolation,
-        lock_timeout_seconds=s.lock_timeout_seconds,
+        lock_timeout_seconds=lock_timeout,
         statement_timeout_seconds=(
             float(policy.hard_query_timeout_seconds) if s.statement_timeout_from_policy else None
         ),

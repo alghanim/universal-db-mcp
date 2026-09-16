@@ -39,8 +39,6 @@ def _guard(engine: str = "db2") -> SqlGuard:
         "SELECT * FROM APP.CUSTOMERS WITH UR",
         "select * from app.customers with ur",
         "SELECT * FROM APP.CUSTOMERS WITH CS",
-        "SELECT * FROM APP.CUSTOMERS WITH RS",
-        "SELECT * FROM APP.CUSTOMERS WITH RR",
         "SELECT * FROM APP.CUSTOMERS FOR READ ONLY",
         "SELECT * FROM APP.CUSTOMERS FOR FETCH ONLY WITH UR",
         "SELECT * FROM APP.CUSTOMERS OPTIMIZE FOR 100 ROWS WITH UR",
@@ -51,6 +49,14 @@ def _guard(engine: str = "db2") -> SqlGuard:
 def test_db2_read_only_tail_clauses_are_allowed(sql: str) -> None:
     result = _guard().validate_select(sql)
     assert result.kind == "select"
+
+
+@pytest.mark.parametrize("sql", ["SELECT * FROM APP.CUSTOMERS WITH RS", "SELECT * FROM APP.CUSTOMERS WITH RR"])
+def test_locking_isolation_levels_are_refused(sql: str) -> None:
+    """RS/RR keep locks for the statement: an agent could otherwise opt out of
+    the session profile's enforced UR (review finding, 2026-09-16)."""
+    with pytest.raises(ToolFailure, match="RS/RR"):
+        _guard().validate_select(sql)
 
 
 def test_locking_clause_is_still_refused() -> None:
