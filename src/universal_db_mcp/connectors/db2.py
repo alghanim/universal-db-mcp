@@ -528,33 +528,48 @@ class Db2Connector(DatabaseConnector):
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
         conn = self._connect()
         try:
-            sql = "SELECT CONSTNAME, TABSCHEMA, TABNAME, REFTABSCHEMA, REFTABNAME FROM SYSCAT.REFERENCES"
+            # SYSCAT.REFERENCES names the constraint and both tables;
+            # SYSCAT.KEYCOLUSE supplies the column lists on both sides
+            # (joined by COLSEQ, so composite keys line up). Verified live on
+            # Db2 11.5.9 (2026-09-16).
+            sql = (
+                "SELECT r.CONSTNAME, r.TABSCHEMA, r.TABNAME, r.REFTABSCHEMA, r.REFTABNAME, "
+                "k.COLNAME, k.COLSEQ, rk.COLNAME "
+                "FROM SYSCAT.REFERENCES r "
+                "JOIN SYSCAT.KEYCOLUSE k ON k.CONSTNAME = r.CONSTNAME "
+                "AND k.TABSCHEMA = r.TABSCHEMA AND k.TABNAME = r.TABNAME "
+                "JOIN SYSCAT.KEYCOLUSE rk ON rk.CONSTNAME = r.REFKEYNAME "
+                "AND rk.TABSCHEMA = r.REFTABSCHEMA AND rk.TABNAME = r.REFTABNAME AND rk.COLSEQ = k.COLSEQ"
+            )
             params: list[Any] = []
             predicates: list[str] = []
             if schema:
-                predicates.append("TABSCHEMA = ?")
+                predicates.append("r.TABSCHEMA = ?")
                 params.append(schema)
             if table:
-                predicates.append("TABNAME = ?")
+                predicates.append("r.TABNAME = ?")
                 params.append(table)
             if predicates:
                 sql += " WHERE " + " AND ".join(predicates)
+            sql += " ORDER BY r.CONSTNAME, k.COLSEQ"
             stmt = self._module.prepare(conn, sql)
             self._module.execute(stmt, tuple(params))
-            rows = []
-            while row := self._module.fetch_tuple(stmt):
-                rows.append(row)
-            # SYSCAT.REFERENCES carries the owning table too; schema-wide
-            # listings (catalog snapshot, relationship inference) need it.
-            return [
-                KeyInfo(
-                    kind="foreign_key", name=_s(r[0]), columns=[], ref_schema=_s(r[3]), ref_table=_s(r[4]),
-                    source_schema=_s(r[1]), source_table=_s(r[2]),
-                )
-                for r in rows
-            ]
+            rows = self._fetch_all(stmt)
         finally:
             self._module.close(conn)
+        grouped: dict[tuple[str, str, str], KeyInfo] = {}
+        for name, src_schema, src_table, ref_schema, ref_table, col, _seq, ref_col in rows:
+            key = (_s(name), _s(src_schema), _s(src_table))
+            info = grouped.get(key)
+            if info is None:
+                info = KeyInfo(
+                    kind="foreign_key", name=key[0], columns=[], ref_schema=_s(ref_schema), ref_table=_s(ref_table),
+                    ref_columns=[], source_schema=key[1], source_table=key[2],
+                )
+                grouped[key] = info
+            info.columns.append(str(_s(col)))
+            info.ref_columns.append(str(_s(ref_col)))
+        return list(grouped.values())
 
     @_meta_translated
     def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:

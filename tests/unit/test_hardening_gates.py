@@ -476,9 +476,15 @@ def test_db2_catalog_loops_stop_on_driver_false_sentinel() -> None:
     conn, _ = _db2_with_fake_driver([("APP", "F1", "F"), ("APP", "P1", "P")])
     assert [(r.name, r.kind) for r in conn.list_routines("APP")] == [("F1", "function"), ("P1", "procedure")]
 
-    conn, _ = _db2_with_fake_driver([("FK1", "APP", "ORDERS", "APP", "CUSTOMERS")])
+    # SYSCAT.REFERENCES joined to KEYCOLUSE on both sides: one row per key column
+    conn, _ = _db2_with_fake_driver([
+        ("FK1", "APP", "ORDERS", "APP", "CUSTOMERS", "CUSTOMER_ID", 1, "ID"),
+        ("FK1", "APP", "ORDERS", "APP", "CUSTOMERS", "REGION", 2, "REGION"),
+    ])
     fks = conn.get_foreign_keys("APP", "ORDERS")
-    assert [(k.name, k.ref_schema, k.ref_table) for k in fks] == [("FK1", "APP", "CUSTOMERS")]
+    assert [(k.name, k.ref_schema, k.ref_table, k.columns, k.ref_columns) for k in fks] == [
+        ("FK1", "APP", "CUSTOMERS", ["CUSTOMER_ID", "REGION"], ["ID", "REGION"])
+    ]
 
 
 def test_db2_empty_result_set_is_empty_list() -> None:
@@ -508,24 +514,26 @@ def test_db2_all_null_row_is_not_mistaken_for_end_of_set() -> None:
     ("schema", "table", "expected_where"),
     [
         (None, None, ""),
-        ("APP", None, " WHERE TABSCHEMA = ?"),
-        (None, "ORDERS", " WHERE TABNAME = ?"),
-        ("APP", "ORDERS", " WHERE TABSCHEMA = ? AND TABNAME = ?"),
+        ("APP", None, " WHERE r.TABSCHEMA = ?"),
+        (None, "ORDERS", " WHERE r.TABNAME = ?"),
+        ("APP", "ORDERS", " WHERE r.TABSCHEMA = ? AND r.TABNAME = ?"),
     ],
 )
 def test_db2_foreign_key_filters_form_a_valid_where_clause(
     schema: str | None, table: str | None, expected_where: str
 ) -> None:
     """Filters used to be appended as ' AND ...' to a query with no WHERE,
-    which is a syntax error on every filtered call."""
+    which is a syntax error on every filtered call. Since 2026-09-16 the
+    statement joins SYSCAT.KEYCOLUSE on both sides (columns of the key), so
+    the predicates are alias-qualified."""
     import sqlglot
 
     conn, fake = _db2_with_fake_driver([])
     assert conn.get_foreign_keys(schema, table) == []
-    base = "SELECT CONSTNAME, TABSCHEMA, TABNAME, REFTABSCHEMA, REFTABNAME FROM SYSCAT.REFERENCES"
-    assert fake.sql == base + expected_where
+    assert fake.sql.endswith(expected_where + " ORDER BY r.CONSTNAME, k.COLSEQ")
+    assert "SYSCAT.KEYCOLUSE k" in fake.sql and "SYSCAT.KEYCOLUSE rk" in fake.sql
     assert fake.params == tuple(p for p in (schema, table) if p)
-    assert "REFERENCES AND" not in fake.sql
+    assert "REFERENCES AND" not in fake.sql and "rk.COLSEQ = k.COLSEQ AND" not in fake.sql
     sqlglot.parse_one(fake.sql)  # raises ParseError if the statement is malformed
 
 

@@ -394,6 +394,9 @@ class PostgresConnector(DatabaseConnector):
                 rows = conn.execute(legacy_sql, params).fetchall()
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2]) for r in rows]
 
+    def text_expression(self, quoted_column: str, portable_name: str) -> str:
+        return f"CAST({quoted_column} AS text)" if portable_name == "uuid" else quoted_column
+
     def placeholder(self, index: int) -> str:
         return "%s"
 

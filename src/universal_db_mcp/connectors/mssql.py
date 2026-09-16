@@ -442,6 +442,9 @@ class MssqlConnector(DatabaseConnector):
     def length_function(self) -> str:
         return "LEN"
 
+    def text_expression(self, quoted_column: str, portable_name: str) -> str:
+        return f"CAST({quoted_column} AS varchar(64))" if portable_name == "uuid" else quoted_column
+
     def build_search_query(
         self, schema: str | None, table: str, select_columns: list[str], where_sql: str, limit: int
     ) -> str:

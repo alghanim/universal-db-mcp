@@ -30,7 +30,7 @@ Every `passed` claim below points at machine-readable evidence in
 
 | Item | Evidence |
 | --- | --- |
-| SQLite MCP server, full 20-tool surface, read-only, bounded execution | `test-evidence/airgap-gateAB/protocol-probe.json` (real stdio MCP session: initialize, 20 tools listed, discovery, query, masking, write denial, sample, capabilities, explain, history) |
+| SQLite MCP server, full tool surface (20 at that run; 25 since 2026-09-16), read-only, bounded execution | `test-evidence/airgap-gateAB/protocol-probe.json` (real stdio MCP session: initialize, 20 tools listed, discovery, query, masking, write denial, sample, capabilities, explain, history) |
 | Gate B — no-network protocol test (pinned MCP SDK client, no npm/browser) | same, run inside `docker --network none` container |
 | Gate A — clean offline installation from bundle only (verify → install → doctor → demo → restart) | `test-evidence/airgap-gateAB/airgap-test-results.json`, `doctor.json` (run 2026-09-08T13:30Z; **caveat:** amd64 userland under Docker Desktop emulation on the staging host; artifacts are genuine x86_64) |
 | Gate A-negative — tampered wheel, missing wheel, wrong-ABI wheel, untrusted signature, missing licensed driver, hostile inherited pip config: all fail fast with no download attempts; each fail_fast case requires nonzero exit AND its expected actionable diagnostic (a classifier that credited any nonzero exit was fixed 2026-09-11); the untrusted-signature case now fails closed if no foreign signature can be produced (a vacuous pass with the original trusted SIGNATURE still in place was reproduced and fixed), and the verifier emits the canonical `signature verification FAILED` diagnostic on every rejection path including OpenSSL-3-only hosts — re-run 2026-09-11: **6/6 passed** | `test-evidence/airgap-failure-modes/results.json` + per-case `*.json` and `*.output.txt` |
@@ -370,6 +370,44 @@ Known and NOT fixed here, now documented rather than implied away:
 | Response size | Every result is transmitted twice (structured + pretty-printed text), so wire bytes are ~2.7x `security.max_response_bytes`. Documented in `docs/tools.md`. |
 | Client adapters | stdio only; an HTTP registration is written by hand. Adapters also do not propagate `*_env` credential variable names into the harness environment. |
 | Container mode | Needs `http_host: 0.0.0.0` and a token file owned by the image's udbmcp UID; both are documented in `packaging/compose.offline.yaml`, neither is exercised by a gate. |
+
+## 3d. Production session safety, discovery tools, version matrix (2026-09-16)
+
+- **Session safety profile** (`docs/session-safety.md`): applied to every
+  server session right after connect and read back for
+  `db_test_connection`. Db2 runs at `UR` and SQL Server at
+  `READ UNCOMMITTED` for read-only connections, enforced (a refusing server
+  fails the connection); PostgreSQL, MySQL, ClickHouse and SQLite refuse
+  writes server-side; lock waits and statement time are capped; sessions are
+  named for DBAs. Live evidence in `test-evidence/session-safety/`: five
+  engines read back, three engines refuse `CREATE TABLE` server-side, and a
+  `db_query` on Db2 with no `WITH UR` in its text reads back
+  `CURRENT ISOLATION = UR`. SQL Server: applied by the connector, verified
+  only where the version matrix can run it (`not_run` natively: no ODBC
+  driver on the staging host).
+- **Discovery tools** (`docs/tools.md`): `db_list_indexes`,
+  `db_get_catalog`, `db_profile_table`, `db_search_values`,
+  `db_infer_relationships`, backed by new connector methods on all seven
+  engines (index listing, schema-wide bulk columns, engine-native limit and
+  placeholder builders) and a portable type vocabulary. Live evidence in
+  `test-evidence/discovery-tools/` on PostgreSQL, MySQL, ClickHouse, Oracle
+  and Db2, including cross-connection inference and a value search across
+  four engines in ~4 s. Two defects found and fixed by that live run:
+  ClickHouse rejects `lower()`/`length()` on UUID and Enum (now cast), and
+  system catalogs were being searched (now excluded by default).
+- **Version matrix** (`scripts/version_matrix/`, evidence in
+  `test-evidence/version-matrix/`): a probe that seeds a themed schema on
+  any server version and drives every connector capability. Results so far:
+
+  | Engine | Versions passing all 21 checks |
+  |---|---|
+  | PostgreSQL | 12, 13, 14, 15, 16, 17 |
+  | MySQL | 5.7, 8.0, 8.4 |
+  | MariaDB | 10.6, 11.4 |
+  | ClickHouse | 23.8, 24.3, 24.8, 25.3 (20 checks; foreign keys do not exist there) |
+
+  Oracle, Db2 and SQL Server rows are recorded as their runs complete; a
+  version not listed here is `not_run`, not "works".
 
 ## 4. Gates not (fully) run (recorded truthfully)
 

@@ -42,6 +42,45 @@ stable category:
 | `db_sample_table` | default 20 rows; masking/omission policy applied |
 | `db_explain` | non-executing plans only |
 | `db_get_query_history` | process-scoped, fingerprints only (see the identity note below) |
+| `db_list_indexes` | indexes + primary keys of one object or a whole schema; ClickHouse reports sorting keys and skipping indices |
+| `db_get_catalog` | one-call paged catalog snapshot: columns with portable types, primary/foreign keys, indexes, row estimates, sensitivity hints; no data read |
+| `db_profile_table` | bounded data profile over the connector's sample (null ratio, distinct, min/max, lengths, top values) + evidence-backed findings; sensitive columns return counts only |
+| `db_search_values` | a value searched across permitted tables of many connections without SQL; per-table hits, time budget, per-table timeout, system schemas and sensitive columns excluded |
+| `db_infer_relationships` | declared foreign keys + inferred join candidates (name/type match, `<table>_id` convention) within and across connections, metadata only |
+
+## Discovery tools for federated work (ETL, documentation, optimization)
+
+The five discovery tools exist so an agent can understand many databases
+without hand-written queries, then document or extract from them:
+
+1. `db_get_catalog` per connection gives every permitted table with columns
+   in one portable vocabulary (`portable_type`: integer, bigint, decimal,
+   float, boolean, string, text, date, time, timestamp, timestamptz, binary,
+   json, uuid, enum, other) and a `kind` that says what may be aggregated
+   (`lob` marks Oracle/Db2 large objects, which are counted but never
+   aggregated or searched).
+   An ETL layer creates targets from this; a documentation pass renders it.
+2. `db_infer_relationships` across connections proposes joins between
+   databases that share keys (a `customer_id` in the CRM and the ERP), with a
+   stated confidence; declared foreign keys are reported as facts.
+3. `db_profile_table` measures a bounded sample and returns findings the
+   agent can turn into recommendations: missing primary key, foreign key
+   without an index, nullable columns that are never null, oversized string
+   declarations, low-cardinality columns (lookup/enum candidates), natural
+   key candidates, integer ranges that fit a smaller type, missing
+   statistics. Every finding carries its evidence and says when the sample
+   is smaller than the table.
+4. `db_search_values` answers "where does this value appear" across
+   everything the agent may read, case-insensitively, bounded per table and
+   by a time budget, under the session safety profile
+   (`docs/session-safety.md`), so a search over production never holds locks
+   or runs unbounded.
+5. `db_list_indexes` supports the optimization pass directly.
+
+What they never do: read table data for the catalog or inference tools,
+return values of columns matching `security.mask_columns`, search or profile
+system catalogs unless asked (`include_system`), or run outside the policy's
+row, byte and time ceilings.
 
 ## Value representation
 

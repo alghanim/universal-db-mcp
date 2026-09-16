@@ -150,3 +150,25 @@ def test_reports_when_the_loader_can_see_the_instant_client(
     check = _checks(run_doctor(cfg), "connection-o-oracle-instant-client")[0]
     assert check["status"] == "ok", check
     assert "libclntsh" in str(check["detail"])
+
+
+# ------------------------------------------------- session profile, resolved offline
+def test_doctor_reports_the_resolved_session_profile_per_connection(tmp_path: Path) -> None:
+    """The upgrade note promises operators can see which level each
+    connection will run at BEFORE upgrading; doctor needs no credentials for
+    that, only the config."""
+    p = tmp_path / "c.yaml"
+    p.write_text(
+        "connections:\n"
+        "  fin:\n    type: db2\n    host: h\n    database: d\n"
+        "  rep:\n    type: postgres\n    host: h\n    database: d\n    username_env: U\n"
+        "  keep:\n    type: db2\n    host: h\n    database: d\n    session:\n      isolation: cs\n      enforce_read_only: false\n",
+        encoding="utf-8",
+    )
+    report = run_doctor(str(p))
+    fin = _checks(report, "session-fin")[0]["detail"]
+    rep = _checks(report, "session-rep")[0]["detail"]
+    keep = _checks(report, "session-keep")[0]["detail"]
+    assert "isolation=ur" in fin and "fail-closed" in fin
+    assert "read-only=server-side (enforced)" in rep
+    assert "isolation=cs" in keep and "read-only=SQL guard only" in keep

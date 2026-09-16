@@ -1,0 +1,172 @@
+{
+  "label": "gvenzl/oracle-xe:21.3.0-slim",
+  "engine": "oracle",
+  "started_utc": "2026-09-16T19:37:56Z",
+  "checks": [
+    {
+      "check": "seed",
+      "status": "failed",
+      "ms": 2070,
+      "detail": "DatabaseError: ORA-01017: invalid username/password; logon denied\nHelp: https://docs.oracle.com/error-help/db/ora-01017/"
+    },
+    {
+      "check": "health_check",
+      "status": "passed",
+      "ms": 14218,
+      "detail": "HealthInfo(healthy=True, server_version='Oracle Database 21c Express Edition Release 21.0.0.0.0 - Pro', latency_ms=14218, detail=None, checked_at=1789587492.737806, session={'engine': 'oracle', 'isola"
+    },
+    {
+      "check": "list_schemas",
+      "status": "passed",
+      "ms": 8640,
+      "detail": "28"
+    },
+    {
+      "check": "list_tables",
+      "status": "passed",
+      "ms": 8456,
+      "detail": "[TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENTS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENT_PRIVS', kind"
+    },
+    {
+      "check": "list_tables_has_seed",
+      "status": "failed",
+      "ms": 0,
+      "detail": "IndexError: list index out of range"
+    },
+    {
+      "check": "list_columns",
+      "status": "passed",
+      "ms": 411,
+      "detail": "[]"
+    },
+    {
+      "check": "list_columns_count",
+      "status": "failed",
+      "ms": 0,
+      "detail": "AssertionError: 0 columns"
+    },
+    {
+      "check": "list_all_columns",
+      "status": "passed",
+      "ms": 722,
+      "detail": "1797"
+    },
+    {
+      "check": "list_indexes",
+      "status": "passed",
+      "ms": 2412,
+      "detail": "[]"
+    },
+    {
+      "check": "index_on_fk_visible",
+      "status": "failed",
+      "ms": 0,
+      "detail": "IndexError: list index out of range"
+    },
+    {
+      "check": "primary_key_visible",
+      "status": "failed",
+      "ms": 15,
+      "detail": "IndexError: list index out of range"
+    },
+    {
+      "check": "get_foreign_keys",
+      "status": "failed",
+      "ms": 2591,
+      "detail": "IndexError: list index out of range"
+    },
+    {
+      "check": "list_views",
+      "status": "passed",
+      "ms": 142,
+      "detail": "MVIEW_EVALUATIONS"
+    },
+    {
+      "check": "list_routines",
+      "status": "passed",
+      "ms": 197,
+      "detail": "6"
+    },
+    {
+      "check": "get_statistics",
+      "status": "passed",
+      "ms": 206,
+      "detail": "{'schema': 'SYSTEM', 'table': 'VM_CUSTOMERS', 'row_estimate': None, 'row_estimate_source': 'unavailable'}"
+    },
+    {
+      "check": "execute_query_count",
+      "status": "failed",
+      "ms": 4529,
+      "detail": "ConnectorError: DatabaseError: ORA-00942: table or view does not exist Help: https://docs.oracle.com/error-help/db/ora-00942/"
+    },
+    {
+      "check": "sample_query",
+      "status": "failed",
+      "ms": 711,
+      "detail": "ConnectorError: DatabaseError: ORA-00942: table or view does not exist Help: https://docs.oracle.com/error-help/db/ora-00942/"
+    },
+    {
+      "check": "profile_aggregate",
+      "status": "failed",
+      "ms": 586,
+      "detail": "ConnectorError: DatabaseError: ORA-00942: table or view does not exist Help: https://docs.oracle.com/error-help/db/ora-00942/"
+    },
+    {
+      "check": "top_values",
+      "status": "failed",
+      "ms": 579,
+      "detail": "ConnectorError: DatabaseError: ORA-00942: table or view does not exist Help: https://docs.oracle.com/error-help/db/ora-00942/"
+    },
+    {
+      "check": "value_search_like",
+      "status": "failed",
+      "ms": 613,
+      "detail": "ConnectorError: DatabaseError: ORA-00942: table or view does not exist Help: https://docs.oracle.com/error-help/db/ora-00942/"
+    },
+    {
+      "check": "explain",
+      "status": "failed",
+      "ms": 0,
+      "detail": "NotImplementedError: Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build"
+    }
+  ],
+  "server_version": "Oracle Database 21c Express Edition Release 21.0.0.0.0 - Pro",
+  "session": {
+    "engine": "oracle",
+    "isolation": null,
+    "lock_timeout_seconds": 5.0,
+    "statement_timeout_seconds": 60.0,
+    "application_name": "udbmcp:vm",
+    "read_only_requested": true,
+    "server_read_only_available": false,
+    "applied": [
+      "client_identifier=udbmcp:vm",
+      "call_timeout=60000ms"
+    ],
+    "skipped": [],
+    "read_only_enforced": false,
+    "server_reports": {
+      "module": "udbmcp",
+      "client_identifier": "udbmcp:vm"
+    }
+  },
+  "healthy": true,
+  "finished_utc": "2026-09-16T19:38:43Z",
+  "summary": {
+    "passed": 9,
+    "failed": [
+      "seed",
+      "list_tables_has_seed",
+      "list_columns_count",
+      "index_on_fk_visible",
+      "primary_key_visible",
+      "get_foreign_keys",
+      "execute_query_count",
+      "sample_query",
+      "profile_aggregate",
+      "top_values",
+      "value_search_like",
+      "explain"
+    ]
+  }
+}

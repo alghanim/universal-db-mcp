@@ -223,6 +223,13 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
             record["checks"].append({"check": name, "status": "passed", "ms": int((time.monotonic() - t0) * 1000),
                                      "detail": (str(value)[:200] if value is not None else None)})
             return value
+        except NotImplementedError as exc:
+            # a capability the connector declares unsupported on this engine
+            # (Oracle/Db2/SQL Server explain need admin-provisioned plan tables
+            # or a separate batch): not a compatibility failure
+            record["checks"].append({"check": name, "status": "skipped", "ms": int((time.monotonic() - t0) * 1000),
+                                     "detail": f"unsupported by design: {str(exc)[:160]}"})
+            return None
         except Exception as exc:  # noqa: BLE001
             record["checks"].append({"check": name, "status": "failed", "ms": int((time.monotonic() - t0) * 1000),
                                      "detail": f"{type(exc).__name__}: {str(exc)[:300]}"})
@@ -263,7 +270,11 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
     idx = check("list_indexes", lambda: conn.list_indexes(schema, t_orders)) or []
     check("index_on_fk_visible", lambda: [i.name for i in idx if any(c.lower() == "customer_id" for c in i.columns)][0])
     check("primary_key_visible", lambda: [i.name for i in conn.list_indexes(schema, t_customers) if i.primary][0])
-    check("get_foreign_keys", lambda: [k.ref_table for k in conn.get_foreign_keys(schema, t_orders)][0])
+    if engine == "clickhouse":
+        record["checks"].append({"check": "get_foreign_keys", "status": "skipped", "ms": 0,
+                                 "detail": "ClickHouse has no foreign keys; the connector reports none"})
+    else:
+        check("get_foreign_keys", lambda: [k.ref_table for k in conn.get_foreign_keys(schema, t_orders)][0])
     check("list_views", lambda: [v.name for v in conn.list_views(schema)][0])
     check("list_routines", lambda: len(conn.list_routines(schema)))
     check("get_statistics", lambda: conn.get_statistics(schema, t_customers))

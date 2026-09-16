@@ -17,8 +17,10 @@ import re
 
 # kind: what profiling may do with the column
 #   numeric / string / temporal / boolean -> COUNT, DISTINCT, MIN, MAX
+#   lob (CLOB/NCLOB/LONG on Oracle, CLOB/DBCLOB on Db2) -> COUNT only: those
+#       engines reject DISTINCT/MIN/MAX on large objects (ORA-00932)
 #   binary / json / opaque              -> COUNT only
-KINDS = ("numeric", "string", "temporal", "boolean", "binary", "json", "opaque")
+KINDS = ("numeric", "string", "lob", "temporal", "boolean", "binary", "json", "opaque")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,7 +98,8 @@ def portable_type(engine: str, data_type: str | None) -> PortableType:  # noqa: 
         if base.startswith(("array", "map", "tuple", "nested", "aggregatefunction", "simpleaggregatefunction")):
             return PortableType("other", "opaque")
         if base.startswith("enum"):
-            return PortableType("string", "string")
+            # string-like for comparisons, but length()/lower() reject it unless cast
+            return PortableType("enum", "string")
         if base.startswith("ipv"):
             return PortableType("string", "string")
         return PortableType("other", "opaque")
@@ -124,9 +127,14 @@ def portable_type(engine: str, data_type: str | None) -> PortableType:  # noqa: 
     if base in ("character varying", "varchar", "varchar2", "nvarchar", "nvarchar2", "character", "char", "nchar",
                 "bpchar", "name", "vargraphic", "graphic", "citext"):
         return PortableType("string", "string", length=p1)
-    if base in ("text", "ntext", "mediumtext", "longtext", "tinytext", "clob", "nclob", "dbclob", "long",
-                "enum", "set"):
-        return PortableType("text", "string") if base not in ("enum", "set") else PortableType("string", "string")
+    if base in ("clob", "nclob", "dbclob", "long"):
+        # Oracle/Db2 large objects: string-like for the ETL vocabulary, but
+        # DISTINCT/MIN/MAX and LOWER() reject them, so never aggregated or searched
+        return PortableType("text", "lob")
+    if base in ("text", "ntext", "mediumtext", "longtext", "tinytext"):
+        return PortableType("text", "string")
+    if base in ("enum", "set"):
+        return PortableType("string", "string")
     if base in ("uuid", "uniqueidentifier"):
         return PortableType("uuid", "string")
     if base in ("varchar(max)", "nvarchar(max)"):
@@ -173,5 +181,7 @@ def compatible(a: PortableType, b: PortableType) -> bool:
     if a.kind != b.kind:
         return False
     if a.kind in ("numeric", "string", "temporal"):
+        return True
+    if {a.kind, b.kind} <= {"string", "lob"}:
         return True
     return a.name == b.name

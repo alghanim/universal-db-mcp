@@ -1,0 +1,162 @@
+{
+  "label": "gvenzl/oracle-free:23-slim",
+  "engine": "oracle",
+  "started_utc": "2026-09-16T19:39:21Z",
+  "checks": [
+    {
+      "check": "seed",
+      "status": "passed",
+      "ms": 834,
+      "detail": "seeded"
+    },
+    {
+      "check": "health_check",
+      "status": "passed",
+      "ms": 95,
+      "detail": "HealthInfo(healthy=True, server_version='Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, ', latency_ms=95, detail=None, checked_at=1789587562.5635169, session={'engine': 'oracle', 'isolati"
+    },
+    {
+      "check": "list_schemas",
+      "status": "passed",
+      "ms": 67,
+      "detail": "29"
+    },
+    {
+      "check": "list_tables",
+      "status": "passed",
+      "ms": 388,
+      "detail": "[TableSummary(schema='SYSTEM', name='AQ$_SCHEDULES', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='HELP', kind='table', row_estimate=Non"
+    },
+    {
+      "check": "list_tables_has_seed",
+      "status": "passed",
+      "ms": 0,
+      "detail": "VM_CUSTOMERS"
+    },
+    {
+      "check": "list_columns",
+      "status": "passed",
+      "ms": 36,
+      "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EMAIL'"
+    },
+    {
+      "check": "list_columns_count",
+      "status": "passed",
+      "ms": 0,
+      "detail": "{'columns': 6, 'expected': 6}"
+    },
+    {
+      "check": "list_all_columns",
+      "status": "passed",
+      "ms": 101,
+      "detail": "459"
+    },
+    {
+      "check": "list_indexes",
+      "status": "passed",
+      "ms": 1526,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C008649', columns=["
+    },
+    {
+      "check": "index_on_fk_visible",
+      "status": "passed",
+      "ms": 0,
+      "detail": "IX_ORDERS_CUSTOMER"
+    },
+    {
+      "check": "primary_key_visible",
+      "status": "passed",
+      "ms": 15,
+      "detail": "SYS_C008648"
+    },
+    {
+      "check": "get_foreign_keys",
+      "status": "passed",
+      "ms": 1465,
+      "detail": "VM_CUSTOMERS"
+    },
+    {
+      "check": "list_views",
+      "status": "passed",
+      "ms": 11,
+      "detail": "MVIEW_EVALUATIONS"
+    },
+    {
+      "check": "list_routines",
+      "status": "passed",
+      "ms": 29,
+      "detail": "1"
+    },
+    {
+      "check": "get_statistics",
+      "status": "passed",
+      "ms": 56,
+      "detail": "{'schema': 'SYSTEM', 'table': 'VM_CUSTOMERS', 'row_estimate': None, 'row_estimate_source': 'catalog_estimate(all_tables.num_rows)', 'last_analyzed': None}"
+    },
+    {
+      "check": "execute_query_count",
+      "status": "passed",
+      "ms": 72,
+      "detail": "300"
+    },
+    {
+      "check": "sample_query",
+      "status": "passed",
+      "ms": 87,
+      "detail": "200"
+    },
+    {
+      "check": "profile_aggregate",
+      "status": "failed",
+      "ms": 27,
+      "detail": "ConnectorError: DatabaseError: ORA-22849: Type CLOB is not supported for this function or operator. Help: https://docs.oracle.com/error-help/db/ora-22849/"
+    },
+    {
+      "check": "top_values",
+      "status": "passed",
+      "ms": 21,
+      "detail": "[['south', 67], ['north', 66]]"
+    },
+    {
+      "check": "value_search_like",
+      "status": "passed",
+      "ms": 20,
+      "detail": "[12, 'user12@example.com', 'north']"
+    },
+    {
+      "check": "explain",
+      "status": "failed",
+      "ms": 0,
+      "detail": "NotImplementedError: Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build"
+    }
+  ],
+  "server_version": "Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, ",
+  "session": {
+    "engine": "oracle",
+    "isolation": null,
+    "lock_timeout_seconds": 5.0,
+    "statement_timeout_seconds": 60.0,
+    "application_name": "udbmcp:vm",
+    "read_only_requested": true,
+    "server_read_only_available": false,
+    "applied": [
+      "client_identifier=udbmcp:vm",
+      "call_timeout=60000ms"
+    ],
+    "skipped": [],
+    "read_only_enforced": false,
+    "server_reports": {
+      "module": "udbmcp",
+      "client_identifier": "udbmcp:vm"
+    }
+  },
+  "healthy": true,
+  "finished_utc": "2026-09-16T19:39:26Z",
+  "summary": {
+    "passed": 19,
+    "failed": [
+      "profile_aggregate",
+      "explain"
+    ]
+  }
+}

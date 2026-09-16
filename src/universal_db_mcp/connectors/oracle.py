@@ -630,10 +630,17 @@ class OracleConnector(DatabaseConnector):
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2].lower()) for r in rows]
 
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
+        # ALL_CONS_COLUMNS on both sides, matched by POSITION so composite
+        # keys line up; the previous statement returned no column names at
+        # all, which left relationship inference with empty key lists.
         sql = (
-            "SELECT a.constraint_name, a.owner, a.table_name, a.r_owner, "
-            "b.table_name FROM all_constraints a JOIN all_constraints b "
-            "ON a.r_constraint_name = b.constraint_name AND a.r_owner = b.owner "
+            "SELECT a.constraint_name, a.owner, a.table_name, a.r_owner, b.table_name, "
+            "ac.column_name, bc.column_name, ac.position "
+            "FROM all_constraints a "
+            "JOIN all_constraints b ON a.r_constraint_name = b.constraint_name AND a.r_owner = b.owner "
+            "JOIN all_cons_columns ac ON ac.owner = a.owner AND ac.constraint_name = a.constraint_name "
+            "JOIN all_cons_columns bc ON bc.owner = b.owner AND bc.constraint_name = b.constraint_name "
+            "AND bc.position = ac.position "
             "WHERE a.constraint_type = 'R'"
         )
         params: list[Any] = []
@@ -641,25 +648,27 @@ class OracleConnector(DatabaseConnector):
             sql += " AND a.owner = :1"
             params.append(schema)
         if table:
-            sql += " AND a.table_name = :2"
+            sql += f" AND a.table_name = :{len(params) + 1}"
             params.append(table)
+        sql += " ORDER BY a.constraint_name, ac.position"
         with translated_driver_errors():
             conn = self._shared_meta_conn()
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-        return [
-            KeyInfo(
-                kind="foreign_key",
-                name=r[0],
-                columns=[],
-                ref_schema=r[3],
-                ref_table=r[4],
-                source_schema=r[1],
-                source_table=r[2],
-            )
-            for r in rows
-        ]
+        grouped: dict[tuple[str, str, str], KeyInfo] = {}
+        for name, owner, tname, r_owner, r_table, col, ref_col, _pos in rows:
+            key = (str(name), str(owner), str(tname))
+            info = grouped.get(key)
+            if info is None:
+                info = KeyInfo(
+                    kind="foreign_key", name=name, columns=[], ref_schema=r_owner, ref_table=r_table,
+                    ref_columns=[], source_schema=owner, source_table=tname,
+                )
+                grouped[key] = info
+            info.columns.append(str(col))
+            info.ref_columns.append(str(ref_col))
+        return list(grouped.values())
 
     def get_statistics(self, schema: str | None, table: str) -> dict[str, Any]:
         sql = "SELECT num_rows, last_analyzed FROM all_tables WHERE owner = :1 AND table_name = :2"

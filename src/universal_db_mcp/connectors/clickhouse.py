@@ -297,6 +297,10 @@ class ClickHouseConnector(DatabaseConnector):
     def length_function(self) -> str:
         return "length"
 
+    def text_expression(self, quoted_column: str, portable_name: str) -> str:
+        # lower()/like reject UUID and Enum arguments; toString() is cheap
+        return f"toString({quoted_column})" if portable_name in ("uuid", "enum") else quoted_column
+
     def placeholder(self, index: int) -> str:
         return f"%(p{index})s"
 

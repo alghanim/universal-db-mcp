@@ -63,8 +63,20 @@ run_one() {
   local waited=0 ready_ok=0 max_wait=240
   [ "$engine" = "db2" ] && max_wait=1800
   [ "$engine" = "oracle" ] && max_wait=1200
+  # The official mysql/mariadb images start a TEMPORARY server for their
+  # init scripts, then restart: a single successful ping can hit the
+  # temporary instance and the real one drops the probe's connection
+  # ("Lost connection ... during query", seen on mysql:5.7). Require the
+  # readiness command to succeed on three consecutive checks 5 s apart.
+  local streak=0 need=1
+  [ "$engine" = "mysql" ] && need=3
   while [ "$waited" -lt "$max_wait" ]; do
-    if docker exec "$name" sh -c "$ready" >/dev/null 2>&1; then ready_ok=1; break; fi
+    if docker exec "$name" sh -c "$ready" >/dev/null 2>&1; then
+      streak=$((streak + 1))
+      if [ "$streak" -ge "$need" ]; then ready_ok=1; break; fi
+    else
+      streak=0
+    fi
     sleep 5; waited=$((waited + 5))
   done
   if [ "$ready_ok" -ne 1 ]; then
@@ -97,7 +109,7 @@ rows = []
 for f in sorted(ev.glob("*.json")):
     d = json.loads(f.read_text())
     if "summary" in d:
-        rows.append((d["label"], d.get("server_version", "")[:30], d["summary"]["passed"], ",".join(d["summary"]["failed"]) or "-"))
+        rows.append((d["label"], str(d.get("server_version") or "")[:30], d["summary"]["passed"], ",".join(d["summary"]["failed"]) or "-"))
     else:
         rows.append((d.get("label", f.name), "", 0, d.get("reason", "not_run")))
 w = max(len(r[0]) for r in rows) if rows else 10

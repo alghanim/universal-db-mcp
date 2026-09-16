@@ -45,6 +45,54 @@ Properties:
   payload to the bundle signature; its guarantee is the integrity-manifest
   gate described below.
 
+## Behavior changes on upgrade: the session safety profile (2026-09-16)
+
+Every connection now applies a session safety profile right after it
+connects (`docs/session-safety.md`). The defaults change what an EXISTING
+deployment does after this upgrade, and two of them are fail-closed, so a
+connection that worked before can be refused afterwards until the config
+says otherwise. Read this before upgrading a production site.
+
+| Engine | New default behavior | Fails closed if the server refuses it |
+|---|---|---|
+| Db2 (read-only connections) | `SET CURRENT ISOLATION = UR` | yes |
+| SQL Server (read-only connections) | `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` | yes |
+| PostgreSQL | `SET default_transaction_read_only = on` | yes |
+| MySQL / MariaDB | `SET SESSION TRANSACTION READ ONLY` | yes |
+| ClickHouse | `readonly=1` on every request | no (server rejects writes and `SETTINGS` overrides instead) |
+| all | lock-wait ceiling 5 s; statement ceiling = `security.hard_query_timeout_seconds`; a named session | no (best-effort, recorded as `skipped`) |
+
+What can turn a working connection into a refused one:
+
+- a MySQL/MariaDB account that cannot run `SET SESSION TRANSACTION READ ONLY`
+  (older than MySQL 5.6.5 / MariaDB 10.0);
+- a PostgreSQL role whose `default_transaction_read_only` was pinned with
+  `ALTER ROLE ... SET` (the session `SET` is still accepted, but verify);
+- a Db2 account that cannot change `CURRENT ISOLATION`, or a Db2 for z/OS or
+  i target (not supported by this build anyway);
+- a SQL Server database that disallows `READ UNCOMMITTED` through policy.
+
+Before upgrading, run the new build's `udbmcp doctor` against the current
+config: it prints the resolved profile per connection (`session-<id>`
+checks) so you can see which connection will run at which level. After
+upgrading, `db_test_connection` returns `session.server_reports`, what the
+server itself answered.
+
+Opt-outs, per connection, when a site needs the old behavior:
+
+```yaml
+connections:
+  finance_db2:
+    session:
+      isolation: cs               # keep committed reads (and the share locks that come with them)
+      enforce_read_only: false    # do not ask the server for a read-only session
+      lock_timeout_seconds: null  # server default instead of 5 s
+      statement_timeout_from_policy: false
+```
+
+The SQL guard remains the write enforcement in every configuration; these
+settings only change what the server session does around it.
+
 ## Rollback
 
 ```bash

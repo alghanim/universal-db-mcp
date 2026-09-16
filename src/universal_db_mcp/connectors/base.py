@@ -278,6 +278,12 @@ class DatabaseConnector(ABC):
         """SQL function returning a string's character length."""
         return "LENGTH"
 
+    def text_expression(self, quoted_column: str, portable_name: str) -> str:
+        """``quoted_column`` as something LOWER()/LIKE accept. Plain strings
+        pass through; engines whose UUID or enum types reject string
+        functions override this with a cast."""
+        return quoted_column
+
     def placeholder(self, index: int) -> str:
         """Driver-native positional placeholder for tool-generated SQL
         (1-based ``index``). Agent SQL is never rewritten; this is only for

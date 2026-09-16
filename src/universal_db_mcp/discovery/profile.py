@@ -81,7 +81,7 @@ def aggregate_select_list(
             layout.append((col.name, "min"))
             parts.append(f"MAX({q})")
             layout.append((col.name, "max"))
-            if pt.kind == "string":
+            if pt.kind == "string" and pt.name not in ("enum", "uuid"):
                 parts.append(f"MAX({length_fn}({q}))")
                 layout.append((col.name, "max_length"))
     return ", ".join(parts), layout

@@ -49,6 +49,7 @@ from universal_db_mcp.discovery.profile import (
     findings_for_table,
     wants_top_values,
 )
+from universal_db_mcp.discovery.system_schemas import is_system_object
 from universal_db_mcp.discovery.types import portable_type
 from universal_db_mcp.errors import ToolFailure
 from universal_db_mcp.models.capabilities import Cap, CapabilityState
@@ -1500,6 +1501,8 @@ def build_server(app: AppContext) -> MCPServer:
         max_hits_per_table: int = 5,
         max_tables: int = 100,
         time_budget_seconds: float = 30.0,
+        per_table_timeout_seconds: float = 10.0,
+        include_system: bool = False,
     ) -> dict[str, Any]:
         async with tool_span(app, "db_search_values") as st:
             if not query or len(query) > 200:
@@ -1511,6 +1514,7 @@ def build_server(app: AppContext) -> MCPServer:
             per_table = max(1, min(int(max_hits_per_table), 50))
             table_cap = max(1, min(int(max_tables), 500))
             budget = max(1.0, min(float(time_budget_seconds), 300.0))
+            per_table_timeout = max(1.0, min(float(per_table_timeout_seconds), 120.0))
             conn_ids = list(connections) if connections is not None else sorted(app.resolved.keys())
             for cid in conn_ids:
                 if cid not in app.resolved:
@@ -1542,6 +1546,8 @@ def build_server(app: AppContext) -> MCPServer:
                 tables = [t for t in tables if t.kind == "table"]
                 if wanted_schemas is not None:
                     tables = [t for t in tables if (t.schema or "").lower() in wanted_schemas]
+                elif not include_system:
+                    tables = [t for t in tables if not is_system_object(policy.engine, t.schema, t.name)]
                 columns_by_schema: dict[str | None, list[Any]] = {}
                 for t in tables:
                     if searched >= table_cap:
@@ -1571,7 +1577,8 @@ def build_server(app: AppContext) -> MCPServer:
                                 needle if match == "exact" else (f"{needle}%" if match == "prefix" else f"%{needle}%")
                             )
                             op = "=" if match == "exact" else "LIKE"
-                            preds.append(f"LOWER({q}) {op} {connector.placeholder(len(params))}")
+                            expr = connector.text_expression(q, pt.name)
+                            preds.append(f"LOWER({expr}) {op} {connector.placeholder(len(params))}")
                             matched_cols.append(c.name)
                         elif pt.kind == "numeric" and numeric is not None and match == "exact":
                             params.append(numeric)
@@ -1588,7 +1595,9 @@ def build_server(app: AppContext) -> MCPServer:
                         max_rows=per_table,
                         max_response_bytes=policy.max_response_bytes,
                         max_cell_bytes=policy.max_cell_bytes,
-                        timeout_seconds=min(policy.clamp_timeout(None), max(1.0, deadline - time.monotonic())),
+                        timeout_seconds=min(
+                            policy.clamp_timeout(None), per_table_timeout, max(1.0, deadline - time.monotonic())
+                        ),
                     )
                     searched += 1
                     try:
@@ -1641,6 +1650,7 @@ def build_server(app: AppContext) -> MCPServer:
         connections: list[str] | None = None,
         schemas: list[str] | None = None,
         cross_connection: bool = True,
+        include_system: bool = False,
     ) -> dict[str, Any]:
         async with tool_span(app, "db_infer_relationships") as st:
             if connections is not None and not connections:
@@ -1666,6 +1676,8 @@ def build_server(app: AppContext) -> MCPServer:
                 tables = [t for t in tables if t.kind == "table"]
                 if wanted is not None:
                     tables = [t for t in tables if (t.schema or "").lower() in wanted]
+                elif not include_system:
+                    tables = [t for t in tables if not is_system_object(policy.engine, t.schema, t.name)]
                 if len(facts) + len(tables) > _INFER_MAX_TABLES:
                     warnings.append(f"connection '{cid}': table limit {_INFER_MAX_TABLES} reached; narrow with schemas")
                     tables = tables[: max(0, _INFER_MAX_TABLES - len(facts))]

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from universal_db_mcp.config import AppConfig, ResolvedConnection, load_config
+from universal_db_mcp.config import AppConfig, ConnectionConfig, ResolvedConnection, load_config
 from universal_db_mcp.connectors import registry
 
 # The bearer-token PATH the package postinstalls provision for the systemd /
@@ -127,6 +127,31 @@ def _mssql_odbc_driver_check(conn_name: str, pyodbc_mod: Any) -> dict[str, Any]:
         fatal=True,
     )
 
+
+
+def _session_check(name: str, conn: ConnectionConfig) -> dict[str, Any]:
+    """Describe the resolved session safety profile of one connection."""
+    from universal_db_mcp.security.session import READ_ONLY_DEFAULT_ISOLATION, SERVER_READ_ONLY_AVAILABLE
+
+    s = conn.session
+    isolation = s.isolation or (READ_ONLY_DEFAULT_ISOLATION.get(conn.type) if conn.read_only else None)
+    parts = [f"isolation={isolation or 'server default'}"]
+    if s.enforce_read_only and conn.read_only:
+        parts.append(
+            "read-only=server-side (enforced)" if SERVER_READ_ONLY_AVAILABLE.get(conn.type)
+            else "read-only=SQL guard (engine has no session switch)"
+        )
+    else:
+        parts.append("read-only=SQL guard only")
+    parts.append(
+        f"lock_timeout={s.lock_timeout_seconds}s" if s.lock_timeout_seconds is not None else "lock_timeout=server default"
+    )
+    parts.append("statement_timeout=policy" if s.statement_timeout_from_policy else "statement_timeout=none")
+    enforced = [x for x in (isolation if conn.type in ("db2", "mssql") else None,
+                            "read-only" if s.enforce_read_only and conn.read_only
+                            and SERVER_READ_ONLY_AVAILABLE.get(conn.type) else None) if x]
+    detail = "; ".join(parts) + (f"; the server must accept: {', '.join(enforced)} (fail-closed)" if enforced else "")
+    return _check(f"session-{name}", True, detail)
 
 def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
@@ -336,6 +361,12 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                         )
                     )
 
+            # session safety profile, resolved OFFLINE from the config: what
+            # this connection will ask the server for right after connecting
+            # (docs/session-safety.md). Shown so an operator sees "db2 runs at
+            # UR" or "postgres read-only server-side" before an upgrade, and
+            # which of those the server must accept (fail-closed) vs may skip.
+            results.append(_session_check(name, conn))
             # driver availability: our connector class AND the real vendor
             # module (a registered class can exist while the driver wheel is
             # absent; the tool layer would fail with DRIVER_MISSING).

@@ -272,6 +272,18 @@ Implement:
 | `db_explain` | Validated SQL and parameters; non-executing plan only unless separately authorized and supported. |
 | `db_get_query_history` | Caller-scoped, redacted operational history; not unrestricted access to audit logs. |
 
+Addendum (2026-09-16), discovery tools for federated ETL, documentation and
+optimization. Same rules as above; none reads data except `db_profile_table`
+and `db_search_values`, which run bounded under the session safety profile:
+
+| Tool | Purpose and essential inputs |
+| --- | --- |
+| `db_list_indexes` | Indexes and primary keys of one object or a whole schema; ClickHouse reports sorting keys and skipping indices. |
+| `db_get_catalog` | One-call paged catalog snapshot: columns with portable types, primary/foreign keys, indexes, row estimates, sensitivity hints. |
+| `db_profile_table` | Bounded sample profile (null ratio, distinct, min/max, lengths, top values) plus evidence-backed optimization findings; sensitive columns return counts only. |
+| `db_search_values` | A value searched across permitted tables of many connections without SQL; per-table hits, time budget, system schemas and sensitive columns excluded. |
+| `db_infer_relationships` | Declared foreign keys plus inferred join candidates within and across connections, from metadata only. |
+
 Metadata responses must be paginated and bounded. Bind opaque cursors to identity, connection, policy, and expiration. Do not reveal unauthorized objects through counts, search, suggestions, cache hits, or error messages.
 
 Return ordinary tool output with fields appropriate to the operation, including `request_id`, `connection_id`, `engine`, `data`, `warnings`, `elapsed_ms`, `returned_row_count`, and `truncated` when applicable. Query results also include typed column metadata. Preserve decimals and large integers without silently losing precision; define representations for timestamps, binary data, LOBs, and nulls.

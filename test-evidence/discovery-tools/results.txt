@@ -1,0 +1,69 @@
+# Discovery tools: live run through the MCP server against the local fixtures
+date_utc: 2026-09-16T19:33:16Z
+
+== mock_pg
+  catalog: 2 tables; buoys: pk=['buoy_id'] cols=6 idx=2 fks=[]
+  profile: sample=3 findings=['statistics_missing']
+     buoy_id [integer] null=0.0 distinct=3 maxlen=None top=[3, 2, 1]
+     callsign [string] null=0.0 distinct=3 maxlen=10 top=['MB-ALPHA', 'MB-CHARLIE', 'MB-BRAVO']
+     region [string] null=0.0 distinct=3 maxlen=12 top=['Arabian Sea', 'Gulf of Oman', 'Red Sea']
+     lat [float] null=0.0 distinct=3 maxlen=None top=[24.4111, 22.4111, 20.1222]
+
+== mock_mysql
+  catalog: 2 tables; cuppings: pk=['cupping_id'] cols=5 idx=2 fks=[(['batch_id'], 'roastery_batches', ['batch_id'])]
+  profile: sample=6 findings=['statistics_missing']
+     cupping_id [integer] null=0.0 distinct=6 maxlen=None top=[1, 2, 3]
+     batch_id [integer] null=0.0 distinct=5 maxlen=None top=[1, 2, 3]
+     taster [string] null=0.0 distinct=3 maxlen=11 top=['R. Haddad', 'T. Nakamura', 'L. Osei']
+     score [decimal] null=0.0 distinct=6 maxlen=None top=['88.50', '87.25', '85.75']
+
+== mock_clickhouse
+  catalog: 3 tables; cdr: pk=['started_at', 'caller_msisdn'] cols=9 idx=1 fks=[]
+  profile: sample=2000 findings=['statistics_missing', 'low_cardinality', 'low_cardinality', 'low_cardinality', 'low_cardinality', 'sampled']
+     call_id [uuid] null=0.0 distinct=2000 maxlen=None top=-
+     started_at [timestamp] null=0.0 distinct=2000 maxlen=None top=-
+     duration_sec [integer] null=0.0 distinct=1800 maxlen=None top=-
+     caller_msisdn [text] null=0.0 distinct=5 maxlen=12 top=['971501000003', '971501000004', '971501000001']
+
+== mock_oracle
+  catalog: 5 tables; TRAVELLERS: pk=['TRAVELLER_ID'] cols=5 idx=2 fks=[]
+  profile: sample=8 findings=['statistics_missing']
+     TRAVELLER_ID [decimal] null=0.0 distinct=8 maxlen=None top=[1, 2, 3]
+     FULL_NAME [string] null=0.0 distinct=8 maxlen=15 top=['Amara Diallo', 'Kenji Watanabe', 'Ingrid Solberg']
+     NATIONALITY [string] null=0.0 distinct=8 maxlen=13 top=['Senegalese', 'Japanese', 'Norwegian']
+     PASSPORT_NO [string] null=0.0 distinct=8 maxlen=9 top=['AE3305677', 'CL9902873', 'JP7712094']
+
+== mock_db2
+  catalog: 3 tables; CITIZENS: pk=['CITIZEN_ID'] cols=7 idx=2 fks=[]
+  profile: sample=6 findings=['statistics_missing']
+     CITIZEN_ID [integer] null=0.0 distinct=6 maxlen=None top=[1, 5, 4]
+     FULL_NAME [string] null=0.0 distinct=6 maxlen=19 top=['Elena Petrova', 'Priya Nair', 'Omar Bin Rashid']
+     DATE_OF_BIRTH [date] null=0.0 distinct=6 maxlen=None top=['1968-01-30', '1992-06-25', '1988-04-08']
+     SEX [string] null=0.0 distinct=2 maxlen=1 top=['F', 'M']
+     warnings: ['sensitive column(s) profiled for null ratio only (values never returned): NATIONAL_ID']
+
+== db_infer_relationships across pg+mysql+db2+oracle (system schemas excluded by default)
+  tables_considered=14 relationships=10
+     declared               1.0 mock_db2.RESIDENCY_PERMITS.['CITIZEN_ID'] -> mock_db2.CITIZENS.['CITIZEN_ID']
+     declared               1.0 mock_db2.VEHICLE_REGISTRATIONS.['CITIZEN_ID'] -> mock_db2.CITIZENS.['CITIZEN_ID']
+     declared               1.0 mock_mysql.cuppings.['batch_id'] -> mock_mysql.roastery_batches.['batch_id']
+     declared               1.0 mock_oracle.BOARDING_PASSES.[] -> mock_oracle.BOOKINGS.[]
+     declared               1.0 mock_oracle.BOOKINGS.[] -> mock_oracle.TRAVELLERS.[]
+     declared               1.0 mock_oracle.BOOKINGS.[] -> mock_oracle.FLIGHTS.[]
+     declared               1.0 mock_pg.readings.['buoy_id'] -> mock_pg.buoys.['buoy_id']
+     inferred_name_type     0.8 mock_oracle.BOARDING_PASSES.['BOOKING_ID'] -> mock_oracle.BOOKINGS.['BOOKING_ID']
+
+== db_search_values 'ahmad' {}: hits=0 searched=13 skipped=4 exhausted=False in 4.4s
+  warnings: ["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this "]
+
+== db_search_values 'gulf' {}: hits=2 searched=13 skipped=4 exhausted=False in 4.4s
+     mock_db2.MOI.RESIDENCY_PERMITS matched=['SPONSOR_NAME'] row={'PERMIT_ID': '1', 'CITIZEN_ID': '3', 'PERMIT_TYPE': 'employment'}
+     mock_pg.ocean.buoys matched=['region'] row={'buoy_id': '2', 'callsign': 'MB-BRAVO', 'region': 'Gulf of Oman'}
+  warnings: ["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this "]
+
+== db_search_values '1' {'match': 'exact'}: hits=14 searched=15 skipped=2 exhausted=False in 4.7s
+     mock_clickhouse.telecom.subscribers matched=['subscriber_id'] row={'subscriber_id': '1', 'msisdn': '971501000001', 'full_name': 'Aisha Kareem'}
+     mock_db2.MOI.CITIZENS matched=['CITIZEN_ID'] row={'CITIZEN_ID': '1', 'FULL_NAME': 'Fatima Al-Mansouri', 'DATE_OF_BIRTH': '1985-03-12'}
+     mock_db2.MOI.RESIDENCY_PERMITS matched=['PERMIT_ID'] row={'PERMIT_ID': '1', 'CITIZEN_ID': '3', 'PERMIT_TYPE': 'employment'}
+     mock_db2.MOI.VEHICLE_REGISTRATIONS matched=['REG_ID', 'CITIZEN_ID'] row={'REG_ID': '1', 'CITIZEN_ID': '1', 'PLATE': 'A 12345'}
+  warnings: ["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this "]

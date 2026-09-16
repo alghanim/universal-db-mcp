@@ -1,0 +1,161 @@
+{
+  "label": "clickhouse/clickhouse-server:25.3",
+  "engine": "clickhouse",
+  "started_utc": "2026-09-16T19:30:40Z",
+  "checks": [
+    {
+      "check": "seed",
+      "status": "passed",
+      "ms": 111,
+      "detail": "seeded"
+    },
+    {
+      "check": "health_check",
+      "status": "passed",
+      "ms": 7,
+      "detail": "HealthInfo(healthy=True, server_version='25.3.14.14', latency_ms=7, detail=None, checked_at=1789587040.5359411, session={'engine': 'clickhouse', 'isolation': None, 'lock_timeout_seconds': 5.0, 'statem"
+    },
+    {
+      "check": "list_schemas",
+      "status": "passed",
+      "ms": 4,
+      "detail": "5"
+    },
+    {
+      "check": "list_tables",
+      "status": "passed",
+      "ms": 3,
+      "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(system.tables.total_rows)', comment=None), TableSummary(schema='vm', name='orders', k"
+    },
+    {
+      "check": "list_tables_has_seed",
+      "status": "passed",
+      "ms": 0,
+      "detail": "customers"
+    },
+    {
+      "check": "list_columns",
+      "status": "passed",
+      "ms": 2,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='vm', table='customers', name='email', data_type='S"
+    },
+    {
+      "check": "list_columns_count",
+      "status": "passed",
+      "ms": 0,
+      "detail": "{'columns': 6, 'expected': 6}"
+    },
+    {
+      "check": "list_all_columns",
+      "status": "passed",
+      "ms": 1,
+      "detail": "12"
+    },
+    {
+      "check": "list_indexes",
+      "status": "passed",
+      "ms": 2,
+      "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
+    },
+    {
+      "check": "index_on_fk_visible",
+      "status": "passed",
+      "ms": 0,
+      "detail": "ix_cust"
+    },
+    {
+      "check": "primary_key_visible",
+      "status": "passed",
+      "ms": 2,
+      "detail": "(sorting key)"
+    },
+    {
+      "check": "get_foreign_keys",
+      "status": "failed",
+      "ms": 0,
+      "detail": "IndexError: list index out of range"
+    },
+    {
+      "check": "list_views",
+      "status": "passed",
+      "ms": 2,
+      "detail": "v_orders"
+    },
+    {
+      "check": "list_routines",
+      "status": "passed",
+      "ms": 0,
+      "detail": "0"
+    },
+    {
+      "check": "get_statistics",
+      "status": "passed",
+      "ms": 2,
+      "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': 300, 'row_estimate_source': 'catalog_estimate(system.tables)', 'total_bytes': '4.86 KiB'}"
+    },
+    {
+      "check": "execute_query_count",
+      "status": "passed",
+      "ms": 5,
+      "detail": "300"
+    },
+    {
+      "check": "sample_query",
+      "status": "passed",
+      "ms": 6,
+      "detail": "200"
+    },
+    {
+      "check": "profile_aggregate",
+      "status": "passed",
+      "ms": 6,
+      "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
+    },
+    {
+      "check": "top_values",
+      "status": "passed",
+      "ms": 5,
+      "detail": "[['south', 67], ['north', 67]]"
+    },
+    {
+      "check": "value_search_like",
+      "status": "passed",
+      "ms": 4,
+      "detail": "[12, 'user12@example.com', None]"
+    },
+    {
+      "check": "explain",
+      "status": "passed",
+      "ms": 4,
+      "detail": "{'raw': [('Expression ((Project names + (Projection + Change column names to column identifiers)))',), ('  Limit (preliminary LIMIT (without OFFSET))',), ('    ReadFromMergeTree (vm.customers)',)]}"
+    }
+  ],
+  "server_version": "25.3.14.14",
+  "session": {
+    "engine": "clickhouse",
+    "isolation": null,
+    "lock_timeout_seconds": 5.0,
+    "statement_timeout_seconds": 60.0,
+    "application_name": "udbmcp:vm",
+    "read_only_requested": true,
+    "server_read_only_available": true,
+    "applied": [
+      "read_only",
+      "max_execution_time=60s"
+    ],
+    "skipped": [],
+    "read_only_enforced": true,
+    "server_reports": {
+      "readonly": "1",
+      "max_execution_time": "60.0"
+    }
+  },
+  "healthy": true,
+  "finished_utc": "2026-09-16T19:30:40Z",
+  "summary": {
+    "passed": 20,
+    "failed": [
+      "get_foreign_keys"
+    ]
+  }
+}

@@ -1,31 +1,31 @@
 {
-  "label": "mysql:5.7",
-  "engine": "mysql",
-  "started_utc": "2026-09-16T19:36:03Z",
+  "label": "mcr.microsoft.com/mssql/server:2022-latest",
+  "engine": "mssql",
+  "started_utc": "2026-09-16T19:41:04Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 598,
+      "ms": 1187,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 18,
-      "detail": "HealthInfo(healthy=True, server_version='5.7.44', latency_ms=18, detail=None, checked_at=1789587364.544909, session={'engine': 'mysql', 'isolation': None, 'lock_timeout_seconds': 5.0, 'statement_timeo"
+      "ms": 45,
+      "detail": "HealthInfo(healthy=True, server_version='Microsoft SQL Server 2022 (RTM-CU26) (KB5093420) - 16.0.4265', latency_ms=44, detail=None, checked_at=1789587665.4775999, session={'engine': 'mssql', 'isolatio"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 23,
-      "detail": "5"
+      "ms": 5,
+      "detail": "13"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 6,
-      "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(information_schema.tables.table_rows)', comment=None), TableSummary(schema='vm', name"
+      "ms": 50,
+      "detail": "[TableSummary(schema='dbo', name='customers', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='dbo', name='orders', kind='table', row_estimate=None, row_e"
     },
     {
       "check": "list_tables_has_seed",
@@ -36,8 +36,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 3,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='varc"
+      "ms": 46,
+      "detail": "[ColumnInfo(schema='dbo', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='dbo', table='customers', name='email', data_type='nv"
     },
     {
       "check": "list_columns_count",
@@ -48,14 +48,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 1,
+      "ms": 19,
       "detail": "12"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 0,
-      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='btree', schema='vm', table='orders'), IndexInfo(name='PRIMARY', columns=['id'], uniqu"
+      "ms": 79,
+      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83F376"
     },
     {
       "check": "index_on_fk_visible",
@@ -66,98 +66,96 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 0,
-      "detail": "PRIMARY"
+      "ms": 34,
+      "detail": "PK__customer__3213E83F6B35EBDB"
     },
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 1,
+      "ms": 46,
       "detail": "customers"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 0,
+      "ms": 11,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 6,
+      "ms": 17,
       "detail": "1"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 0,
-      "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': 300, 'row_estimate_source': 'catalog_estimate(information_schema; InnoDB estimates vary)', 'data_bytes': 16384, 'index_bytes': None, 'last_update"
+      "ms": 61,
+      "detail": "{'schema': 'dbo', 'table': 'customers', 'row_estimate': 300, 'row_estimate_source': 'catalog_estimate(sys.partitions)'}"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 15,
+      "ms": 3,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 16,
+      "ms": 6,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 18,
+      "ms": 31,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 16,
+      "ms": 4,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 13,
+      "ms": 4,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
-      "status": "passed",
-      "ms": 14,
-      "detail": "{'raw': [['1', 'SIMPLE', 'customers', 'None', 'ALL', 'None', 'None', 'None', 'None', '300', '100.0', 'None']]}"
+      "status": "skipped",
+      "ms": 0,
+      "detail": "unsupported by design: T-SQL plan capture requires SET SHOWPLAN_XML in a separate batch; not implemented in this build"
     }
   ],
-  "server_version": "5.7.44",
+  "server_version": "Microsoft SQL Server 2022 (RTM-CU26) (KB5093420) - 16.0.4265",
   "session": {
-    "engine": "mysql",
-    "isolation": null,
+    "engine": "mssql",
+    "isolation": "read_uncommitted",
     "lock_timeout_seconds": 5.0,
     "statement_timeout_seconds": 60.0,
     "application_name": "udbmcp:vm",
     "read_only_requested": true,
-    "server_read_only_available": true,
+    "server_read_only_available": false,
     "applied": [
-      "read_only",
-      "statement_timeout=60000ms",
-      "innodb_lock_wait_timeout=5s",
-      "lock_wait_timeout=5s"
+      "statement_timeout=60s",
+      "isolation=read_uncommitted",
+      "lock_timeout=5000ms"
     ],
     "skipped": [],
-    "read_only_enforced": true,
+    "read_only_enforced": false,
     "server_reports": {
-      "read_only": "1",
-      "isolation": "REPEATABLE-READ",
-      "statement_timeout_ms": "60000",
-      "innodb_lock_wait_timeout": "5"
+      "isolation": "read_uncommitted",
+      "application_name": "udbmcp:vm",
+      "lock_timeout_ms": "5000"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T19:36:04Z",
+  "finished_utc": "2026-09-16T19:41:05Z",
   "summary": {
-    "passed": 21,
+    "passed": 20,
     "failed": []
   }
 }
