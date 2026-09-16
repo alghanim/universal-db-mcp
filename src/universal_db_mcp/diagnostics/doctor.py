@@ -9,6 +9,7 @@ import os
 import platform
 import stat
 import sys
+from ctypes.util import find_library
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -286,14 +287,25 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
                             )
                         )
                     else:
+                        # Ask the LOADER whether it can see the client. This
+                        # reads the loader cache; it does not dlopen anything,
+                        # because loading the client would switch this process
+                        # to Thick mode permanently - never a side effect of a
+                        # diagnostic.
+                        found = find_library("clntsh")
                         results.append(
                             _check(
                                 f"connection-{name}-oracle-instant-client",
-                                True,
-                                "oracle thick_mode without options.lib_dir: the Instant Client must "
-                                "be on the system library search path before the process starts "
-                                "(Linux: /etc/ld.so.conf.d + ldconfig, which survives the env reset "
-                                "systemd applies to LD_LIBRARY_PATH)",
+                                bool(found),
+                                (
+                                    f"Instant Client visible to the loader ({found})"
+                                    if found
+                                    else "oracle thick_mode is set but the loader cannot see "
+                                    "libclntsh: unzip the administrator-supplied Instant Client "
+                                    "under /opt, add its directory to /etc/ld.so.conf.d/ and run "
+                                    "ldconfig (systemd clears LD_LIBRARY_PATH, so ldconfig is the "
+                                    "route that survives)"
+                                ),
                             )
                         )
                 # A TNS alias is unresolvable without tnsnames.ora in tns_admin.

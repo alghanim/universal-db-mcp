@@ -1,0 +1,37 @@
+# Oracle Thick mode: live evidence (no server-side change)
+date_utc: 2026-09-16T03:04:49Z
+client: linux/amd64 container (udbmcp-baseline:ubuntu24.04-cp312) under emulation, venv built offline from the signed bundle wheelhouse
+oracle client: Instant Client Basic Lite 19.28 (Oracle-licensed, administrator-supplied; NOT part of the udbmcp release), installed via ldconfig - no lib_dir
+libaio: libaio1t64 0.3.113-6build1.1 + libaio.so.1 compatibility symlink
+
+## Case A - Oracle Database 11g Express Edition 11.2.0.2.0, account APP10G
+server settings: sec_case_sensitive_logon=FALSE; dba_users.password_versions = '10G 11G'
+probe: udbmcp OracleConnector.health_check() then a real query, same config both times apart from options.thick_mode
+
+  THIN  healthy=False  DPY-3010: connections to this database server version are not supported by python-oracledb in thin mode
+  THICK healthy=True   SELECT COUNT(*) FROM app_rows -> [[2]]
+
+Conclusion for 11.x servers: thin cannot reach them at all (thin floor is 12.1);
+thick mode reaches them with the administrator-supplied client and NOTHING changes on the server.
+
+## Case B - Oracle Database 18c XE (18.4.0.0.0), account APP10G with ONLY the 10G verifier
+This is the customer's exact condition, built deliberately:
+  - SQLNET.ALLOWED_LOGON_VERSION_SERVER=8 in the server's sqlnet.ora
+  - sec_case_sensitive_logon=FALSE
+  - the account's 10G hash was copied from the 11.2 fixture with
+    ALTER USER app10g IDENTIFIED BY VALUES '<10G hash>', so
+    dba_users.password_versions = '10G'  (no 11G, no 12C)
+probe: one process per mode (python-oracledb refuses to switch a process to Thick
+       after a Thin connection: DPY-2019), same config apart from options.thick_mode
+
+  THIN  healthy=False  DPY-3015: password verifier type 0x939 is not supported by
+                       python-oracledb in thin mode   <- the customer's exact error
+  THICK healthy=True   SELECT COUNT(*) FROM app_rows -> [[2]]
+
+Conclusion: options.thick_mode: true with an administrator-supplied Instant Client 19.28,
+loaded through ldconfig, authenticates an account that carries ONLY the legacy 10G
+verifier and runs real queries through the udbmcp connector. NOTHING was changed on the
+database server for the THICK run: the same server, same account, same password.
+
+Not covered here: the customer's own server version and network. The client half is
+proven on 11.2 and 18c; Instant Client 19 is supported against 11.2 through current.

@@ -255,3 +255,30 @@ def test_thick_init_is_skipped_when_driver_is_already_thick(
 
     assert fake.init_calls == [], "already in Thick mode: do not re-initialize"
     assert len(fake.connect_kwargs) == 1
+
+
+def test_thick_after_thin_explains_the_ordering_not_a_missing_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seen live 2026-09-16 while proving thick mode against an 18c server:
+    python-oracledb refuses to switch a process to Thick mode once a Thin
+    connection exists (DPY-2019). That is an ordering problem, but the
+    connector reported it as an Instant Client that could not be loaded,
+    sending the reader to the library path instead of the config."""
+    fake = _FakeOracleDb()
+
+    def boom(**_kwargs: Any) -> None:
+        raise RuntimeError(
+            "DPY-2019: python-oracledb thick mode cannot be used because thin mode has "
+            "already been enabled or a thin mode connection has already been created"
+        )
+
+    fake.init_oracle_client = boom  # type: ignore[method-assign]
+    conn, _ = _connector(tmp_path, monkeypatch, options={"thick_mode": True}, fake=fake)
+
+    with pytest.raises(ConnectorError) as exc:
+        conn._connect()
+    text = str(exc.value)
+    assert "DPY-2019" in text
+    assert "thick_mode" in text and "every oracle connection" in text
+    assert "Instant Client could not be loaded" not in text

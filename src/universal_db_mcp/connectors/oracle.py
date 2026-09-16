@@ -165,6 +165,18 @@ def _enable_thick_mode(module: Any, lib_dir: str | None, tns_admin: str | None) 
         try:
             module.init_oracle_client(**kwargs)
         except Exception as exc:
+            if "DPY-2019" in str(exc):
+                # Ordering, not a missing library: the process already made a
+                # Thin connection and the driver cannot switch afterwards.
+                # Config validation keeps every oracle connection on the same
+                # mode, so this means something else dialed Oracle first.
+                raise ConnectorError(
+                    "oracle thick_mode could not be enabled because this process already used "
+                    f"thin mode ({str(exc).strip()[:120]}). Thick mode is process-global and must "
+                    "be enabled before the first oracle connection: make sure every oracle "
+                    "connection in the config sets options.thick_mode: true, then restart the "
+                    "server so no thin connection precedes it"
+                ) from exc
             raise ConnectorError(
                 "oracle thick_mode is enabled but the Oracle Instant Client could not be "
                 f"loaded ({str(exc).strip()[:160]}). The client is Oracle-licensed and "

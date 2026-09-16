@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from universal_db_mcp.diagnostics.doctor import run_doctor
 
 
@@ -46,10 +48,14 @@ def test_present_instant_client_dir_passes(tmp_path: Path) -> None:
 
 
 def test_thick_mode_without_lib_dir_is_reported_not_fatal(tmp_path: Path) -> None:
+    """Without lib_dir (the documented Linux route) doctor reports whether the
+    loader can see the client. It is not fatal: ORACLE_HOME and other loader
+    configurations can make the client available in ways the cache lookup does
+    not show."""
     cfg = _config(tmp_path, "      thick_mode: true\n")
     check = _checks(run_doctor(cfg), "connection-o-oracle-instant-client")[0]
     assert check["status"] != "fatal", check
-    assert "search path" in str(check["detail"]).lower()
+    assert "loader" in str(check["detail"]).lower()
 
 
 def test_tns_alias_without_tnsnames_file_is_fatal(tmp_path: Path) -> None:
@@ -113,3 +119,34 @@ def test_thick_mode_accepts_an_orapki_wallet(tmp_path: Path) -> None:
     (wallet / "cwallet.sso").write_bytes(b"\x00")
     check = _checks(run_doctor(_tls_config(tmp_path, wallet, thick=True)), "connection-o-oracle-wallet")[0]
     assert check["status"] == "ok", check
+
+
+# ------------------------------------------------- is the client actually loadable?
+# With ldconfig (the documented Linux route) there is no lib_dir to check, so
+# doctor used to say only "it must be on the search path". It now asks the
+# loader whether it can see libclntsh - without dlopen'ing it, which would put
+# this process into Thick mode permanently.
+
+
+def test_reports_when_the_loader_cannot_see_the_instant_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from universal_db_mcp.diagnostics import doctor as doctor_module
+
+    monkeypatch.setattr(doctor_module, "find_library", lambda _name: None)
+    cfg = _config(tmp_path, "      thick_mode: true\n")
+    check = _checks(run_doctor(cfg), "connection-o-oracle-instant-client")[0]
+    assert check["status"] != "ok", check
+    assert "ldconfig" in str(check["detail"])
+
+
+def test_reports_when_the_loader_can_see_the_instant_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from universal_db_mcp.diagnostics import doctor as doctor_module
+
+    monkeypatch.setattr(doctor_module, "find_library", lambda _name: "libclntsh.so.19.1")
+    cfg = _config(tmp_path, "      thick_mode: true\n")
+    check = _checks(run_doctor(cfg), "connection-o-oracle-instant-client")[0]
+    assert check["status"] == "ok", check
+    assert "libclntsh" in str(check["detail"])

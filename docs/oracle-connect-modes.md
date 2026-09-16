@@ -45,12 +45,32 @@ packages, and accepting Oracle's licence is an administrative decision.
 Air-gapped delivery, mirroring the trust bootstrap:
 
 1. On the staging machine (the only machine with network access), download the
-   Instant Client **Basic** package for the target platform from Oracle and
-   accept the licence there.
-2. Carry it on the same trusted channel (USB) as the release, and unpack it on
-   the target, e.g. `/opt/oracle/instantclient_23_5`. On Linux the client also
-   needs `libaio`; install it from the OS packages already on the channel.
-3. Point the connection at it:
+   Instant Client for the target platform from Oracle and accept the licence
+   there. The **19** line is the widest choice: it reaches servers from 11.2
+   through current, and python-oracledb supports client libraries from 19.
+2. Carry it on the same trusted channel (USB) as the release, together with
+   `libaio` (the client links against it and a minimal Ubuntu does not have
+   it). On Ubuntu 24.04 the package is `libaio1t64`, which ships
+   `libaio.so.1t64`, so the client also needs a `libaio.so.1` symlink.
+3. Install it so the LOADER can find it, which on Linux means `ldconfig`, not
+   `options.lib_dir`:
+
+```bash
+sudo dpkg -i libaio1t64_*.deb
+ls /usr/lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || \
+  sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+sudo mkdir -p /opt/oracle
+sudo unzip instantclient-basiclite-linux.x64-19.28.zip -d /opt/oracle
+echo /opt/oracle/instantclient_19_28 | sudo tee /etc/ld.so.conf.d/oracle-instantclient.conf
+sudo ldconfig
+ldconfig -p | grep libclntsh     # must print a match
+```
+
+   Keep the client under `/opt` or `/usr/local`: the loader refuses libraries
+   in unsafe paths such as a user's home directory. Use `ldconfig` rather than
+   `LD_LIBRARY_PATH`, which systemd clears for the service.
+
+4. Point the connection at it:
 
 ```yaml
 connections:
@@ -63,17 +83,19 @@ connections:
     password_file: /home/<you>/.universal-db-mcp/secrets/legacy_ora.password
     read_only: true
     options:
-      thick_mode: true
-      lib_dir: /opt/oracle/instantclient_23_5
+      thick_mode: true          # and NO lib_dir on Linux: see step 3
 ```
 
-4. `udbmcp doctor` reports `connection-<name>-oracle-instant-client`. It checks
+5. `udbmcp doctor` reports `connection-<name>-oracle-instant-client`. It checks
    the directory only: loading the client would switch the whole process to
    Thick mode, which a diagnostic must never do as a side effect.
 
 **Thick mode is process-global.** `init_oracle_client()` switches the entire
 server process, so the config refuses a mix: either every oracle connection
-sets `thick_mode: true`, or none does.
+sets `thick_mode: true`, or none does. It also cannot be enabled after the
+process has already made a Thin connection (`DPY-2019`), which is why the rule
+is all-or-nothing rather than per connection. Restart the service after
+switching a deployment to Thick mode.
 
 ## 2. Pre-12c databases that register a SID
 
@@ -123,5 +145,7 @@ builds a TCPS descriptor and requires the administrator-supplied wallet. A
 | Service-name, legacy SID and `tnsnames.ora` alias connects | passed (live) | `test-evidence/oracle-connect-modes/` against Oracle 23ai Free on this host |
 | `DPY-3015` mapped to an error naming both remedies | passed (unit) | `tests/unit/test_oracle_connect_modes.py` with a driver fake |
 | Thick mode initialization, single init, fail-closed diagnostics | passed (unit) | same file |
-| Thick mode live round trip against a real 10G-verifier account | `not_run` | no Oracle Instant Client on the staging host (licensed, admin-supplied), and Oracle 21c+ desupported the 10G verifier so the fixture cannot create such an account |
+| Thick mode against an account carrying ONLY the 10G verifier (Oracle 18c XE, `password_versions = '10G'`) | **passed (live)** | `test-evidence/oracle-thick-mode/`: through `OracleConnector`, Thin fails with exactly `DPY-3015 ... 0x939` and Thick connects and returns query rows. Nothing changed on the server between the two runs. |
+| Thick mode against an Oracle 11.2 server | passed (live) | same evidence file: Thin cannot reach 11.x at all (`DPY-3010`, below the Thin floor); Thick connects with Instant Client 19.28 loaded via `ldconfig` in a no-network container |
+| Thick mode enabled after a Thin connection in the same process | refused with the ordering explained (`DPY-2019`) | unit-tested; the config's all-or-nothing rule prevents it in a real deployment |
 | TLS/TCPS with a wallet | `not_run` | no wallet-enabled Oracle fixture |

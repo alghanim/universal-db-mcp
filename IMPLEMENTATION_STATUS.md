@@ -241,8 +241,13 @@ closed.
   (2026-09-11); the remaining capability surface (catalog batteries,
   explain, remote cancel) is `unverified`. Thick mode is opt-in since 2026-09-15
   (`options.thick_mode`, admin-supplied Instant Client) because Thin mode
-  refuses accounts carrying only the legacy 10G verifier (`DPY-3015`); the
-  live thick-mode round trip is `not_run` (no Instant Client on this host).
+  refuses accounts carrying only the legacy 10G verifier (`DPY-3015`). The
+  thick-mode round trip is now **passed (live)**: against an Oracle 18c XE
+  account built to carry ONLY the 10G verifier, Thin fails with exactly
+  `DPY-3015 ... 0x939` and Thick connects and queries with an
+  administrator-supplied Instant Client 19.28 loaded through `ldconfig`, with
+  no server-side change between the runs; Thick also reaches an 11.2 server
+  that Thin cannot reach at all (`test-evidence/oracle-thick-mode/`).
   Service-name, legacy SID and tnsnames alias connect forms were verified
   live against Oracle 23ai (`test-evidence/oracle-connect-modes/`).
 - **SQL Server connector** (pyodbc + admin-supplied ODBC Driver 18):
