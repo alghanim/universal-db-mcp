@@ -55,6 +55,12 @@ Notes:
   dialing, because no CLI quoting form carries it. The Gate C orchestrator
   has not been re-run; Db2 TLS and the remaining capabilities stay
   unverified.
+- **Db2 read-only tail clauses are accepted** (`WITH UR|CS|RS|RR`,
+  `FOR READ ONLY`, `FOR FETCH ONLY`, `OPTIMIZE FOR n ROWS`). They are removed
+  before validation only, because sqlglot parses Db2 under the postgres
+  grammar and would reject them; the executor sends the original text, so Db2
+  still receives the clause. `USE AND KEEP ... LOCKS` is refused: it takes real
+  locks rather than stating read intent.
 - SQL validation dialects: mssql statements are validated as T-SQL (`tsql`)
   and db2 statements are parsed under the postgres dialect for validation
   (sqlglot has no DB2 dialect); any parse failure is a denial, never approval.

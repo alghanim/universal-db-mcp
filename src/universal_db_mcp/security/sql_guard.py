@@ -354,6 +354,25 @@ def _func_name(node: Any) -> str | None:
     return None
 
 
+# Db2 read-only tail clauses. sqlglot has no Db2 dialect (statements are parsed
+# under postgres), so `SELECT ... WITH UR` - the standard Db2 reporting idiom
+# that avoids lock waits - failed to parse and every such query was denied.
+# These clauses only choose an isolation level or state read intent; none of
+# them can write. They are removed for VALIDATION only: the executor sends the
+# original text, so Db2 still receives the clause.
+_DB2_READ_TAIL = re.compile(
+    r"\s+(?:"
+    r"FOR\s+(?:READ|FETCH)\s+ONLY"
+    r"|OPTIMIZE\s+FOR\s+\d+\s+ROWS?"
+    r"|WITH\s+(?:UR|CS|RS|RR)"
+    r")\s*$",
+    re.IGNORECASE,
+)
+# `USE AND KEEP <mode> LOCKS` takes real locks (SHARE/UPDATE/EXCLUSIVE) and is
+# not a read-only hint, so it is never stripped and never allowed.
+_DB2_LOCK_TAIL = re.compile(r"\bUSE\s+AND\s+KEEP\s+\w+\s+LOCKS?\b", re.IGNORECASE)
+
+
 class SqlGuard:
     def __init__(
         self,
@@ -361,11 +380,33 @@ class SqlGuard:
         policy: EffectivePolicy,
         resolver: ObjectResolver | None = None,
     ) -> None:
+        self._engine = dialect  # pre-mapping: db2 needs engine-specific handling
         self._dialect = _DIALECT_MAP.get(dialect, dialect)
         self._policy = policy
         self._resolver = resolver
 
     # ---- shared core -----------------------------------------------------
+
+    @staticmethod
+    def _strip_db2_read_tail(sql: str) -> str:
+        """Remove Db2 read-only tail clauses before parsing (validation only).
+
+        Anchored at the end of the statement, so nothing arbitrary can hide
+        behind one: a second statement after the clause leaves the tail
+        unmatched and the full text is parsed (and refused) as submitted.
+        """
+        if _DB2_LOCK_TAIL.search(sql):
+            raise _deny(
+                "Db2 locking clause 'USE AND KEEP ... LOCKS' is not permitted on a read-only "
+                "connection; use the isolation clause alone (for example WITH UR)"
+            )
+        for _ in range(4):  # FOR READ ONLY + OPTIMIZE FOR n ROWS + WITH UR can combine
+            trimmed = _DB2_READ_TAIL.sub("", sql, count=1).rstrip()
+            if trimmed == sql:
+                break
+            sql = trimmed
+        return sql
+
 
     def _parse_single(self, sql: str, kind: str) -> exp.Expression:
         if "\x00" in sql:
@@ -380,6 +421,8 @@ class SqlGuard:
         stripped = sql.strip().rstrip(";").strip()
         if not stripped:
             raise ToolFailure(ErrorCategory.VALIDATION, "empty statement")
+        if self._engine == "db2":
+            stripped = self._strip_db2_read_tail(stripped)
         # Primary parse: the text exactly as submitted. Only if that fails do
         # we retry a view with format/pyformat placeholders (%s, %(name)s)
         # masked to qmark — sqlglot's tokenizer reads '%' as modulo in most
