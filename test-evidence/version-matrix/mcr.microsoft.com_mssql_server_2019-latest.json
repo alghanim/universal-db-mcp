@@ -2,30 +2,30 @@
   "label": "mcr.microsoft.com/mssql/server:2019-latest",
   "engine": "mssql",
   "probe_rev": "unknown",
-  "started_utc": "2026-09-16T20:01:52Z",
+  "started_utc": "2026-09-16T20:46:25Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 933,
+      "ms": 1144,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 30,
+      "ms": 31,
       "detail": "Microsoft SQL Server 2019 (RTM-CU32-GDR) (KB5122772) - 15.0."
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 7,
+      "ms": 5,
       "detail": "dbo"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 46,
+      "ms": 37,
       "detail": "[TableSummary(schema='dbo', name='customers', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='dbo', name='orders', kind='table', row_estimate=None, row_e"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 40,
+      "ms": 45,
       "detail": "[ColumnInfo(schema='dbo', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='dbo', table='customers', name='email', data_type='nv"
     },
     {
@@ -55,8 +55,8 @@
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 66,
-      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83F8DB"
+      "ms": 72,
+      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83F403"
     },
     {
       "check": "index_on_fk_visible",
@@ -68,7 +68,7 @@
       "check": "primary_key_visible",
       "status": "passed",
       "ms": 1,
-      "detail": "PK__customer__3213E83F5CD719F3"
+      "detail": "PK__customer__3213E83F4FAFB252"
     },
     {
       "check": "composite_unique_index",
@@ -85,19 +85,19 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 10,
+      "ms": 12,
       "detail": "f_one"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 44,
+      "ms": 64,
       "detail": "catalog_estimate(sys.partitions)"
     },
     {
@@ -109,20 +109,20 @@
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 6,
+      "ms": 7,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 33,
+      "ms": 31,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
-      "status": "failed",
+      "status": "passed",
       "ms": 3,
-      "detail": "AssertionError: [['north', 100]]"
+      "detail": "[['north', 100]]"
     },
     {
       "check": "value_search_like",
@@ -161,11 +161,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:01:53Z",
+  "finished_utc": "2026-09-16T20:46:27Z",
   "summary": {
-    "passed": 20,
-    "failed": [
-      "top_values"
-    ]
+    "passed": 21,
+    "failed": []
   }
 }

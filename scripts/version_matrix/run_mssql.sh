@@ -55,7 +55,7 @@ for image in "${IMAGES[@]}"; do
     docker rm -f "$name" >/dev/null 2>&1 || true
     continue
   fi
-  docker run --rm --platform linux/amd64 --network "$NET" \
+  docker run --rm --platform linux/amd64 --network "$NET" -e "VM_PROBE_REV=$(git -C "$PROJECT" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     -v "$PROJECT/src":/work/src:ro -v "$PROJECT/scripts":/work/scripts:ro -v "$PWDIR":/secrets:ro -v "$EV":/out \
     -w /work "$CLIENT_IMG" python scripts/version_matrix/probe.py --engine mssql --host "$name" --port 1433 \
     --database vm --user sa --password-file /secrets/pw --label "$image" --out "/out/$(basename "$out")" 2>&1 | tail -3

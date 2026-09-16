@@ -1,31 +1,31 @@
 {
   "label": "gvenzl/oracle-xe:11.2.0.2-slim (thick)",
   "engine": "oracle",
-  "probe_rev": "unknown",
-  "started_utc": "2026-09-16T20:22:35Z",
+  "probe_rev": "02f7e46",
+  "started_utc": "2026-09-16T21:49:49Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 677,
+      "ms": 636,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 232,
+      "ms": 225,
       "detail": "Oracle Database 11g Express Edition Release 11.2.0.2.0 - 64b"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 261,
+      "ms": 252,
       "detail": "SYSTEM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 407,
+      "ms": 467,
       "detail": "[TableSummary(schema='SYSTEM', name='AQ$DEF$_AQCALL', kind='view', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='AQ$DEF$_AQERROR', kind='view', row_es"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 20,
+      "ms": 18,
       "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EM"
     },
     {
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 418,
+      "ms": 426,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 381,
+      "ms": 346,
       "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C006988', columns=["
     },
     {
@@ -67,7 +67,7 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 260,
+      "ms": 336,
       "detail": "SYS_C006987"
     },
     {
@@ -79,19 +79,19 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 1872,
+      "ms": 1785,
       "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 90,
+      "ms": 84,
       "detail": "VM_V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 69,
+      "ms": 63,
       "detail": "VM_F_ONE"
     },
     {
@@ -103,31 +103,31 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 209,
+      "ms": 211,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 220,
+      "ms": 238,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 210,
+      "ms": 207,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 237,
+      "ms": 242,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 218,
+      "ms": 220,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:22:41Z",
+  "finished_utc": "2026-09-16T21:49:55Z",
   "summary": {
     "passed": 21,
     "failed": []

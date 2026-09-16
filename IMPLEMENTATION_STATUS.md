@@ -419,17 +419,55 @@ Known and NOT fixed here, now documented rather than implied away:
   the staging Mac) and proven only by the container matrix.
 - **Version matrix** (`scripts/version_matrix/`, evidence in
   `test-evidence/version-matrix/`): a probe that seeds a themed schema on
-  any server version and drives every connector capability. Results so far:
+  any server version and drives every connector capability (22 checks:
+  seed, health, schemas, tables, columns, bulk columns, indexes, index on a
+  foreign key, primary key, foreign keys, views, routines, statistics,
+  counted query, bounded sample, profile aggregate, top values, value
+  search, EXPLAIN, session read-back, composite unique index, list_columns
+  count). Final run on 2026-09-16 at commits 5d8ec4e..02f7e46 (the only
+  source difference between those commits is the LIKE escape helper, which
+  the probe does not exercise); `summarize.py` output, unedited:
 
-  | Engine | Versions passing all 21 checks |
-  |---|---|
-  | PostgreSQL | 12, 13, 14, 15, 16, 17 |
-  | MySQL | 5.7, 8.0, 8.4 |
-  | MariaDB | 10.6, 11.4 |
-  | ClickHouse | 23.8, 24.3, 24.8, 25.3 (20 checks; foreign keys do not exist there) |
+  | Engine | Image | Server reports | Checks | Result | Session |
+  |---|---|---|---|---|---|
+  | clickhouse | `clickhouse/clickhouse-server:23.8` | 23.8.16.16 | 19/22 | passed (skipped: composite_unique_index, get_foreign_keys, list_routines) | default/server-ro |
+  | clickhouse | `clickhouse/clickhouse-server:24.3` | 24.3.18.7 | 19/22 | passed (skipped: composite_unique_index, get_foreign_keys, list_routines) | default/server-ro |
+  | clickhouse | `clickhouse/clickhouse-server:24.8` | 24.8.14.39 | 19/22 | passed (skipped: composite_unique_index, get_foreign_keys, list_routines) | default/server-ro |
+  | clickhouse | `clickhouse/clickhouse-server:25.3` | 25.3.14.14 | 19/22 | passed (skipped: composite_unique_index, get_foreign_keys, list_routines) | default/server-ro |
+  | oracle | `gvenzl/oracle-free:23-slim` | Oracle AI Database 26ai Free Relea | 21/22 | passed (skipped: explain) | default/guard-ro |
+  | oracle | `gvenzl/oracle-free:23-slim (thick)` | Oracle AI Database 26ai Free Relea | 21/22 | passed (skipped: explain) | default/guard-ro |
+  | oracle | `gvenzl/oracle-xe:11.2.0.2-slim (thick)` | Oracle Database 11g Express Editio | 21/22 | passed (skipped: explain) | default/guard-ro |
+  | oracle | `gvenzl/oracle-xe:18.4.0-slim` | Oracle Database 18c Express Editio | 21/22 | passed (skipped: explain) | default/guard-ro |
+  | oracle | `gvenzl/oracle-xe:18.4.0-slim (thick)` | Oracle Database 18c Express Editio | 21/22 | passed (skipped: explain) | default/guard-ro |
+  | oracle | `gvenzl/oracle-xe:21.3.0-slim` | Oracle Database 21c Express Editio | 21/22 | passed (skipped: explain) | default/guard-ro |
+  | db2 | `icr.io/db2_community/db2:11.5.8.0` | DB2 v11.5.8.0 | 21/22 | passed (skipped: explain) | ur/guard-ro |
+  | db2 | `icr.io/db2_community/db2:11.5.9.0` | DB2 v11.5.9.0 | 21/22 | passed (skipped: explain) | ur/guard-ro |
+  | mysql | `mariadb:10.6` | 10.6.28-MariaDB-ubu2204 | 22/22 | passed | default/server-ro |
+  | mysql | `mariadb:11.4` | 11.4.13-MariaDB-ubu2404 | 22/22 | passed | default/server-ro |
+  | mssql | `mcr.microsoft.com/mssql/server:2017-latest` | Microsoft SQL Server 2017 (RTM-CU3 | 21/22 | passed (skipped: explain) | read_uncommitted/guard-ro |
+  | mssql | `mcr.microsoft.com/mssql/server:2019-latest` | Microsoft SQL Server 2019 (RTM-CU3 | 21/22 | passed (skipped: explain) | read_uncommitted/guard-ro |
+  | mssql | `mcr.microsoft.com/mssql/server:2022-latest` | Microsoft SQL Server 2022 (RTM-CU2 | 21/22 | passed (skipped: explain) | read_uncommitted/guard-ro |
+  | mysql | `mysql:5.7` | 5.7.44 | 22/22 | passed | default/server-ro |
+  | mysql | `mysql:8.0` | 8.0.46 | 22/22 | passed | default/server-ro |
+  | mysql | `mysql:8.4` | 8.4.11 | 22/22 | passed | default/server-ro |
+  | postgres | `postgres:12` | PostgreSQL 12.22 (Debian 12.22-1.p | 22/22 | passed | default/server-ro |
+  | postgres | `postgres:13` | PostgreSQL 13.23 (Debian 13.23-1.p | 22/22 | passed | default/server-ro |
+  | postgres | `postgres:14` | PostgreSQL 14.24 (Debian 14.24-1.p | 22/22 | passed | default/server-ro |
+  | postgres | `postgres:15` | PostgreSQL 15.19 (Debian 15.19-1.p | 22/22 | passed | default/server-ro |
+  | postgres | `postgres:16` | PostgreSQL 16.13 (Debian 16.13-1.p | 22/22 | passed | default/server-ro |
+  | postgres | `postgres:17` | PostgreSQL 17.9 (Debian 17.9-1.pgd | 22/22 | passed | default/server-ro |
 
-  Oracle, Db2 and SQL Server rows are recorded as their runs complete; a
-  version not listed here is `not_run`, not "works".
+  Reading the table: "skipped" is a capability the engine does not have or
+  the build disables on purpose, never a failed check: ClickHouse has no
+  foreign keys, routines or unique indexes; Oracle EXPLAIN PLAN needs a
+  provisioned plan table and is disabled; SQL Server and Db2 EXPLAIN are not
+  implemented in this build. Oracle 11.2 exists only as a thick-mode row
+  because python-oracledb's thin mode cannot connect to that server version
+  at all (DPY-3010); the thick rows ran the same probe inside a no-network
+  container with the administrator-supplied Instant Client. The SQL Server
+  rows carry `probe_rev: unknown` because the Gate C client container has
+  no git checkout; the runners now pass the revision in (VM_PROBE_REV) for
+  the next run. A version not listed here is `not_run`, not "works".
 
 ## 4. Gates not (fully) run (recorded truthfully)
 

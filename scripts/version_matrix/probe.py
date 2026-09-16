@@ -223,13 +223,17 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
     args = ap.parse_args()
     engine = args.engine
     password = Path(args.password_file).read_text(encoding="utf-8").strip()
-    try:
-        import subprocess
-        probe_rev = subprocess.run(  # noqa: S603, S607 - staging-only evidence stamp
-            ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False
-        ).stdout.strip() or "unknown"
-    except Exception:  # noqa: BLE001
-        probe_rev = "unknown"
+    # Inside the no-network probe containers (SQL Server, thick Oracle) there
+    # is no git checkout: the runner passes the revision it mounted instead.
+    probe_rev = os.environ.get("VM_PROBE_REV", "").strip()
+    if not probe_rev:
+        try:
+            import subprocess
+            probe_rev = subprocess.run(  # noqa: S603, S607 - staging-only evidence stamp
+                ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False
+            ).stdout.strip() or "unknown"
+        except Exception:  # noqa: BLE001
+            probe_rev = "unknown"
     record: dict[str, Any] = {"label": args.label, "engine": engine, "probe_rev": probe_rev,
                               "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checks": []}
 

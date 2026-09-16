@@ -89,7 +89,7 @@ documented floor, not a tested one.
 | PostgreSQL | 10 | 12, 13, 14, 15, 16, 17 | psycopg 3 supports 10-18. `pg_proc.prokind` is 11+, so `db_list_routines` falls back to a pre-11 query. |
 | MySQL / MariaDB | MySQL 5.7, MariaDB 10.3 | MySQL 5.7, 8.0, 8.4; MariaDB 10.6, 11.4 | PyMySQL's stated range. Our catalog SQL uses `information_schema` only. |
 | ClickHouse | actively supported releases | 23.8, 24.3, 24.8, 25.3 | clickhouse-connect 1.7.0 removed compatibility branches for servers older than 25.8; the tested older servers pass the probed subset. |
-| Oracle | Thin 12.1, Thick 11.2 | Thin: 18.4, 21.3, 23; Thin on 11.2 fails as documented (DPY-3010); Thick: see the ledger table | python-oracledb. Sampling uses `ROWNUM`, not the 12c-only `FETCH FIRST`. |
+| Oracle | Thin 12.1, Thick 11.2 | Thin: 18.4, 21.3, 23 (thin cannot reach 11.2 at all: DPY-3010); Thick: 11.2, 18.4, 23, all 21 checks | python-oracledb. Sampling uses `ROWNUM`, not the 12c-only `FETCH FIRST`. |
 | SQL Server | 2017 | 2017, 2019, 2022 | Microsoft lists only 2017/2019/2022/2025 for ODBC Driver 18. |
 | **IBM Db2 LUW** | **11.1** | 11.5.8, 11.5.9 (11.1: `not_run`) | ibm_db 3.2.7+ bundles clidriver 12.1, which supports LUW 12.1/11.5/11.1 and **drops 10.5**. |
 
