@@ -163,7 +163,12 @@ def test_length_substring_and_like_builders_per_engine(tmp_path: Path) -> None:
     assert conns["db2"].substring_expression("c", 200) == (
         "SUBSTR(c, 1, CASE WHEN LENGTH(c) < 200 THEN LENGTH(c) ELSE 200 END)"
     )  # Db2 raises SQL0138N when the length argument exceeds the value
-    assert conns["postgres"].escape_like("100%_x\\y") == "100\\%\\_x\\\\y"
-    assert conns["mssql"].escape_like("a[b]%") == "a\\[b]\\%"
-    assert conns["postgres"].like_predicate("LOWER(c)", "%s") == "LOWER(c) LIKE %s ESCAPE '\\'"
+    # '!' is the escape everywhere an ESCAPE clause exists: a backslash literal is
+    # spelled '\\' on MySQL and '\' on PostgreSQL, so it cannot be emitted portably
+    # (live run 2026-09-16: MySQL 1064 on ESCAPE '\', swallowed as zero hits)
+    assert conns["postgres"].escape_like("100%_x!y") == "100!%!_x!!y"
+    assert conns["mysql"].escape_like("o_ei") == "o!_ei"
+    assert conns["mssql"].escape_like("a[b]%") == "a![b]!%"
+    assert conns["postgres"].like_predicate("LOWER(c)", "%s") == "LOWER(c) LIKE %s ESCAPE '!'"
+    assert conns["clickhouse"].escape_like("100%_x\\y") == "100\\%\\_x\\\\y"
     assert conns["clickhouse"].like_predicate("lower(c)", "%(p1)s") == "lower(c) LIKE %(p1)s"

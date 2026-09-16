@@ -1,30 +1,31 @@
 {
   "label": "clickhouse/clickhouse-server:24.8",
   "engine": "clickhouse",
-  "started_utc": "2026-09-16T19:43:11Z",
+  "probe_rev": "c820896",
+  "started_utc": "2026-09-16T20:36:55Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 83,
+      "ms": 121,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
       "ms": 6,
-      "detail": "HealthInfo(healthy=True, server_version='24.8.14.39', latency_ms=6, detail=None, checked_at=1789587791.267961, session={'engine': 'clickhouse', 'isolation': None, 'lock_timeout_seconds': 5.0, 'stateme"
+      "detail": "24.8.14.39"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 5,
-      "detail": "5"
+      "ms": 4,
+      "detail": "vm"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 2,
+      "ms": 4,
       "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(system.tables.total_rows)', comment=None), TableSummary(schema='vm', name='orders', k"
     },
     {
@@ -36,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='vm', table='customers', name='email', data_type='S"
     },
     {
@@ -48,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 2,
-      "detail": "12"
+      "ms": 1,
+      "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
     },
     {
@@ -66,8 +67,14 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "(sorting key)"
+    },
+    {
+      "check": "composite_unique_index",
+      "status": "skipped",
+      "ms": 0,
+      "detail": "ClickHouse has no unique indexes"
     },
     {
       "check": "get_foreign_keys",
@@ -78,31 +85,31 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
-      "status": "passed",
+      "status": "skipped",
       "ms": 0,
-      "detail": "0"
+      "detail": "no routine seeded on this engine/version"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 3,
-      "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': 300, 'row_estimate_source': 'catalog_estimate(system.tables)', 'total_bytes': '4.86 KiB'}"
+      "ms": 1,
+      "detail": "catalog_estimate(system.tables)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 6,
+      "ms": 7,
       "detail": "200"
     },
     {
@@ -114,46 +121,47 @@
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 6,
+      "ms": 5,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 5,
+      "ms": 4,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 5,
-      "detail": "{'raw': [('Expression (Project names)',), ('  Limit (preliminary LIMIT (without OFFSET))',), ('    Expression ((Projection + Change column names to column identifiers))',), ('      ReadFromMergeTree ("
+      "ms": 4,
+      "detail": "['raw']"
     }
   ],
   "server_version": "24.8.14.39",
   "session": {
     "engine": "clickhouse",
     "isolation": null,
-    "lock_timeout_seconds": 5.0,
+    "lock_timeout_seconds": null,
     "statement_timeout_seconds": 60.0,
     "application_name": "udbmcp:vm",
     "read_only_requested": true,
     "server_read_only_available": true,
     "applied": [
-      "read_only",
-      "max_execution_time=60s"
+      "max_execution_time=60s",
+      "read_only"
     ],
     "skipped": [],
     "read_only_enforced": true,
+    "read_only_verified": true,
     "server_reports": {
       "readonly": "1",
       "max_execution_time": "60.0"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T19:43:11Z",
+  "finished_utc": "2026-09-16T20:36:55Z",
   "summary": {
-    "passed": 20,
+    "passed": 19,
     "failed": []
   }
 }

@@ -461,7 +461,7 @@ class MssqlConnector(DatabaseConnector):
 
     def escape_like(self, needle: str) -> str:
         # T-SQL LIKE also treats [ as a wildcard-class opener
-        return super().escape_like(needle).replace("[", "\\[")
+        return super().escape_like(needle).replace("[", self.LIKE_ESCAPE + "[")
 
     def text_expression(self, quoted_column: str, portable_name: str) -> str:
         return f"CAST({quoted_column} AS varchar(64))" if portable_name == "uuid" else quoted_column

@@ -162,7 +162,7 @@ def discovery_evidence(server: Any, conn_ids: list[str], search_query: str) -> s
                 out.append(
                     f"  profile: sample={(pd.get('sample') or {}).get('rows')} row_estimate={pd.get('row_estimate')} "
                     f"findings={[f['code'] for f in pd.get('findings', [])]}"
-                    + (f" warnings={pd.get('warnings')}" if pd.get("warnings") else "")
+                    + (f" warnings={prof.get('warnings')}" if prof.get("warnings") else "")
                 )
                 for col in pd.get("columns", [])[:4]:
                     out.append(
@@ -183,22 +183,29 @@ def discovery_evidence(server: Any, conn_ids: list[str], search_query: str) -> s
         )
         d = hits["data"]
         out.append(f"  query={search_query!r} hits={len(d['hits'])} tables_searched={d.get('tables_searched')} "
-                   f"warnings={d.get('warnings')}")
+                   f"warnings={hits.get('warnings')}")
         for h in d["hits"][:6]:
             out.append(f"     {h['connection']}.{h.get('schema')}.{h['table']} matched={h['matched_columns']}")
-        lit = _call(server, "db_search_values", {"query": "100%", "max_hits_per_table": 1, "time_budget_seconds": 30})
-        out.append(f"  literal-wildcard query '100%': hits={len(lit['data']['hits'])} (must not act as a wildcard)")
+        for literal in ("100%", "gu_f"):
+            lit = _call(
+                server, "db_search_values", {"query": literal, "max_hits_per_table": 1, "time_budget_seconds": 30}
+            )
+            out.append(
+                f"  literal query {literal!r}: hits={len(lit['data']['hits'])} "
+                f"(wildcard characters are data; 'gulf' rows must not match) warnings={lit.get('warnings')}"
+            )
     except Exception as exc:  # noqa: BLE001
         out.append(f"  FAILED {type(exc).__name__}: {str(exc)[:240]}")
     out.append("")
     out.append("== relationship inference (all connections)")
     try:
-        rel = _call(server, "db_infer_relationships", {})["data"]
+        rel_env = _call(server, "db_infer_relationships", {})
+        rel = rel_env["data"]
         kinds: dict[str, int] = {}
         for r in rel.get("relationships", []):
             kinds[r.get("kind", "?")] = kinds.get(r.get("kind", "?"), 0) + 1
         out.append(
-            f"  relationships={len(rel.get('relationships', []))} by kind={kinds} warnings={rel.get('warnings')}"
+            f"  relationships={len(rel.get('relationships', []))} by kind={kinds} warnings={rel_env.get('warnings')}"
         )
         for r in rel.get("relationships", [])[:5]:
             src, tgt = r.get("source") or {}, r.get("target") or {}

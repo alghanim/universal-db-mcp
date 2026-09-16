@@ -1,5 +1,5 @@
 # Discovery tools: live run through the MCP server against the local fixtures
-date_utc: 2026-09-16T20:30:47Z
+date_utc: 2026-09-16T20:39:18Z
 
 == mock_clickhouse
   catalog: 3 tables; cdr: pk=['started_at', 'caller_msisdn'] cols=9 idx=1 fks=[]
@@ -16,7 +16,7 @@ date_utc: 2026-09-16T20:30:47Z
   catalog: 3 tables; CITIZENS: pk=['CITIZEN_ID'] cols=7 idx=2 fks=[]
   portable types in CITIZENS: ['date', 'integer', 'string']
   declared types (first 6): ['INTEGER', 'VARCHAR(120)', 'DATE', 'CHARACTER(1)', 'CHARACTER(3)', 'VARCHAR(18)']
-  profile: sample=6 row_estimate=None findings=['statistics_missing']
+  profile: sample=6 row_estimate=None findings=['statistics_missing'] warnings=['sensitive column(s) profiled for null ratio only (values never returned): NATIONAL_ID']
      CITIZEN_ID [numeric] null=0.0 distinct=6 maxlen=None min=1 top=[1, 5, 4, 3, 2]
      FULL_NAME [string] null=0.0 distinct=6 maxlen=19 min="Elena Petrova" top=["Elena Petrova", "Priya Nair", "Omar Bin Rashid", "Kwame...
      DATE_OF_BIRTH [temporal] null=0.0 distinct=6 maxlen=None min="1968-01-30" top=["1968-01-30", "1992-06-25", "1988-04-08", "1985-03-12", ...
@@ -41,7 +41,7 @@ date_utc: 2026-09-16T20:30:47Z
   catalog: 4 tables; BOARDING_PASSES: pk=['PASS_ID'] cols=5 idx=1 fks=['SYS_C008677']
   portable types in BOARDING_PASSES: ['decimal', 'string', 'timestamp']
   declared types (first 6): ['NUMBER', 'NUMBER', 'VARCHAR2(6)', 'VARCHAR2(5)', 'TIMESTAMP(6)']
-  profile: sample=0 row_estimate=None findings=['foreign_key_without_index', 'statistics_missing']
+  profile: sample=0 row_estimate=None findings=['foreign_key_without_index', 'statistics_missing'] warnings=['the sample returned no rows (empty table, or the account cannot read it): column measures are absent and only metadata findings apply']
      PASS_ID [numeric] null=None distinct=0 maxlen=None min=null top=[]
      BOOKING_ID [numeric] null=None distinct=0 maxlen=None min=null top=[]
      SEAT [string] null=None distinct=0 maxlen=None min=null top=[]
@@ -60,13 +60,14 @@ date_utc: 2026-09-16T20:30:47Z
   indexes in schema: 3
 
 == cross-connection search
-  query='gulf' hits=2 tables_searched=13 warnings=None
+  query='gulf' hits=2 tables_searched=13 warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
      mock_db2.MOI.RESIDENCY_PERMITS matched=['SPONSOR_NAME']
      mock_pg.ocean.buoys matched=['region']
-  literal-wildcard query '100%': hits=0 (must not act as a wildcard)
+  literal query '100%': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
+  literal query 'gu_f': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
 
 == relationship inference (all connections)
-  relationships=8 by kind={'declared': 7, 'inferred_name_type': 1} warnings=None
+  relationships=8 by kind={'declared': 7, 'inferred_name_type': 1} warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
      declared: mock_db2.RESIDENCY_PERMITS['CITIZEN_ID'] -> mock_db2.CITIZENS['CITIZEN_ID'] confidence=1.0
      declared: mock_db2.VEHICLE_REGISTRATIONS['CITIZEN_ID'] -> mock_db2.CITIZENS['CITIZEN_ID'] confidence=1.0
      declared: mock_mysql.cuppings['batch_id'] -> mock_mysql.roastery_batches['batch_id'] confidence=1.0

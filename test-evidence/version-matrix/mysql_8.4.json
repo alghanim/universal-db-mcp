@@ -1,25 +1,26 @@
 {
   "label": "mysql:8.4",
   "engine": "mysql",
-  "started_utc": "2026-09-16T19:27:51Z",
+  "probe_rev": "c820896",
+  "started_utc": "2026-09-16T20:35:15Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 1186,
+      "ms": 798,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
       "ms": 8,
-      "detail": "HealthInfo(healthy=True, server_version='8.4.11', latency_ms=8, detail=None, checked_at=1789586872.369716, session={'engine': 'mysql', 'isolation': None, 'lock_timeout_seconds': 5.0, 'statement_timeou"
+      "detail": "8.4.11"
     },
     {
       "check": "list_schemas",
       "status": "passed",
       "ms": 7,
-      "detail": "5"
+      "detail": "vm"
     },
     {
       "check": "list_tables",
@@ -49,7 +50,7 @@
       "check": "list_all_columns",
       "status": "passed",
       "ms": 0,
-      "detail": "12"
+      "detail": "9"
     },
     {
       "check": "list_indexes",
@@ -70,6 +71,12 @@
       "detail": "PRIMARY"
     },
     {
+      "check": "composite_unique_index",
+      "status": "passed",
+      "ms": 0,
+      "detail": "ux_customers_region_email"
+    },
+    {
       "check": "get_foreign_keys",
       "status": "passed",
       "ms": 1,
@@ -78,20 +85,20 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 1,
+      "ms": 0,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
       "status": "passed",
       "ms": 0,
-      "detail": "1"
+      "detail": "f_one"
     },
     {
       "check": "get_statistics",
       "status": "passed",
       "ms": 0,
-      "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': 300, 'row_estimate_source': 'catalog_estimate(information_schema; InnoDB estimates vary)', 'data_bytes': 16384, 'index_bytes': None, 'last_update"
+      "detail": "catalog_estimate(information_schema; InnoDB estimates vary)"
     },
     {
       "check": "execute_query_count",
@@ -102,13 +109,13 @@
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 7,
+      "ms": 8,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 8,
+      "ms": 7,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
@@ -121,13 +128,13 @@
       "check": "value_search_like",
       "status": "passed",
       "ms": 5,
-      "detail": "[12, 'user12@example.com', 'north']"
+      "detail": "[122, 'user122@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
       "ms": 5,
-      "detail": "{'raw': [['1', 'SIMPLE', 'customers', 'None', 'ALL', 'None', 'None', 'None', 'None', '300', '100.0', 'None']]}"
+      "detail": "['raw']"
     }
   ],
   "server_version": "8.4.11",
@@ -147,6 +154,7 @@
     ],
     "skipped": [],
     "read_only_enforced": true,
+    "read_only_verified": true,
     "server_reports": {
       "read_only": "1",
       "isolation": "REPEATABLE-READ",
@@ -155,9 +163,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T19:27:52Z",
+  "finished_utc": "2026-09-16T20:35:16Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }

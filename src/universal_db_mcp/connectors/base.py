@@ -304,12 +304,15 @@ class DatabaseConnector(ABC):
         """The first ``chars`` characters of a string column."""
         return f"SUBSTR({quoted_column}, 1, {int(chars)})"
 
+    LIKE_ESCAPE = "!"  # a backslash literal is spelled differently on MySQL and old PostgreSQL
+
     def escape_like(self, needle: str) -> str:
         """Make %, _ and the escape character literal in a LIKE value."""
-        return needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        e = self.LIKE_ESCAPE
+        return needle.replace(e, e + e).replace("%", e + "%").replace("_", e + "_")
 
     def like_predicate(self, expression: str, placeholder: str) -> str:
-        return f"{expression} LIKE {placeholder} ESCAPE '\\'"
+        return f"{expression} LIKE {placeholder} ESCAPE '{self.LIKE_ESCAPE}'"
 
     def text_expression(self, quoted_column: str, portable_name: str) -> str:
         """``quoted_column`` as something LOWER()/LIKE accept. Plain strings

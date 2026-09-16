@@ -356,8 +356,11 @@ class ClickHouseConnector(DatabaseConnector):
     def substring_expression(self, quoted_column: str, chars: int) -> str:
         return f"substringUTF8({quoted_column}, 1, {int(chars)})"
 
+    def escape_like(self, needle: str) -> str:
+        # ClickHouse LIKE has no ESCAPE clause; backslash is its (only) escape
+        return needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     def like_predicate(self, expression: str, placeholder: str) -> str:
-        # ClickHouse LIKE has no ESCAPE clause; backslash is its escape already
         return f"{expression} LIKE {placeholder}"
 
     def text_expression(self, quoted_column: str, portable_name: str) -> str:
