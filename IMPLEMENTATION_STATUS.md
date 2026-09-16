@@ -469,6 +469,25 @@ Known and NOT fixed here, now documented rather than implied away:
   no git checkout; the runners now pass the revision in (VM_PROBE_REV) for
   the next run. A version not listed here is `not_run`, not "works".
 
+- **Release artifacts of this pass (built from commit ebd5f34; this note
+  was added in the following docs-only commit)**: signed bundles for
+  `linux-x86_64-ubuntu24.04-cp312` and `macos-arm64-cp312` with
+  `source_rev = ebd5f34...`, signed with the demo release key the user's
+  site already trusts. Gates run on 2026-09-16: `test_package_deb.sh`
+  PASSED (key-material rejection, no-network install, tamper and
+  zero-length-verifier negatives; evidence `out/package-evidence/deb/`),
+  `test_package_pkg.sh` PASSED (payload identity, tampered payload rejected;
+  evidence `out/package-evidence/pkg/`). Artifacts and SHA-256:
+  `dist/universal-db-mcp_0.1.0~ebd5f342d8ad5e1a5d9e118548c7fd6337b14b23_amd64.deb`
+  `67a921d74694e8500b8028b7d68b2bf99f39d3ac472f0b3cef3ea77799af86e0`;
+  `dist/universal-db-mcp-0.1.0-macos-arm64.pkg`
+  `2cc37e71f0889fc322d2519786df1c46d5d07715749c76e750262bb3d27a477d`.
+  USB folder for the Ubuntu site: `dist/usb-ubuntu-ebd5f34/` (the .deb,
+  `trust-bootstrap-linux/` refreshed from this commit, `oracle-instantclient/`,
+  `SHA256SUMS`, 10 files verified). Unchanged caveat: a .deb version of
+  `0.1.0~<sha>` sorts lexically, so `dpkg -i` over an installed build whose
+  hash sorts higher is a downgrade; the offline upgrade script handles it.
+
 ## 4. Gates not (fully) run (recorded truthfully)
 
 - **Gate D (egress observation):** harness provided
