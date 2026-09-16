@@ -9,14 +9,18 @@ Stdout is protocol-only (stdio transport); application logs go to stderr.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import getpass
+import json
+import os
 import sqlite3
 import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 from mcp.server.mcpserver import MCPServer
@@ -25,7 +29,7 @@ from mcp.server.mcpserver import MCPServer
 # message to the client; any other exception is masked as UnexpectedToolError
 # with a generic message (verified against the pinned SDK source).
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from sqlglot import exp
 
 from universal_db_mcp.config import AppConfig, ResolvedConnection
@@ -37,6 +41,15 @@ from universal_db_mcp.connectors.base import (
     ObjectNotFound,
     QuerySpec,
 )
+from universal_db_mcp.discovery.inference import TableFacts, TableRef, infer_relationships
+from universal_db_mcp.discovery.profile import (
+    TOP_VALUES,
+    aggregate_select_list,
+    build_profiles,
+    findings_for_table,
+    wants_top_values,
+)
+from universal_db_mcp.discovery.types import portable_type
 from universal_db_mcp.errors import ToolFailure
 from universal_db_mcp.models.capabilities import Cap, CapabilityState
 from universal_db_mcp.models.responses import Envelope, ErrorCategory
@@ -56,9 +69,33 @@ from universal_db_mcp.services.metadata import MetadataCache, rank_search
 
 _PAGE_SIZE = 50
 _SEARCH_CAP = 25
+
+_DISCOVERY_MAX_SCHEMAS = 20
+_PROFILE_MAX_COLUMNS = 60
+_PROFILE_DEFAULT_SAMPLE = 10_000
+_PROFILE_MAX_SAMPLE = 200_000
+_PROFILE_MAX_TOP_COLUMNS = 20
+_SEARCH_MAX_SELECT = 8
+_INFER_MAX_TABLES = 500
 _HISTORY_CAP = 200
 _INFER_MAX_TABLES = 50  # bounds metadata traversal for inference
 _META_TIMEOUT = 15.0
+
+
+def _process_identity() -> str:
+    """Audit identity of this process. ``getpass.getuser()`` RAISES (KeyError
+    on 3.12, OSError on 3.13+, ImportError without ``pwd``) when the UID has no
+    passwd entry - the normal state inside a container running as an unmapped
+    UID - and the CLI reported that as CONFIG_ERROR, blaming the config file.
+    The numeric UID is a truthful identity for the audit trail in that case."""
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError, ImportError):
+        user = ""
+    if user:
+        return user
+    getuid = getattr(os, "getuid", None)  # absent on Windows
+    return f"uid:{getuid()}" if getuid is not None else "unknown"
 
 
 class AppContext:
@@ -82,7 +119,7 @@ class AppContext:
         )
         self.cache = MetadataCache(path=cfg.application.metadata_cache_path, ttl_seconds=300.0)
         self.cursors = CursorCodec()
-        self.identity = getpass.getuser() or "unknown"
+        self.identity = _process_identity()
         self.history: deque[dict[str, Any]] = deque(maxlen=_HISTORY_CAP)
 
     def connection(self, connection_id: str) -> tuple[DatabaseConnector, EffectivePolicy]:
@@ -292,6 +329,12 @@ async def tool_span(
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _compact_result(data: dict[str, Any]) -> CallToolResult:
+    """One compact JSON text block plus the same dict as structured content."""
+    text = json.dumps(data, separators=(",", ":"), ensure_ascii=False, default=str)
+    return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=data)
 
 
 def _envelope(
@@ -506,12 +549,25 @@ def build_server(app: AppContext) -> MCPServer:
     )
 
     def register(name: str, description: str, handler: Callable[..., Any]) -> None:
+        # Every result is transmitted twice: as structuredContent AND as the
+        # text block the model actually reads. Left to the SDK, that text is
+        # pretty-printed (indent=2) - ~1.7x the compact size on every call -
+        # so the handler is wrapped to emit one compact text block itself.
+        # functools.wraps keeps the handler's signature/annotations visible,
+        # so the SDK still validates arguments and derives the output schema
+        # from the original ``dict[str, Any]`` return; a CallToolResult passes
+        # through convert_result with structured_content validated against it.
+        @functools.wraps(handler)
+        async def compact(*args: Any, **kwargs: Any) -> CallToolResult:
+            data = await handler(*args, **kwargs)
+            return _compact_result(data)
+
         mcp.tool(
             name=name,
             description=description,
             structured_output=True,
             annotations=read_only_annotations,
-        )(handler)
+        )(compact)
 
     # ---- discovery ---------------------------------------------------------
 
@@ -557,6 +613,10 @@ def build_server(app: AppContext) -> MCPServer:
             }
             if health.detail:
                 data["detail"] = health.detail
+            if health.session:
+                # The session safety profile as the SERVER reported it back
+                # (isolation, ceilings, read-only, identity): verified, not assumed.
+                data["session"] = health.session
             return _envelope(st, connection_id, policy.engine, data)
 
     register(
@@ -678,7 +738,11 @@ def build_server(app: AppContext) -> MCPServer:
             connector, policy = _require_engine(app, connection_id)
             if schema is not None:
                 policy.check_object(schema, "*")
-            kinds = set(object_kinds or ["table", "view", "materialized_view"])
+            if object_kinds is not None and not object_kinds:
+                # `x or default` made an explicit [] mean "every kind"; None
+                # is the default, an empty list is a caller mistake.
+                raise ToolFailure(ErrorCategory.VALIDATION, "object_kinds must be omitted or non-empty")
+            kinds = set(object_kinds) if object_kinds is not None else {"table", "view", "materialized_view"}
             unknown = kinds - {"table", "view", "materialized_view", "foreign_table", "alias"}
             if unknown:
                 raise ToolFailure(ErrorCategory.VALIDATION, f"unknown object kinds: {sorted(unknown)}")
@@ -869,10 +933,14 @@ def build_server(app: AppContext) -> MCPServer:
             if not query or len(query) > 200:
                 raise ToolFailure(ErrorCategory.VALIDATION, "query must be 1-200 characters")
             cap = min(max(result_cap, 1), _SEARCH_CAP)
-            conn_ids = connections or sorted(app.resolved.keys())
+            if connections is not None and not connections:
+                raise ToolFailure(ErrorCategory.VALIDATION, "connections must be omitted or non-empty")
+            conn_ids = list(connections) if connections is not None else sorted(app.resolved.keys())
             for cid in conn_ids:
                 if cid not in app.resolved:
                     raise ToolFailure(ErrorCategory.AUTHZ, f"connection '{cid}' is not available to this caller")
+            if object_types is not None and not object_types:
+                raise ToolFailure(ErrorCategory.VALIDATION, "object_types must be omitted or non-empty")
             types = set(object_types or ["table", "view", "materialized_view"])
             items: list[tuple[str, str, str, str]] = []
             warnings: list[str] = []
@@ -981,7 +1049,9 @@ def build_server(app: AppContext) -> MCPServer:
 
     # ---- query path -------------------------------------------------------------
 
-    async def db_validate_query(connection_id: str, sql: str, operation: str = "query") -> dict[str, Any]:
+    async def db_validate_query(
+        connection_id: str, sql: str, operation: Literal["query", "explain"] = "query"
+    ) -> dict[str, Any]:
         async with tool_span(app, "db_validate_query", connection_id, sql=sql) as st:
             connector, policy = _require_engine(app, connection_id)
             guard = await guard_for(app, connector, policy)
@@ -1174,6 +1244,470 @@ def build_server(app: AppContext) -> MCPServer:
         "db_get_query_history",
         "Caller-scoped, redacted operational history (fingerprints, not raw SQL). Not a substitute for the audit log.",
         db_get_query_history,
+    )
+
+
+    # ---- discovery: indexes, catalog snapshot, profiling, value search, inference
+
+    def _meta_call(method: str, *args: Any) -> Callable[[DatabaseConnector], Any]:
+        """A typed thunk for run_meta: ``connector.<method>(*args)``."""
+
+        def call(c: DatabaseConnector) -> Any:
+            return getattr(c, method)(*args)
+
+        return call
+
+    def _sensitive(policy: EffectivePolicy, name: str) -> bool:
+        return any(p.search(name) for p in policy.sensitive_patterns)
+
+    async def _permitted_tables(
+        app_: AppContext, connector: DatabaseConnector, policy: EffectivePolicy, schema: str | None
+    ) -> list[Any]:
+        tables = await app_.tables_for(policy, connector)
+        if schema is not None:
+            if not (policy.schema_allowed(schema) or policy.system_schema_allowed(schema)):
+                raise ToolFailure(
+                    ErrorCategory.AUTHZ, f"schema '{schema}' is not permitted on connection '{policy.connection_id}'"
+                )
+            tables = [t for t in tables if (t.schema or "").lower() == schema.lower()]
+        return tables
+
+    async def db_list_indexes(
+        connection_id: str, object_name: str | None = None, schema: str | None = None
+    ) -> dict[str, Any]:
+        async with tool_span(app, "db_list_indexes", connection_id) as st:
+            connector, policy = _require_engine(app, connection_id)
+            if object_name:
+                schema2, name = await _resolve_object(app, connector, policy, schema, object_name)
+                indexes = await run_meta(app, connection_id, lambda c: c.list_indexes(schema2, name))
+            else:
+                tables = await _permitted_tables(app, connector, policy, schema)
+                permitted = {((t.schema or "").lower(), t.name.lower()) for t in tables}
+                schemas = sorted({t.schema for t in tables if t.schema})[:_DISCOVERY_MAX_SCHEMAS]
+                indexes = []
+                for sch in schemas:
+                    found = await run_meta(app, connection_id, _meta_call("list_indexes", sch, None))
+                    indexes.extend(i for i in found if ((i.schema or "").lower(), (i.table or "").lower()) in permitted)
+            data = [dataclasses.asdict(i) for i in indexes]
+            st["row_count"] = len(data)
+            return _envelope(st, connection_id, policy.engine, {"indexes": data})
+
+    register(
+        "db_list_indexes",
+        "Indexes and primary keys of one permitted object, or of every permitted table in a schema "
+        "(ClickHouse: sorting keys and data-skipping indices).",
+        db_list_indexes,
+    )
+
+    async def db_get_catalog(
+        connection_id: str,
+        schema: str | None = None,
+        include_indexes: bool = True,
+        cursor: str | None = None,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        async with tool_span(app, "db_get_catalog", connection_id) as st:
+            connector, policy = _require_engine(app, connection_id)
+            size = max(1, min(int(page_size), 200))
+            tables = await _permitted_tables(app, connector, policy, schema)
+            tables = sorted(tables, key=lambda t: ((t.schema or "").lower(), t.name.lower()))
+            page, next_cursor = _page(
+                app, tables, cursor, kind="catalog", connection_id=connection_id, policy=policy, page_size=size
+            )
+            by_schema: dict[str | None, dict[str, Any]] = {}
+            for sch in sorted({t.schema for t in page}, key=lambda x: x or ""):
+                cols = await run_meta(app, connection_id, _meta_call("list_all_columns", sch))
+                idx = (
+                    await run_meta(app, connection_id, _meta_call("list_indexes", sch, None))
+                    if include_indexes else []
+                )
+                fks = await run_meta(app, connection_id, _meta_call("get_foreign_keys", sch, None))
+                by_schema[sch] = {"columns": cols, "indexes": idx, "fks": fks}
+            out_tables: list[dict[str, Any]] = []
+            for t in page:
+                sch = t.schema
+                bag = by_schema.get(sch, {"columns": [], "indexes": [], "fks": []})
+                key = ((sch or "").lower(), t.name.lower())
+                cols = [c for c in bag["columns"] if ((c.schema or sch or "").lower(), c.table.lower()) == key]
+                idx = [i for i in bag["indexes"] if ((i.schema or sch or "").lower(), (i.table or "").lower()) == key]
+                fks = [
+                    k for k in bag["fks"]
+                    if ((k.source_schema or sch or "").lower(), (k.source_table or "").lower()) == key
+                ]
+                pk = next((i.columns for i in idx if i.primary), None)
+                out_tables.append({
+                    "schema": sch,
+                    "name": t.name,
+                    "kind": t.kind,
+                    "row_estimate": t.row_estimate,
+                    "row_estimate_source": t.row_estimate_source,
+                    "comment": t.comment,
+                    "primary_key": pk,
+                    "columns": [
+                        {
+                            "name": c.name,
+                            "data_type": c.data_type,
+                            **portable_type(policy.engine, c.data_type).as_dict(),
+                            "nullable": c.nullable,
+                            "default": c.default,
+                            "comment": c.comment,
+                            "in_primary_key": bool(pk and c.name in pk),
+                            "sensitive": _sensitive(policy, c.name),
+                        }
+                        for c in cols
+                    ],
+                    "indexes": [dataclasses.asdict(i) for i in idx],
+                    "foreign_keys": [dataclasses.asdict(k) for k in fks],
+                })
+            st["row_count"] = len(out_tables)
+            return _envelope(
+                st, connection_id, policy.engine,
+                {
+                    "tables": out_tables,
+                    "table_count": len(tables),
+                    "note": (
+                        "column 'sensitive' is a name heuristic from security.mask_columns, "
+                        "not a data classification"
+                    ),
+                },
+                next_cursor=next_cursor,
+            )
+
+    register(
+        "db_get_catalog",
+        "One-call catalog snapshot of the permitted tables of a connection (paged): columns with "
+        "portable types, primary keys, foreign keys, indexes and row estimates. No table data is read.",
+        db_get_catalog,
+    )
+
+    async def db_profile_table(
+        connection_id: str,
+        object_name: str,
+        schema: str | None = None,
+        columns: list[str] | None = None,
+        sample_rows: int | None = None,
+        include_top_values: bool = True,
+    ) -> dict[str, Any]:
+        async with tool_span(app, "db_profile_table", connection_id) as st:
+            connector, policy = _require_engine(app, connection_id)
+            schema2, name = await _resolve_object(app, connector, policy, schema, object_name)
+            all_cols = await run_meta(app, connection_id, lambda c: c.list_columns(schema2, name))
+            if columns is not None and not columns:
+                raise ToolFailure(ErrorCategory.VALIDATION, "columns must be omitted or non-empty")
+            if columns:
+                known = {c.name for c in all_cols}
+                bad = [c for c in columns if c not in known]
+                if bad:
+                    raise ToolFailure(ErrorCategory.VALIDATION, f"unknown columns: {bad}")
+                all_cols = [c for c in all_cols if c.name in set(columns)]
+            all_cols = all_cols[:_PROFILE_MAX_COLUMNS]
+            requested = _PROFILE_DEFAULT_SAMPLE if sample_rows is None else int(sample_rows)
+            if requested < 1 or requested > _PROFILE_MAX_SAMPLE:
+                raise ToolFailure(ErrorCategory.VALIDATION, f"sample_rows must be 1-{_PROFILE_MAX_SAMPLE}")
+            omit = policy.mask_action == "omit"
+            sensitive = {c.name for c in all_cols if _sensitive(policy, c.name)}
+            if omit:
+                all_cols = [c for c in all_cols if c.name not in sensitive]
+            # sensitive columns are profiled for nulls/distinct only: no values leave the database
+            profiled = [c for c in all_cols if c.name not in sensitive]
+            null_only = [c for c in all_cols if c.name in sensitive]
+            sample_sql = connector.build_sample_query(schema2, name, [c.name for c in all_cols], requested)
+            select_list, layout = aggregate_select_list(
+                profiled, policy.engine, connector.quote_identifier, connector.length_function()
+            )
+            for c in null_only:
+                select_list += f", COUNT({connector.quote_identifier(c.name)})"
+                layout.append((c.name, "non_null"))
+            spec = QuerySpec(
+                # identifiers come from the catalog and are quoted by the connector;
+                # the sample subquery is the connector's own bounded builder
+                sql=f"SELECT {select_list} FROM ({sample_sql}) s",  # noqa: S608
+                parameters=None,
+                max_rows=1,
+                max_response_bytes=policy.max_response_bytes,
+                max_cell_bytes=policy.max_cell_bytes,
+                timeout_seconds=policy.clamp_timeout(None),
+            )
+            st["connector"] = connector
+            outcome = await run_query(app, connection_id, spec, f"profile of '{connection_id}'")
+            row = outcome.rows[0] if outcome.rows else []
+            total, profiles = build_profiles(all_cols, policy.engine, layout, row)
+            top_done = 0
+            if include_top_values:
+                for c in profiled:
+                    prof = profiles[c.name]
+                    if not wants_top_values(prof) or top_done >= _PROFILE_MAX_TOP_COLUMNS:
+                        continue
+                    tv_spec = QuerySpec(
+                        sql=connector.build_top_values_query(sample_sql, c.name, TOP_VALUES),
+                        parameters=None,
+                        max_rows=TOP_VALUES,
+                        max_response_bytes=policy.max_response_bytes,
+                        max_cell_bytes=policy.max_cell_bytes,
+                        timeout_seconds=policy.clamp_timeout(None),
+                    )
+                    tv = await run_query(app, connection_id, tv_spec, f"top values on '{connection_id}'")
+                    prof.top_values = [{"value": r[0], "count": r[1]} for r in tv.rows]
+                    top_done += 1
+            indexes = await run_meta(app, connection_id, lambda c: c.list_indexes(schema2, name))
+            fks = await run_meta(app, connection_id, lambda c: c.get_foreign_keys(schema2, name))
+            try:
+                stats = await run_meta(app, connection_id, lambda c: c.get_statistics(schema2, name))
+            except (ConnectorError, ToolFailure):
+                stats = None
+            row_estimate = stats.get("row_estimate") if isinstance(stats, dict) else None
+            findings = findings_for_table(
+                sample_size=total, row_estimate=row_estimate, columns=all_cols, profiles=profiles,
+                indexes=indexes, foreign_keys=fks, stats=stats if isinstance(stats, dict) else None,
+            )
+            if sensitive:
+                st["warnings"].append(
+                    "sensitive column(s) profiled for null ratio only (values never returned): "
+                    + ", ".join(sorted(sensitive))
+                )
+            st["row_count"] = total
+            return _envelope(
+                st, connection_id, policy.engine,
+                {
+                    "schema": schema2,
+                    "name": name,
+                    "sample": {
+                        "rows": total,
+                        "requested": requested,
+                        "method": "first rows in storage order (the connector's bounded sample query)",
+                    },
+                    "row_estimate": row_estimate,
+                    "columns": [profiles[c.name].as_dict() for c in all_cols],
+                    "primary_key": next((i.columns for i in indexes if i.primary), None),
+                    "findings": [f.as_dict() for f in findings],
+                },
+                warnings=st["warnings"],
+            )
+
+    register(
+        "db_profile_table",
+        "Bounded data profile of one permitted table (null ratio, distinct, min/max, string lengths, "
+        "top values for low-cardinality columns) plus evidence-backed optimization findings. "
+        "Runs over a sample under the session safety profile; sensitive columns return counts only.",
+        db_profile_table,
+    )
+
+    async def db_search_values(
+        query: str,
+        connections: list[str] | None = None,
+        schemas: list[str] | None = None,
+        match: Literal["contains", "exact", "prefix"] = "contains",
+        max_hits_per_table: int = 5,
+        max_tables: int = 100,
+        time_budget_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        async with tool_span(app, "db_search_values") as st:
+            if not query or len(query) > 200:
+                raise ToolFailure(ErrorCategory.VALIDATION, "query must be 1-200 characters")
+            if connections is not None and not connections:
+                raise ToolFailure(ErrorCategory.VALIDATION, "connections must be omitted or non-empty")
+            if schemas is not None and not schemas:
+                raise ToolFailure(ErrorCategory.VALIDATION, "schemas must be omitted or non-empty")
+            per_table = max(1, min(int(max_hits_per_table), 50))
+            table_cap = max(1, min(int(max_tables), 500))
+            budget = max(1.0, min(float(time_budget_seconds), 300.0))
+            conn_ids = list(connections) if connections is not None else sorted(app.resolved.keys())
+            for cid in conn_ids:
+                if cid not in app.resolved:
+                    raise ToolFailure(ErrorCategory.AUTHZ, f"connection '{cid}' is not available to this caller")
+            wanted_schemas = {s.lower() for s in schemas} if schemas else None
+            numeric: int | float | None = None
+            try:
+                numeric = int(query) if query.lstrip("-").isdigit() else float(query)
+            except ValueError:
+                numeric = None
+            needle = query.lower()
+            deadline = time.monotonic() + budget
+            hits: list[dict[str, Any]] = []
+            warnings: list[str] = []
+            searched = skipped = 0
+            exhausted = False
+            for cid in conn_ids:
+                if time.monotonic() > deadline:
+                    exhausted = True
+                    break
+                try:
+                    connector, policy = _require_engine(app, cid)
+                    tables = await app.tables_for(policy, connector)
+                except (ToolFailure, ConnectorError, DriverUnavailableError) as exc:
+                    if connections is not None and len(conn_ids) == 1:
+                        raise
+                    warnings.append(f"connection '{cid}' skipped: {scrub_exception(exc)}")
+                    continue
+                tables = [t for t in tables if t.kind == "table"]
+                if wanted_schemas is not None:
+                    tables = [t for t in tables if (t.schema or "").lower() in wanted_schemas]
+                columns_by_schema: dict[str | None, list[Any]] = {}
+                for t in tables:
+                    if searched >= table_cap:
+                        break
+                    if time.monotonic() > deadline:
+                        exhausted = True
+                        break
+                    if t.schema not in columns_by_schema:
+                        try:
+                            columns_by_schema[t.schema] = await run_meta(
+                                app, cid, _meta_call("list_all_columns", t.schema)
+                            )
+                        except (ToolFailure, ConnectorError) as exc:
+                            warnings.append(f"{cid}.{t.schema}: columns unavailable: {scrub_exception(exc)}")
+                            columns_by_schema[t.schema] = []
+                    cols = [c for c in columns_by_schema[t.schema] if c.table.lower() == t.name.lower()]
+                    preds: list[str] = []
+                    params: list[Any] = []
+                    matched_cols: list[str] = []
+                    for c in cols:
+                        if _sensitive(policy, c.name):
+                            continue
+                        pt = portable_type(policy.engine, c.data_type)
+                        q = connector.quote_identifier(c.name)
+                        if pt.kind == "string":
+                            params.append(
+                                needle if match == "exact" else (f"{needle}%" if match == "prefix" else f"%{needle}%")
+                            )
+                            op = "=" if match == "exact" else "LIKE"
+                            preds.append(f"LOWER({q}) {op} {connector.placeholder(len(params))}")
+                            matched_cols.append(c.name)
+                        elif pt.kind == "numeric" and numeric is not None and match == "exact":
+                            params.append(numeric)
+                            preds.append(f"{q} = {connector.placeholder(len(params))}")
+                            matched_cols.append(c.name)
+                    if not preds:
+                        skipped += 1
+                        continue
+                    select_cols = [c.name for c in cols if not _sensitive(policy, c.name)][:_SEARCH_MAX_SELECT]
+                    sql = connector.build_search_query(t.schema, t.name, select_cols, " OR ".join(preds), per_table)
+                    spec = QuerySpec(
+                        sql=sql,
+                        parameters=connector.pack_parameters(params),
+                        max_rows=per_table,
+                        max_response_bytes=policy.max_response_bytes,
+                        max_cell_bytes=policy.max_cell_bytes,
+                        timeout_seconds=min(policy.clamp_timeout(None), max(1.0, deadline - time.monotonic())),
+                    )
+                    searched += 1
+                    try:
+                        outcome = await run_query(app, cid, spec, f"value search on '{cid}'")
+                    except (ToolFailure, ConnectorError) as exc:
+                        warnings.append(f"{cid}.{t.schema}.{t.name}: {scrub_exception(exc)}")
+                        continue
+                    if not outcome.rows:
+                        continue
+                    columns2, rows = _apply_masking(policy, outcome.columns, outcome.rows, st)
+                    names = [n for n, _t in columns2]
+                    for row in rows:
+                        where = [
+                            n for n, v in zip(names, row, strict=False)
+                            if n in matched_cols and v is not None and (
+                                (needle in str(v).lower())
+                                if match != "exact"
+                                else (str(v).lower() == needle or v == numeric)
+                            )
+                        ]
+                        hits.append({
+                            "connection": cid, "schema": t.schema, "table": t.name,
+                            "matched_columns": where, "row": dict(zip(names, row, strict=False)),
+                        })
+            st["row_count"] = len(hits)
+            if exhausted:
+                warnings.append(f"time budget of {budget:.0f}s exhausted; results are partial")
+            if warnings:
+                st["warnings"].extend(warnings)
+            return _envelope(
+                st, None, None,
+                {
+                    "query": query, "match": match, "hits": hits,
+                    "tables_searched": searched, "tables_skipped_no_candidate_columns": skipped,
+                    "budget_exhausted": exhausted,
+                    "note": "contains/prefix matching is case-insensitive on string columns; numeric columns "
+                    "match only with match=exact and a numeric query; sensitive columns are never searched",
+                },
+                warnings=st["warnings"],
+            )
+
+    register(
+        "db_search_values",
+        "Search a value across the permitted tables of one or more connections without writing SQL: "
+        "bounded per-table hits, a time budget, session-safe reads, sensitive columns excluded.",
+        db_search_values,
+    )
+
+    async def db_infer_relationships(
+        connections: list[str] | None = None,
+        schemas: list[str] | None = None,
+        cross_connection: bool = True,
+    ) -> dict[str, Any]:
+        async with tool_span(app, "db_infer_relationships") as st:
+            if connections is not None and not connections:
+                raise ToolFailure(ErrorCategory.VALIDATION, "connections must be omitted or non-empty")
+            if schemas is not None and not schemas:
+                raise ToolFailure(ErrorCategory.VALIDATION, "schemas must be omitted or non-empty")
+            conn_ids = list(connections) if connections is not None else sorted(app.resolved.keys())
+            for cid in conn_ids:
+                if cid not in app.resolved:
+                    raise ToolFailure(ErrorCategory.AUTHZ, f"connection '{cid}' is not available to this caller")
+            wanted = {s.lower() for s in schemas} if schemas else None
+            facts: list[TableFacts] = []
+            warnings: list[str] = []
+            for cid in conn_ids:
+                try:
+                    connector, policy = _require_engine(app, cid)
+                    tables = await app.tables_for(policy, connector)
+                except (ToolFailure, ConnectorError, DriverUnavailableError) as exc:
+                    if connections is not None and len(conn_ids) == 1:
+                        raise
+                    warnings.append(f"connection '{cid}' skipped: {scrub_exception(exc)}")
+                    continue
+                tables = [t for t in tables if t.kind == "table"]
+                if wanted is not None:
+                    tables = [t for t in tables if (t.schema or "").lower() in wanted]
+                if len(facts) + len(tables) > _INFER_MAX_TABLES:
+                    warnings.append(f"connection '{cid}': table limit {_INFER_MAX_TABLES} reached; narrow with schemas")
+                    tables = tables[: max(0, _INFER_MAX_TABLES - len(facts))]
+                per_schema: dict[str | None, tuple[list[Any], list[Any], list[Any]]] = {}
+                for sch in sorted({t.schema for t in tables}, key=lambda x: x or ""):
+                    try:
+                        cols = await run_meta(app, cid, _meta_call("list_all_columns", sch))
+                        idx = await run_meta(app, cid, _meta_call("list_indexes", sch, None))
+                        fks = await run_meta(app, cid, _meta_call("get_foreign_keys", sch, None))
+                    except (ToolFailure, ConnectorError) as exc:
+                        warnings.append(f"{cid}.{sch}: metadata unavailable: {scrub_exception(exc)}")
+                        cols, idx, fks = [], [], []
+                    per_schema[sch] = (cols, idx, fks)
+                for t in tables:
+                    cols, idx, fks = per_schema.get(t.schema, ([], [], []))
+                    key = t.name.lower()
+                    facts.append(TableFacts(
+                        ref=TableRef(cid, t.schema, t.name), engine=policy.engine,
+                        columns=[c for c in cols if c.table.lower() == key],
+                        indexes=[i for i in idx if (i.table or "").lower() == key],
+                        foreign_keys=[k for k in fks if (k.source_table or "").lower() == key],
+                    ))
+            rels = infer_relationships(facts, cross_connection=cross_connection)
+            st["row_count"] = len(rels)
+            if warnings:
+                st["warnings"].extend(warnings)
+            return _envelope(
+                st, None, None,
+                {
+                    "relationships": [r.as_dict() for r in rels],
+                    "tables_considered": len(facts),
+                    "note": "declared = foreign keys from the catalogs; inferred = name/type heuristics with a stated "
+                    "confidence, no data was read",
+                },
+                warnings=st["warnings"],
+            )
+
+    register(
+        "db_infer_relationships",
+        "Declared foreign keys plus inferred join candidates (same key column name and compatible type, "
+        "or the <table>_id convention) within and across connections, from metadata only.",
+        db_infer_relationships,
     )
 
     return mcp

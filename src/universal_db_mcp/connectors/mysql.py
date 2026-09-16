@@ -11,6 +11,7 @@ connections so cancellation/discards are well-defined.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Iterator
@@ -23,6 +24,7 @@ from universal_db_mcp.connectors.base import (
     ConnectorError,
     DatabaseConnector,
     HealthInfo,
+    IndexInfo,
     KeyInfo,
     QueryOutcome,
     QuerySpec,
@@ -157,8 +159,9 @@ class MySQLConnector(DatabaseConnector):
                 kw["ssl"]["cert"] = cfg.tls.client_cert_file
             if cfg.tls.client_key_file:
                 kw["ssl"]["key"] = cfg.tls.client_key_file
+        kw["program_name"] = self.session_profile.application_name
         try:
-            return self._module.connect(**kw)
+            conn = self._module.connect(**kw)
         except AttributeError as exc:
             # PyMySQL dispatches mysql_old_password (pre-4.1 hashes, removed in
             # MySQL 5.7.5) to a helper it no longer ships, so the driver raises
@@ -172,6 +175,70 @@ class MySQLConnector(DatabaseConnector):
                     "(ALTER USER ... IDENTIFIED WITH caching_sha2_password BY '<password>')"
                 ) from exc
             raise
+        self._configure_session(conn)
+        return conn
+
+    def _configure_session(self, conn: Any) -> None:
+        """Apply the session safety profile. READ ONLY is required when
+        requested (MySQL 5.6.5+, MariaDB 10.0+); the ceilings are
+        best-effort because their names differ across versions and forks
+        (max_execution_time on MySQL 5.7.8+, max_statement_time on MariaDB)."""
+        prof = self.session_profile
+        self._session_reset()
+        with conn.cursor() as cur:
+            if prof.enforce_read_only:
+                try:
+                    cur.execute("SET SESSION TRANSACTION READ ONLY")
+                    self._session_applied("read_only")
+                except Exception as exc:  # noqa: BLE001
+                    raise self._session_required("read-only mode", exc) from exc
+            if prof.isolation:
+                level = prof.isolation.replace("_", " ").upper()
+                try:
+                    cur.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {level}")
+                    self._session_applied(f"isolation={prof.isolation}")
+                except Exception as exc:  # noqa: BLE001
+                    raise self._session_required(f"isolation {prof.isolation}", exc) from exc
+            if prof.statement_timeout_seconds:
+                ms = int(math.ceil(prof.statement_timeout_seconds * 1000))
+                try:
+                    cur.execute(f"SET SESSION max_execution_time = {ms}")
+                    self._session_applied(f"statement_timeout={ms}ms")
+                except Exception as exc:  # noqa: BLE001
+                    try:  # MariaDB spells it differently and takes seconds
+                        cur.execute(f"SET SESSION max_statement_time = {math.ceil(prof.statement_timeout_seconds)}")
+                        self._session_applied(f"statement_timeout(mariadb)={math.ceil(prof.statement_timeout_seconds)}s")
+                    except Exception:  # noqa: BLE001
+                        self._session_skipped("statement_timeout", exc)
+            if prof.lock_timeout_seconds is not None:
+                secs = max(1, int(math.ceil(prof.lock_timeout_seconds)))
+                for var in ("innodb_lock_wait_timeout", "lock_wait_timeout"):
+                    try:
+                        cur.execute(f"SET SESSION {var} = {secs}")
+                        self._session_applied(f"{var}={secs}s")
+                    except Exception as exc:  # noqa: BLE001
+                        self._session_skipped(var, exc)
+
+    def _session_readback(self, conn: Any) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        with conn.cursor() as cur:
+            for key, expr in (
+                ("read_only", "@@session.transaction_read_only"),
+                ("isolation", "@@session.transaction_isolation"),
+                ("statement_timeout_ms", "@@session.max_execution_time"),
+                ("innodb_lock_wait_timeout", "@@session.innodb_lock_wait_timeout"),
+            ):
+                try:
+                    cur.execute(f"SELECT {expr}")
+                    # The connector's cursor class streams (SSCursor); drain the
+                    # single-row result so the next execute does not trip the
+                    # driver's "unbuffered result left incomplete" warning.
+                    rows = cur.fetchall()
+                    if rows:
+                        out[key] = str(rows[0][0])
+                except Exception:  # noqa: BLE001, S112 - older servers lack some of these
+                    continue
+        return out
 
     # PyMySQL has no safe out-of-band cancel; the executor reports this
     # truthfully and discards the connection on timeout.
@@ -228,6 +295,7 @@ class MySQLConnector(DatabaseConnector):
                 with conn.cursor() as cur:
                     cur.execute("SELECT VERSION()")
                     row = cur.fetchone()
+                session = self.session_report(self._session_readback(conn))
             finally:
                 conn.close()
             ver = row[0] if row else None
@@ -235,6 +303,7 @@ class MySQLConnector(DatabaseConnector):
                 healthy=True,
                 server_version=str(ver),
                 latency_ms=int((time.monotonic() - start) * 1000),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001, S110
             return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
@@ -314,6 +383,51 @@ class MySQLConnector(DatabaseConnector):
             )
             for r in rows
         ]
+
+    def placeholder(self, index: int) -> str:
+        return "%s"
+
+    def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
+        schema = schema or self.connection.config.database or ""
+        sql = (
+            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position "
+            "FROM information_schema.columns WHERE table_schema = %s ORDER BY table_name, ordinal_position"
+        )
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, (schema,))
+                rows = cur.fetchall()
+        return [
+            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=r[2], nullable=r[3] == "YES",
+                       default=r[4], ordinal=r[5])
+            for r in rows
+        ]
+
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        schema = schema or self.connection.config.database or ""
+        sql = (
+            "SELECT table_name, index_name, non_unique, column_name, seq_in_index, index_type "
+            "FROM information_schema.statistics WHERE table_schema = %s"
+        )
+        params: list[Any] = [schema]
+        if table:
+            sql += " AND table_name = %s"
+            params.append(table)
+        sql += " ORDER BY table_name, index_name, seq_in_index"
+        with translated_driver_errors():
+            with self._shared_meta_conn() as conn, conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        grouped: dict[tuple[str, str], IndexInfo] = {}
+        for tname, iname, non_unique, col, _seq, itype in rows:
+            info = grouped.get((tname, iname))
+            if info is None:
+                info = IndexInfo(name=iname, columns=[], unique=not bool(int(non_unique or 0)),
+                                 primary=(str(iname).upper() == "PRIMARY"), kind=str(itype).lower(),
+                                 schema=schema, table=tname)
+                grouped[(tname, iname)] = info
+            info.columns.append(str(col) if col is not None else "(expression)")
+        return list(grouped.values())
 
     def list_views(self, schema: str | None) -> list[ViewInfo]:
         sql = (

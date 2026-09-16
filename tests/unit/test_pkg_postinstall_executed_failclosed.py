@@ -105,6 +105,9 @@ _PATH_REWRITES = [
         r'^APP_DIR="/Applications/Configure UniversalDB MCP\.app"$',
         'APP_DIR="{app_dir}"',
     ),
+    # The best-effort newsyslog rotation install must land inside the sandbox,
+    # not the real /etc/newsyslog.d.
+    (r'^NEWSYSLOG_DST="/etc/newsyslog\.d/udbmcp\.conf"$', 'NEWSYSLOG_DST="{newsyslog}"'),
 ]
 
 
@@ -129,6 +132,7 @@ def _sandbox_postinstall(tmp_path: Path) -> Path:
         "shim": str(tmp_path / "shim-bin"),
         "pyshim": str(tmp_path / "shim-bin" / "python312-sandbox"),
         "app_dir": str(tmp_path / "applications" / "Configure UniversalDB MCP.app"),
+        "newsyslog": str(tmp_path / "etc" / "newsyslog.d" / "udbmcp.conf"),
     }
     for pattern, replacement in _PATH_REWRITES:
         new_text, n = re.subn(pattern, replacement.format(**dirs), text, flags=re.MULTILINE)

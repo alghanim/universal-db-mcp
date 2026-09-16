@@ -22,7 +22,18 @@ from universal_db_mcp.connectors import registry
 # receives this path via UDBMCP_HTTP_BEARER_TOKEN_FILE — an env var an admin
 # shell does not have). doctor validates it whenever the file exists, even if
 # THIS config says stdio. Module-level so tests can point it at a tmp file.
-SERVICE_TOKEN_PATH = Path("/etc/universal-db-mcp/http-token")
+# Platform-aware: the MSI service action provisions the token next to the
+# machine-wide config under %ProgramData%\UniversalDB MCP\ (service.ps1), so a
+# POSIX-only path would make doctor validate a file nothing runs on Windows.
+
+
+def service_token_path() -> Path:
+    from universal_db_mcp.agents.core import system_config_dir
+
+    return system_config_dir() / "http-token"
+
+
+SERVICE_TOKEN_PATH = service_token_path()
 
 CHECKS: list[dict[str, Any]] = []
 

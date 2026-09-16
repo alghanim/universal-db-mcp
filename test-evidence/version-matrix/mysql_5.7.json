@@ -1,0 +1,168 @@
+{
+  "label": "mysql:5.7",
+  "engine": "mysql",
+  "started_utc": "2026-09-16T19:26:58Z",
+  "checks": [
+    {
+      "check": "seed",
+      "status": "failed",
+      "ms": 19,
+      "detail": "OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "health_check",
+      "status": "passed",
+      "ms": 3,
+      "detail": "HealthInfo(healthy=False, server_version=None, latency_ms=None, detail=\"OperationalError: (2013, 'Lost connection to MySQL server during query')\", checked_at=1789586818.1414368, session=None)"
+    },
+    {
+      "check": "health_healthy",
+      "status": "failed",
+      "detail": "OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "list_schemas",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "list_tables",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "list_tables_has_seed",
+      "status": "failed",
+      "ms": 0,
+      "detail": "IndexError: list index out of range"
+    },
+    {
+      "check": "list_columns",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "list_columns_count",
+      "status": "failed",
+      "ms": 0,
+      "detail": "AssertionError: 0 columns"
+    },
+    {
+      "check": "list_all_columns",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "list_indexes",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "index_on_fk_visible",
+      "status": "failed",
+      "ms": 0,
+      "detail": "IndexError: list index out of range"
+    },
+    {
+      "check": "primary_key_visible",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "get_foreign_keys",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "list_views",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "list_routines",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "get_statistics",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "execute_query_count",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "sample_query",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "profile_aggregate",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "top_values",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "value_search_like",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    },
+    {
+      "check": "explain",
+      "status": "failed",
+      "ms": 2,
+      "detail": "ConnectorError: OperationalError: (2013, 'Lost connection to MySQL server during query')"
+    }
+  ],
+  "server_version": null,
+  "session": null,
+  "healthy": false,
+  "finished_utc": "2026-09-16T19:26:58Z",
+  "summary": {
+    "passed": 1,
+    "failed": [
+      "seed",
+      "health_healthy",
+      "list_schemas",
+      "list_tables",
+      "list_tables_has_seed",
+      "list_columns",
+      "list_columns_count",
+      "list_all_columns",
+      "list_indexes",
+      "index_on_fk_visible",
+      "primary_key_visible",
+      "get_foreign_keys",
+      "list_views",
+      "list_routines",
+      "get_statistics",
+      "execute_query_count",
+      "sample_query",
+      "profile_aggregate",
+      "top_values",
+      "value_search_like",
+      "explain"
+    ]
+  }
+}

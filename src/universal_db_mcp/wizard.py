@@ -82,8 +82,10 @@ def secrets_dir_for(config_path: Path) -> Path:
 def _write_secret(path: Path, content: str) -> None:
     """Create-or-truncate a 0600 secret file WITHOUT a wider-permission window:
     the file is born with its final mode (no write-then-chmod race) and
-    O_NOFOLLOW refuses a pre-planted symlink at that path."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    O_NOFOLLOW refuses a pre-planted symlink at that path (POSIX; the flag does
+    not exist on Windows, where it used to escape as a raw AttributeError)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
     try:
         os.write(fd, (content + "\n").encode("utf-8"))
     finally:

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers_session import SessionHandle
 
 from universal_db_mcp.config import ConnectionConfig, ResolvedConnection, SecurityConfig
 from universal_db_mcp.connectors.base import ConnectorError
@@ -77,9 +78,9 @@ class _FakePyodbc:
     def drivers(self) -> list[str]:
         return ["ODBC Driver 18 for SQL Server"]
 
-    def connect(self, conn_string: str, **kwargs: Any) -> str:
+    def connect(self, conn_string: str, **kwargs: Any) -> SessionHandle:
         self.conn_strings.append(conn_string)
-        return "handle"
+        return SessionHandle()
 
 
 def test_mssql_refuses_closing_brace_in_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

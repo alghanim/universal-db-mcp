@@ -25,6 +25,7 @@ from __future__ import annotations
 import enum
 import json
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -150,7 +151,28 @@ def load_yaml_or_fail_closed(path: Path) -> tuple[Any | None, str | None]:
 # user - harness (stdio) spawns run as the logged-in user and died right after
 # connecting with "Permission denied" when pointed at it (seen live
 # 2026-09-14). Resolution therefore checks READABILITY, not mere existence.
-SYSTEM_CONFIG_PATH = Path("/etc/universal-db-mcp/config.yaml")
+#
+# Platform-aware: the MSI installs the machine-wide deployment under
+# %ProgramData%\UniversalDB MCP\ (packaging/msi/udbmcp.wxs, CommonAppDataFolder);
+# the POSIX path is what the deb/pkg installers and the service units use. A
+# POSIX-only constant made every Windows CLI path silently fall through to the
+# per-user config.
+SYSTEM_CONFIG_DIR_WIN32 = ("UniversalDB MCP",)  # relative to %ProgramData%
+
+
+def system_config_dir() -> Path:
+    """Root/administrator-owned deployment directory for the running platform."""
+    if sys.platform == "win32":
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")).joinpath(*SYSTEM_CONFIG_DIR_WIN32)
+    return Path("/etc/universal-db-mcp")
+
+
+def system_config_path() -> Path:
+    """The system deployment's config file (``config.yaml``) for this platform."""
+    return system_config_dir() / "config.yaml"
+
+
+SYSTEM_CONFIG_PATH = system_config_path()
 PER_USER_CONFIG_DIR = ".universal-db-mcp"
 
 _SEED_CONFIG_TEMPLATE = """\

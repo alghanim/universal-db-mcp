@@ -331,6 +331,26 @@ if [ ! -f "$DEMO_DB" ]; then
   fi
 fi
 
+# --- step 6b: newsyslog rotation for the launchd daemon's logs ---------------
+# The plist sends StandardOutPath/StandardErrorPath to $LOG_DIR and launchd
+# never rotates them. The rotation config is payload material staged by
+# build_pkg.sh beside the bundle at $PREFIX/share/ (like the GUI app script).
+# BEST-EFFORT by design (like the udbmcp alias and the demo database): the
+# daemon does not depend on rotation, so a failure here degrades to a loud
+# WARNING, never an aborted install.
+echo "==> postinstall: installing newsyslog rotation for $LOG_DIR"
+NEWSYSLOG_SRC="$PREFIX/share/udbmcp.newsyslog.conf"
+NEWSYSLOG_DST="/etc/newsyslog.d/udbmcp.conf"
+if [ ! -f "$NEWSYSLOG_SRC" ]; then
+  echo "WARNING: $NEWSYSLOG_SRC missing from the payload; logs under $LOG_DIR are not rotated." >&2
+elif install -d -m 0755 -o root -g wheel "$(dirname "$NEWSYSLOG_DST")" 2>/dev/null \
+     && install -m 0644 -o root -g wheel "$NEWSYSLOG_SRC" "$NEWSYSLOG_DST" 2>/dev/null; then
+  echo "    installed $NEWSYSLOG_DST (rotates $LOG_DIR/*.log)"
+else
+  echo "WARNING: could not install $NEWSYSLOG_DST; logs under $LOG_DIR are not rotated" >&2
+  echo "         (install it manually from $NEWSYSLOG_SRC)." >&2
+fi
+
 # --- step 7: publish manifest.json next to the venv (doctor hook) ------------
 # doctor derives the installed profile from this file instead of guessing from
 # the running platform (it looks at Path(sys.executable).resolve().parent.parent,

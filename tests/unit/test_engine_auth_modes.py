@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers_session import SessionHandle
 
 from universal_db_mcp.config import ConnectionConfig, ResolvedConnection, SecurityConfig
 from universal_db_mcp.security.policy import EffectivePolicy
@@ -59,9 +60,9 @@ class _FakePyodbc:
     def drivers(self) -> list[str]:
         return ["ODBC Driver 18 for SQL Server"]
 
-    def connect(self, cs: str, **kwargs: Any) -> str:
+    def connect(self, cs: str, **kwargs: Any) -> SessionHandle:
         self.conn_strings.append(cs)
-        return "handle"
+        return SessionHandle()
 
 
 def test_mssql_trusted_connection_omits_sql_login(
@@ -121,6 +122,9 @@ class _FakeIbmDb:
         self.dsns.append(dsn)
         return "handle"
 
+    def exec_immediate(self, conn: str, sql: str) -> str:
+        return "stmt"
+
 
 def test_db2_authentication_mechanism_is_selectable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -146,9 +150,9 @@ class _FakePsycopg:
     def __init__(self) -> None:
         self.kwargs: list[dict[str, Any]] = []
 
-    def connect(self, **kwargs: Any) -> str:
+    def connect(self, **kwargs: Any) -> SessionHandle:
         self.kwargs.append(kwargs)
-        return "handle"
+        return SessionHandle()
 
 
 def test_postgres_gssapi_options_reach_the_driver(
@@ -181,9 +185,9 @@ class _FakePyMySQL:
         self.kwargs: list[dict[str, Any]] = []
         self.cursors = types.SimpleNamespace(SSCursor=object)
 
-    def connect(self, **kwargs: Any) -> str:
+    def connect(self, **kwargs: Any) -> SessionHandle:
         self.kwargs.append(kwargs)
-        return "handle"
+        return SessionHandle()
 
 
 def test_mysql_unix_socket_replaces_the_host(

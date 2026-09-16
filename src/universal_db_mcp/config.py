@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -147,7 +148,7 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
     # MssqlConnector reads options.odbc_driver to select the installed ODBC
     # driver (and doctor matches the exact name); a wrong name fails closed
     # at connect time naming the installed drivers.
-    "mssql": {"odbc_driver": str, "trusted_connection": bool},
+    "mssql": {"odbc_driver": str, "trusted_connection": bool, "application_intent": str},
     # authentication: the CLI keyword the bundled clidriver already supports;
     # without it a server demanding a specific mechanism answers SQL30082N
     # reason 17, indistinguishable from the credential bug fixed in 854b50d.
@@ -183,6 +184,66 @@ def _reject_oracle_grammar(field: str, value: str | None) -> None:
         )
 
 
+# Isolation levels each engine can be asked for. Db2 and SQL Server take
+# share locks on ordinary reads, so a reporting session against production
+# must run at an isolation that does not (UR / READ UNCOMMITTED); the MVCC
+# engines never block writers with a read, so their server default stands.
+ENGINE_ISOLATION_LEVELS: dict[str, tuple[str, ...]] = {
+    "db2": ("ur", "cs", "rs", "rr"),
+    "mssql": ("read_uncommitted", "read_committed", "repeatable_read", "serializable", "snapshot"),
+    "postgres": ("read_committed", "repeatable_read", "serializable"),
+    "mysql": ("read_uncommitted", "read_committed", "repeatable_read", "serializable"),
+    "oracle": ("read_committed", "serializable"),
+    "clickhouse": (),
+    "sqlite": (),
+}
+_APP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,64}$")
+
+
+class SessionConfig(StrictModel):
+    """What the connector does to the SERVER session right after connecting,
+    so an agent's reads cannot hurt production. Resolved per engine by
+    ``universal_db_mcp.security.session``.
+
+    * ``isolation``: engine-specific level; None = the engine's safe default
+      (Db2 ``ur`` and SQL Server ``read_uncommitted`` for read-only
+      connections, otherwise the server default). Setting it is enforced:
+      a server that refuses it fails the connection rather than running at
+      the default level silently.
+    * ``lock_timeout_seconds``: how long a statement may wait for a lock
+      (None = server default). Default 5 s so the agent never queues behind
+      a writer indefinitely.
+    * ``application_name``: what DBAs see in the session list; default
+      ``udbmcp:<connection id>``. DSN-safe characters only.
+    * ``enforce_read_only``: ask the server to refuse writes for this
+      session where the engine supports it (PostgreSQL, MySQL, ClickHouse,
+      SQLite). The SQL guard remains the enforcement on Oracle/Db2/SQL Server.
+    * ``statement_timeout_from_policy``: apply the policy's hard query
+      timeout server-side too, not only as a client-side cancel.
+    """
+
+    isolation: str | None = None
+    lock_timeout_seconds: float | None = Field(default=5.0, ge=0, le=300)
+    application_name: str | None = None
+    enforce_read_only: bool = True
+    statement_timeout_from_policy: bool = True
+
+    @field_validator("isolation")
+    @classmethod
+    def _lower(cls, v: str | None) -> str | None:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("application_name")
+    @classmethod
+    def _dsn_safe(cls, v: str | None) -> str | None:
+        if v is not None and not _APP_NAME_RE.match(v):
+            raise ValueError(
+                "session.application_name may contain only letters, digits, '_', '.', ':', '@' "
+                "and '-' (1-64 chars): it is written into driver connection strings"
+            )
+        return v
+
+
 class ConnectionConfig(StrictModel):
     type: Literal["sqlite", "db2", "oracle", "mssql", "postgres", "clickhouse", "mysql"]
     family: str | None = None  # db2: luw | zos | i
@@ -202,6 +263,7 @@ class ConnectionConfig(StrictModel):
     connect_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     # Engine-specific, tightly validated options (see engine modules).
     options: dict[str, Any] = Field(default_factory=dict)
+    session: SessionConfig = Field(default_factory=SessionConfig)
 
     @model_validator(mode="after")
     def _hosts(self) -> ConnectionConfig:
@@ -237,6 +299,14 @@ class ConnectionConfig(StrictModel):
                 "OS user, or 'default' on clickhouse). Set options.os_authentication: true to "
                 "choose that deliberately"
             )
+        if self.session.isolation is not None:
+            allowed_levels = ENGINE_ISOLATION_LEVELS.get(self.type, ())
+            if self.session.isolation not in allowed_levels:
+                raise ValueError(
+                    f"session.isolation '{self.session.isolation}' is not valid for {self.type}"
+                    + (f"; use one of {list(allowed_levels)}" if allowed_levels else
+                       "; this engine has no session isolation setting")
+                )
         if self.type == "clickhouse" and self.port in (9000, 9440):
             raise ValueError(
                 f"clickhouse port {self.port} is the NATIVE TCP protocol; clickhouse-connect "

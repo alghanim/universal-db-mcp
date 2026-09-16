@@ -32,6 +32,14 @@ PrivateDevices=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# ProtectSystem=strict makes ReadWritePaths= the only writable state, but the
+# mount namespace setup fails (exit 226/NAMESPACE) when a listed path does not
+# exist — the documented manual unit install creates neither directory.
+# StateDirectory=/LogsDirectory= have systemd create /var/lib/universal-db-mcp
+# and /var/log/universal-db-mcp (owned by User=/Group=) before the sandbox is
+# set up; ReadWritePaths= is kept so the intent stays explicit.
+StateDirectory=universal-db-mcp
+LogsDirectory=universal-db-mcp
 ReadWritePaths=/var/lib/universal-db-mcp /var/log/universal-db-mcp
 CapabilityBoundingSet=
 AmbientCapabilities=

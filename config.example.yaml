@@ -80,6 +80,20 @@ connections:
   #   allowed_schemas: [REPORTING]
   #   read_only: true
 
+  # Session safety profile (optional; every field has a safe default). Applied
+  # to the SERVER session right after connecting so the agent cannot forget it:
+  # Db2 runs at UR and SQL Server at READ UNCOMMITTED (no share locks on
+  # production tables), PostgreSQL/MySQL/ClickHouse/SQLite refuse writes
+  # server-side, lock waits and statement time are capped, and the session is
+  # named so DBAs can see it. See docs/session-safety.md.
+  #
+  #   session:
+  #     isolation: ur                  # db2: ur|cs|rs|rr ; mssql: read_uncommitted|...
+  #     lock_timeout_seconds: 5        # null = server default
+  #     application_name: udbmcp:finance_db2
+  #     enforce_read_only: true
+  #     statement_timeout_from_policy: true
+
   # Engine-specific options (all optional; each is refused unless the engine
   # actually consumes it). Added 2026-09-15 for deployments that no plain
   # host/port/database connection can express:

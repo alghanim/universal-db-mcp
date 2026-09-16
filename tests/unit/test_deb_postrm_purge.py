@@ -53,6 +53,11 @@ def _sandbox_postrm(tmp_path: Path) -> Path:
     # lives under /etc: rewrite it too so the sandbox purge can never touch
     # the real host /etc.
     text = text.replace("/etc/universal-db-mcp", str(tmp_path / "etc" / "universal-db-mcp"))
+    # The deployed unit + drop-in dir (postinst-installed) and the unit hash
+    # record are purged too: rewrite them so the sandbox purge never touches
+    # the host's /etc/systemd/system or /var/lib.
+    text = text.replace("/etc/systemd/system", str(tmp_path / "etc" / "systemd" / "system"))
+    text = text.replace("/var/lib/universal-db-mcp", str(tmp_path / "var" / "lib" / "universal-db-mcp"))
     script = tmp_path / "postrm.sh"
     script.write_text(text, encoding="utf-8")
     return script

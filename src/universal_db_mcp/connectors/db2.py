@@ -16,6 +16,7 @@ Per spec §5:
 from __future__ import annotations
 
 import functools
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from universal_db_mcp.connectors.base import (
     ConnectorError,
     DatabaseConnector,
     HealthInfo,
+    IndexInfo,
     KeyInfo,
     QueryOutcome,
     QuerySpec,
@@ -63,6 +65,13 @@ def _meta_translated(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _s(value: Any) -> Any:
+    """SYSCAT identifier columns come back CHAR-padded ('MOI     '); every
+    name comparison downstream (object resolution, search, quoting) needs
+    the trimmed value."""
+    return value.rstrip() if isinstance(value, str) else value
+
+
 class Db2Connector(DatabaseConnector):
     engine = "db2"
 
@@ -90,7 +99,12 @@ class Db2Connector(DatabaseConnector):
             ("HOSTNAME", f"{cfg.host}"),
             ("PORT", f"{cfg.port or 50000}"),
             ("PROTOCOL", "TCPIP"),
+            # What DBAs see in LIST APPLICATIONS / MON_GET_CONNECTION.
+            ("CLIENTAPPLNAME", self.session_profile.application_name),
         ]
+        if self.session_profile.statement_timeout_seconds:
+            # CLI-level statement ceiling, in addition to the client-side cancel.
+            fields.append(("QUERYTIMEOUT", str(int(math.ceil(self.session_profile.statement_timeout_seconds)))))
         if auth := cfg.options.get("authentication"):
             # Servers that demand a specific mechanism (Kerberos, TOKEN, AES)
             # otherwise answer SQL30082N reason 17, which reads exactly like
@@ -121,7 +135,52 @@ class Db2Connector(DatabaseConnector):
                     "connection string cannot carry in any quoting form; change that value"
                 )
         dsn = "".join(f"{key}={value};" for key, value in fields)
-        return self._module.connect(dsn, "", "")
+        conn = self._module.connect(dsn, "", "")
+        self._configure_session(conn)
+        return conn
+
+    def _configure_session(self, conn: Any) -> None:
+        """Apply the session safety profile.
+
+        The isolation level is the production-safety promise on Db2: an
+        ordinary SELECT at the default CS takes share locks and queues behind
+        writers, so read-only connections run at UR unless configured
+        otherwise, and it is REQUIRED (a refusal fails the connection rather
+        than running at CS silently). The agent no longer has to remember
+        WITH UR - though the clause still works. The lock ceiling is
+        best-effort. Db2 has no session-wide read-only; the guard enforces it.
+        """
+        prof = self.session_profile
+        self._session_reset()
+        if prof.isolation:
+            try:
+                self._module.exec_immediate(conn, f"SET CURRENT ISOLATION = {prof.isolation.upper()}")
+                self._session_applied(f"isolation={prof.isolation}")
+            except Exception as exc:  # noqa: BLE001
+                raise self._session_required(f"isolation {prof.isolation}", exc) from exc
+        if prof.lock_timeout_seconds is not None:
+            secs = int(math.ceil(prof.lock_timeout_seconds))
+            try:
+                self._module.exec_immediate(conn, f"SET CURRENT LOCK TIMEOUT = {secs}")
+                self._session_applied(f"lock_timeout={secs}s")
+            except Exception as exc:  # noqa: BLE001
+                self._session_skipped("lock_timeout", exc)
+
+    def _session_readback(self, conn: Any) -> dict[str, Any]:
+        try:
+            stmt = self._module.exec_immediate(
+                conn, "VALUES (CURRENT ISOLATION, CURRENT LOCK TIMEOUT, CURRENT CLIENT_APPLNAME)"
+            )
+            row = self._module.fetch_tuple(stmt)
+        except Exception:  # noqa: BLE001 - reporting only
+            return {}
+        if not row or len(row) < 3:
+            return {}
+        return {
+            "isolation": str(row[0]).strip().lower() or "server default",
+            "lock_timeout_seconds": str(row[1]),
+            "application_name": str(row[2]),
+        }
 
     def _dbi_conn(self) -> Any:
         """ibm_db_dbi wrapper for DB-API access."""
@@ -232,12 +291,14 @@ class Db2Connector(DatabaseConnector):
                 except Exception:  # noqa: BLE001 - version is optional
                     stmt = self._module.exec_immediate(conn, "SELECT 1 FROM SYSIBM.SYSDUMMY1")
                     self._module.fetch_tuple(stmt)
+                session = self.session_report(self._session_readback(conn))
             finally:
                 self._module.close(conn)
             return HealthInfo(
                 healthy=True,
                 server_version=str(row[0]) if row else None,
                 latency_ms=int((time.monotonic() - start) * 1000),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001, S110
             return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
@@ -255,7 +316,7 @@ class Db2Connector(DatabaseConnector):
                 self._module.execute(stmt, (f"%{search}%",))
             rows = []
             while row := self._module.fetch_tuple(stmt):
-                rows.append(row[0])
+                rows.append(_s(row[0]))
             return rows
         finally:
             self._module.close(conn)
@@ -293,8 +354,8 @@ class Db2Connector(DatabaseConnector):
                     continue
                 out.append(
                     TableSummary(
-                        schema=row[0],
-                        name=row[1],
+                        schema=_s(row[0]),
+                        name=_s(row[1]),
                         kind=kind,
                         row_estimate=int(row[3]) if row[3] is not None and row[3] >= 0 else None,
                         row_estimate_source="catalog_estimate(SYSCAT.TABLES.CARD)"
@@ -323,8 +384,8 @@ class Db2Connector(DatabaseConnector):
                 ColumnInfo(
                     schema=schema,
                     table=table,
-                    name=r[0],
-                    data_type=r[1],
+                    name=_s(r[0]),
+                    data_type=_s(r[1]),
                     nullable=r[2] == "Y",
                     default=r[3],
                     ordinal=r[4],
@@ -333,6 +394,76 @@ class Db2Connector(DatabaseConnector):
             ]
         finally:
             self._module.close(conn)
+
+    def build_search_query(
+        self, schema: str | None, table: str, select_columns: list[str], where_sql: str, limit: int
+    ) -> str:
+        cols = ", ".join(self.quote_identifier(c) for c in select_columns) if select_columns else "*"
+        qualified = (
+            f"{self.quote_identifier(schema)}.{self.quote_identifier(table)}"
+            if schema
+            else self.quote_identifier(table)
+        )
+        return f"SELECT {cols} FROM {qualified} WHERE {where_sql} FETCH FIRST {int(limit)} ROWS ONLY"
+
+    def build_top_values_query(self, sample_sql: str, column: str, limit: int) -> str:
+        q = self.quote_identifier(column)
+        return (
+            f"SELECT {q} AS v, COUNT(*) AS cnt FROM ({sample_sql}) s "
+            f"WHERE {q} IS NOT NULL GROUP BY {q} ORDER BY cnt DESC FETCH FIRST {int(limit)} ROWS ONLY"
+        )
+
+    @_meta_translated
+    def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
+        conn = self._connect()
+        try:
+            sql = (
+                "SELECT TABNAME, COLNAME, TYPENAME, NULLS, DEFAULT, COLNO FROM SYSCAT.COLUMNS "
+                "WHERE TABSCHEMA = ? ORDER BY TABNAME, COLNO"
+            )
+            stmt = self._module.prepare(conn, sql)
+            self._module.execute(stmt, (schema,))
+            rows = self._fetch_all(stmt)
+            return [
+                ColumnInfo(schema=schema, table=_s(r[0]), name=_s(r[1]), data_type=_s(r[2]),
+                           nullable=r[3] == "Y", default=r[4], ordinal=r[5])
+                for r in rows
+            ]
+        finally:
+            self._module.close(conn)
+
+    @_meta_translated
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        conn = self._connect()
+        try:
+            sql = (
+                "SELECT i.TABNAME, i.INDNAME, i.UNIQUERULE, ic.COLNAME, ic.COLSEQ, i.INDEXTYPE "
+                "FROM SYSCAT.INDEXES i JOIN SYSCAT.INDEXCOLUSE ic "
+                "ON ic.INDSCHEMA = i.INDSCHEMA AND ic.INDNAME = i.INDNAME "
+                "WHERE i.TABSCHEMA = ?"
+            )
+            params: list[Any] = [schema]
+            if table:
+                sql += " AND i.TABNAME = ?"
+                params.append(table)
+            sql += " ORDER BY i.TABNAME, i.INDNAME, ic.COLSEQ"
+            stmt = self._module.prepare(conn, sql)
+            self._module.execute(stmt, tuple(params))
+            rows = self._fetch_all(stmt)
+        finally:
+            self._module.close(conn)
+        grouped: dict[tuple[str, str], IndexInfo] = {}
+        for tname, iname, rule, col, _seq, itype in rows:
+            key = (_s(tname), _s(iname))
+            info = grouped.get(key)
+            if info is None:
+                # UNIQUERULE: P = primary key, U = unique, D = duplicates allowed
+                info = IndexInfo(name=key[1], columns=[], unique=(_s(rule) in ("P", "U")),
+                                 primary=(_s(rule) == "P"), kind=str(_s(itype)).lower(),
+                                 schema=schema, table=key[0])
+                grouped[key] = info
+            info.columns.append(str(_s(col)))
+        return list(grouped.values())
 
     @_meta_translated
     def list_views(self, schema: str | None) -> list[ViewInfo]:
@@ -349,7 +480,7 @@ class Db2Connector(DatabaseConnector):
             rows = []
             while row := self._module.fetch_tuple(stmt):
                 rows.append(row)
-            return [ViewInfo(schema=r[0], name=r[1], kind="view", definition_state="unavailable") for r in rows]
+            return [ViewInfo(schema=_s(r[0]), name=_s(r[1]), kind="view", definition_state="unavailable") for r in rows]
         finally:
             self._module.close(conn)
 
@@ -367,7 +498,10 @@ class Db2Connector(DatabaseConnector):
             rows = []
             while row := self._module.fetch_tuple(stmt):
                 rows.append(row)
-            return [SynonymInfo(schema=r[0], name=r[1], target_schema=r[2], target_name=r[3]) for r in rows]
+            return [
+                SynonymInfo(schema=_s(r[0]), name=_s(r[1]), target_schema=_s(r[2]), target_name=_s(r[3]))
+                for r in rows
+            ]
         finally:
             self._module.close(conn)
 
@@ -386,7 +520,7 @@ class Db2Connector(DatabaseConnector):
             while row := self._module.fetch_tuple(stmt):
                 rows.append(row)
             kinds = {"F": "function", "P": "procedure"}
-            return [RoutineInfo(schema=r[0], name=r[1], kind=kinds.get(r[2], r[2])) for r in rows]
+            return [RoutineInfo(schema=_s(r[0]), name=_s(r[1]), kind=kinds.get(_s(r[2]), _s(r[2]))) for r in rows]
         finally:
             self._module.close(conn)
 
@@ -410,7 +544,15 @@ class Db2Connector(DatabaseConnector):
             rows = []
             while row := self._module.fetch_tuple(stmt):
                 rows.append(row)
-            return [KeyInfo(kind="foreign_key", name=r[0], columns=[], ref_schema=r[3], ref_table=r[4]) for r in rows]
+            # SYSCAT.REFERENCES carries the owning table too; schema-wide
+            # listings (catalog snapshot, relationship inference) need it.
+            return [
+                KeyInfo(
+                    kind="foreign_key", name=_s(r[0]), columns=[], ref_schema=_s(r[3]), ref_table=_s(r[4]),
+                    source_schema=_s(r[1]), source_table=_s(r[2]),
+                )
+                for r in rows
+            ]
         finally:
             self._module.close(conn)
 

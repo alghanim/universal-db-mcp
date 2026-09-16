@@ -16,6 +16,7 @@ from typing import Any
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.models.capabilities import CapabilityMatrix
 from universal_db_mcp.security.policy import EffectivePolicy
+from universal_db_mcp.security.session import SessionProfile, resolve_session
 
 
 class ConnectorError(Exception):
@@ -87,6 +88,10 @@ class IndexInfo:
     columns: list[str]
     unique: bool = False
     definition: str | None = None
+    primary: bool = False  # the table's primary key (ClickHouse: its sorting key)
+    kind: str | None = None  # btree | hash | clustered | nonclustered | sorting_key | skipping:<type> | ...
+    schema: str | None = None  # set on schema-wide listings
+    table: str | None = None
 
 
 @dataclass
@@ -143,6 +148,7 @@ class HealthInfo:
     latency_ms: int | None = None
     detail: str | None = None
     checked_at: float = field(default_factory=time.time)
+    session: dict[str, Any] | None = None  # the applied session safety profile, read back
 
 
 class DatabaseConnector(ABC):
@@ -154,6 +160,45 @@ class DatabaseConnector(ABC):
     def __init__(self, connection: ResolvedConnection, policy: EffectivePolicy) -> None:
         self.connection = connection
         self.policy = policy
+        # Session safety profile (isolation, lock/statement ceilings, app
+        # name, server-side read-only). Applied by each connector right after
+        # connecting; the outcome is recorded here and read back for
+        # db_test_connection.
+        self.session_profile: SessionProfile = resolve_session(connection, policy)
+        self.session_status: dict[str, list[str]] = {"applied": [], "skipped": []}
+
+    # ---- session profile bookkeeping --------------------------------------
+
+    def _session_reset(self) -> None:
+        self.session_status = {"applied": [], "skipped": []}
+
+    def _session_applied(self, what: str) -> None:
+        self.session_status["applied"].append(what)
+
+    def _session_skipped(self, what: str, exc: BaseException) -> None:
+        self.session_status["skipped"].append(f"{what}: {type(exc).__name__}: {str(exc)[:80]}")
+
+    def _session_required(self, what: str, exc: BaseException) -> ConnectorError:
+        """A setting that IS the production-safety promise did not take."""
+        return ConnectorError(
+            f"could not apply the session {what} on connection '{self.connection.name}' "
+            f"({type(exc).__name__}: {str(exc)[:120]}); refusing to run at the server's default "
+            "level. Adjust connections.<id>.session in the config if this server cannot support it"
+        )
+
+    def session_report(self, readback: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Profile + what was applied/skipped + optional values read back."""
+        report = self.session_profile.as_dict()
+        report["applied"] = list(self.session_status["applied"])
+        report["skipped"] = list(self.session_status["skipped"])
+        report["read_only_enforced"] = bool(
+            self.session_profile.enforce_read_only
+            and self.session_profile.server_read_only_available
+            and any(a.startswith("read_only") for a in self.session_status["applied"])
+        )
+        if readback:
+            report["server_reports"] = readback
+        return report
 
     @abstractmethod
     def capabilities(self) -> CapabilityMatrix: ...
@@ -212,6 +257,56 @@ class DatabaseConnector(ABC):
 
     def quote_identifier(self, name: str) -> str:
         return '"' + name.replace('"', '""') + '"'
+
+    # ---- discovery surface (indexes, bulk columns, profiling helpers) ------
+
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        """Indexes (and primary keys) of one table, or of a whole schema when
+        ``table`` is None. Engines override; the default reports nothing
+        rather than guessing."""
+        return []
+
+    def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
+        """Every column of every table in ``schema`` - ONE catalog query on
+        engines that override this; the default composes per-table calls."""
+        out: list[ColumnInfo] = []
+        for t in self.list_tables(schema, {"table", "view"}, None):
+            out.extend(self.list_columns(t.schema, t.name))
+        return out
+
+    def length_function(self) -> str:
+        """SQL function returning a string's character length."""
+        return "LENGTH"
+
+    def placeholder(self, index: int) -> str:
+        """Driver-native positional placeholder for tool-generated SQL
+        (1-based ``index``). Agent SQL is never rewritten; this is only for
+        statements this server builds itself."""
+        return "?"
+
+    def pack_parameters(self, values: list[Any]) -> Any:
+        """Shape the values for ``execute_query`` to match ``placeholder``."""
+        return list(values)
+
+    def build_search_query(
+        self, schema: str | None, table: str, select_columns: list[str], where_sql: str, limit: int
+    ) -> str:
+        """Bounded ``SELECT cols FROM table WHERE <where_sql>``."""
+        cols = ", ".join(self.quote_identifier(c) for c in select_columns) if select_columns else "*"
+        qualified = (
+            f"{self.quote_identifier(schema)}.{self.quote_identifier(table)}"
+            if schema
+            else self.quote_identifier(table)
+        )
+        return f"SELECT {cols} FROM {qualified} WHERE {where_sql} LIMIT {int(limit)}"
+
+    def build_top_values_query(self, sample_sql: str, column: str, limit: int) -> str:
+        """Most frequent values of ``column`` over a bounded sample subquery."""
+        q = self.quote_identifier(column)
+        return (
+            f"SELECT {q} AS v, COUNT(*) AS cnt FROM ({sample_sql}) s "
+            f"WHERE {q} IS NOT NULL GROUP BY {q} ORDER BY cnt DESC LIMIT {int(limit)}"
+        )
 
     def build_sample_query(self, schema: str | None, table: str, columns: list[str] | None, limit: int) -> str:
         """Engine-correct bounded sample query. Identifiers must be validated

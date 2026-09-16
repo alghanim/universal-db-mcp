@@ -1,0 +1,32 @@
+# Session safety profile: live read-back through the connectors' health_check
+date_utc: 2026-09-16T19:07:56Z
+host: native Darwin arm64; fixtures on loopback (config.mockdbs.yaml); policy hard_query_timeout=60s, lock_timeout default 5s
+
+== mock_pg: healthy=True version='PostgreSQL 17.9 (Debian 17.9'
+   isolation=None read_only_enforced=True app=udbmcp:mock_pg
+   applied=['read_only', 'statement_timeout=60000ms', 'lock_timeout=5000ms']
+   server_reports={'read_only': 'on', 'statement_timeout': '1min', 'lock_timeout': '5s', 'application_name': 'udbmcp:mock_pg', 'isolation': 'read committed'}
+== mock_mysql: healthy=True version='9.7.2'
+   isolation=None read_only_enforced=True app=udbmcp:mock_mysql
+   applied=['read_only', 'statement_timeout=60000ms', 'innodb_lock_wait_timeout=5s', 'lock_wait_timeout=5s']
+   server_reports={'read_only': '1', 'isolation': 'REPEATABLE-READ', 'statement_timeout_ms': '60000', 'innodb_lock_wait_timeout': '5'}
+== mock_clickhouse: healthy=True version='26.3.3.20'
+   isolation=None read_only_enforced=True app=udbmcp:mock_clickhouse
+   applied=['read_only', 'max_execution_time=60s']
+   server_reports={'readonly': '1', 'max_execution_time': '60.0'}
+== mock_oracle: healthy=True version='Oracle AI Database 26ai Free'
+   isolation=None read_only_enforced=False app=udbmcp:mock_oracle
+   applied=['client_identifier=udbmcp:mock_oracle', 'call_timeout=60000ms']
+   server_reports={'module': 'udbmcp', 'client_identifier': 'udbmcp:mock_oracle'}
+== mock_db2: healthy=True version='DB2 v11.5.9.0'
+   isolation=ur read_only_enforced=False app=udbmcp:mock_db2
+   applied=['isolation=ur', 'lock_timeout=5s']
+   server_reports={'isolation': 'ur', 'lock_timeout_seconds': '5', 'application_name': 'udbmcp:mock_db2'}
+
+## Server-side write refusal under the profile (raw drivers, same session settings)
+  mock_pg: write refused by the server -> cannot execute CREATE TABLE in a read-only transaction
+  mock_mysql: write refused by the server -> (1792, 'Cannot execute statement in a READ ONLY transaction.')
+  mock_clickhouse: write refused by the server -> Received ClickHouse exception, code: 164, server response: Code: 164. DB::Exception: defau
+
+## Db2: an agent query WITHOUT the WITH UR clause now runs at UR (VALUES CURRENT ISOLATION inside the session)
+  db_query path -> [['UR', 5]]

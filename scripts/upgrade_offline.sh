@@ -165,10 +165,16 @@ verify_with_proof "$STAGING"
 NEW_BUNDLE="$STAGING"
 
 echo "==> backing up current configuration and local state"
-mkdir -p "$BACKUP/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
-cp -a /etc/universal-db-mcp "$BACKUP/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)/" 2>/dev/null || true
+# One timestamp for the whole backup: computing it per command meant that
+# across a second boundary the cp targets named a directory mkdir never
+# created, and `|| true` swallowed the failure — an upgrade that reported a
+# backup it did not take.
+BACKUP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP_DIR="$BACKUP/pre-upgrade-$BACKUP_STAMP"
+mkdir -p "$BACKUP_DIR"
+cp -a /etc/universal-db-mcp "$BACKUP_DIR/" 2>/dev/null || true
 [ -f /var/lib/universal-db-mcp/metadata.sqlite ] && \
-  cp /var/lib/universal-db-mcp/metadata.sqlite "$BACKUP/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)/" || true
+  cp /var/lib/universal-db-mcp/metadata.sqlite "$BACKUP_DIR/" || true
 
 echo "==> installing the bundle's OS packages (dpkg only, no apt, no network)"
 PY=python3.12
@@ -208,8 +214,13 @@ $sudo_ok find "$NEWVENV/bin" -type f -exec chmod 755 {} +
 
 echo "==> smoke check + doctor on the NEW venv before switching"
 $sudo_ok "$NEWVENV/bin/python" -m universal_db_mcp version
+# Both doctor runs go through $sudo_ok like every other privileged step: the
+# config is root:udbmcp 0640, so a non-root operator's unprivileged doctor
+# cannot even read it and the upgrade aborted with "doctor failed" on a
+# healthy release. `env` carries the variable across sudo (same pattern as
+# the pip invocation above).
 if [ -f /etc/universal-db-mcp/config.yaml ]; then
-  UDBMCP_CONFIG=/etc/universal-db-mcp/config.yaml "$NEWVENV/bin/python" -m universal_db_mcp doctor \
+  $sudo_ok env UDBMCP_CONFIG=/etc/universal-db-mcp/config.yaml "$NEWVENV/bin/python" -m universal_db_mcp doctor \
     || { echo "FAIL: doctor failed on the new venv; aborting without switching" >&2; $sudo_ok rm -rf "$NEWVENV"; exit 1; }
 fi
 
@@ -240,7 +251,7 @@ echo "==> validating effective installation"
 # upgrade into an automatic rollback, so only run the config-aware doctor
 # when a config actually resolves.
 if [ -n "${UDBMCP_CONFIG:-}" ] || [ -f /etc/universal-db-mcp/config.yaml ]; then
-  if ! "$TARGET/venv/bin/python" -m universal_db_mcp doctor \
+  if ! $sudo_ok "$TARGET/venv/bin/python" -m universal_db_mcp doctor \
     --config "${UDBMCP_CONFIG:-/etc/universal-db-mcp/config.yaml}"; then
     echo "FAIL: doctor failed after switch; rolling back automatically" >&2
     $sudo_ok rm -rf "$TARGET/venv.failed"; $sudo_ok mv "$TARGET/venv" "$TARGET/venv.failed"

@@ -1,0 +1,39 @@
+Unable to find image 'mysql:8.0' locally
+8.0: Pulling from library/mysql
+e9b2852d2a9d: Pulling fs layer
+fa30ab141b5a: Pulling fs layer
+ad770837e789: Pulling fs layer
+605b7f42ac6e: Pulling fs layer
+70a53223cb4c: Pulling fs layer
+42505e6e6b91: Pulling fs layer
+4fcb28d1dfcf: Pulling fs layer
+1959e4a06a1c: Pulling fs layer
+7ce425b17caf: Pulling fs layer
+7b9f24d93d52: Pulling fs layer
+11c0b299cb47: Pulling fs layer
+70a53223cb4c: Download complete
+7a0e30178db8: Download complete
+e9b2852d2a9d: Download complete
+42505e6e6b91: Download complete
+7ce425b17caf: Download complete
+4fcb28d1dfcf: Download complete
+578f543767f0: Download complete
+7b9f24d93d52: Download complete
+11c0b299cb47: Download complete
+1959e4a06a1c: Download complete
+ad770837e789: Download complete
+ad770837e789: Pull complete
+70a53223cb4c: Pull complete
+7b9f24d93d52: Pull complete
+11c0b299cb47: Pull complete
+e9b2852d2a9d: Pull complete
+7ce425b17caf: Pull complete
+fa30ab141b5a: Download complete
+605b7f42ac6e: Download complete
+1959e4a06a1c: Pull complete
+605b7f42ac6e: Pull complete
+fa30ab141b5a: Pull complete
+42505e6e6b91: Pull complete
+4fcb28d1dfcf: Pull complete
+Digest: sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+Status: Downloaded newer image for mysql:8.0

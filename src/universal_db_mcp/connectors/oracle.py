@@ -23,6 +23,7 @@ from universal_db_mcp.connectors.base import (
     ConnectorError,
     DatabaseConnector,
     HealthInfo,
+    IndexInfo,
     KeyInfo,
     QueryOutcome,
     QuerySpec,
@@ -287,7 +288,7 @@ class OracleConnector(DatabaseConnector):
         """connect() with the driver's account-level refusals translated into
         remediation the operator can act on."""
         try:
-            return self._module.connect(**kw)
+            conn = self._module.connect(**kw)
         except Exception as exc:
             text = str(exc)
             if "DPY-3015" in text:
@@ -303,6 +304,55 @@ class OracleConnector(DatabaseConnector):
                     "Client (options.lib_dir), which still accepts the 10G verifier."
                 ) from exc
             raise
+        self._configure_session(conn)
+        return conn
+
+    def _configure_session(self, conn: Any) -> None:
+        """Apply the session safety profile.
+
+        Oracle readers never block writers and there is no session-wide
+        read-only (SET TRANSACTION READ ONLY is per transaction and does not
+        stop DDL), so the guard stays the write enforcement and the profile
+        reports that. What Oracle does offer: module/action/client identifier
+        for the DBA's session views, a call timeout, and serializable
+        isolation on request.
+        """
+        prof = self.session_profile
+        self._session_reset()
+        try:
+            conn.module = "udbmcp"
+            conn.action = prof.connection_id[:32]
+            conn.client_identifier = prof.application_name[:64]
+            self._session_applied(f"client_identifier={prof.application_name}")
+        except Exception as exc:  # noqa: BLE001
+            self._session_skipped("client_identifier", exc)
+        if prof.statement_timeout_seconds:
+            try:
+                conn.call_timeout = int(prof.statement_timeout_seconds * 1000)
+                self._session_applied(f"call_timeout={conn.call_timeout}ms")
+            except Exception as exc:  # noqa: BLE001
+                self._session_skipped("call_timeout", exc)
+        if prof.isolation == "serializable":
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")
+                self._session_applied("isolation=serializable")
+            except Exception as exc:  # noqa: BLE001
+                raise self._session_required("isolation serializable", exc) from exc
+
+    def _session_readback(self, conn: Any) -> dict[str, Any]:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT sys_context('USERENV','MODULE'), sys_context('USERENV','CLIENT_IDENTIFIER') "
+                    "FROM dual"
+                )
+                row = cur.fetchone()
+        except Exception:  # noqa: BLE001 - reporting only
+            return {}
+        if not row or len(row) < 2:
+            return {}
+        return {"module": str(row[0]), "client_identifier": str(row[1])}
 
     def cancel_current(self) -> bool:
         target = self._cancel_target
@@ -384,12 +434,14 @@ class OracleConnector(DatabaseConnector):
                     except Exception:  # noqa: BLE001 - version is optional
                         cur.execute("SELECT 1 FROM DUAL")
                         cur.fetchone()
+                session = self.session_report(self._session_readback(conn))
             finally:
                 conn.close()
             return HealthInfo(
                 healthy=True,
                 server_version=str(row[0])[:60] if row else None,
                 latency_ms=int((time.monotonic() - start) * 1000),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001, S110
             return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
@@ -460,6 +512,73 @@ class OracleConnector(DatabaseConnector):
             )
             for r in rows
         ]
+
+    def placeholder(self, index: int) -> str:
+        return f":{index}"
+
+    def build_search_query(
+        self, schema: str | None, table: str, select_columns: list[str], where_sql: str, limit: int
+    ) -> str:
+        cols = ", ".join(self.quote_identifier(c) for c in select_columns) if select_columns else "*"
+        qualified = (
+            f"{self.quote_identifier(schema)}.{self.quote_identifier(table)}"
+            if schema
+            else self.quote_identifier(table)
+        )
+        return f"SELECT * FROM (SELECT {cols} FROM {qualified} WHERE {where_sql}) WHERE ROWNUM <= {int(limit)}"
+
+    def build_top_values_query(self, sample_sql: str, column: str, limit: int) -> str:
+        q = self.quote_identifier(column)
+        inner = (
+            f"SELECT {q} AS v, COUNT(*) AS cnt FROM ({sample_sql}) s "
+            f"WHERE {q} IS NOT NULL GROUP BY {q} ORDER BY cnt DESC"
+        )
+        return f"SELECT * FROM ({inner}) WHERE ROWNUM <= {int(limit)}"
+
+    def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
+        sql = (
+            "SELECT table_name, column_name, data_type, nullable, data_default, column_id "
+            "FROM all_tab_columns WHERE owner = :1 ORDER BY table_name, column_id"
+        )
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, [schema])
+                rows = cur.fetchall()
+        return [
+            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=r[2], nullable=r[3] == "Y",
+                       default=r[4], ordinal=r[5])
+            for r in rows
+        ]
+
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        sql = (
+            "SELECT i.table_name, i.index_name, i.uniqueness, ic.column_name, ic.column_position, i.index_type, "
+            "(SELECT MAX(c.constraint_type) FROM all_constraints c "
+            " WHERE c.owner = i.owner AND c.index_name = i.index_name AND c.constraint_type = 'P') "
+            "FROM all_indexes i JOIN all_ind_columns ic "
+            "ON ic.index_owner = i.owner AND ic.index_name = i.index_name "
+            "WHERE i.table_owner = :1"
+        )
+        params: list[Any] = [schema]
+        if table:
+            sql += " AND i.table_name = :2"
+            params.append(table)
+        sql += " ORDER BY i.table_name, i.index_name, ic.column_position"
+        with translated_driver_errors():
+            conn = self._shared_meta_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        grouped: dict[tuple[str, str], IndexInfo] = {}
+        for tname, iname, uniq, col, _pos, itype, pk in rows:
+            info = grouped.get((tname, iname))
+            if info is None:
+                info = IndexInfo(name=iname, columns=[], unique=(str(uniq).upper() == "UNIQUE"),
+                                 primary=(pk == "P"), kind=str(itype).lower(), schema=schema, table=tname)
+                grouped[(tname, iname)] = info
+            info.columns.append(str(col))
+        return list(grouped.values())
 
     def list_views(self, schema: str | None) -> list[ViewInfo]:
         sql = "SELECT owner, view_name, text FROM all_views"

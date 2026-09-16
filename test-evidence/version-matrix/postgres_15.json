@@ -1,0 +1,163 @@
+{
+  "label": "postgres:15",
+  "engine": "postgres",
+  "started_utc": "2026-09-16T19:26:15Z",
+  "checks": [
+    {
+      "check": "seed",
+      "status": "passed",
+      "ms": 72,
+      "detail": "seeded"
+    },
+    {
+      "check": "health_check",
+      "status": "passed",
+      "ms": 6,
+      "detail": "HealthInfo(healthy=True, server_version='PostgreSQL 15.19 (Debian 15.19-1.pgdg13+', latency_ms=6, detail=None, checked_at=1789586775.2676601, session={'engine': 'postgres', 'isolation': None, 'lock_ti"
+    },
+    {
+      "check": "list_schemas",
+      "status": "passed",
+      "ms": 4,
+      "detail": "5"
+    },
+    {
+      "check": "list_tables",
+      "status": "passed",
+      "ms": 1,
+      "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='vm', name='orders', kind='table', row_estimate=None, row_est"
+    },
+    {
+      "check": "list_tables_has_seed",
+      "status": "passed",
+      "ms": 0,
+      "detail": "customers"
+    },
+    {
+      "check": "list_columns",
+      "status": "passed",
+      "ms": 3,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
+    },
+    {
+      "check": "list_columns_count",
+      "status": "passed",
+      "ms": 0,
+      "detail": "{'columns': 6, 'expected': 6}"
+    },
+    {
+      "check": "list_all_columns",
+      "status": "passed",
+      "ms": 1,
+      "detail": "12"
+    },
+    {
+      "check": "list_indexes",
+      "status": "passed",
+      "ms": 1,
+      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition='CREATE INDEX ix_orders_customer ON vm.orders USING btree (customer_id)', primary=False, kind='btree', schema='v"
+    },
+    {
+      "check": "index_on_fk_visible",
+      "status": "passed",
+      "ms": 0,
+      "detail": "ix_orders_customer"
+    },
+    {
+      "check": "primary_key_visible",
+      "status": "passed",
+      "ms": 1,
+      "detail": "customers_pkey"
+    },
+    {
+      "check": "get_foreign_keys",
+      "status": "passed",
+      "ms": 2,
+      "detail": "customers"
+    },
+    {
+      "check": "list_views",
+      "status": "passed",
+      "ms": 0,
+      "detail": "v_orders"
+    },
+    {
+      "check": "list_routines",
+      "status": "passed",
+      "ms": 5,
+      "detail": "1"
+    },
+    {
+      "check": "get_statistics",
+      "status": "passed",
+      "ms": 1,
+      "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': -1, 'row_estimate_source': 'catalog_estimate(pg_class.reltuples / pg_stat_user_tables)', 'last_analyze': None, 'note': 'estimates; freshness depe"
+    },
+    {
+      "check": "execute_query_count",
+      "status": "passed",
+      "ms": 5,
+      "detail": "300"
+    },
+    {
+      "check": "sample_query",
+      "status": "passed",
+      "ms": 6,
+      "detail": "200"
+    },
+    {
+      "check": "profile_aggregate",
+      "status": "passed",
+      "ms": 6,
+      "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
+    },
+    {
+      "check": "top_values",
+      "status": "passed",
+      "ms": 5,
+      "detail": "[['south', 67], ['north', 66]]"
+    },
+    {
+      "check": "value_search_like",
+      "status": "passed",
+      "ms": 6,
+      "detail": "[12, 'user12@example.com', 'north']"
+    },
+    {
+      "check": "explain",
+      "status": "passed",
+      "ms": 4,
+      "detail": "{'raw': 'Seq Scan on customers  (cost=0.00..11.30 rows=130 width=596)'}"
+    }
+  ],
+  "server_version": "PostgreSQL 15.19 (Debian 15.19-1.pgdg13+",
+  "session": {
+    "engine": "postgres",
+    "isolation": null,
+    "lock_timeout_seconds": 5.0,
+    "statement_timeout_seconds": 60.0,
+    "application_name": "udbmcp:vm",
+    "read_only_requested": true,
+    "server_read_only_available": true,
+    "applied": [
+      "read_only",
+      "statement_timeout=60000ms",
+      "lock_timeout=5000ms"
+    ],
+    "skipped": [],
+    "read_only_enforced": true,
+    "server_reports": {
+      "read_only": "on",
+      "statement_timeout": "1min",
+      "lock_timeout": "5s",
+      "application_name": "udbmcp:vm",
+      "isolation": "read committed"
+    }
+  },
+  "healthy": true,
+  "finished_utc": "2026-09-16T19:26:15Z",
+  "summary": {
+    "passed": 21,
+    "failed": []
+  }
+}

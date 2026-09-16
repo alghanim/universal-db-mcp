@@ -9,6 +9,7 @@ cannot exhaust client memory.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
@@ -19,6 +20,7 @@ from universal_db_mcp.connectors.base import (
     ColumnInfo,
     DatabaseConnector,
     HealthInfo,
+    IndexInfo,
     KeyInfo,
     QueryOutcome,
     QuerySpec,
@@ -49,6 +51,27 @@ class ClickHouseConnector(DatabaseConnector):
         self._exec_lock = threading.Lock()  # serializes queries: cancel slot correctness
         self._pool_lock = threading.Lock()
         self._meta_client: Any = None  # reused metadata client (probe on checkout)
+
+    def _session_settings(self) -> dict[str, Any]:
+        prof = self.session_profile
+        self._session_reset()
+        settings: dict[str, Any] = {}
+        if prof.enforce_read_only:
+            settings["readonly"] = 1
+            self._session_applied("read_only")
+        if prof.statement_timeout_seconds:
+            settings["max_execution_time"] = int(math.ceil(prof.statement_timeout_seconds))
+            self._session_applied(f"max_execution_time={settings['max_execution_time']}s")
+        return settings
+
+    def _session_readback(self, client: Any) -> dict[str, Any]:
+        try:
+            row = client.query("SELECT getSetting('readonly'), getSetting('max_execution_time')").result_rows
+        except Exception:  # noqa: BLE001 - reporting only
+            return {}
+        if not row or len(row[0]) < 2:
+            return {}
+        return {"readonly": str(row[0][0]), "max_execution_time": str(row[0][1])}
 
     def _shared_meta_client(self) -> Any:
         """Lock-guarded reusable metadata client with probe-on-checkout
@@ -83,6 +106,13 @@ class ClickHouseConnector(DatabaseConnector):
             # this never truncates a permitted query but does stop a runaway
             # result from exhausting client memory.
             "query_limit": self.policy.hard_max_rows,
+            # Session safety profile, applied to EVERY request this client
+            # sends: readonly=1 makes the server refuse writes and any
+            # SETTINGS override inside agent SQL; max_execution_time is the
+            # policy ceiling server-side. client_name is what shows up in
+            # system.query_log / system.processes.
+            "client_name": self.session_profile.application_name,
+            "settings": self._session_settings(),
         }
         if self.connection.username:
             kw["username"] = self.connection.username.value
@@ -185,10 +215,12 @@ class ClickHouseConnector(DatabaseConnector):
         try:
             client = self._connect()
             row = client.query("SELECT version()").result_rows
+            session = self.session_report(self._session_readback(client))
             return HealthInfo(
                 healthy=True,
                 server_version=str(row[0][0]) if row else None,
                 latency_ms=int((time.monotonic() - start) * 1000),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001, S110
             return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
@@ -261,6 +293,61 @@ class ClickHouseConnector(DatabaseConnector):
             )
             for i, r in enumerate(rows)
         ]
+
+    def length_function(self) -> str:
+        return "length"
+
+    def placeholder(self, index: int) -> str:
+        return f"%(p{index})s"
+
+    def pack_parameters(self, values: list[Any]) -> Any:
+        return {f"p{i}": v for i, v in enumerate(values, start=1)}
+
+    def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
+        db = schema or self.connection.config.database
+        with translated_driver_errors():
+            client = self._shared_meta_client()
+            rows = client.query(
+                "SELECT table, name, type, comment, position FROM system.columns "
+                "WHERE database = %(db)s ORDER BY table, position",
+                parameters={"db": db},
+            ).result_rows
+        return [
+            ColumnInfo(schema=db, table=r[0], name=r[1], data_type=r[2],
+                       nullable=str(r[2]).startswith("Nullable("), comment=r[3] or None, ordinal=int(r[4]))
+            for r in rows
+        ]
+
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        """ClickHouse has no secondary B-tree indexes: the MergeTree sorting
+        key is what the engine reads by (reported as the primary key), and
+        data-skipping indices are the rest."""
+        db = schema or self.connection.config.database
+        out: list[IndexInfo] = []
+        with translated_driver_errors():
+            client = self._shared_meta_client()
+            sql = "SELECT name, sorting_key, primary_key, engine FROM system.tables WHERE database = %(db)s"
+            params: dict[str, Any] = {"db": db}
+            if table:
+                sql += " AND name = %(t)s"
+                params["t"] = table
+            for tname, sorting, primary, engine in client.query(sql, parameters=params).result_rows:
+                key = primary or sorting
+                if key:
+                    out.append(IndexInfo(name="(sorting key)", columns=[c.strip() for c in str(key).split(",")],
+                                         unique=False, primary=True, kind="sorting_key",
+                                         definition=f"{engine} ORDER BY ({sorting})", schema=db, table=tname))
+            sql = (
+                "SELECT table, name, type, expr, granularity FROM system.data_skipping_indices "
+                "WHERE database = %(db)s"
+            )
+            if table:
+                sql += " AND table = %(t)s"
+            for tname, iname, itype, expr, gran in client.query(sql, parameters=params).result_rows:
+                out.append(IndexInfo(name=iname, columns=[str(expr)], unique=False, primary=False,
+                                     kind=f"skipping:{itype}", definition=f"GRANULARITY {gran}",
+                                     schema=db, table=tname))
+        return out
 
     def list_views(self, schema: str | None) -> list[ViewInfo]:
         tables = self.list_tables(schema, {"view"}, None)

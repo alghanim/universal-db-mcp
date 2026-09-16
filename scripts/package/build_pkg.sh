@@ -216,6 +216,11 @@ APP_SRC="$PROJECT/packaging/macos-app/configure_agents_app.sh"
 SHARE_DEST="$ROOT/usr/local/universal-db-mcp/share"
 mkdir -p "$SHARE_DEST"
 install -m 0755 "$APP_SRC" "$SHARE_DEST/configure_agents_app.sh"
+# newsyslog rotation for the daemon's launchd logs; postinstall installs it
+# (best-effort) at /etc/newsyslog.d/udbmcp.conf.
+NEWSYSLOG_SRC="$PROJECT/packaging/launchd/udbmcp.newsyslog.conf"
+[ -f "$NEWSYSLOG_SRC" ] || fail "newsyslog rotation config missing at $NEWSYSLOG_SRC"
+install -m 0644 "$NEWSYSLOG_SRC" "$SHARE_DEST/udbmcp.newsyslog.conf"
 
 # --- pkgbuild: component package ---
 CORE_PKG="$WORK/core.pkg"

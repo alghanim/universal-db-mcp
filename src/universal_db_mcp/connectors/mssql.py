@@ -17,6 +17,7 @@ happens to trust.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import ssl
 import threading
@@ -30,6 +31,7 @@ from universal_db_mcp.connectors.base import (
     ConnectorError,
     DatabaseConnector,
     HealthInfo,
+    IndexInfo,
     KeyInfo,
     QueryOutcome,
     QuerySpec,
@@ -214,7 +216,75 @@ class MssqlConnector(DatabaseConnector):
                 parts.append(f"Uid={esc(self.connection.username.value, 'Uid')}")
             if self.connection.password:
                 parts.append(f"Pwd={esc(self.connection.password.value, 'Pwd')}")
-        return self._module.connect(";".join(parts), timeout=int(cfg.connect_timeout_seconds))
+        parts.append(f"APP={esc(self.session_profile.application_name, 'session.application_name')}")
+        if str(cfg.options.get("application_intent", "")).lower() == "readonly":
+            # Availability Groups route read-intent connections to a readable
+            # secondary; on a standalone server the keyword is accepted and
+            # has no effect. Opt-in: a secondary may lag the primary.
+            parts.append("ApplicationIntent=ReadOnly")
+        conn = self._module.connect(
+            ";".join(parts), timeout=int(math.ceil(cfg.connect_timeout_seconds))
+        )
+        self._configure_session(conn)
+        return conn
+
+    def _configure_session(self, conn: Any) -> None:
+        """Apply the session safety profile. The isolation level is REQUIRED
+        when the profile has one (READ UNCOMMITTED for read-only connections
+        by default: ordinary reads take share locks under READ COMMITTED and
+        queue behind writers); the lock ceiling is best-effort. The policy's
+        hard timeout also becomes the driver's query timeout."""
+        prof = self.session_profile
+        self._session_reset()
+        if prof.statement_timeout_seconds:
+            try:
+                conn.timeout = int(math.ceil(prof.statement_timeout_seconds))
+                self._session_applied(f"statement_timeout={conn.timeout}s")
+            except Exception as exc:  # noqa: BLE001
+                self._session_skipped("statement_timeout", exc)
+        cur = conn.cursor()
+        try:
+            if prof.isolation:
+                level = prof.isolation.replace("_", " ").upper()
+                try:
+                    cur.execute(f"SET TRANSACTION ISOLATION LEVEL {level}")
+                    self._session_applied(f"isolation={prof.isolation}")
+                except Exception as exc:  # noqa: BLE001
+                    raise self._session_required(f"isolation {prof.isolation}", exc) from exc
+            if prof.lock_timeout_seconds is not None:
+                ms = int(math.ceil(prof.lock_timeout_seconds * 1000))
+                try:
+                    cur.execute(f"SET LOCK_TIMEOUT {ms}")
+                    self._session_applied(f"lock_timeout={ms}ms")
+                except Exception as exc:  # noqa: BLE001
+                    self._session_skipped("lock_timeout", exc)
+        finally:
+            close = getattr(cur, "close", None)
+            if callable(close):
+                close()
+
+    _ISOLATION_NAMES = {
+        0: "unspecified", 1: "read_uncommitted", 2: "read_committed",
+        3: "repeatable_read", 4: "serializable", 5: "snapshot",
+    }
+
+    def _session_readback(self, conn: Any) -> dict[str, Any]:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT s.transaction_isolation_level, s.program_name, @@LOCK_TIMEOUT "
+                "FROM sys.dm_exec_sessions s WHERE s.session_id = @@SPID"
+            )
+            row = cur.fetchone()
+        except Exception:  # noqa: BLE001 - reporting only
+            return {}
+        if not row or len(row) < 3:
+            return {}
+        return {
+            "isolation": self._ISOLATION_NAMES.get(int(row[0]), str(row[0])),
+            "application_name": str(row[1]),
+            "lock_timeout_ms": str(row[2]),
+        }
 
     # pyodbc exposes no safe out-of-band cancel through this API surface.
     def cancel_current(self) -> bool:
@@ -284,12 +354,14 @@ class MssqlConnector(DatabaseConnector):
                 cur = conn.cursor()
                 cur.execute("SELECT @@VERSION")
                 row = cur.fetchone()
+                session = self.session_report(self._session_readback(conn))
             finally:
                 conn.close()
             return HealthInfo(
                 healthy=True,
                 server_version=str(row[0])[:60] if row else None,
                 latency_ms=int((time.monotonic() - start) * 1000),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001
             return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
@@ -366,6 +438,79 @@ class MssqlConnector(DatabaseConnector):
             )
             for r in rows
         ]
+
+    def length_function(self) -> str:
+        return "LEN"
+
+    def build_search_query(
+        self, schema: str | None, table: str, select_columns: list[str], where_sql: str, limit: int
+    ) -> str:
+        cols = ", ".join(self.quote_identifier(c) for c in select_columns) if select_columns else "*"
+        qualified = (
+            f"{self.quote_identifier(schema)}.{self.quote_identifier(table)}"
+            if schema
+            else self.quote_identifier(table)
+        )
+        return f"SELECT TOP {int(limit)} {cols} FROM {qualified} WHERE {where_sql}"
+
+    def build_top_values_query(self, sample_sql: str, column: str, limit: int) -> str:
+        q = self.quote_identifier(column)
+        return (
+            f"SELECT TOP {int(limit)} {q} AS v, COUNT(*) AS cnt FROM ({sample_sql}) s "
+            f"WHERE {q} IS NOT NULL GROUP BY {q} ORDER BY cnt DESC"
+        )
+
+    def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
+        sql = (
+            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position "
+            "FROM information_schema.columns WHERE table_schema = ? ORDER BY table_name, ordinal_position"
+        )
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, [schema])
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        return [
+            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=r[2], nullable=r[3] == "YES",
+                       default=r[4], ordinal=r[5])
+            for r in rows
+        ]
+
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        sql = (
+            "SELECT t.name, i.name, i.is_unique, i.is_primary_key, i.type_desc, c.name, ic.key_ordinal "
+            "FROM sys.indexes i "
+            "JOIN sys.tables t ON t.object_id = i.object_id "
+            "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+            "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+            "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+            "WHERE i.name IS NOT NULL AND ic.is_included_column = 0 AND s.name = ?"
+        )
+        params: list[Any] = [schema]
+        if table:
+            sql += " AND t.name = ?"
+            params.append(table)
+        sql += " ORDER BY t.name, i.name, ic.key_ordinal"
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        grouped: dict[tuple[str, str], IndexInfo] = {}
+        for tname, iname, unique, primary, tdesc, col, _ord in rows:
+            info = grouped.get((tname, iname))
+            if info is None:
+                info = IndexInfo(name=iname, columns=[], unique=bool(unique), primary=bool(primary),
+                                 kind=str(tdesc).lower(), schema=schema, table=tname)
+                grouped[(tname, iname)] = info
+            info.columns.append(str(col))
+        return list(grouped.values())
 
     def list_views(self, schema: str | None) -> list[ViewInfo]:
         sql = "SELECT table_schema, table_name FROM information_schema.views"

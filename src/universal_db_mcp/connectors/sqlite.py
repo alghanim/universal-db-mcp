@@ -133,7 +133,17 @@ class SQLiteConnector(DatabaseConnector):
             isolation_level=None,  # autocommit; we never open transactions
         )
         conn.enable_load_extension(False)
+        # Session safety profile: the read-only URI + query_only IS the
+        # server-side read-only here; the lock ceiling is SQLite's busy
+        # timeout. Both PRAGMAs run BEFORE the authorizer is installed,
+        # because the authorizer denies PRAGMA to everything that follows.
+        self._session_reset()
         conn.execute("PRAGMA query_only = ON")
+        self._session_applied("read_only")
+        lock = self.session_profile.lock_timeout_seconds
+        if lock is not None:
+            conn.execute(f"PRAGMA busy_timeout = {int(lock * 1000)}")
+            self._session_applied(f"busy_timeout={int(lock * 1000)}ms")
         conn.set_authorizer(self._authorizer)
         return conn
 
@@ -218,10 +228,12 @@ class SQLiteConnector(DatabaseConnector):
         try:
             with self._open() as conn:
                 row = conn.execute("SELECT sqlite_version()").fetchone()
+            session = self.session_report({"uri_mode": "ro", "query_only": "on"})
             return HealthInfo(
                 healthy=True,
                 server_version=row[0] if row else sqlite3.sqlite_version,
                 latency_ms=int((time.monotonic() - start) * 1000),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001 - health reports failures
             detail = str(exc)
@@ -350,6 +362,22 @@ class SQLiteConnector(DatabaseConnector):
             for r in rows
         ]
         return [c for c, r in zip(cols, rows, strict=True) if r[5] > 0]
+
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        with self._open() as conn:
+            names = [table] if table else [t.name for t in self.list_tables(schema, {"table"}, None)]
+            out: list[IndexInfo] = []
+            for name in names:
+                pk = [c.name for c in self._pk_columns(conn, schema or "main", name)]
+                if pk:
+                    out.append(IndexInfo(name="(primary key)", columns=pk, unique=True, primary=True,
+                                         kind="primary_key", schema=schema or "main", table=name))
+                for idx in self._indexes(conn, schema or "main", name):
+                    idx.schema = schema or "main"
+                    idx.table = name
+                    idx.kind = "btree"
+                    out.append(idx)
+        return out
 
     def _indexes(self, conn: sqlite3.Connection, schema: str, name: str) -> list[IndexInfo]:
         out = []

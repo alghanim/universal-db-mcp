@@ -7,6 +7,7 @@ C). TLS uses the explicit CA file; verification is never disabled.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Iterator
@@ -19,6 +20,7 @@ from universal_db_mcp.connectors.base import (
     ConnectorError,
     DatabaseConnector,
     HealthInfo,
+    IndexInfo,
     KeyInfo,
     QueryOutcome,
     QuerySpec,
@@ -128,7 +130,69 @@ class PostgresConnector(DatabaseConnector):
             value = cfg.options.get(key)
             if value:
                 kw[key] = value
-        return self._module.connect(**kw)
+        kw["application_name"] = self.session_profile.application_name
+        conn = self._module.connect(**kw)
+        self._configure_session(conn)
+        return conn
+
+    def _configure_session(self, conn: Any) -> None:
+        """Apply the session safety profile (see security/session.py).
+
+        SET inside psycopg's implicit transaction would be rolled back with
+        it, so the statements run with autocommit on and the previous mode is
+        restored. Server-side read-only is REQUIRED when requested: it is the
+        promise this profile makes. The ceilings are best-effort and recorded.
+        """
+        prof = self.session_profile
+        self._session_reset()
+        previous = getattr(conn, "autocommit", None)
+        try:
+            if previous is False:
+                conn.autocommit = True
+            if prof.enforce_read_only:
+                try:
+                    conn.execute("SET default_transaction_read_only = on")
+                    self._session_applied("read_only")
+                except Exception as exc:  # noqa: BLE001
+                    raise self._session_required("read-only mode", exc) from exc
+            if prof.statement_timeout_seconds:
+                ms = int(math.ceil(prof.statement_timeout_seconds * 1000))
+                try:
+                    conn.execute(f"SET statement_timeout = '{ms}ms'")
+                    self._session_applied(f"statement_timeout={ms}ms")
+                except Exception as exc:  # noqa: BLE001
+                    self._session_skipped("statement_timeout", exc)
+            if prof.lock_timeout_seconds is not None:
+                ms = int(math.ceil(prof.lock_timeout_seconds * 1000))
+                try:
+                    conn.execute(f"SET lock_timeout = '{ms}ms'")
+                    self._session_applied(f"lock_timeout={ms}ms")
+                except Exception as exc:  # noqa: BLE001
+                    self._session_skipped("lock_timeout", exc)
+            if prof.isolation:
+                level = prof.isolation.replace("_", " ")
+                try:
+                    conn.execute(f"SET default_transaction_isolation = '{level}'")
+                    self._session_applied(f"isolation={prof.isolation}")
+                except Exception as exc:  # noqa: BLE001
+                    raise self._session_required(f"isolation {prof.isolation}", exc) from exc
+        finally:
+            if previous is False:
+                conn.autocommit = previous
+
+    def _session_readback(self, conn: Any) -> dict[str, Any]:
+        try:
+            row = conn.execute(
+                "SELECT current_setting('default_transaction_read_only'), "
+                "current_setting('statement_timeout'), current_setting('lock_timeout'), "
+                "current_setting('application_name'), current_setting('default_transaction_isolation')"
+            ).fetchone()
+        except Exception:  # noqa: BLE001 - reporting only
+            return {}
+        if not row or len(row) < 5:
+            return {}
+        keys = ("read_only", "statement_timeout", "lock_timeout", "application_name", "isolation")
+        return {k: str(v) for k, v in zip(keys, row, strict=False)}
 
     def cancel_current(self) -> bool:
         """Request-scoped best-effort cancel of the executing query.
@@ -207,10 +271,12 @@ class PostgresConnector(DatabaseConnector):
         try:
             with self._connect() as conn:
                 row = conn.execute("SELECT version()").fetchone()
+                session = self.session_report(self._session_readback(conn))
             return HealthInfo(
                 healthy=True,
                 server_version=(row[0] if row else "")[:40],
                 latency_ms=int((time.monotonic() - start) * 1000),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001, S110
             return HealthInfo(healthy=False, detail=scrub_exception(exc)[:300])
@@ -327,6 +393,52 @@ class PostgresConnector(DatabaseConnector):
             except Exception:  # noqa: BLE001 - pre-11 servers lack prokind
                 rows = conn.execute(legacy_sql, params).fetchall()
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2]) for r in rows]
+
+    def placeholder(self, index: int) -> str:
+        return "%s"
+
+    def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
+        schema = schema or "public"
+        sql = (
+            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position "
+            "FROM information_schema.columns WHERE table_schema = %s ORDER BY table_name, ordinal_position"
+        )
+        with self._shared_meta_conn() as conn:
+            rows = conn.execute(sql, (schema,)).fetchall()
+        return [
+            ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=r[2], nullable=r[3] == "YES",
+                       default=r[4], ordinal=r[5])
+            for r in rows
+        ]
+
+    def list_indexes(self, schema: str | None, table: str | None) -> list[IndexInfo]:
+        schema = schema or "public"
+        sql = (
+            "SELECT t.relname, i.relname, ix.indisunique, ix.indisprimary, a.attname, k.ord, am.amname, "
+            "pg_get_indexdef(ix.indexrelid) "
+            "FROM pg_index ix JOIN pg_class t ON t.oid = ix.indrelid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_am am ON am.oid = i.relam "
+            "CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) "
+            "LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
+            "WHERE n.nspname = %s"
+        )
+        params: list[Any] = [schema]
+        if table:
+            sql += " AND t.relname = %s"
+            params.append(table)
+        sql += " ORDER BY t.relname, i.relname, k.ord"
+        with self._shared_meta_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        grouped: dict[tuple[str, str], IndexInfo] = {}
+        for tname, iname, unique, primary, col, _ord, am, definition in rows:
+            info = grouped.get((tname, iname))
+            if info is None:
+                info = IndexInfo(name=iname, columns=[], unique=bool(unique), primary=bool(primary),
+                                 kind=str(am), definition=definition, schema=schema, table=tname)
+                grouped[(tname, iname)] = info
+            info.columns.append(str(col) if col is not None else "(expression)")
+        return list(grouped.values())
 
     def get_foreign_keys(self, schema: str | None, table: str | None) -> list[KeyInfo]:
         # Query the catalog directly with the schema/table as bound parameters:

@@ -287,7 +287,7 @@ def _indent_block(text: str, prefix: str = "    ") -> str:
 
 def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str], home: Path) -> None:
     """Run one confirmed apply and print the outcome; never raises."""
-    from universal_db_mcp.agents.core import AgentConfigError, ensure_per_user_harness_config
+    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus, ensure_per_user_harness_config
 
     try:
         result = registry.apply_confirmed(name, env, home, True)
@@ -306,6 +306,43 @@ def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str],
     seeded, note = ensure_per_user_harness_config(env, home)
     if seeded is not None:
         print(f"  seeded per-user harness config: {seeded} ({note})")
+    if result.status is AgentStatus.CONFIGURED:
+        _warn_env_secret_connections(env, home)
+
+
+def _warn_env_secret_connections(env: Mapping[str, str], home: Path) -> None:
+    """After a registration is written: name every connection whose
+    credentials come from ``username_env``/``password_env``.
+
+    The adapters put only UDBMCP_CONFIG into the harness entry's env, so such
+    variables must exist in the HARNESS process environment - which a GUI
+    harness (Claude Desktop, VS Code, Cursor launched from the Dock/Finder)
+    does not inherit from any shell. The registered server then dies at
+    startup with "environment variable ... is not set". Names only: the
+    values are never read or printed here.
+    """
+    from universal_db_mcp.agents.core import resolve_harness_config_path
+    from universal_db_mcp.config import load_config
+    from universal_db_mcp.errors import ConfigError
+
+    cfg_path = Path(resolve_harness_config_path(env, home))
+    if not cfg_path.is_file():
+        return
+    try:
+        cfg = load_config(cfg_path)
+    except ConfigError:
+        return  # `doctor --config` reports config problems; this notice is about env-sourced secrets only
+    for name, conn in sorted(cfg.connections.items()):
+        variables = [v for v in (conn.username_env, conn.password_env) if v]
+        if not variables:
+            continue
+        print(
+            f"  WARNING: connection '{name}' in {cfg_path} reads {', '.join(variables)} from the "
+            "environment; a GUI harness does not inherit shell variables, so the registered server "
+            "will fail at startup unless they are set in the harness's own environment. "
+            "Prefer username_file/password_file (see `udbmcp add-connection`).",
+            file=sys.stderr,
+        )
 
 
 def _configure_agents(args: argparse.Namespace) -> int:
@@ -398,6 +435,8 @@ def _configure_agents(args: argparse.Namespace) -> int:
                 try:
                     result = registry.apply_confirmed(name, env, home, True)
                     seeded, _seed_note = ensure_per_user_harness_config(env, home)
+                    if result.status is AgentStatus.CONFIGURED:
+                        _warn_env_secret_connections(env, home)  # stderr only; stdout stays JSON
                     applied.append(
                         {
                             "agent": name,

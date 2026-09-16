@@ -49,6 +49,9 @@ class _RealisticFakeIbmDb:
                 )
         return "handle"
 
+    def exec_immediate(self, conn: str, sql: str) -> str:  # session profile statements
+        return "stmt"
+
 
 def _secret(tmp_path: Path, name: str, value: str) -> str:
     path = tmp_path / name

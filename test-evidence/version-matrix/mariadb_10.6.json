@@ -1,0 +1,160 @@
+{
+  "label": "mariadb:10.6",
+  "engine": "mysql",
+  "started_utc": "2026-09-16T19:28:14Z",
+  "checks": [
+    {
+      "check": "seed",
+      "status": "passed",
+      "ms": 289,
+      "detail": "seeded"
+    },
+    {
+      "check": "health_check",
+      "status": "passed",
+      "ms": 5,
+      "detail": "HealthInfo(healthy=True, server_version='10.6.28-MariaDB-ubu2204', latency_ms=5, detail=None, checked_at=1789586895.0552971, session={'engine': 'mysql', 'isolation': None, 'lock_timeout_seconds': 5.0,"
+    },
+    {
+      "check": "list_schemas",
+      "status": "passed",
+      "ms": 4,
+      "detail": "5"
+    },
+    {
+      "check": "list_tables",
+      "status": "passed",
+      "ms": 0,
+      "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(information_schema.tables.table_rows)', comment=None), TableSummary(schema='vm', name"
+    },
+    {
+      "check": "list_tables_has_seed",
+      "status": "passed",
+      "ms": 0,
+      "detail": "customers"
+    },
+    {
+      "check": "list_columns",
+      "status": "passed",
+      "ms": 0,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='varc"
+    },
+    {
+      "check": "list_columns_count",
+      "status": "passed",
+      "ms": 0,
+      "detail": "{'columns': 6, 'expected': 6}"
+    },
+    {
+      "check": "list_all_columns",
+      "status": "passed",
+      "ms": 0,
+      "detail": "12"
+    },
+    {
+      "check": "list_indexes",
+      "status": "passed",
+      "ms": 0,
+      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='btree', schema='vm', table='orders'), IndexInfo(name='PRIMARY', columns=['id'], uniqu"
+    },
+    {
+      "check": "index_on_fk_visible",
+      "status": "passed",
+      "ms": 0,
+      "detail": "ix_orders_customer"
+    },
+    {
+      "check": "primary_key_visible",
+      "status": "passed",
+      "ms": 0,
+      "detail": "PRIMARY"
+    },
+    {
+      "check": "get_foreign_keys",
+      "status": "passed",
+      "ms": 0,
+      "detail": "customers"
+    },
+    {
+      "check": "list_views",
+      "status": "passed",
+      "ms": 0,
+      "detail": "v_orders"
+    },
+    {
+      "check": "list_routines",
+      "status": "passed",
+      "ms": 1,
+      "detail": "1"
+    },
+    {
+      "check": "get_statistics",
+      "status": "passed",
+      "ms": 0,
+      "detail": "{'schema': 'vm', 'table': 'customers', 'row_estimate': 300, 'row_estimate_source': 'catalog_estimate(information_schema; InnoDB estimates vary)', 'data_bytes': 16384, 'index_bytes': None, 'last_update"
+    },
+    {
+      "check": "execute_query_count",
+      "status": "passed",
+      "ms": 4,
+      "detail": "300"
+    },
+    {
+      "check": "sample_query",
+      "status": "passed",
+      "ms": 6,
+      "detail": "200"
+    },
+    {
+      "check": "profile_aggregate",
+      "status": "passed",
+      "ms": 5,
+      "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
+    },
+    {
+      "check": "top_values",
+      "status": "passed",
+      "ms": 4,
+      "detail": "[['south', 67], ['north', 66]]"
+    },
+    {
+      "check": "value_search_like",
+      "status": "passed",
+      "ms": 4,
+      "detail": "[12, 'user12@example.com', 'north']"
+    },
+    {
+      "check": "explain",
+      "status": "passed",
+      "ms": 4,
+      "detail": "{'raw': [['1', 'SIMPLE', 'customers', 'ALL', 'None', 'None', 'None', 'None', '300', '']]}"
+    }
+  ],
+  "server_version": "10.6.28-MariaDB-ubu2204",
+  "session": {
+    "engine": "mysql",
+    "isolation": null,
+    "lock_timeout_seconds": 5.0,
+    "statement_timeout_seconds": 60.0,
+    "application_name": "udbmcp:vm",
+    "read_only_requested": true,
+    "server_read_only_available": true,
+    "applied": [
+      "read_only",
+      "statement_timeout(mariadb)=60s",
+      "innodb_lock_wait_timeout=5s",
+      "lock_wait_timeout=5s"
+    ],
+    "skipped": [],
+    "read_only_enforced": true,
+    "server_reports": {
+      "innodb_lock_wait_timeout": "5"
+    }
+  },
+  "healthy": true,
+  "finished_utc": "2026-09-16T19:28:15Z",
+  "summary": {
+    "passed": 21,
+    "failed": []
+  }
+}
