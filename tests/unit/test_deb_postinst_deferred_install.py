@@ -222,7 +222,11 @@ def test_deferred_branch_installs_guard_drop_in_before_spawning_worker() -> None
     assert 'grep -qx success "$STATUS"' in block, "only an explicit 'success' may allow the start"
     assert "exit 1" in block, "any other status must refuse the start (fail closed)"
     assert "refusing to start" in block, "the refusal must carry a diagnostic"
-    assert "dpkg --configure universal-db-mcp" in block, "the diagnostic must point at the re-run"
+    # After a deferred FAILURE dpkg already holds the package as configured, so
+    # `dpkg --configure` answers "already installed and configured": the only
+    # retry that respawns the worker is a fresh `dpkg -i` (code review, 2026-09-17).
+    assert "dpkg -i <the release .deb>" in block, "the diagnostic must point at the retry that works"
+    assert "dpkg --configure universal-db-mcp" not in block, "dpkg --configure is a dead end after a deferred failure"
     # The guard is live immediately: postinst reloads the manager (guarded,
     # container-safe) right after installing the drop-in.
     assert code.index("systemctl daemon-reload", guard_at) < spawn_at
