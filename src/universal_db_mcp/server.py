@@ -36,6 +36,7 @@ from sqlglot import exp
 from universal_db_mcp.config import AppConfig, ResolvedConnection
 from universal_db_mcp.connectors import registry
 from universal_db_mcp.connectors.base import (
+    ColumnInfo,
     ConnectorError,
     DatabaseConnector,
     DriverUnavailableError,
@@ -43,7 +44,7 @@ from universal_db_mcp.connectors.base import (
     ObjectNotFound,
     QuerySpec,
 )
-from universal_db_mcp.discovery.document import render_data_dictionary
+from universal_db_mcp.discovery.document import render_data_dictionary, render_table
 from universal_db_mcp.discovery.inference import TableFacts, TableRef, infer_relationships
 from universal_db_mcp.discovery.profile import (
     TOP_VALUES,
@@ -393,29 +394,42 @@ def _page(
     page_size: int,
 ) -> tuple[list[Any], str | None]:
     """Opaque, identity/policy/expiry-bound pagination."""
-    offset = 0
-    if cursor:
-        body = app.cursors.decode(
-            cursor,
-            expect_identity=app.identity,
-            expect_connection=connection_id,
-            expect_kind=kind,
-            policy_fingerprint=policy_fingerprint(policy),
-        )
-        offset = int(body.get("offset", 0))
+    offset = _cursor_offset(app, cursor, kind=kind, connection_id=connection_id, policy=policy)
     window = items[offset : offset + page_size]
     next_cursor = None
     if offset + page_size < len(items):
-        next_cursor = app.cursors.encode(
-            {
-                "offset": offset + page_size,
-                "identity": app.identity,
-                "connection_id": connection_id,
-                "kind": kind,
-                "policy": policy_fingerprint(policy),
-            }
-        )
+        next_cursor = _cursor_for(app, offset + page_size, kind=kind, connection_id=connection_id, policy=policy)
     return window, next_cursor
+
+
+def _cursor_offset(
+    app: AppContext, cursor: str | None, *, kind: str, connection_id: str, policy: EffectivePolicy
+) -> int:
+    if not cursor:
+        return 0
+    body = app.cursors.decode(
+        cursor,
+        expect_identity=app.identity,
+        expect_connection=connection_id,
+        expect_kind=kind,
+        policy_fingerprint=policy_fingerprint(policy),
+    )
+    return int(body.get("offset", 0))
+
+
+def _cursor_for(app: AppContext, offset: int, *, kind: str, connection_id: str, policy: EffectivePolicy) -> str:
+    """A cursor that resumes at ``offset``: tools that stop a page early (time
+    or byte budget) hand back exactly the position they reached, so no item
+    is skipped."""
+    return app.cursors.encode(
+        {
+            "offset": int(offset),
+            "identity": app.identity,
+            "connection_id": connection_id,
+            "kind": kind,
+            "policy": policy_fingerprint(policy),
+        }
+    )
 
 
 def _sensitive_output_names(policy: EffectivePolicy, ast: exp.Expression) -> frozenset[str]:
@@ -839,7 +853,7 @@ def build_server(app: AppContext) -> MCPServer:
                 st,
                 connection_id,
                 policy.engine,
-                {"columns": [c.__dict__ for c in window]},
+                {"columns": [{**c.__dict__, "default": _masked_default(policy, c)} for c in window]},
                 next_cursor=next_cursor,
                 returned_row_count=len(window),
                 truncated=next_cursor is not None,
@@ -1364,9 +1378,12 @@ def build_server(app: AppContext) -> MCPServer:
             # biggest tables first: that is where an index or a type change pays
             tables.sort(key=lambda t: (t.row_estimate is None, -(t.row_estimate or 0), (t.schema or "").lower(),
                                        t.name.lower()))
-            page, next_cursor = _page(
-                app, tables, cursor, kind=f"review:{schema or '*'}:{int(include_system)}",
-                connection_id=connection_id, policy=policy, page_size=size,
+            kind = f"review:{schema or '*'}:{int(include_system)}"
+            offset = _cursor_offset(app, cursor, kind=kind, connection_id=connection_id, policy=policy)
+            page = tables[offset : offset + size]
+            next_cursor = (
+                _cursor_for(app, offset + size, kind=kind, connection_id=connection_id, policy=policy)
+                if offset + size < len(tables) else None
             )
             budget = float(policy.discovery_time_budget_seconds)
             deadline = time.monotonic() + budget
@@ -1376,11 +1393,17 @@ def build_server(app: AppContext) -> MCPServer:
             by_severity: dict[str, int] = {}
             by_code: dict[str, int] = {}
             exhausted = False
+            used_bytes = 0
             st["connector"] = connector
-            for t in page:
+            for i, t in enumerate(page):
                 now = time.monotonic()
                 if now >= deadline:
                     exhausted = True
+                    st["warnings"].append(
+                        f"discovery time budget of {budget:.0f}s exhausted after {len(reviewed)} of {len(page)} "
+                        "tables; continue with the cursor"
+                    )
+                    next_cursor = _cursor_for(app, offset + i, kind=kind, connection_id=connection_id, policy=policy)
                     break
                 table_deadline = min(deadline, now + share)
                 try:
@@ -1389,24 +1412,31 @@ def build_server(app: AppContext) -> MCPServer:
                         columns=None, sample_rows=sample_rows, include_top_values=include_top_values,
                         deadline=table_deadline,
                     )
-                except (ToolFailure, ConnectorError) as exc:
+                except Exception as exc:  # noqa: BLE001 - one unreadable table must not end the review
                     st["warnings"].append(f"{t.schema}.{t.name}: {scrub_exception(exc)}")
                     continue
                 findings = data["findings"]
-                reviewed.append({
+                entry = {
                     "schema": t.schema, "name": t.name, "row_estimate": data["row_estimate"],
                     "sample_rows": data["sample"]["rows"], "findings": findings,
-                })
+                }
+                used_bytes += len(json.dumps(entry, default=str))
+                if used_bytes > policy.max_response_bytes and reviewed:
+                    # the ceiling binds the whole review, not each aggregate row;
+                    # resume exactly here rather than dropping tables silently
+                    exhausted = True
+                    st["warnings"].append(
+                        f"response byte ceiling (security.max_response_bytes) reached after {len(reviewed)} of "
+                        f"{len(page)} tables; continue with the cursor"
+                    )
+                    next_cursor = _cursor_for(app, offset + i, kind=kind, connection_id=connection_id, policy=policy)
+                    break
+                reviewed.append(entry)
                 for f in findings:
                     by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
                     by_code[f["code"]] = by_code.get(f["code"], 0) + 1
                     recommendations.append({"schema": t.schema, "table": t.name, **f})
             recommendations.sort(key=lambda r: (_SEVERITY_RANK.get(r["severity"], 9), r["code"], r["table"]))
-            if exhausted:
-                st["warnings"].append(
-                    f"discovery time budget of {budget:.0f}s exhausted after {len(reviewed)} of {len(page)} "
-                    "tables; continue with the cursor"
-                )
             st["row_count"] = len(reviewed)
             return _envelope(
                 st, connection_id, policy.engine,
@@ -1451,11 +1481,29 @@ def build_server(app: AppContext) -> MCPServer:
             size = max(1, min(int(page_size), _DOCUMENT_MAX_TABLES))
             tables = await _permitted_tables(app, connector, policy, schema, include_system)
             tables = sorted(tables, key=lambda t: ((t.schema or "").lower(), t.name.lower()))
-            page, next_cursor = _page(
-                app, tables, cursor, kind=f"document:{schema or '*'}:{int(include_indexes)}:{int(include_system)}",
-                connection_id=connection_id, policy=policy, page_size=size,
+            kind = f"document:{schema or '*'}:{int(include_indexes)}:{int(include_system)}"
+            offset = _cursor_offset(app, cursor, kind=kind, connection_id=connection_id, policy=policy)
+            page = tables[offset : offset + size]
+            next_cursor = (
+                _cursor_for(app, offset + size, kind=kind, connection_id=connection_id, policy=policy)
+                if offset + size < len(tables) else None
             )
             entries = await _catalog_tables(app, connection_id, policy, page, include_indexes)
+            # the byte ceiling binds the rendered document: keep whole tables and
+            # resume at the first one that did not fit
+            kept: list[dict[str, Any]] = []
+            used = 0
+            for i, entry in enumerate(entries):
+                used += len(render_table(entry)) + 2
+                if used > policy.max_response_bytes and kept:
+                    st["warnings"].append(
+                        f"response byte ceiling (security.max_response_bytes) reached after {len(kept)} of "
+                        f"{len(entries)} tables; continue with the cursor"
+                    )
+                    next_cursor = _cursor_for(app, offset + i, kind=kind, connection_id=connection_id, policy=policy)
+                    break
+                kept.append(entry)
+            entries = kept
             markdown = render_data_dictionary(connection_id, policy.engine, entries, schema=schema)
             st["row_count"] = len(entries)
             return _envelope(
@@ -1469,6 +1517,7 @@ def build_server(app: AppContext) -> MCPServer:
                     "marked 'sensitive' come from the security.mask_columns name heuristic.",
                 },
                 next_cursor=next_cursor,
+                warnings=st["warnings"],
             )
 
     register(
@@ -1816,6 +1865,14 @@ def _sensitive(policy: EffectivePolicy, name: str) -> bool:
     return any(p.search(name) for p in policy.sensitive_patterns)
 
 
+def _masked_default(policy: EffectivePolicy, col: ColumnInfo) -> Any:
+    """A sensitive column's DEFAULT literal is a value too (legacy schemas
+    carry `password ... DEFAULT 'changeme'`); it is hidden like row values."""
+    if col.default is not None and _sensitive(policy, col.name):
+        return "<masked>"
+    return col.default
+
+
 async def _catalog_tables(
     app: AppContext, connection_id: str, policy: EffectivePolicy, page: list[Any], include_indexes: bool
 ) -> list[dict[str, Any]]:
@@ -1858,7 +1915,7 @@ async def _catalog_tables(
                     "data_type": c.data_type,
                     **portable_type(policy.engine, c.data_type).as_dict(),
                     "nullable": c.nullable,
-                    "default": c.default,
+                    "default": _masked_default(policy, c),
                     "comment": c.comment,
                     "in_primary_key": bool(pk and c.name in pk),
                     "sensitive": _sensitive(policy, c.name),
@@ -2023,22 +2080,52 @@ def _redact_foreign_target(policy: EffectivePolicy, key: KeyInfo) -> dict[str, A
 
 def _unquote_identifier(part: str) -> str:
     part = part.strip()
-    quoted = len(part) >= 2 and (
-        (part[0] == part[-1] and part[0] in ('"', '`')) or (part[0] == "[" and part[-1] == "]")
-    )
-    if quoted:
-        return part[1:-1]
+    if len(part) >= 2 and part[0] == part[-1] and part[0] in ('"', '`'):
+        return part[1:-1].replace(part[0] * 2, part[0])
+    if len(part) >= 2 and part[0] == "[" and part[-1] == "]":
+        return part[1:-1].replace("]]", "]")
     return part
+
+
+def _split_dotted(name: str) -> list[str]:
+    """Split on dots that are OUTSIDE quotes ("a.b" is one identifier;
+    doubled quotes inside a quoted part are literal)."""
+    parts: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if quote:
+            closing = "]" if quote == "[" else quote
+            if ch == closing:
+                if name[i + 1 : i + 2] == closing:  # doubled closer = literal
+                    cur.append(ch + ch)
+                    i += 2
+                    continue
+                quote = None
+            cur.append(ch)
+        elif ch in ('"', "`", "["):
+            quote = ch
+            cur.append(ch)
+        elif ch == ".":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return parts
 
 
 def _split_qualified_name(schema: str | None, object_name: str) -> tuple[str | None, str]:
     """Accept ``schema.table`` (optionally quoted parts) in ``object_name``.
 
-    A three-part name is refused: the database is fixed by the connection,
-    so ``db.schema.table`` cannot be honoured and must not be silently
-    reinterpreted. When both the ``schema`` argument and a qualified name are
-    given they have to agree."""
-    parts = object_name.split(".") if "." in object_name else [object_name]
+    Dots inside quotes belong to the identifier. A three-part name is
+    refused: the database is fixed by the connection, so ``db.schema.table``
+    cannot be honoured and must not be silently reinterpreted. When both the
+    ``schema`` argument and a qualified name are given they have to agree."""
+    parts = _split_dotted(object_name)
     if len(parts) == 1:
         return schema, _unquote_identifier(object_name)
     if len(parts) != 2 or not all(p.strip() for p in parts):

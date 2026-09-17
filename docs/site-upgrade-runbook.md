@@ -77,8 +77,14 @@ grep -c -- --force-reinstall /usr/local/lib/udbmcp-trust/install_offline.sh   # 
 ```
 
 It installs `verify_bundle.py`, `profiles.py`, `install_offline.sh`,
-`lib/os_packages.sh` to `/usr/local/lib/udbmcp-trust/` and the release
-public key to `/etc/universal-db-mcp/keys/release.pub.pem`. Safe to repeat.
+`lib/os_packages.sh` to `/usr/local/lib/udbmcp-trust/`, and prints the
+SHA-256 fingerprint of the release public key on the stick. On a machine
+that already has a key installed it compares the two: the same key is left
+in place; a DIFFERENT key makes it stop, because a stick that carried its
+own key, verifier and package would otherwise verify itself. Only when
+your release administrator has confirmed the new fingerprint out-of-band
+(by phone, in person, on paper) re-run it with `--rotate-key`. Safe to
+repeat.
 
 ## Path A: upgrade in place
 
@@ -158,7 +164,7 @@ sudo cp -a /etc/systemd/system/universal-db-mcp.service "$B/" 2>/dev/null || tru
 sudo cp -a /etc/systemd/system/universal-db-mcp.service.d "$B/" 2>/dev/null || true
 sudo cp -a /var/log/universal-db-mcp "$B/audit-log" 2>/dev/null || true       # audit trail
 sudo cp -a /var/lib/universal-db-mcp "$B/state" 2>/dev/null || true           # metadata cache, demo db
-cp -a ~/.universal-db-mcp "$B-user" 2>/dev/null || true                        # your per-user config (not touched by purge)
+cp -a ~/.universal-db-mcp ~/udbmcp-user-backup-$(date +%F-%H%M) 2>/dev/null || true   # your per-user config (purge never touches it)
 sudo ls "$B"
 ```
 

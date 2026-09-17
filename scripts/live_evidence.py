@@ -48,7 +48,8 @@ def _short(value: Any, n: int = 60) -> str:
     return text if len(text) <= n else text[: n - 3] + "..."
 
 
-def session_evidence(server: Any, conn_ids: list[str], policy_note: str) -> str:
+def session_evidence(server: Any, conn_ids: list[str], policy_note: str) -> tuple[str, dict[str, dict[str, Any]]]:
+    reports: dict[str, dict[str, Any]] = {}
     out = [
         "# Session safety profile: live read-back through the connectors' health_check",
         f"date_utc: {dt.datetime.now(dt.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}",
@@ -64,6 +65,7 @@ def session_evidence(server: Any, conn_ids: list[str], policy_note: str) -> str:
             continue
         data = env.get("data", env)
         s = data.get("session") or {}
+        reports[cid] = s
         out.append(f"== {cid}: healthy={data.get('healthy')} version={_short(data.get('server_version'), 40)}")
         if data.get("detail"):
             out.append(f"   detail={_short(data.get('detail'), 160)}")
@@ -77,20 +79,30 @@ def session_evidence(server: Any, conn_ids: list[str], policy_note: str) -> str:
             out.append(f"   skipped={s.get('skipped')}")
         out.append(f"   server_reports={s.get('server_reports')}")
         out.append("")
-    return "\n".join(out) + "\n"
+    return "\n".join(out) + "\n", reports
 
 
 SERVER_SIDE_READ_ONLY = ("postgres", "mysql", "clickhouse", "sqlite")
+_WRITE_ACCEPTED = False
 
 
-def write_refusal_evidence(app: AppContext, server: Any, conn_ids: list[str]) -> str:
+def write_refusal_evidence(
+    app: AppContext, server: Any, conn_ids: list[str], reports: dict[str, dict[str, Any]], *, allow_ddl: bool
+) -> str:
     """Send a CREATE TABLE straight to the connector (guard bypassed on
-    purpose) where the session profile pins a SERVER-side read-only; on the
-    engines without one the guard is the only barrier and no write is ever
-    attempted against the fixture."""
+    purpose) ONLY where the session profile pinned a SERVER-side read-only
+    and the connector reports it as enforced: the probe proves the server
+    refuses, it never relies on being lucky. Engines without a server-side
+    read-only, and connections whose profile did not apply it, are never
+    probed. If a server ever accepts the DDL the probe table is dropped
+    again and the run exits non-zero."""
     from universal_db_mcp.connectors.base import QuerySpec
 
     out = ["== server-side write refusal (SQL guard bypassed on purpose)"]
+    if not allow_ddl:
+        out.append("   not run: pass --i-know-this-sends-ddl (the probe sends DDL to every listed connection)")
+        return "\n".join(out) + "\n"
+    accepted: list[str] = []
     for cid in conn_ids:
         conn = app.connectors.get(cid)
         engine = app.resolved[cid].config.type
@@ -100,6 +112,15 @@ def write_refusal_evidence(app: AppContext, server: Any, conn_ids: list[str]) ->
         if engine not in SERVER_SIDE_READ_ONLY:
             out.append(
                 f"   {cid} ({engine}): not applicable, no session-level read-only exists; the SQL guard enforces"
+            )
+            continue
+        # the health check's report comes from the connection's own thread; a
+        # session_report() taken here would read this thread's empty status
+        report = reports.get(cid) or {}
+        if not conn.session_profile.enforce_read_only or not report.get("read_only_enforced"):
+            out.append(
+                f"   {cid} ({engine}): NOT PROBED - the server-side read-only is not enforced on this "
+                "connection (session.enforce_read_only / read_only), so a write could succeed"
             )
             continue
         ddl = "CREATE TABLE udbmcp_ro_probe_zz (x INT)"
@@ -112,9 +133,22 @@ def write_refusal_evidence(app: AppContext, server: Any, conn_ids: list[str]) ->
                     raw.execute(ddl)
             else:
                 conn.execute_query(QuerySpec(sql=ddl, max_rows=1, timeout_seconds=15))
-            out.append(f"   {cid} ({engine}): NOT REFUSED - the server accepted a write (investigate)")
+            accepted.append(cid)
+            out.append(f"   {cid} ({engine}): NOT REFUSED - the server accepted a write; probe table dropped again")
+            try:
+                if engine == "postgres":
+                    with conn._shared_meta_conn() as raw:  # noqa: SLF001
+                        raw.execute("DROP TABLE udbmcp_ro_probe_zz")
+                else:
+                    conn.execute_query(QuerySpec(sql="DROP TABLE udbmcp_ro_probe_zz", max_rows=1, timeout_seconds=15))
+            except Exception as exc:  # noqa: BLE001
+                out.append(f"   {cid} ({engine}): DROP of the probe table failed too: {type(exc).__name__}")
         except Exception as exc:  # noqa: BLE001 - the refusal IS the evidence
             out.append(f"   {cid} ({engine}): refused -> {type(exc).__name__}: {str(exc)[:150]}")
+    if accepted:
+        out.append(f"   FAILED: {len(accepted)} connection(s) accepted a write: {accepted}")
+        global _WRITE_ACCEPTED
+        _WRITE_ACCEPTED = True
     if "mock_db2" in conn_ids and app.connectors.get("mock_db2") is not None:
         try:
             got = app.connectors["mock_db2"].execute_query(
@@ -242,7 +276,13 @@ def main() -> int:
     ap.add_argument("--config", default="config.mockdbs.yaml")
     ap.add_argument("--search", default="user12@", help="value to look for across every connection")
     ap.add_argument("--only", nargs="*", help="connection ids (default: all)")
+    ap.add_argument(
+        "--i-know-this-sends-ddl", action="store_true",
+        help="run the write-refusal probe (a CREATE TABLE sent past the SQL guard to every connection whose "
+        "server-side read-only is enforced). Implied for the default mock config; required for any other.",
+    )
     args = ap.parse_args()
+    allow_ddl = args.i_know_this_sends_ddl or Path(args.config).name == "config.mockdbs.yaml"
     app_cfg, resolved = load_resolved(Path(args.config))
     app = AppContext(app_cfg, resolved)
     server = build_server(app)
@@ -252,12 +292,16 @@ def main() -> int:
     ev = ROOT / "test-evidence"
     (ev / "session-safety").mkdir(parents=True, exist_ok=True)
     (ev / "discovery-tools").mkdir(parents=True, exist_ok=True)
-    s = session_evidence(server, conn_ids, note) + "\n" + write_refusal_evidence(app, server, conn_ids)
+    session_text, reports = session_evidence(server, conn_ids, note)
+    s = session_text + "\n" + write_refusal_evidence(app, server, conn_ids, reports, allow_ddl=allow_ddl)
     (ev / "session-safety" / "results.txt").write_text(s, encoding="utf-8")
     print(s)
     d = discovery_evidence(server, conn_ids, args.search)
     (ev / "discovery-tools" / "results.txt").write_text(d, encoding="utf-8")
     print(d)
+    if _WRITE_ACCEPTED:
+        print("FAILED: a server accepted a write on a connection that claimed server-side read-only", file=sys.stderr)
+        return 1
     return 0
 
 

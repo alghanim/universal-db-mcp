@@ -20,7 +20,8 @@ def _seed(db: Path) -> None:
     c.executescript(
         """
         CREATE TABLE customers (
-            customer_id INTEGER PRIMARY KEY, email TEXT, region TEXT, ssn TEXT, note TEXT, balance REAL);
+            customer_id INTEGER PRIMARY KEY, email TEXT, region TEXT, ssn TEXT DEFAULT 'unknown',
+            note TEXT, balance REAL);
         CREATE TABLE orders (
             order_id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(customer_id), total REAL);
         CREATE INDEX ix_orders_customer ON orders(customer_id);
@@ -313,3 +314,80 @@ def test_document_schema_renders_a_data_dictionary_without_values(server: Any) -
     assert "user12@" not in md and "123-45-0007" not in md
     two = _call(server, "db_document_schema", {"connection_id": "shop", "page_size": 2})
     assert two["data"]["tables"] == 2 and two["next_cursor"]
+
+
+def test_sensitive_column_defaults_are_masked_in_every_metadata_path(server: Any) -> None:
+    """A DEFAULT literal is a value too (legacy schemas: password DEFAULT 'changeme')."""
+    cat = _call(server, "db_get_catalog", {"connection_id": "shop"})["data"]["tables"]
+    ssn = next(c for t in cat if t["name"] == "customers" for c in t["columns"] if c["name"] == "ssn")
+    assert ssn["default"] == "<masked>" and ssn["sensitive"] is True
+    email = next(c for t in cat if t["name"] == "customers" for c in t["columns"] if c["name"] == "email")
+    assert email["default"] is None
+    cols = _call(server, "db_list_columns", {"connection_id": "shop", "object_name": "customers"})["data"]["columns"]
+    assert next(c for c in cols if c["name"] == "ssn")["default"] == "<masked>"
+    md = _call(server, "db_document_schema", {"connection_id": "shop"})["data"]["markdown"]
+    assert "'unknown'" not in md and "| ssn | TEXT |" in md and "<masked>" in md
+
+
+def test_review_byte_ceiling_stops_a_page_and_resumes_exactly_there(tmp_path: Path) -> None:
+    db = tmp_path / "shop.db"
+    _seed(db)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "application:\n  transport: stdio\n"
+        f"  audit_path: {tmp_path / 'audit.jsonl'}\n"
+        f"  metadata_cache_path: {tmp_path / 'cache.sqlite'}\n"
+        "security:\n  max_response_bytes: 700\n"
+        f"connections:\n  shop:\n    type: sqlite\n    database: {db}\n",
+        encoding="utf-8",
+    )
+    app_cfg, resolved = load_resolved(cfg)
+    srv = build_server(AppContext(app_cfg, resolved))
+    seen: list[str] = []
+    cursor = None
+    for _ in range(10):
+        env = _call(srv, "db_review_schema", {"connection_id": "shop", "sample_rows": 20, "cursor": cursor})
+        seen += [t["name"] for t in env["data"]["tables"]]
+        if env["data"]["budget_exhausted"]:
+            assert any("byte ceiling" in w for w in env.get("warnings", []))
+        cursor = env.get("next_cursor")
+        if not cursor:
+            break
+    assert sorted(seen) == sorted({"customers", "orders", "order_items", "products"}), seen
+    assert len(seen) == len(set(seen)), "a table was reviewed twice or skipped"
+
+
+def test_review_survives_one_unreadable_table(server: Any, monkeypatch: Any) -> None:
+    import universal_db_mcp.server as srv_mod
+
+    real = srv_mod._profile_object
+
+    async def flaky(app: Any, cid: Any, connector: Any, policy: Any, st: Any, schema: Any, name: Any, **kw: Any) -> Any:
+        if name == "orders":
+            raise RuntimeError("no such table: main.orders")  # a raw driver error, not a ConnectorError
+        return await real(app, cid, connector, policy, st, schema, name, **kw)
+
+    monkeypatch.setattr(srv_mod, "_profile_object", flaky)
+    env = _call(server, "db_review_schema", {"connection_id": "shop", "sample_rows": 20})
+    names = {t["name"] for t in env["data"]["tables"]}
+    assert "orders" not in names and {"customers", "order_items", "products"} <= names
+    assert any("orders" in w for w in env["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [
+        ('"odd.name"', (None, "odd.name")),
+        ('main."a.b"', ("main", "a.b")),
+        ('"my schema"."t"', ("my schema", "t")),
+        ('[dbo].[a.b]', ("dbo", "a.b")),
+        ('`s`.`t`', ("s", "t")),
+        ('"say ""hi""".t', ('say "hi"', "t")),
+        ("plain", (None, "plain")),
+        ("s.t", ("s", "t")),
+    ],
+)
+def test_qualified_name_splitting_respects_quotes(spelling: str, expected: tuple[str | None, str]) -> None:
+    from universal_db_mcp.server import _split_qualified_name
+
+    assert _split_qualified_name(None, spelling) == expected

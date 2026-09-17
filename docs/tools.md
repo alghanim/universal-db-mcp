@@ -90,7 +90,10 @@ without hand-written queries, then document or extract from them:
 7. `db_document_schema` is the documentation pass in one call: a Markdown
    data dictionary rendered from the same catalog `db_get_catalog` returns,
    page by page, with declared relationships listed per page. No table data
-   is read and no column value appears in it.
+   is read and no row value appears in it; a sensitive column's DEFAULT
+   literal is shown as `<masked>` (in `db_get_catalog` and `db_list_columns`
+   too), and names or comments from the database are escaped so they cannot
+   change the document's structure.
 
 What they never do: read table data for the catalog or inference tools,
 return values of columns matching `security.mask_columns`, search or infer
