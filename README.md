@@ -37,7 +37,7 @@ scripts/install_offline.sh out/bundle/universal-db-mcp-*/ /opt/universal-db-mcp
 | --- | --- |
 | `docs/architecture.md` | components, data flow, process boundaries |
 | `docs/security.md` | threat model, policy, secrets, TLS |
-| `docs/tools.md` | MCP tool contract (25 `db_*` tools incl. discovery for federated ETL/docs/optimization) |
+| `docs/tools.md` | MCP tool contract (27 `db_*` tools incl. discovery, review and documentation for federated ETL/docs/optimization) |
 | `docs/session-safety.md` | what every connection does to the server session so agent reads cannot hurt production (Db2 UR, server-side read-only, ceilings) |
 | `docs/oracle-connect-modes.md` | Oracle thick mode (legacy password verifiers), SID and TNS alias connections, TLS |
 | `docs/db2-tls-setup.md` | Db2 TLS enablement runbook |

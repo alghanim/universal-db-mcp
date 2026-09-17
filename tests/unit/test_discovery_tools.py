@@ -264,3 +264,52 @@ def test_three_part_and_disagreeing_object_names_are_refused(server: Any) -> Non
         _call(server, "db_profile_table", {"connection_id": "shop", "object_name": "main.orders", "schema": "other"})
     with pytest.raises(Exception, match="not a permitted object"):
         _call(server, "db_profile_table", {"connection_id": "shop", "object_name": "nope.orders"})
+
+
+def test_review_schema_profiles_every_table_and_prioritizes_findings(server: Any) -> None:
+    env = _call(server, "db_review_schema", {"connection_id": "shop", "sample_rows": 50})
+    data = env["data"]
+    names = {t["name"] for t in data["tables"]}
+    assert {"customers", "orders", "order_items", "products"} <= names
+    assert data["summary"]["tables_reviewed"] == len(data["tables"]) == data["summary"]["tables_in_scope"]
+    codes = {r["code"] for r in data["recommendations"]}
+    # the seed's only foreign key is indexed, so the unindexed-key rule cannot
+    # fire here (it is pinned in test_discovery_logic); the review must carry
+    # the metadata finding on order_items and the sampling notice
+    assert {"no_primary_key", "sampled"} <= codes
+    assert any(r["table"] == "order_items" and r["code"] == "no_primary_key" for r in data["recommendations"])
+    ranks = [{"high": 0, "medium": 1, "low": 2, "info": 3}[r["severity"]] for r in data["recommendations"]]
+    assert ranks == sorted(ranks), "recommendations must be ordered by severity"
+    assert all("evidence" in r and "suggestion" in r and "table" in r for r in data["recommendations"])
+    assert data["budget_exhausted"] is False
+    # the sensitive column is never profiled for values, only counted
+    cust = next(t for t in data["tables"] if t["name"] == "customers")
+    assert cust["sample_rows"] > 0
+    assert env.get("warnings") and any("ssn" in w for w in env["warnings"])
+
+
+def test_review_schema_pages_and_binds_the_cursor(server: Any) -> None:
+    first = _call(server, "db_review_schema", {"connection_id": "shop", "max_tables": 2, "sample_rows": 20})
+    assert len(first["data"]["tables"]) == 2 and first["next_cursor"]
+    second = _call(
+        server, "db_review_schema",
+        {"connection_id": "shop", "max_tables": 2, "sample_rows": 20, "cursor": first["next_cursor"]},
+    )
+    assert {t["name"] for t in first["data"]["tables"]}.isdisjoint({t["name"] for t in second["data"]["tables"]})
+    with pytest.raises(Exception, match="cursor"):
+        _call(server, "db_get_catalog", {"connection_id": "shop", "cursor": first["next_cursor"]})
+
+
+def test_document_schema_renders_a_data_dictionary_without_values(server: Any) -> None:
+    env = _call(server, "db_document_schema", {"connection_id": "shop"})
+    md = env["data"]["markdown"]
+    assert env["data"]["format"] == "markdown" and env["data"]["tables"] == env["data"]["table_count"]
+    assert "# Data dictionary: shop (sqlite)" in md
+    assert "## main.customers" in md and "## main.orders" in md
+    assert "| ssn |" in md and "sensitive (masked)" in md
+    assert "FK -> main.customers(customer_id)" in md  # the seed references customers.customer_id
+    assert "Primary key: id" in md
+    # no row VALUE from the seeded data leaks into a metadata-only document
+    assert "user12@" not in md and "123-45-0007" not in md
+    two = _call(server, "db_document_schema", {"connection_id": "shop", "page_size": 2})
+    assert two["data"]["tables"] == 2 and two["next_cursor"]

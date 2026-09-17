@@ -1,5 +1,5 @@
 # Discovery tools: live run through the MCP server against the local fixtures
-date_utc: 2026-09-16T20:39:18Z
+date_utc: 2026-09-17T00:50:42Z
 
 == mock_clickhouse
   catalog: 3 tables; cdr: pk=['started_at', 'caller_msisdn'] cols=9 idx=1 fks=[]
@@ -11,6 +11,11 @@ date_utc: 2026-09-16T20:39:18Z
      duration_sec [numeric] null=0.0 distinct=500 maxlen=None min=5 top=[]
      caller_msisdn [string] null=0.0 distinct=5 maxlen=12 min="971501000001" top=["971501000003", "971501000004", "971501000001", "9715010...
   indexes in schema: 3
+  review: reviewed=3/3 by_severity={'info': 5} by_code={'low_cardinality': 4, 'sampled': 1} budget_exhausted=False
+     info   low_cardinality                  cdr.caller_msisdn: 5 distinct values across 500 sampled rows
+     info   low_cardinality                  cdr.cell_id: 5 distinct values across 500 sampled rows
+     info   low_cardinality                  cdr.direction: 2 distinct values across 500 sampled rows
+  document: 3 tables rendered, 2105 chars, sections=4 next_cursor=no
 
 == mock_db2
   catalog: 3 tables; CITIZENS: pk=['CITIZEN_ID'] cols=7 idx=2 fks=[]
@@ -22,6 +27,11 @@ date_utc: 2026-09-16T20:39:18Z
      DATE_OF_BIRTH [temporal] null=0.0 distinct=6 maxlen=None min="1968-01-30" top=["1968-01-30", "1992-06-25", "1988-04-08", "1985-03-12", ...
      SEX [string] null=0.0 distinct=2 maxlen=1 min="F" top=["F", "M"]
   indexes in schema: 5
+  review: reviewed=3/3 by_severity={'low': 3, 'medium': 2} by_code={'statistics_missing': 3, 'foreign_key_without_index': 2} budget_exhausted=False warnings=['sensitive column(s) profiled for null ratio only (values never returned): NATIONAL_ID']
+     medium foreign_key_without_index        RESIDENCY_PERMITS.CITIZEN_ID: foreign key SQL260911182059310 on (CITIZEN_ID) has no index whose lead
+     medium foreign_key_without_index        VEHICLE_REGISTRATIONS.CITIZEN_ID: foreign key SQL260911182059370 on (CITIZEN_ID) has no index whose lead
+     low    statistics_missing               CITIZENS.-: the catalog reports no statistics collection time (stats_time is empty
+  document: 3 tables rendered, 2548 chars, sections=4 next_cursor=no
 
 == mock_mssql
   FAILED ToolError: Error executing tool db_get_catalog: CONNECTION_ERROR: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see
@@ -30,12 +40,16 @@ date_utc: 2026-09-16T20:39:18Z
   catalog: 2 tables; cuppings: pk=['cupping_id'] cols=5 idx=2 fks=['cuppings_ibfk_1']
   portable types in cuppings: ['decimal', 'integer', 'string']
   declared types (first 6): ['int', 'int', 'varchar(60)', 'decimal(4,2)', 'varchar(200)']
-  profile: sample=6 row_estimate=6 findings=[]
+  profile: sample=6 row_estimate=6 findings=['statistics_missing']
      cupping_id [numeric] null=0.0 distinct=6 maxlen=None min=1 top=[1, 2, 3, 4, 5]
      batch_id [numeric] null=0.0 distinct=5 maxlen=None min=1 top=[1, 2, 3, 4, 5]
      taster [string] null=0.0 distinct=3 maxlen=11 min="L. Osei" top=["R. Haddad", "T. Nakamura", "L. Osei"]
      score [numeric] null=0.0 distinct=6 maxlen=None min="82.50" top=["88.50", "87.25", "85.75", "91.00", "82.50"]
   indexes in schema: 3
+  review: reviewed=2/2 by_severity={'low': 2} by_code={'statistics_missing': 2} budget_exhausted=False
+     low    statistics_missing               cuppings.-: the catalog reports no statistics collection time (last_update is empt
+     low    statistics_missing               roastery_batches.-: the catalog reports no statistics collection time (last_update is empt
+  document: 2 tables rendered, 1634 chars, sections=3 next_cursor=no
 
 == mock_oracle
   catalog: 4 tables; BOARDING_PASSES: pk=['PASS_ID'] cols=5 idx=1 fks=['SYS_C008677']
@@ -47,6 +61,11 @@ date_utc: 2026-09-16T20:39:18Z
      SEAT [string] null=None distinct=0 maxlen=None min=null top=[]
      GATE [string] null=None distinct=0 maxlen=None min=null top=[]
   indexes in schema: 5
+  review: reviewed=4/4 by_severity={'medium': 3, 'low': 1} by_code={'foreign_key_without_index': 3, 'statistics_missing': 1} budget_exhausted=False warnings=['the sample returned no rows (empty table, or the account cannot read it): column measures are absent and only metadata findings apply']
+     medium foreign_key_without_index        BOARDING_PASSES.BOOKING_ID: foreign key SYS_C008677 on (BOOKING_ID) has no index whose leading col
+     medium foreign_key_without_index        BOOKINGS.TRAVELLER_ID: foreign key SYS_C008671 on (TRAVELLER_ID) has no index whose leading c
+     medium foreign_key_without_index        BOOKINGS.FLIGHT_ID: foreign key SYS_C008672 on (FLIGHT_ID) has no index whose leading colu
+  document: 4 tables rendered, 3143 chars, sections=5 next_cursor=no
 
 == mock_pg
   catalog: 4 tables; buoys: pk=['buoy_id'] cols=6 idx=2 fks=[]
@@ -58,6 +77,11 @@ date_utc: 2026-09-16T20:39:18Z
      region [string] null=0.0 distinct=3 maxlen=12 min="Arabian Sea" top=["Arabian Sea", "Gulf of Oman", "Red Sea"]
      lat [numeric] null=0.0 distinct=3 maxlen=None min=20.1222 top=[24.4111, 22.4111, 20.1222]
   indexes in schema: 3
+  review: reviewed=3/4 by_severity={'medium': 1, 'low': 3, 'high': 1} by_code={'foreign_key_without_index': 1, 'statistics_missing': 3, 'no_primary_key': 1} budget_exhausted=False warnings=['the sample returned no rows (empty table, or the account cannot read it): column measures are absent and only metadata findings apply', 'reporting.secret: ConnectorError: InsufficientPrivilege: permission denied for table secret']
+     high   no_primary_key                   demo.-: no primary key (or ClickHouse sorting key) is declared
+     medium foreign_key_without_index        readings.buoy_id: foreign key readings_buoy_id_fkey on (buoy_id) has no index whose lead
+     low    statistics_missing               buoys.-: the catalog reports no statistics collection time (last_analyze is emp
+  document: 4 tables rendered, 2031 chars, sections=5 next_cursor=no
 
 == cross-connection search
   query='gulf' hits=2 tables_searched=13 warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]

@@ -125,7 +125,7 @@ registration is written by hand, as above.
 ```
 
 The probe is an MCP client over the pinned SDK: it initializes the server,
-lists the 25 tools, and runs one themed query per configured engine. On a
+lists the 27 tools, and runs one themed query per configured engine. On a
 healthy deployment it reports `status: passed`; per-engine `KNOWN-BLOCKED`
 entries name the specific missing administrator prerequisite (e.g. the SQL
 Server ODBC driver package).

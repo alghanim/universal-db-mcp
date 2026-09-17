@@ -173,6 +173,25 @@ def discovery_evidence(server: Any, conn_ids: list[str], search_query: str) -> s
                     )
             idx = _call(server, "db_list_indexes", {"connection_id": cid})["data"]["indexes"]
             out.append(f"  indexes in schema: {len(idx)}")
+            rev = _call(server, "db_review_schema", {"connection_id": cid, "max_tables": 10, "sample_rows": 500})
+            rd = rev["data"]
+            out.append(
+                f"  review: reviewed={rd['summary']['tables_reviewed']}/{rd['summary']['tables_in_scope']} "
+                f"by_severity={rd['summary']['by_severity']} by_code={rd['summary']['by_code']} "
+                f"budget_exhausted={rd['budget_exhausted']}"
+                + (f" warnings={rev.get('warnings')}" if rev.get("warnings") else "")
+            )
+            for r in rd["recommendations"][:3]:
+                out.append(
+                    f"     {r['severity']:<6} {r['code']:<32} {r['table']}.{r.get('column') or '-'}: "
+                    f"{r['evidence'][:70]}"
+                )
+            doc = _call(server, "db_document_schema", {"connection_id": cid, "page_size": 10})
+            md = doc["data"]["markdown"]
+            out.append(
+                f"  document: {doc['data']['tables']} tables rendered, {len(md)} chars, "
+                f"sections={md.count(chr(10) + '## ')} next_cursor={'yes' if doc.get('next_cursor') else 'no'}"
+            )
         except Exception as exc:  # noqa: BLE001 - recorded, not hidden
             out.append(f"  FAILED {type(exc).__name__}: {str(exc)[:240]}")
         out.append("")

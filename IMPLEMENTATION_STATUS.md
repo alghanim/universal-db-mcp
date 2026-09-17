@@ -465,10 +465,28 @@ Known and NOT fixed here, now documented rather than implied away:
   because python-oracledb's thin mode cannot connect to that server version
   at all (DPY-3010); the thick rows ran the same probe inside a no-network
   container with the administrator-supplied Instant Client. The SQL Server
-  rows carry `probe_rev: unknown` because the Gate C client container has
-  no git checkout; the runners now pass the revision in (VM_PROBE_REV) for
-  the next run. A version not listed here is `not_run`, not "works".
+  rows were re-run on 2026-09-17 at 332b7e2 (identical connector source)
+  after the runner learned to pass the revision into the Gate C client
+  container (VM_PROBE_REV); they pass 21/22 with the stamp. A version not
+  listed here is `not_run`, not "works".
 
+- **Schema-wide review and documentation (2026-09-17)**: two tools on top
+  of the same building blocks, taking the surface to 27: `db_review_schema`
+  runs the per-table profile and findings over every permitted table of a
+  schema or connection (biggest tables first, one
+  `security.discovery_time_budget_seconds` budget shared fairly across the
+  page, paged by cursor) and returns findings prioritized by severity, each
+  with evidence and a suggestion; `db_document_schema` renders a Markdown
+  data dictionary from the catalog (declared and portable types, keys,
+  indexes, comments, declared relationships) page by page, metadata only.
+  Unit-tested on the seeded SQLite database (`tests/unit/test_discovery_tools.py`,
+  `tests/unit/test_data_dictionary.py`); live in
+  `test-evidence/discovery-tools/results.txt`: the review reported
+  unindexed foreign keys on the Db2 and Oracle fixtures, missing statistics
+  on Db2/MySQL/PostgreSQL and enum candidates on ClickHouse, and the
+  dictionary rendered every fixture schema without a column value in it.
+  The 25-tool pins (protocol probe, stdio integration test, agent
+  descriptions) were moved to 27.
 - **Release artifacts of this pass (built from commit ebd5f34; this note
   was added in the following docs-only commit)**: signed bundles for
   `linux-x86_64-ubuntu24.04-cp312` and `macos-arm64-cp312` with

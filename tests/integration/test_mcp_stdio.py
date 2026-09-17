@@ -43,6 +43,8 @@ EXPECTED_TOOLS = {
     "db_profile_table",
     "db_search_values",
     "db_infer_relationships",
+    "db_review_schema",
+    "db_document_schema",
 }
 
 

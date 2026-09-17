@@ -47,6 +47,8 @@ stable category:
 | `db_profile_table` | `object_name` accepts `table` or `schema.table` (every tool that names an object does); bounded data profile over the connector's sample (null ratio, distinct, min/max cut to 200 characters, character lengths, top values) + evidence-backed findings; sensitive columns return counts only; a profile whose aggregate row exceeds `security.max_response_bytes` is a `LIMIT` error, never a silent row of nulls |
 | `db_search_values` | a value searched across permitted tables of many connections without SQL; the query is literal text (`%`, `_` and `[` are escaped, never wildcards); per-table hits, time budget clamped to the policy, per-table timeout, response byte ceiling, system schemas and sensitive columns excluded; one unreachable connection is a warning, not a failure |
 | `db_infer_relationships` | declared foreign keys + inferred join candidates (name/type match, `<table>_id` convention) within and across connections, metadata only |
+| `db_review_schema` | optimization review of a schema or whole connection: every permitted table profiled on a bounded sample under one time budget (biggest tables first, paged), findings prioritized by severity with evidence and a suggestion; `sensitive` columns counted only |
+| `db_document_schema` | Markdown data dictionary of a schema or whole connection (paged): columns with declared and portable types, nullability, defaults, keys, indexes, comments, declared relationships; metadata only |
 
 ## Discovery tools for federated work (ETL, documentation, optimization)
 
@@ -79,6 +81,16 @@ without hand-written queries, then document or extract from them:
    (`docs/session-safety.md`), so a search over production never holds locks
    or runs unbounded.
 5. `db_list_indexes` supports the optimization pass directly.
+6. `db_review_schema` is the optimization pass in one call: the per-table
+   profile and findings of `db_profile_table` over every permitted table
+   of a schema (or connection), biggest first, under one
+   `security.discovery_time_budget_seconds` budget, with a
+   `recommendations` list sorted by severity. Its output is a review to
+   act on, never a change: nothing in this server alters a database.
+7. `db_document_schema` is the documentation pass in one call: a Markdown
+   data dictionary rendered from the same catalog `db_get_catalog` returns,
+   page by page, with declared relationships listed per page. No table data
+   is read and no column value appears in it.
 
 What they never do: read table data for the catalog or inference tools,
 return values of columns matching `security.mask_columns`, search or infer
