@@ -487,31 +487,43 @@ Known and NOT fixed here, now documented rather than implied away:
   dictionary rendered every fixture schema without a column value in it.
   The 25-tool pins (protocol probe, stdio integration test, agent
   descriptions) were moved to 27.
-- **Release artifacts (built from commit 4d830b6; this note was added in
+- **Security review and hardening (2026-09-17)**: `/security-review` (two
+  independent identification passes, four candidates verified one by one)
+  found no HIGH or MEDIUM vulnerability in the session's changes; every
+  candidate was a false positive under the review's rules. The hardening
+  it recommended was applied anyway in commit e980058: a sensitive
+  column's DEFAULT literal is `<masked>` in `db_get_catalog`,
+  `db_list_columns` and the data dictionary; `db_review_schema` and
+  `db_document_schema` are bounded by `security.max_response_bytes` and
+  resume exactly where a page stopped (time or bytes), one unreadable
+  table is a warning; quoted object names keep their dots; every name and
+  comment in the data dictionary is escaped; the evidence script's write
+  probe runs only where the health check proved server-side read-only and
+  drops its table if a server ever accepts it; the trust bootstrap
+  (`packaging/trust-bootstrap-linux/bootstrap.sh`, now in the repository)
+  prints the release-key fingerprint and refuses to replace a different
+  installed key without `--rotate-key`.
+- **Release artifacts (built from commit e980058; this note was added in
   the following docs-only commit)**: signed bundles for
   `linux-x86_64-ubuntu24.04-cp312` and `macos-arm64-cp312` with
-  `source_rev = 4d830b6...`, signed with the demo release key the user's
-  site already trusts. Same 27-tool source as ab90e02 plus the corrected
-  deferred-install guard hint in postinst (retry is `dpkg -i`, not
-  `dpkg --configure`) and the reviewed site runbook. Gates run on
-  2026-09-17: `test_package_deb.sh` PASSED (key-material rejection,
-  no-network install with the 27-tool protocol probe, tamper and
-  zero-length-verifier negatives; evidence `out/package-evidence/deb/`),
-  `test_package_pkg.sh` PASSED (payload identity, tampered payload
-  rejected, native unit suite; evidence `out/package-evidence/pkg/`).
-  Artifacts and SHA-256:
-  `dist/universal-db-mcp_0.1.0~4d830b60af56b2987bfd2792de6d93e8e6860de2_amd64.deb`
-  `2093e780493d0a47a9ac156a2b78eba9d563a9f264d0534e7bd20c43c648b938`;
+  `source_rev = e980058...`, signed with the demo release key the user's
+  site already trusts. Gates run on 2026-09-17: `test_package_deb.sh`
+  PASSED (key-material rejection, no-network install with the 27-tool
+  protocol probe, tamper and zero-length-verifier negatives; evidence
+  `out/package-evidence/deb/`), `test_package_pkg.sh` PASSED (payload
+  identity, tampered payload rejected, native unit suite; evidence
+  `out/package-evidence/pkg/`). Artifacts and SHA-256:
+  `dist/universal-db-mcp_0.1.0~e980058889c42138bb26dd0b6e352f96239e890f_amd64.deb`
+  `48719f76b8e66e4b09160e8aecff50e71a93505ef854ec7594aa09f82a9f537b`;
   `dist/universal-db-mcp-0.1.0-macos-arm64.pkg`
-  `135c93f87c7c7dbc1e469e900c3bbebabbc8ac952913414e5f3b2bd0a5a5fef1`.
-  USB folder for the Ubuntu site: `dist/usb-ubuntu-4d830b6/` (the .deb,
-  `trust-bootstrap-linux/` refreshed from this commit, `oracle-instantclient/`
-  now including Ubuntu 24.04's `unzip` package, `UPGRADE-README.md` = the
-  site runbook, `SHA256SUMS`, 12 files verified). It supersedes
-  `dist/usb-ubuntu-ab90e02/` and every earlier folder. Unchanged caveat: a
-  .deb version of `0.1.0~<sha>` sorts lexically, so `dpkg -i` prints a
-  downgrade warning when the new hash sorts lower; the runbook says to use
-  `dpkg -i`, never `apt`.
+  `b2b16c18287f0bbdfdc419f91776a0f86a20968280c66522e191d98584488f7b`.
+  USB folder for the Ubuntu site: `dist/usb-ubuntu-e980058/` (the .deb,
+  `trust-bootstrap-linux/` with the key-rotation guard, `oracle-instantclient/`
+  with Ubuntu 24.04's `unzip`, `UPGRADE-README.md` = the site runbook,
+  `SHA256SUMS`, 12 files verified). It supersedes every earlier
+  `usb-ubuntu-*` folder. Unchanged caveat: a .deb version of `0.1.0~<sha>`
+  sorts lexically, so `dpkg -i` prints a downgrade warning when the new
+  hash sorts lower; the runbook says to use `dpkg -i`, never `apt`.
 
 ## 4. Gates not (fully) run (recorded truthfully)
 
