@@ -622,6 +622,10 @@ connection error.
 
 ### Upgrade, remove, purge
 
+Operators: `docs/site-upgrade-runbook.md` is the command-by-command version of this
+section for a live site (upgrade in place, or erase and reinstall), including the
+mandatory trust-tools refresh and the deferred-install status check.
+
 | Action | Service | `/etc/universal-db-mcp/config.yaml` (dpkg conffile; postinst seeds only if absent) | venv `/opt/universal-db-mcp/venv` | Audit/state `/var/lib`, `/var/log/universal-db-mcp` |
 |---|---|---|---|---|
 | `dpkg -i` (upgrade) | stopped by `prerm`, then re-enabled and started by `postinst` (`enable --now`) | kept (conffile semantics: your edits survive; dpkg prompts only if your modified config conflicts with a changed shipped default) | rebuilt against the new bundle | kept |
