@@ -487,27 +487,31 @@ Known and NOT fixed here, now documented rather than implied away:
   dictionary rendered every fixture schema without a column value in it.
   The 25-tool pins (protocol probe, stdio integration test, agent
   descriptions) were moved to 27.
-- **Release artifacts (built from commit ab90e02, the 27-tool surface; this
-  note was added in the following docs-only commit)**: signed bundles for
+- **Release artifacts (built from commit 4d830b6; this note was added in
+  the following docs-only commit)**: signed bundles for
   `linux-x86_64-ubuntu24.04-cp312` and `macos-arm64-cp312` with
-  `source_rev = ab90e02...`, signed with the demo release key the user's
-  site already trusts. Gates run on 2026-09-17: `test_package_deb.sh`
-  PASSED (key-material rejection, no-network install with the 27-tool
-  protocol probe, tamper and zero-length-verifier negatives; evidence
-  `out/package-evidence/deb/`), `test_package_pkg.sh` PASSED (payload
-  identity, tampered payload rejected; evidence `out/package-evidence/pkg/`).
+  `source_rev = 4d830b6...`, signed with the demo release key the user's
+  site already trusts. Same 27-tool source as ab90e02 plus the corrected
+  deferred-install guard hint in postinst (retry is `dpkg -i`, not
+  `dpkg --configure`) and the reviewed site runbook. Gates run on
+  2026-09-17: `test_package_deb.sh` PASSED (key-material rejection,
+  no-network install with the 27-tool protocol probe, tamper and
+  zero-length-verifier negatives; evidence `out/package-evidence/deb/`),
+  `test_package_pkg.sh` PASSED (payload identity, tampered payload
+  rejected, native unit suite; evidence `out/package-evidence/pkg/`).
   Artifacts and SHA-256:
-  `dist/universal-db-mcp_0.1.0~ab90e0238ea1e44b66fa22386ed80721eb29cf3f_amd64.deb`
-  `85b49beeaed2db82b5afe80e73b14ddc96cd8cb16c4cd1fa8bc96d65910807e3`;
+  `dist/universal-db-mcp_0.1.0~4d830b60af56b2987bfd2792de6d93e8e6860de2_amd64.deb`
+  `2093e780493d0a47a9ac156a2b78eba9d563a9f264d0534e7bd20c43c648b938`;
   `dist/universal-db-mcp-0.1.0-macos-arm64.pkg`
-  `f12f1bddd642e34a9e54f68c175445fd1f0d75124e55ef644de17bdc4aadf445`.
-  USB folder for the Ubuntu site: `dist/usb-ubuntu-ab90e02/` (the .deb,
-  `trust-bootstrap-linux/` refreshed from this commit, `oracle-instantclient/`,
-  `SHA256SUMS`, 10 files verified). It supersedes `dist/usb-ubuntu-ebd5f34/`
-  (built earlier the same day from the 25-tool commit; same gates passed,
-  deb `67a921d7...`, pkg `2cc37e71...`). Unchanged caveat: a .deb version of
-  `0.1.0~<sha>` sorts lexically, so `dpkg -i` over an installed build whose
-  hash sorts higher is a downgrade; the offline upgrade script handles it.
+  `135c93f87c7c7dbc1e469e900c3bbebabbc8ac952913414e5f3b2bd0a5a5fef1`.
+  USB folder for the Ubuntu site: `dist/usb-ubuntu-4d830b6/` (the .deb,
+  `trust-bootstrap-linux/` refreshed from this commit, `oracle-instantclient/`
+  now including Ubuntu 24.04's `unzip` package, `UPGRADE-README.md` = the
+  site runbook, `SHA256SUMS`, 12 files verified). It supersedes
+  `dist/usb-ubuntu-ab90e02/` and every earlier folder. Unchanged caveat: a
+  .deb version of `0.1.0~<sha>` sorts lexically, so `dpkg -i` prints a
+  downgrade warning when the new hash sorts lower; the runbook says to use
+  `dpkg -i`, never `apt`.
 
 ## 4. Gates not (fully) run (recorded truthfully)
 
