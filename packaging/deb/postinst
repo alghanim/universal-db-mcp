@@ -234,7 +234,7 @@ if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
 # /etc/systemd/system (admin-controlled, like the unit itself) and persists
 # on remove/purge exactly like that unit.
 [Service]
-ExecStartPre=/bin/sh -ec 'if [ -f "$STATUS" ]; then grep -qx success "$STATUS" || { echo "universal-db-mcp: deferred install not complete (status file: $STATUS, log: $LOG); refusing to start. Check the log, then re-run: sudo dpkg --configure universal-db-mcp" >&2; exit 1; }; fi'
+ExecStartPre=/bin/sh -ec 'if [ -f "$STATUS" ]; then grep -qx success "$STATUS" || { echo "universal-db-mcp: deferred install not complete (status file: $STATUS, log: $LOG); refusing to start. Check the log, then install the package again with: sudo dpkg -i <the release .deb> (dpkg --configure answers already-configured in this state)" >&2; exit 1; }; fi'
 DROPIN_EOF
   chmod 644 "$UNIT_DROPIN"
   systemctl daemon-reload 2>/dev/null || \

@@ -630,7 +630,7 @@ mandatory trust-tools refresh and the deferred-install status check.
 |---|---|---|---|---|
 | `dpkg -i` (upgrade) | stopped by `prerm`, then re-enabled and started by `postinst` (`enable --now`) | kept (conffile semantics: your edits survive; dpkg prompts only if your modified config conflicts with a changed shipped default) | rebuilt against the new bundle | kept |
 | `dpkg -r` (remove) | stopped and disabled | **kept** | kept (fast reinstall / rollback) | kept |
-| `dpkg -P` (purge) | **not stopped** — `prerm` acts only on `remove`/`upgrade`/`deconfigure`/`failed-upgrade`; the `purge` action falls into its catch-all, which only prints a warning. Stop it manually first (`systemctl stop universal-db-mcp`) if it is running | **deleted** (dpkg removes conffiles on purge; `postrm` also removes the postinst-seeded fallback copy — belt and braces; `/etc/universal-db-mcp/keys/` with the release public key is never touched) | deleted, plus installer staging leftovers under `/usr/share/universal-db-mcp/bundle` | **kept** — the audit trail must outlive the package; delete explicitly if you really want it gone |
+| `dpkg -P` (purge) | stopped and disabled: dpkg runs the package's `prerm remove` before `postrm remove` and `postrm purge`, so the service is handled exactly as on `dpkg -r` (a manual stop first is harmless) | **deleted** (dpkg removes conffiles on purge; `postrm` also removes the postinst-seeded fallback copy — belt and braces; `/etc/universal-db-mcp/keys/` with the release public key is never touched) | deleted, plus installer staging leftovers under `/usr/share/universal-db-mcp/bundle` | **kept** — the audit trail must outlive the package; delete explicitly if you really want it gone |
 
 Notes:
 
