@@ -11,7 +11,7 @@ What is on the stick:
 | Path | Purpose |
 |---|---|
 | `SHA256SUMS` | checksums of every other file on the stick |
-| `universal-db-mcp_0.1.0~<sha>_amd64.deb` | the package (its payload is the signed offline bundle) |
+| `universal-db-mcp_0.1.0+<build stamp>.g<sha7>_amd64.deb` | the package (its payload is the signed offline bundle); the version rises with every build |
 | `trust-bootstrap-linux/` | the trusted verifier, installer and release public key; `bootstrap.sh` installs them |
 | `oracle-instantclient/` | Oracle Instant Client 19.28, `libaio` and `unzip`, only for thick-mode Oracle connections |
 | `UPGRADE-README.md` | this file |
@@ -46,8 +46,8 @@ Then, in the shell you will use for the rest of the runbook:
 
 ```bash
 STICK=$(ls -d /mnt/usb/usb-ubuntu-* | head -1); echo "release folder: $STICK"
-DEB=$(ls "$STICK"/universal-db-mcp_0.1.0~*_amd64.deb); echo "package: $DEB"
-SHA=$(basename "$DEB" | sed -E 's/^universal-db-mcp_0\.1\.0~([0-9a-f]+)_amd64\.deb$/\1/'); echo "release commit: $SHA"
+DEB=$(ls "$STICK"/universal-db-mcp_*_amd64.deb); echo "package: $DEB"
+SHA=$(basename "$DEB" | sed -E 's/^.*\.g([0-9a-f]+)_amd64\.deb$/\1/'); echo "release commit (short): $SHA"
 (cd "$STICK" && sha256sum -c SHA256SUMS)             # every line must end in ": OK"
 
 # what is installed right now (keep this output; it is your rollback reference)
@@ -100,10 +100,11 @@ sudo dpkg -i "$DEB"
 
 Expect and accept during the install:
 
-- `dpkg: warning: downgrading universal-db-mcp from 0.1.0~… to 0.1.0~…` is
-  normal. Versions carry the commit hash and dpkg compares them as text, so
-  a newer build can sort "lower". dpkg proceeds; `apt` would refuse, which
-  is why the command is `dpkg -i`.
+- No downgrade warning is expected any more: versions are
+  `0.1.0+<build stamp>.g<commit>` and rise with every build, and a package
+  of this scheme always counts as newer than an older `0.1.0~<hash>` install
+  (dpkg sorts `~` first). If you ever see `dpkg: warning: downgrading`, the
+  stick is older than what is installed: stop and check the build stamps.
 - If dpkg asks what to do with `/etc/universal-db-mcp/config.yaml`
   ("configuration file … modified"), answer `N` (keep your current
   version). Your connections and security block are in that file; the
@@ -244,7 +245,7 @@ use the same mode: thick mode is process-wide.
 
 ```bash
 # the installed code is this stick's release
-sudo python3 -c 'import json; print(json.load(open("/opt/universal-db-mcp/manifest.json"))["source_rev"])'; echo "expected: $SHA"
+sudo python3 -c 'import json; print(json.load(open("/opt/universal-db-mcp/manifest.json"))["source_rev"])'; echo "expected to start with: $SHA"
 grep -c db_review_schema /opt/universal-db-mcp/venv/lib/python3.12/site-packages/universal_db_mcp/server.py
 #   -> greater than 0: the new code is in the installed venv, not only in the package
 
@@ -300,9 +301,11 @@ rules make it a real rollback instead of a masked one:
    upgrading (or remove every `session:` block), for the system and the
    per-user file.
 3. **Delete the venv before installing the old package**, then verify.
+   Installing the older package now prints `dpkg: warning: downgrading`,
+   which is correct and expected here; `dpkg -i` proceeds.
 
 ```bash
-OLD=$(ls /mnt/usb/usb-ubuntu-*/universal-db-mcp_0.1.0~*_amd64.deb | head -1)   # the OLD stick, mounted as in step 0
+OLD=$(ls /mnt/usb/usb-ubuntu-*/universal-db-mcp_*_amd64.deb | head -1)   # the OLD stick, mounted as in step 0
 sudo systemctl stop universal-db-mcp
 sudo rm -rf /opt/universal-db-mcp/venv
 sudo dpkg -i "$OLD"

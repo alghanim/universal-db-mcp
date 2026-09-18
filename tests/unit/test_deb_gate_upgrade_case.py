@@ -36,6 +36,7 @@ def test_upgrade_case_keeps_the_admin_config_and_refuses_an_outdated_installer()
     assert 'grep -v -- "--force-reinstall" /trust/install_offline.sh' in body
     assert 'grep -q "OUTDATED copy"' in body and "upgrade_refuses_outdated_installer" in body
     assert "install_pkg recovery" in body and "upgrade_after_refresh" in body
+    assert 'dpkg --compare-versions "$NEWVER" gt "0.1.0~' in body and "upgrade_version_ordering" in body
 
 
 def test_upgrade_case_runs_in_its_own_no_network_container_and_is_merged() -> None:

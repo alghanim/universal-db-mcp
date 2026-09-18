@@ -11,7 +11,9 @@
 #      (<bundle-dir>/../trusted-tools/), with the admin-supplied public key.
 #      Any verification failure aborts the build (fail closed).
 #   2. Stages a deb root:
-#        DEBIAN/control  — Version = manifest.release + "~" + manifest.source_rev
+#        DEBIAN/control  — Version = manifest.release + "+" + build stamp
+#                          (manifest.created as YYYYMMDDHHMM UTC) + ".g" + the
+#                          first 7 characters of manifest.source_rev
 #                          (a manifest whose source_rev is missing or is the
 #                          builder sentinel "unknown" FAILS the build — see
 #                          the provenance guard below)
@@ -175,12 +177,26 @@ with open(sys.argv[1]) as fh:
 
 release = m.get("release")
 source_rev = m.get("source_rev")
+created = m.get("created")
 target = m.get("target") or {}
 
-missing = [k for k, v in (("release", release), ("source_rev", source_rev)) if not v]
+missing = [k for k, v in (("release", release), ("source_rev", source_rev), ("created", created)) if not v]
 if missing:
     print("MISSING:" + ",".join(missing))
     raise SystemExit(1)
+
+# The bundle's build instant, as a 12-digit UTC stamp (YYYYMMDDHHMM): the
+# monotonic part of the package version. created is written by the bundle
+# builder in ISO 8601 (with offset) and travels inside the SIGNED manifest.
+import datetime
+try:
+    ts = datetime.datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+except ValueError:
+    print("BAD-CREATED:" + str(created))
+    raise SystemExit(1)
+if ts.tzinfo is not None:
+    ts = ts.astimezone(datetime.UTC)
+build_stamp = ts.strftime("%Y%m%d%H%M")
 
 # This builder only produces Ubuntu .debs; refuse anything else loudly
 # instead of silently mis-packaging another platform bundle.
@@ -193,6 +209,7 @@ print(release)
 print(source_rev)
 print(os_name)
 print(str(target.get("arch", "")))
+print(build_stamp)
 PYEOF
 if [ "$_fields_ok" -ne 1 ]; then
     rm -f "$FIELDS_TMP"
@@ -203,6 +220,7 @@ RELEASE="$(sed -n '1p' "$FIELDS_TMP")"
 SOURCE_REV="$(sed -n '2p' "$FIELDS_TMP")"
 TARGET_OS="$(sed -n '3p' "$FIELDS_TMP")"
 TARGET_ARCH="$(sed -n '4p' "$FIELDS_TMP")"
+BUILD_STAMP="$(sed -n '5p' "$FIELDS_TMP")"
 rm -f "$FIELDS_TMP"
 
 case "$TARGET_ARCH" in
@@ -211,7 +229,7 @@ case "$TARGET_ARCH" in
 esac
 
 # Fail closed on missing provenance (completeness-critic round 2): the deb
-# version embeds manifest.source_rev (0.1.0~<rev>), and the bundle builder's
+# version embeds manifest.source_rev (0.1.0+<stamp>.g<rev7>), and the bundle builder's
 # sentinel value "unknown" (prepare_offline_bundle.py's default when neither
 # --source-rev nor UDBMCP_SOURCE_REV was given) would ship a package whose
 # version ties it to NO source revision — the signature would attest the
@@ -232,10 +250,20 @@ case "$SOURCE_REV" in
         die "manifest source_rev contains characters invalid in a dpkg version: '$SOURCE_REV' — refusing to build a package around a malformed revision" ;;
 esac
 
-# dpkg version: upstream release + debian-ish source revision, e.g.
-# 0.1.0~<source_rev>. Both come from the SIGNED manifest, never from the
-# staging host, so the package version is exactly what was signed.
-DEB_VERSION="${RELEASE}~${SOURCE_REV}"
+# dpkg version: <release>+<build stamp>.g<rev7>, e.g. 0.1.0+202609181305.gab90e02.
+# Everything comes from the SIGNED manifest (release, created, source_rev),
+# never from the staging host. The build stamp makes versions MONOTONIC for
+# dpkg and apt (the earlier 0.1.0~<full hash> scheme compared hashes as
+# text, so a newer build could sort as a downgrade), and because '~' sorts
+# before everything, every package of this scheme upgrades a legacy
+# 0.1.0~<hash> install. The short revision keeps the source tie visible in
+# the file name; the full revision stays in the manifest.
+case "$BUILD_STAMP" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    *) die "manifest created did not yield a 12-digit UTC build stamp ('$BUILD_STAMP')" ;;
+esac
+REV7="$(printf '%s' "$SOURCE_REV" | cut -c1-7)"
+DEB_VERSION="${RELEASE}+${BUILD_STAMP}.g${REV7}"
 DEB_FILE="universal-db-mcp_${DEB_VERSION}_${DEB_ARCH}.deb"
 
 echo "==> bundle:    $BUNDLE"

@@ -523,9 +523,9 @@ If either path is missing, `preinst` prints the matching bootstrap block and
 Transfer the `.deb` into the air gap on approved media, then:
 
 ```bash
-sudo apt-get install ./universal-db-mcp_0.1.0~<source_rev>_amd64.deb
+sudo apt-get install ./universal-db-mcp_0.1.0+<build-stamp>.g<rev7>_amd64.deb
 # or, equivalently:
-sudo dpkg -i universal-db-mcp_0.1.0~<source_rev>_amd64.deb
+sudo dpkg -i universal-db-mcp_0.1.0+<build-stamp>.g<rev7>_amd64.deb
 ```
 
 (The exact version string is derived from the signed manifest — upstream

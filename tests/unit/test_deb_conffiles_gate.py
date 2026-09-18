@@ -363,7 +363,8 @@ def test_end_to_end_build_declares_the_conffile(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     (bundle / "config-templates").mkdir(parents=True)
     (bundle / "manifest.json").write_text(
-        '{"release": "0.1.0", "source_rev": "testsrc", "target": {"os": "ubuntu-24.04", "arch": "x86_64"}}\n',
+        '{"release": "0.1.0", "source_rev": "testsrc", "created": "2026-09-18T13:05:00+00:00", '
+        '"target": {"os": "ubuntu-24.04", "arch": "x86_64"}}\n',
         encoding="utf-8",
     )
     (bundle / "SIGNATURE").write_text("stub\n", encoding="utf-8")
@@ -410,4 +411,5 @@ def test_end_to_end_build_declares_the_conffile(tmp_path: Path) -> None:
     for member in ("control", "preinst", "postinst", "prerm", "postrm"):
         assert (capture / "DEBIAN" / member).is_file(), f"DEBIAN/{member} missing from the staged package"
     control = (capture / "DEBIAN" / "control").read_text(encoding="utf-8")
-    assert "Version: 0.1.0~testsrc" in control
+    # monotonic scheme: <release>+<build stamp from manifest.created>.g<rev7>
+    assert "Version: 0.1.0+202609181305.gtestsrc" in control

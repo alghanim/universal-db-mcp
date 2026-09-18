@@ -1054,6 +1054,17 @@ else
   rec upgrade_refuses_outdated_installer failed "could not derive an outdated installer copy from /trust/install_offline.sh (no PIP_FIND_LINKS line?)"
 fi
 
+# --- version ordering: this package must upgrade a legacy 0.1.0~<hash> install
+#     and any package with an older build stamp ---------------------------------
+NEWVER="$(dpkg-deb -f "$DEB" Version)"
+if dpkg --compare-versions "$NEWVER" gt "0.1.0~ffffffffffffffffffffffffffffffffffffffff" \
+   && dpkg --compare-versions "$NEWVER" gt "0.1.0+190001010000.g0000000" \
+   && ! dpkg --compare-versions "$NEWVER" gt "0.1.0+299912312359.g0000000"; then
+  rec upgrade_version_ordering passed "version $NEWVER upgrades a legacy 0.1.0~<hash> install and an older build stamp, and is older than a newer stamp"
+else
+  rec upgrade_version_ordering failed "version $NEWVER does not order as an upgrade over the legacy scheme / older stamps"
+fi
+
 # --- doctor reports the installed release ------------------------------------
 if "$VENV/bin/python" -m universal_db_mcp doctor --config /usr/share/universal-db-mcp/bundle/config-templates/config.yaml \
     > "$EV/doctor-upgrade.json" 2> "$EV/doctor-upgrade.stderr.txt" || true; then

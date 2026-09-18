@@ -42,7 +42,7 @@ if [ "$(bundle_rev out/bundle-macos)" = "$SHA" ]; then echo "=== macos bundle al
 
 echo "=== deb gate (reuses the signed linux bundle, builds the .deb, installs it with no network)"
 UDBMCP_PUBKEY="$PUB" bash scripts/package/test_package_deb.sh
-DEB="$(ls -t "dist/universal-db-mcp_0.1.0~${SHA}_amd64.deb" 2>/dev/null | head -1 || true)"
+DEB="$(ls -t dist/universal-db-mcp_*.g${SHA7}_amd64.deb 2>/dev/null | head -1 || true)"
 [ -n "$DEB" ] || { echo "FAIL: no .deb for $SHA in dist/" >&2; exit 1; }
 
 echo "=== pkg gate (reuses the signed macos bundle, builds and inspects the .pkg)"
