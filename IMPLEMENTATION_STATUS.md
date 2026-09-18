@@ -503,21 +503,29 @@ Known and NOT fixed here, now documented rather than implied away:
   (`packaging/trust-bootstrap-linux/bootstrap.sh`, now in the repository)
   prints the release-key fingerprint and refuses to replace a different
   installed key without `--rotate-key`.
-- **Release artifacts (built from commit e980058; this note was added in
+- **Package guard against outdated trusted tools (2026-09-18, commit
+  d76c6c9)**: `preinst` and `postinst` refuse a trusted installer that
+  runs pip without `--force-reinstall` (any copy from before 2026-09-15),
+  naming the stick's trust bootstrap as the fix; the runbook's mandatory
+  Step 1 is now enforced by the package. `doctor` reports an
+  `installed-release` line (release, `source_rev`, build time) from the
+  installed manifest. The release procedure is
+  `scripts/package/release_usb.sh` (previously outside the repository).
+- **Release artifacts (built from commit d76c6c9; this note was added in
   the following docs-only commit)**: signed bundles for
   `linux-x86_64-ubuntu24.04-cp312` and `macos-arm64-cp312` with
-  `source_rev = e980058...`, signed with the demo release key the user's
-  site already trusts. Gates run on 2026-09-17: `test_package_deb.sh`
+  `source_rev = d76c6c9...`, signed with the demo release key the user's
+  site already trusts. Gates run on 2026-09-18: `test_package_deb.sh`
   PASSED (key-material rejection, no-network install with the 27-tool
   protocol probe, tamper and zero-length-verifier negatives; evidence
   `out/package-evidence/deb/`), `test_package_pkg.sh` PASSED (payload
   identity, tampered payload rejected, native unit suite; evidence
   `out/package-evidence/pkg/`). Artifacts and SHA-256:
-  `dist/universal-db-mcp_0.1.0~e980058889c42138bb26dd0b6e352f96239e890f_amd64.deb`
-  `48719f76b8e66e4b09160e8aecff50e71a93505ef854ec7594aa09f82a9f537b`;
+  `dist/universal-db-mcp_0.1.0~d76c6c988aa162e2b6a1dcf310b1e77851fa36e3_amd64.deb`
+  `c5204162bf272f245dce25bc393cb54bc693b4b5d30e6ca1b6e3e5424372f71a`;
   `dist/universal-db-mcp-0.1.0-macos-arm64.pkg`
-  `b2b16c18287f0bbdfdc419f91776a0f86a20968280c66522e191d98584488f7b`.
-  USB folder for the Ubuntu site: `dist/usb-ubuntu-e980058/` (the .deb,
+  `be17d621f435c5c0781ccf7c739b6df680eec62451c6c1967907a6eb28f4a494`.
+  USB folder for the Ubuntu site: `dist/usb-ubuntu-d76c6c9/` (the .deb,
   `trust-bootstrap-linux/` with the key-rotation guard, `oracle-instantclient/`
   with Ubuntu 24.04's `unzip`, `UPGRADE-README.md` = the site runbook,
   `SHA256SUMS`, 12 files verified). It supersedes every earlier
