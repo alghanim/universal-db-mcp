@@ -287,9 +287,25 @@ you:
 
 ## Rollback (to the previous stick's release)
 
-The package path rebuilds the venv in place, so there is no previous venv
-to swap back to; rolling back is an install of the previous package. Three
-rules make it a real rollback instead of a masked one:
+Since this release an upgrade keeps the previous venv at
+`/opt/universal-db-mcp/venv.previous` with an integrity manifest, so the
+quick rollback is the bundle's own script (it verifies the manifest before
+it executes anything, then swaps the venvs back):
+
+```bash
+# 1. put back the config the previous release understood (older releases reject unknown keys such as session:)
+sudo systemctl stop universal-db-mcp
+sudo cp "$(sudo cat /root/udbmcp-last-backup 2>/dev/null)/etc/config.yaml" /etc/universal-db-mcp/config.yaml 2>/dev/null || true
+# 2. swap the venvs back (verified against the manifest first)
+sudo bash /usr/share/universal-db-mcp/bundle/operations/rollback_offline.sh /opt/universal-db-mcp
+sudo systemctl restart universal-db-mcp
+grep -c db_review_schema /opt/universal-db-mcp/venv/lib/python3.12/site-packages/universal_db_mcp/server.py   # 0 on a pre-27-tool release
+```
+
+That restores the venv installed BEFORE this upgrade (depth one). To go
+back to an older package instead, or when the site was installed before
+this release (no `venv.previous` yet), install the previous stick's package.
+Three rules make that a real rollback instead of a masked one:
 
 1. **Keep the current trusted tools.** Do NOT run the older stick's
    `trust-bootstrap-linux/bootstrap.sh`: copies built before 2026-09-15 lack

@@ -174,7 +174,17 @@ STAGING_BASE="${UDBMCP_STAGING_DIR:-/var/tmp}"  # mktemp -d always creates the d
 $sudo_ok mkdir -p "$STAGING_BASE"
 STAGING="$($sudo_ok mktemp -d "$STAGING_BASE/udbmcp-install.XXXXXX")"
 cleanup_staging() { ${sudo_ok:+sudo }rm -rf -- "$STAGING" 2>/dev/null || true; }
-trap cleanup_staging EXIT
+# An install killed between the two renames of the venv switch (the only
+# window with no venv in place) is recovered here: the demoted venv comes
+# back so the service can start again without manual help.
+restore_previous_venv_on_interrupt() {
+  if [ -n "${TARGET:-}" ] && [ -d "$TARGET/venv.previous" ] && [ ! -d "$TARGET/venv" ]; then
+    echo "==> install interrupted mid-switch; restoring $TARGET/venv.previous" >&2
+    $sudo_ok mv "$TARGET/venv.previous" "$TARGET/venv"
+  fi
+}
+on_exit() { restore_previous_venv_on_interrupt; cleanup_staging; }
+trap on_exit EXIT
 $sudo_ok chmod 700 "$STAGING"
 echo "==> staging a private copy of the verified bundle (closes the verify-then-use race)"
 $sudo_ok cp -a "$BUNDLE"/. "$STAGING/"
@@ -211,29 +221,51 @@ $sudo_ok install -d -o udbmcp -g udbmcp /var/lib/universal-db-mcp /var/log/unive
   exit 1
 }
 
-echo "==> creating virtual environment at $TARGET/venv"
 if [ ! -d "$TARGET" ]; then
   # root-owned 755: the venv is code that root-run tools and the service
   # execute; it must never be owned (or writable) by the invoking operator.
   $sudo_ok install -d -m 755 -o root -g root "$TARGET"
 fi
-$sudo_ok "$PY" -m venv "$TARGET/venv"
+# Build-then-switch. A first install builds $TARGET/venv directly. An
+# UPGRADE (a venv already exists) builds the new venv BESIDE it and switches
+# with two renames, keeping the running release as venv.previous with its
+# integrity manifest: exactly the layout rollback_offline.sh restores. The
+# live venv is never modified in place, so an install that dies mid-pip
+# leaves the current release untouched, and a stdio client that spawns the
+# venv during the upgrade keeps a consistent tree until the switch.
+if [ -d "$TARGET/venv" ]; then
+  # re-run hygiene: an earlier attempt that died between venv creation and
+  # the switch leaves a venv.new-* tree behind (hundreds of MB); discard it
+  $sudo_ok rm -rf "$TARGET"/venv.new-* 2>/dev/null || true
+  VENV_BUILD="$TARGET/venv.new-$(date -u +%Y%m%dT%H%M%SZ)"
+  echo "==> existing installation found: building the new venv at $VENV_BUILD, switching after the smoke check"
+else
+  VENV_BUILD="$TARGET/venv"
+  echo "==> creating virtual environment at $VENV_BUILD"
+fi
+# --copies: the interpreter is copied INTO the tree instead of symlinked to
+# the base install, so the rollback integrity manifest covers the binary the
+# service executes and rollback_offline.sh's symlink-containment gate holds
+# (a standard venv's bin/python -> /usr/.../python3.12 points outside the
+# tree and was refused by that gate, seen in the deb upgrade gate 2026-09-18).
+$sudo_ok "$PY" -m venv --copies "$VENV_BUILD"
 
 echo "==> installing application from bundle wheelhouse (no index, hashed)"
-# --force-reinstall is MANDATORY on upgrades (mirrors packaging/pkg/postinstall):
-# the app wheel's version string does not change between code-only releases
-# (0.1.0 -> 0.1.0) and the .deb postinst re-runs this installer over the
-# EXISTING venv, so without it pip reports "already satisfied" and keeps the
-# previous release's code while dpkg reports a successful upgrade (seen live
-# 2026-09-15: the Db2 credential fix was dpkg-installed yet the same
-# SQL30082N errors persisted). Every package is still resolved only from the
-# verified wheelhouse and checked against runtime.lock's hashes.
+# --force-reinstall stays MANDATORY (mirrors packaging/pkg/postinstall): the
+# app wheel's version string does not change between code-only releases
+# (0.1.0 -> 0.1.0), and before the build-then-switch above this installer
+# re-ran pip over the EXISTING venv, where "already satisfied" kept the
+# previous release's code while dpkg reported a successful upgrade (seen
+# live 2026-09-15). The switch makes that impossible; the flag remains as
+# defence in depth and as the marker packaging/deb/preinst uses to refuse an
+# outdated copy of this installer. Every package is still resolved only from
+# the verified wheelhouse and checked against runtime.lock's hashes.
 $sudo_ok env \
   PIP_CONFIG_FILE=/dev/null \
   PIP_DISABLE_PIP_VERSION_CHECK=1 \
   PIP_NO_INDEX=1 \
   PIP_FIND_LINKS="$BUNDLE/wheelhouse" \
-  "$TARGET/venv/bin/python" -m pip --isolated --disable-pip-version-check install \
+  "$VENV_BUILD/bin/python" -m pip --isolated --disable-pip-version-check install \
   --no-index \
   --no-cache-dir \
   --find-links="$BUNDLE/wheelhouse" \
@@ -247,18 +279,33 @@ $sudo_ok env \
 udbmcp_install_os_packages "$BUNDLE" "$PY" "$sudo_ok"
 
 echo "==> smoke check"
-$sudo_ok "$TARGET/venv/bin/python" -m universal_db_mcp version
+$sudo_ok "$VENV_BUILD/bin/python" -m universal_db_mcp version
 
 # Venv mode normalization: the venv is CODE the service account executes, but
 # the creating context's umask leaks into it (seen live 2026-09-15: a umask
 # 077 install left the venv 0700 root:root and the udbmcp service died with
 # 203/EXEC Permission denied - the interpreter was fine, the SERVICE ACCOUNT
 # just could not traverse into the tree). Normalize unconditionally: dirs
-# 0755 (traversable), files 0644, bin executables 0755. $TARGET/venv itself
-# is root-owned either way - this grants read+traverse, never write.
-$sudo_ok find "$TARGET/venv" -type d -exec chmod 755 {} +
-$sudo_ok find "$TARGET/venv" -type f -exec chmod 644 {} +
-$sudo_ok find "$TARGET/venv/bin" -type f -exec chmod 755 {} +
+# 0755 (traversable), files 0644, bin executables 0755. The tree itself is
+# root-owned either way - this grants read+traverse, never write.
+$sudo_ok find "$VENV_BUILD" -type d -exec chmod 755 {} +
+$sudo_ok find "$VENV_BUILD" -type f -exec chmod 644 {} +
+$sudo_ok find "$VENV_BUILD/bin" -type f -exec chmod 755 {} +
+
+if [ "$VENV_BUILD" != "$TARGET/venv" ]; then
+  echo "==> switching (the running release is kept as $TARGET/venv.previous for rollback_offline.sh; depth 1)"
+  $sudo_ok rm -rf "$TARGET/venv.previous"          # rollback depth is one release
+  $sudo_ok rm -f "$TARGET/venv.previous.sha256"     # manifest of the discarded release
+  # rollback_offline.sh executes the demoted venv only after it matches this
+  # manifest, so record it BEFORE the rename (same recipe as upgrade_offline.sh:
+  # relative paths, regular files only, sorted, sha256sum).
+  $sudo_ok sh -c 'cd "$1/venv" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$1/venv.previous.sha256"' sh "$TARGET" \
+    || { $sudo_ok rm -f "$TARGET/venv.previous.sha256"; $sudo_ok rm -rf "$VENV_BUILD"
+         echo "FAIL: could not record the rollback integrity manifest; the running venv was left untouched" >&2; exit 1; }
+  $sudo_ok mv "$TARGET/venv" "$TARGET/venv.previous"
+  $sudo_ok mv "$VENV_BUILD" "$TARGET/venv"
+  echo "==> switched: $TARGET/venv is the new release, $TARGET/venv.previous the one before"
+fi
 
 # Short CLI alias on PATH: pip's [project.scripts] entry point lands at
 # $TARGET/venv/bin/udbmcp; link it into /usr/local/bin so `udbmcp doctor`

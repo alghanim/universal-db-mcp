@@ -432,9 +432,9 @@ def test_install_offline_normalizes_venv_modes() -> None:
     text = (Path(__file__).resolve().parents[2] / "scripts" / "install_offline.sh").read_text(
         encoding="utf-8"
     )
-    assert 'find "$TARGET/venv" -type d -exec chmod 755' in text
-    assert 'find "$TARGET/venv" -type f -exec chmod 644' in text
-    assert 'find "$TARGET/venv/bin" -type f -exec chmod 755' in text
+    assert 'find "$VENV_BUILD" -type d -exec chmod 755' in text  # the tree being built (venv or venv.new-*)
+    assert 'find "$VENV_BUILD" -type f -exec chmod 644' in text
+    assert 'find "$VENV_BUILD/bin" -type f -exec chmod 755' in text
     assert text.index("-type d -exec chmod 755") < text.index("udbmcp CLI alias"), (
         "the venv must be normalized before the PATH alias step exposes it"
     )

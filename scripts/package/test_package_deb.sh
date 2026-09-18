@@ -1024,6 +1024,24 @@ if grep -q "ADMIN-EDIT-MARKER" "$CONFIG"; then
 else
   rec upgrade_keeps_admin_config failed "admin edit in $CONFIG was lost by the upgrade"
 fi
+# --- the previous release is kept beside the new one, and rollback restores it
+PREV="$(dirname "$VENV")/venv.previous"
+if [ -d "$PREV" ] && [ -s "$PREV.sha256" ] && grep -q "STALE-RELEASE-MARKER" "$PREV/lib/python3."*"/site-packages/universal_db_mcp/__init__.py"; then
+  rec upgrade_keeps_previous_venv passed "venv.previous holds the previous release (marker present) with its integrity manifest"
+else
+  rec upgrade_keeps_previous_venv failed "no venv.previous with the previous release and a manifest after the upgrade"
+fi
+ROLLBACK=/usr/share/universal-db-mcp/bundle/operations/rollback_offline.sh
+if [ -f "$ROLLBACK" ]; then
+  if bash "$ROLLBACK" "$(dirname "$VENV")" > /tmp/rollback.log 2>&1 && grep -q "STALE-RELEASE-MARKER" "$PKG_INIT"; then
+    rec rollback_restores_previous_release passed "rollback_offline.sh restored the previous venv (marker back) after verifying its manifest"
+  else
+    cp /tmp/rollback.log "$EV/rollback-upgrade.log" 2>/dev/null || true
+    rec rollback_restores_previous_release failed "rollback did not restore the previous release: $(tail -c 300 /tmp/rollback.log | tr '\n' ' ')"
+  fi
+else
+  rec rollback_restores_previous_release failed "bundle ships no operations/rollback_offline.sh"
+fi
 if "$VENV/bin/python" -m universal_db_mcp version > /tmp/version.txt 2>&1; then
   rec upgrade_venv_runs passed "upgraded venv runs: $(tr '\n' ' ' < /tmp/version.txt | cut -c1-80)"
 else

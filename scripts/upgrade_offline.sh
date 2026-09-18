@@ -193,7 +193,8 @@ $sudo_ok mkdir -p "$TARGET"
 # would contest the same venv), so anything matching here is debris.
 $sudo_ok rm -rf "$TARGET"/venv.new-* 2>/dev/null || true
 NEWVENV="$TARGET/venv.new-$(date -u +%Y%m%dT%H%M%SZ)"
-$sudo_ok "$PY" -m venv "$NEWVENV"
+# --copies: see install_offline.sh; keeps rollback_offline.sh's containment gate satisfied
+$sudo_ok "$PY" -m venv --copies "$NEWVENV"
 $sudo_ok env PIP_CONFIG_FILE=/dev/null PIP_DISABLE_PIP_VERSION_CHECK=1 \
   PIP_NO_INDEX=1 PIP_FIND_LINKS="$NEW_BUNDLE/wheelhouse" \
   "$NEWVENV/bin/python" -m pip --isolated --disable-pip-version-check install \

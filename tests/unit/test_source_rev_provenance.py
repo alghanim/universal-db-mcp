@@ -71,6 +71,7 @@ def _make_bundle(tmp_path: Path, source_rev: str | None) -> Path:
     bundle.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, object] = {
         "release": "0.1.0",
+        "created": "2026-09-18T12:00:00+00:00",  # the monotonic version scheme needs the build instant
         "target": {"os": "ubuntu-24.04", "arch": "x86_64", "python": "3.12", "abi": "cp312"},
     }
     if source_rev is not None:
@@ -101,7 +102,7 @@ def test_build_deb_guard_reads_source_rev_from_signed_manifest_before_version_de
     code = _noncomment(_read(_BUILD_DEB))
     read_at = code.index('SOURCE_REV="$(sed -n \'2p\' "$FIELDS_TMP")"')
     guard_at = code.index("manifest source_rev is the builder sentinel 'unknown'")
-    version_at = code.index('DEB_VERSION="${RELEASE}~${SOURCE_REV}"')
+    version_at = code.index('DEB_VERSION="${RELEASE}+${BUILD_STAMP}.g${REV7}"')
     assert read_at < guard_at < version_at, (
         "the provenance guard must run after SOURCE_REV is read from the "
         "manifest and before the deb version is derived"

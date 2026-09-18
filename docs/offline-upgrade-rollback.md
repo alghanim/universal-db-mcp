@@ -5,9 +5,10 @@
 Sites installed from the **.deb** upgrade with `dpkg -i` of the new package
 (the command-by-command procedure, including the mandatory trust-tools
 refresh and the deferred-install status check, is `docs/site-upgrade-runbook.md`,
-shipped on the release stick as `UPGRADE-README.md`). That path rebuilds
-the venv in place through the trusted installer, so it has NO
-`venv.previous`; its rollback is an install of the previous package. The
+shipped on the release stick as `UPGRADE-README.md`). Since 2026-09-18 the
+trusted installer builds the new venv beside the running one and switches
+with two renames, so a `.deb` upgrade also leaves `venv.previous` and its
+integrity manifest behind and `rollback_offline.sh` works there too. The
 procedure below is the bundle-level path for hosts installed directly from
 a signed bundle.
 
