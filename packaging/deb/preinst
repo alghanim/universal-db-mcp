@@ -123,6 +123,26 @@ bundle must never be installed."
     exit 1
 fi
 
+# --- prerequisite 3: the trusted installer is not an outdated copy ---------
+# The package runs the ADMIN-installed installer, never its own copy. A copy
+# from before 2026-09-15 runs pip without --force-reinstall: the app wheel's
+# version does not change between releases, so pip keeps the previous code
+# while dpkg, the manifest and the status file all report a successful
+# upgrade (seen live at a site). Refuse such a copy before the payload is
+# unpacked; the fix is to re-run the trust bootstrap from the release stick.
+INSTALLER="${TRUST_DIR}/install_offline.sh"
+if [ -s "$INSTALLER" ] && grep -q "PIP_FIND_LINKS" "$INSTALLER" && ! grep -q -- "--force-reinstall" "$INSTALLER"; then
+    fail "the trusted installer at $INSTALLER is an OUTDATED copy (it runs pip without --force-reinstall).
+An upgrade through it would keep the previous release's code in the venv while
+reporting success. Refresh the trusted tools from the release stick first:
+
+    sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh
+
+then re-run this install."
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
+
 echo "universal-db-mcp preinst: trust prerequisites present."
 echo "  verifier: $VERIFIER"
 echo "  pubkey:   $PUBKEY"

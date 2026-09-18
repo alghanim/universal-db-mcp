@@ -128,6 +128,15 @@ for f in "$TRUST_DIR/verify_bundle.py" \
     exit 1
   fi
 done
+if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
+   && ! grep -q -- "--force-reinstall" "$TRUST_DIR/install_offline.sh"; then
+  echo "FAIL: the trusted installer at $TRUST_DIR/install_offline.sh is an OUTDATED copy" >&2
+  echo "      (it runs pip without --force-reinstall): an upgrade through it keeps the" >&2
+  echo "      previous release's code while reporting success. Refresh the trusted tools" >&2
+  echo "      from the release stick (sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh)," >&2
+  echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
+  exit 1
+fi
 echo "==> admin trust dir complete at $TRUST_DIR (the package never writes to it)"
 
 # --- step 2: the release public key must already be installed (fail closed) -

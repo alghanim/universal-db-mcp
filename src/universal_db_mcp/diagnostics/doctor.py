@@ -51,6 +51,16 @@ def _bundle_profile() -> str:
     must never report a hardcoded profile name it did not verify: claiming
     ``linux-x86_64-ubuntu24.04-cp312`` on a Windows host would be a lie, not
     a diagnostic."""
+    manifest = _bundle_manifest()
+    profile = manifest.get("profile") if manifest else None
+    if isinstance(profile, str) and profile:
+        return profile
+    return f"{platform.system()}/{platform.machine()} cpython {platform.python_version()}"
+
+
+def _bundle_manifest() -> dict[str, Any] | None:
+    """The installed bundle's manifest.json, or None (development checkout,
+    unreadable or corrupt file)."""
     manifest_path: Path | None = None
     env_manifest = os.environ.get("UDBMCP_BUNDLE_MANIFEST")
     if env_manifest:
@@ -66,14 +76,13 @@ def _bundle_profile() -> str:
             candidate = Path(sys.prefix).parent / "manifest.json"
             if candidate.is_file():
                 manifest_path = candidate
-    if manifest_path is not None and manifest_path.is_file():
-        try:
-            profile = json.loads(manifest_path.read_text(encoding="utf-8")).get("profile")
-            if isinstance(profile, str) and profile:
-                return profile
-        except (OSError, ValueError):
-            pass  # unreadable/corrupt manifest -> fall through to the honest default
-    return f"{platform.system()}/{platform.machine()} cpython {platform.python_version()}"
+    if manifest_path is None or not manifest_path.is_file():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _mssql_odbc_remediation() -> str:
@@ -173,6 +182,20 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
             f"(bundle profile: {profile})",
         )
     )
+    manifest = _bundle_manifest()
+    if manifest is not None:
+        # The one line an operator compares with the release stick after an
+        # upgrade: the commit the installed payload was built from.
+        results.append(
+            _check(
+                "installed-release",
+                True,
+                f"release {manifest.get('release')} source_rev {manifest.get('source_rev')} "
+                f"(built {manifest.get('created')})",
+            )
+        )
+    else:
+        results.append(_check("installed-release", True, "no bundle manifest next to this venv (development checkout)"))
 
     # --- application wheel import -------------------------------------------
     try:

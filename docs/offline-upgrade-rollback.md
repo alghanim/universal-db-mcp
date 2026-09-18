@@ -2,6 +2,15 @@
 
 ## Upgrade
 
+Sites installed from the **.deb** upgrade with `dpkg -i` of the new package
+(the command-by-command procedure, including the mandatory trust-tools
+refresh and the deferred-install status check, is `docs/site-upgrade-runbook.md`,
+shipped on the release stick as `UPGRADE-README.md`). That path rebuilds
+the venv in place through the trusted installer, so it has NO
+`venv.previous`; its rollback is an install of the previous package. The
+procedure below is the bundle-level path for hosts installed directly from
+a signed bundle.
+
 ```bash
 # 1. acquire the NEW signed bundle (staging) and transfer into the air gap
 # 2. preflight + install (atomic venv switch, config/state backup first)

@@ -38,6 +38,7 @@ scripts/install_offline.sh out/bundle/universal-db-mcp-*/ /opt/universal-db-mcp
 | `docs/architecture.md` | components, data flow, process boundaries |
 | `docs/security.md` | threat model, policy, secrets, TLS |
 | `docs/tools.md` | MCP tool contract (27 `db_*` tools incl. discovery, review and documentation for federated ETL/docs/optimization) |
+| `scripts/package/release_usb.sh` | Builds a release for the air-gapped site from the current commit: signed bundles, .deb + .pkg through their gates, and the `dist/usb-ubuntu-<sha7>/` folder (trust bootstrap, Oracle client, runbook, SHA256SUMS) |
 | `docs/site-upgrade-runbook.md` | Step-by-step upgrade in place or erase-and-reinstall on the air-gapped Ubuntu site (also shipped on the USB folder as `UPGRADE-README.md`) |
 | `docs/session-safety.md` | what every connection does to the server session so agent reads cannot hurt production (Db2 UR, server-side read-only, ceilings) |
 | `docs/oracle-connect-modes.md` | Oracle thick mode (legacy password verifiers), SID and TNS alias connections, TLS |
