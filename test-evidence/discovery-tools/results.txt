@@ -1,5 +1,5 @@
 # Discovery tools: live run through the MCP server against the local fixtures
-date_utc: 2026-09-17T14:15:00Z
+date_utc: 2026-09-18T13:02:05Z
 
 == mock_clickhouse
   catalog: 3 tables; cdr: pk=['started_at', 'caller_msisdn'] cols=9 idx=1 fks=[]
@@ -89,6 +89,16 @@ date_utc: 2026-09-17T14:15:00Z
      mock_pg.ocean.buoys matched=['region']
   literal query '100%': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
   literal query 'gu_f': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
+
+== federated read (one aliased statement per connection, merged by shape)
+  run=5 failed=0 merged_rows=15 columns=['connection', 'id', 'label'] warnings=[]
+     ['mock_pg', 1, 'MB-ALPHA']
+     ['mock_pg', 2, 'MB-BRAVO']
+     ['mock_pg', 3, 'MB-CHARLIE']
+     ['mock_mysql', 1, 'R. Haddad']
+     ['mock_mysql', 2, 'T. Nakamura']
+     ['mock_mysql', 3, 'R. Haddad']
+  join pg buoys x readings on buoy_id: rows=5 matched_left=1 unmatched_left=0 truncated=True warnings=[]
 
 == relationship inference (all connections)
   relationships=8 by kind={'declared': 7, 'inferred_name_type': 1} warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
