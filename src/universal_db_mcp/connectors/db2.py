@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import math
+import re
 import secrets
 import threading
 import time
@@ -694,6 +695,7 @@ class Db2Connector(DatabaseConnector):
         if analyze:
             raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
         queryno = secrets.randbelow(2_000_000_000) + 1
+        cleanup_warning: str | None = None
         with translated_driver_errors():
             conn = self._connect()
             try:
@@ -748,8 +750,14 @@ class Db2Connector(DatabaseConnector):
                         conn, f"DELETE FROM {q}.EXPLAIN_INSTANCE WHERE EXPLAIN_REQUESTER = ? AND EXPLAIN_TIME = ?"  # noqa: S608
                     )
                     self._module.execute(stmt, (keys[0], keys[1]))
-                except Exception:  # noqa: BLE001, S110 - scratch rows; a DBA can prune the explain tables
-                    pass
+                except Exception as exc:  # noqa: BLE001 - scratch rows stay behind: reported, never hidden
+                    code = re.search(r"SQL\d{4,5}[NWC]|SQLSTATE[= ]*\w{5}", str(exc))
+                    cleanup_warning = (
+                        f"the explain rows written for this call could not be deleted from {schema}.EXPLAIN_INSTANCE"
+                        + (f" ({code.group(0)})" if code else "")
+                        + "; the account needs DELETE on the explain tables (INSERT is needed to write them); "
+                        "a DBA can prune EXPLAIN_INSTANCE"
+                    )
             finally:
                 self._module.close(conn)
         rows = [
@@ -768,6 +776,7 @@ class Db2Connector(DatabaseConnector):
         return {
             "raw": text or None, "rows": rows, "total_cost": head[8],
             "method": f"EXPLAIN PLAN into {schema}.EXPLAIN_* (timerons), not executed",
+            **({"cleanup_warning": cleanup_warning} if cleanup_warning else {}),
         }
 
     def _explain_schema(self, conn: Any) -> str | None:

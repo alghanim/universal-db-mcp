@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import stat
+import subprocess
 import sys
 from ctypes.util import find_library
 from pathlib import Path
@@ -56,6 +57,52 @@ def _bundle_profile() -> str:
     if isinstance(profile, str) and profile:
         return profile
     return f"{platform.system()}/{platform.machine()} cpython {platform.python_version()}"
+
+
+def _venv_interpreter_check() -> dict[str, Any] | None:
+    """The offline installer creates the venv with `python -m venv --copies`
+    (so the rollback verifier can prove the tree is self-contained): the venv
+    carries its own COPY of the interpreter, and an OS python update does not
+    reach it. Compare the running interpreter with the base it was copied from
+    and say so when they drift; a re-run of the installer refreshes the copy."""
+    if Path(sys.prefix) == Path(sys.base_prefix):
+        return None  # not a venv
+    cfg = Path(sys.prefix) / "pyvenv.cfg"
+    if not cfg.is_file():
+        return None
+    keys: dict[str, str] = {}
+    for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            keys[k.strip()] = v.strip()
+    base: Path | None = None
+    if keys.get("executable"):
+        base = Path(keys["executable"])
+    elif keys.get("home"):
+        base = Path(keys["home"]) / "python3"
+    copied = not Path(sys.executable).is_symlink()
+    how = "a copy of the interpreter (installed with --copies)" if copied else "a symlink to the interpreter"
+    if base is None or not base.exists():
+        return _check("venv-interpreter", True, f"venv carries {how}; base interpreter not found to compare against")
+    try:
+        proc = subprocess.run(  # noqa: S603 - the interpreter pyvenv.cfg names, fixed argv
+            [str(base), "-c", "import platform; print(platform.python_version())"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        base_version = proc.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _check("venv-interpreter", True, f"venv carries {how}; base interpreter {base} could not be run ({exc})")
+    running = platform.python_version()
+    if base_version and base_version != running:
+        return _check(
+            "venv-interpreter",
+            False,
+            f"venv runs CPython {running} while the base interpreter {base} is now {base_version}: {how} did not "
+            "follow the OS update; re-run the offline installer (or reinstall the package) to refresh it",
+        )
+    return _check(
+        "venv-interpreter", True, f"CPython {running} matches the base interpreter {base}; venv carries {how}"
+    )
 
 
 def _bundle_manifest() -> dict[str, Any] | None:
@@ -196,6 +243,9 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
         )
     else:
         results.append(_check("installed-release", True, "no bundle manifest next to this venv (development checkout)"))
+    interp = _venv_interpreter_check()
+    if interp is not None:
+        results.append(interp)
 
     # --- application wheel import -------------------------------------------
     try:

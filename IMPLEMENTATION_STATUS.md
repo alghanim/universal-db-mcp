@@ -581,7 +581,38 @@ Requested after the honest 7/10 assessment. What was done, with evidence:
   mode (`test-evidence/session-safety/mysql-no-backslash-escapes.txt`).
 - **Site check**: `universal_db_mcp site-check` runs the agent's tools
   read-only on every connection and writes a value-free JSON report for
-  the first run at the site (runbook step).
+  the first run at the site (runbook step); the report is written mode
+  0600 and never over an existing file (`--force`).
+- **Reviews of the program (2026-09-18)**: a correctness review and a
+  security review of the commits above (f5b733f..cd81c8e), both by
+  independent reviewers with the code in front of them; the security
+  review confirmed no vulnerability and listed hardening items. Every
+  finding was applied and pinned by
+  `tests/unit/test_review_fixes_2026_09_18.py`: join keys longer than 28
+  digits were rounded by `Decimal.normalize()` and `-0` did not equal `0`;
+  `db_explain` silently dropped `parameters` (now refused) and re-rendered
+  the AST, which lost Db2 `WITH UR`/`OPTIMIZE FOR` (the validated text is
+  sent as written on every engine); the value search did not name the
+  connections the budget never reached (`connections_not_searched`,
+  `connections_failed`); `db_federated_join` output had no byte ceiling
+  (now the stricter of the two policies); `db_federated_query` could run a
+  statement and drop its result after the fact (each statement now runs
+  with what is left of the shared ceiling and is always reported); the
+  federated tools left one audit record for many statements (one record
+  per statement now, same request id); the guard accepted `NEXT VALUE
+  FOR`, Oracle `NEXTVAL`/`CURRVAL` and every T-SQL table hint (only
+  NOLOCK, READUNCOMMITTED, READPAST, NOWAIT remain); a failed Db2 explain
+  cleanup was swallowed (a warning now; INSERT and DELETE on the explain
+  tables documented); `release_usb.sh` defaulted to the demo key (a key
+  pair or `--demo` is now explicit, the fingerprint is printed and shipped
+  as `RELEASE-KEY-FINGERPRINT.txt`); the trusted installer carries a
+  format marker (`udbmcp-installer-format: 3`) that preinst/postinst
+  require of any pip-running copy (deb gate case added); `live_evidence.py`
+  implied DDL consent from a config file name (flag always required);
+  `http_client_evidence.py` could leak its server and proxy on a failure
+  (cleanup always runs, unique container name, stderr to a file); the
+  copied interpreter of a `--copies` venv is documented and `doctor`
+  compares it with its base (`venv-interpreter`).
 - **Not raised from here, stated plainly**: the site's own confirmation
   (only your run can give it; the site-check exists to make that run
   structured), the Windows MSI (WiX does not compile on macOS, see §1d),

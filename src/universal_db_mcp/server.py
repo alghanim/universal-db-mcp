@@ -254,7 +254,9 @@ async def tool_span(
     """Request lifecycle: timing, audit, structured error mapping, history."""
     start = time.monotonic()
     request_id = new_request_id()
-    state: dict[str, Any] = {"request_id": request_id, "start": start, "row_count": None, "warnings": []}
+    state: dict[str, Any] = {
+        "request_id": request_id, "tool": tool, "start": start, "row_count": None, "warnings": [],
+    }
     outcome = "allow"
     category = None
     try:
@@ -1180,9 +1182,28 @@ def build_server(app: AppContext) -> MCPServer:
                     break
                 t0 = time.monotonic()
                 try:
-                    read = await _guarded_read(
-                        app, st, cid, statement, parameters, max_rows_per_connection, min(remaining, budget)
+                    _, pol = _require_engine(app, cid)
+                    # the strictest ceiling seen so far binds the whole response;
+                    # each statement gets what is left of it, so a result that
+                    # ran is always reported (truncated by its own read, never
+                    # dropped after the fact)
+                    byte_ceiling = (
+                        pol.max_response_bytes if byte_ceiling is None else min(byte_ceiling, pol.max_response_bytes)
                     )
+                    remaining_bytes = byte_ceiling - used_bytes
+                    if remaining_bytes <= 0:
+                        st["warnings"].append(
+                            "response byte ceiling (security.max_response_bytes) reached; "
+                            f"'{cid}' and later connections were not run"
+                        )
+                        exhausted = True
+                        break
+                    read = await _guarded_read(
+                        app, st, cid, statement, parameters, max_rows_per_connection, min(remaining, budget),
+                        byte_budget=remaining_bytes,
+                    )
+                except AuditWriteFailure:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - one failing connection is reported, not fatal
                     results.append({"connection": cid, "error": scrub_exception(exc)})
                     st["warnings"].append(f"'{cid}': {scrub_exception(exc)}")
@@ -1195,18 +1216,14 @@ def build_server(app: AppContext) -> MCPServer:
                     "truncated": read.outcome.truncated,
                     "elapsed_ms": int((time.monotonic() - t0) * 1000),
                 }
-                byte_ceiling = (
-                    read.policy.max_response_bytes if byte_ceiling is None
-                    else min(byte_ceiling, read.policy.max_response_bytes)
-                )
                 used_bytes += len(json.dumps(entry, default=str))
-                if used_bytes > byte_ceiling and results:
+                results.append(entry)
+                if used_bytes >= byte_ceiling:
                     st["warnings"].append(
                         "response byte ceiling (security.max_response_bytes) reached; later connections were not run"
                     )
                     exhausted = True
                     break
-                results.append(entry)
             ok = [r for r in results if "rows" in r]
             merged: dict[str, Any] | None = None
             if ok:
@@ -1221,7 +1238,10 @@ def build_server(app: AppContext) -> MCPServer:
                                 break
                         if len(rows) >= _FEDERATED_MAX_MERGED_ROWS:
                             break
-                    merged = {"columns": names, "rows": rows, "truncated": sum(len(r["rows"]) for r in ok) > len(rows)}
+                    merged = {
+                        "columns": names, "rows": rows, "row_count": len(rows),
+                        "truncated": sum(len(r["rows"]) for r in ok) > len(rows),
+                    }
                 else:
                     st["warnings"].append(
                         "column names differ between connections; no merged view (per-connection results only)"
@@ -1304,26 +1324,44 @@ def build_server(app: AppContext) -> MCPServer:
             matched_left = 0
             unmatched_left = 0
             truncated = False
+            byte_truncated = False
+            used_bytes = 0
+            # each side was bounded by its own policy; the joined output (a
+            # cross product per key) is bounded by the stricter of the two
+            byte_ceiling = min(reads["left"].policy.max_response_bytes, reads["right"].policy.max_response_bytes)
             empty_right = [None] * len(rcols)
+
+            def emit(joined: list[Any]) -> bool:
+                nonlocal used_bytes, truncated, byte_truncated
+                if len(out_rows) >= cap:
+                    truncated = True
+                    return False
+                size = len(json.dumps(joined, default=str))
+                if out_rows and used_bytes + size > byte_ceiling:
+                    truncated = byte_truncated = True
+                    return False
+                used_bytes += size
+                out_rows.append(joined)
+                return True
+
             for row in reads["left"].rows:
                 k = key(row, li)
                 matches = index.get(k, []) if k is not None else []
                 if matches:
                     matched_left += 1
                     for m in matches:
-                        if len(out_rows) >= cap:
-                            truncated = True
+                        if not emit([*row, *m]):
                             break
-                        out_rows.append([*row, *m])
                 else:
                     unmatched_left += 1
                     if join == "left":
-                        if len(out_rows) >= cap:
-                            truncated = True
-                            break
-                        out_rows.append([*row, *empty_right])
+                        emit([*row, *empty_right])
                 if truncated:
                     break
+            if byte_truncated:
+                st["warnings"].append(
+                    "response byte ceiling (security.max_response_bytes) reached; the join output is partial"
+                )
             if any(read.outcome.truncated for read in reads.values()):
                 st["warnings"].append(
                     "a side was truncated by its row or byte ceiling; the join is incomplete (raise max_rows_per_side "
@@ -1416,18 +1454,32 @@ def build_server(app: AppContext) -> MCPServer:
         parameters: list[Any] | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async with tool_span(app, "db_explain", connection_id, sql=sql) as st:
+            if parameters:
+                # a plan is captured for the statement text as written; a bound
+                # value that is silently dropped would plan a different statement
+                raise ToolFailure(
+                    ErrorCategory.VALIDATION,
+                    "db_explain does not bind parameters: inline the literal values in the statement "
+                    "(the plan is captured for the text as written) or leave parameters empty",
+                )
             connector, policy = _require_engine(app, connection_id)
             guard = await guard_for(app, connector, policy)
             result = await anyio.to_thread.run_sync(guard.validate_explain, sql)
             if analyze and result.kind == "explain" and not policy.allow_explain_analyze:
                 raise ToolFailure(ErrorCategory.POLICY, "EXPLAIN ANALYZE is disabled by policy")
+            # the engine sees the statement the guard validated, as written:
+            # re-rendering the AST drops clauses sqlglot does not carry (Db2
+            # WITH UR, OPTIMIZE FOR n ROWS), which would plan a different text
+            statement = result.text or result.ast.sql(dialect=sqlglot_dialect(policy.engine))
             st["connector"] = connector  # ANALYZE executes; discarded on cancellation
             plan = await app.executor.run_bounded(
                 connector,
-                lambda c: c.explain(result.ast.sql(dialect=sqlglot_dialect(policy.engine)), analyze),
+                lambda c: c.explain(statement, analyze),
                 policy.clamp_timeout(None),
                 description=f"explain on '{connection_id}'",
             )
+            if isinstance(plan, dict) and plan.get("cleanup_warning"):
+                st["warnings"].append(str(plan.pop("cleanup_warning")))
             st["row_count"] = 1
             return _envelope(
                 st,
@@ -1436,8 +1488,10 @@ def build_server(app: AppContext) -> MCPServer:
                 {
                     "plan": plan,
                     "raw_preserved": True,
-                    "note": "raw plan output is preserved; no optimization findings are invented",
+                    "note": "raw plan output is preserved; no optimization findings are invented; the plan names "
+                    "every object the engine touches, including base tables behind a permitted view",
                 },
+                warnings=st["warnings"],
             )
 
     register(
@@ -1815,9 +1869,12 @@ def build_server(app: AppContext) -> MCPServer:
             warnings: list[str] = []
             searched = skipped = 0
             exhausted = False
-            for cid in conn_ids:
-                if time.monotonic() > deadline:
+            connections_not_searched: list[str] = []  # never reached: the budget or the byte ceiling ended first
+            connections_failed: list[str] = []  # reached, but unusable (dead or metadata unavailable)
+            for i, cid in enumerate(conn_ids):
+                if exhausted or time.monotonic() > deadline:
                     exhausted = True
+                    connections_not_searched = conn_ids[i:]
                     break
                 try:
                     connector, policy = _require_engine(app, cid)
@@ -1825,6 +1882,7 @@ def build_server(app: AppContext) -> MCPServer:
                 except Exception as exc:  # noqa: BLE001 - one dead connection must not end the search
                     if connections is not None and len(conn_ids) == 1:
                         raise
+                    connections_failed.append(cid)
                     warnings.append(f"connection '{cid}' skipped: {scrub_exception(exc)}")
                     continue
                 # the policy's discovery budget and byte ceiling bind the whole search
@@ -1934,6 +1992,11 @@ def build_server(app: AppContext) -> MCPServer:
                     + (", time budget" if exhausted else "")
                     + "); a needle in one of them is NOT reported: narrow with schemas or raise max_tables"
                 )
+            if connections_not_searched:
+                warnings.append(
+                    f"{len(connections_not_searched)} connection(s) were never searched (the time budget or the "
+                    f"byte ceiling ended the search first): {', '.join(connections_not_searched)}"
+                )
             if exhausted:
                 warnings.append(f"time budget of {budget:.0f}s exhausted; results are partial")
             if warnings:
@@ -1944,6 +2007,8 @@ def build_server(app: AppContext) -> MCPServer:
                     "query": query, "match": match, "hits": hits,
                     "tables_searched": searched, "tables_skipped_no_candidate_columns": skipped,
                     "tables_not_searched": not_reached,
+                    "connections_not_searched": connections_not_searched,
+                    "connections_failed": connections_failed,
                     "budget_exhausted": exhausted,
                     "note": "contains/prefix matching is case-insensitive on string columns; numeric columns "
                     "match only with match=exact and a numeric query; sensitive columns are never searched",
@@ -2304,6 +2369,41 @@ class _GuardedRead:
     row_limit: int
 
 
+async def _audit_statement(
+    app: AppContext,
+    st: dict[str, Any],
+    connection_id: str,
+    sql: str,
+    *,
+    outcome: str,
+    category: Any,
+    row_count: int | None,
+    started: float,
+) -> None:
+    """The federated tools run several statements under ONE tool span. Each
+    statement leaves its own audit record (same request_id, action
+    '<tool>:statement', its connection and fingerprint) so the per-connection
+    trail is as complete as db_query's. Written shielded and fail-closed
+    exactly like the span's own record."""
+    record: dict[str, Any] = {
+        "request_id": st["request_id"],
+        "action": f"{st.get('tool', 'tool')}:statement",
+        "connection_id": connection_id,
+        "outcome": outcome,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "sql_fingerprint": sql_fingerprint(sql),
+        "row_count": row_count,
+    }
+    if category:
+        record["category"] = category
+    audit_record = {"event": "tool_call", "caller": app.identity, **redact_value(record)}
+    if app.cfg.security.audit_sql_text:
+        audit_record["sql_text"] = redact_text(sql)
+    with anyio.CancelScope(shield=True):
+        await anyio.to_thread.run_sync(app.audit.record, audit_record)
+    app.record_history({**record, "ts": _now()})
+
+
 async def _guarded_read(
     app: AppContext,
     st: dict[str, Any],
@@ -2312,24 +2412,56 @@ async def _guarded_read(
     parameters: list[Any] | dict[str, Any] | None,
     max_rows: int | None,
     timeout_seconds: float | None,
+    *,
+    byte_budget: int | None = None,
 ) -> _GuardedRead:
-    connector, policy = _require_engine(app, connection_id)
-    guard = await guard_for(app, connector, policy)
-    validated = await anyio.to_thread.run_sync(guard.validate_select, sql)
-    row_limit = policy.clamp_row_limit(max_rows)
-    timeout = policy.clamp_timeout(timeout_seconds)
-    spec = QuerySpec(
-        sql=sql,
-        parameters=parameters,
-        max_rows=row_limit,
-        max_response_bytes=policy.max_response_bytes,
-        max_cell_bytes=policy.max_cell_bytes,
-        timeout_seconds=timeout,
+    """One statement on one connection, exactly as db_query runs it, plus its
+    own audit record. `byte_budget` lets a federated caller hand each
+    statement what is left of the shared response ceiling."""
+    started = time.monotonic()
+    try:
+        connector, policy = _require_engine(app, connection_id)
+        guard = await guard_for(app, connector, policy)
+        validated = await anyio.to_thread.run_sync(guard.validate_select, sql)
+        row_limit = policy.clamp_row_limit(max_rows)
+        timeout = policy.clamp_timeout(timeout_seconds)
+        ceiling = policy.max_response_bytes
+        if byte_budget is not None:
+            ceiling = max(1, min(ceiling, int(byte_budget)))
+        spec = QuerySpec(
+            sql=sql,
+            parameters=parameters,
+            max_rows=row_limit,
+            max_response_bytes=ceiling,
+            max_cell_bytes=policy.max_cell_bytes,
+            timeout_seconds=timeout,
+        )
+        st["connector"] = connector  # discarded if the request is cancelled mid-query
+        outcome = await run_query(app, connection_id, spec, f"query on '{connection_id}'")
+        sensitive = _sensitive_output_names(policy, validated.ast)
+        columns, rows = _apply_masking(policy, outcome.columns, outcome.rows, st, sensitive_names=sensitive)
+    except ToolFailure as exc:
+        await _audit_statement(
+            app, st, connection_id, sql, outcome="deny", category=exc.category, row_count=None, started=started
+        )
+        raise
+    except ConnectorError:
+        await _audit_statement(
+            app, st, connection_id, sql, outcome="error", category=ErrorCategory.CONNECTION, row_count=None,
+            started=started,
+        )
+        raise
+    except AuditWriteFailure:
+        raise
+    except Exception:
+        await _audit_statement(
+            app, st, connection_id, sql, outcome="error", category=ErrorCategory.INTERNAL, row_count=None,
+            started=started,
+        )
+        raise
+    await _audit_statement(
+        app, st, connection_id, sql, outcome="allow", category=None, row_count=len(rows), started=started
     )
-    st["connector"] = connector  # discarded if the request is cancelled mid-query
-    outcome = await run_query(app, connection_id, spec, f"query on '{connection_id}'")
-    sensitive = _sensitive_output_names(policy, validated.ast)
-    columns, rows = _apply_masking(policy, outcome.columns, outcome.rows, st, sensitive_names=sensitive)
     return _GuardedRead(policy=policy, columns=columns, rows=rows, outcome=outcome, row_limit=row_limit)
 
 
@@ -2341,8 +2473,16 @@ def _join_key(value: Any, case_insensitive: bool) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float | decimal.Decimal):
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)  # nan/inf stay text and never equal a number
         d = decimal.Decimal(str(value))
-        text = format(d.normalize(), "f") if d == d.to_integral() or True else str(d)
+        if not d.is_finite():
+            return str(value)
+        if d == 0:
+            return "0"  # 0, 0.0, -0.0 and 0E+2 are one key
+        # plain digits, no exponent, no context rounding (Decimal.normalize()
+        # would round a key longer than the 28-digit default precision)
+        text = format(d, "f")
         return text.rstrip("0").rstrip(".") if "." in text else text
     text = str(value).strip()
     if text.lstrip("-").replace(".", "", 1).isdigit():

@@ -13,6 +13,7 @@ What is on the stick:
 | `SHA256SUMS` | checksums of every other file on the stick |
 | `universal-db-mcp_0.1.0+<build stamp>.g<sha7>_amd64.deb` | the package (its payload is the signed offline bundle); the version rises with every build |
 | `trust-bootstrap-linux/` | the trusted verifier, installer and release public key; `bootstrap.sh` installs them |
+| `RELEASE-KEY-FINGERPRINT.txt` | SHA-256 fingerprint of the release public key on this stick, written by the release build; `bootstrap.sh` prints the same value, and your release administrator holds it out-of-band |
 | `oracle-instantclient/` | Oracle Instant Client 19.28, `libaio` and `unzip`, only for thick-mode Oracle connections |
 | `UPGRADE-README.md` | this file |
 
@@ -74,7 +75,13 @@ OLDER stick's bootstrap afterwards:
 ```bash
 sudo bash "$STICK/trust-bootstrap-linux/bootstrap.sh"
 grep -c -- --force-reinstall /usr/local/lib/udbmcp-trust/install_offline.sh   # must print 2
+grep -c 'udbmcp-installer-format: 3' /usr/local/lib/udbmcp-trust/install_offline.sh   # must print 1
+cat "$STICK/RELEASE-KEY-FINGERPRINT.txt"   # must equal the fingerprint bootstrap.sh printed
 ```
+
+The package refuses to install over a trusted installer that lacks the
+`udbmcp-installer-format: 3` marker or `--force-reinstall` (both diagnostics
+say `OUTDATED copy`); this step is the fix.
 
 It installs `verify_bundle.py`, `profiles.py`, `install_offline.sh`,
 `lib/os_packages.sh` to `/usr/local/lib/udbmcp-trust/`, and prints the
@@ -266,6 +273,9 @@ and timings only, never a row value, so it can leave the site:
 sudo -u udbmcp /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp site-check \
   --config /etc/universal-db-mcp/config.yaml --out /tmp/udbmcp-site-check.json
 ```
+
+The report file is written private (mode 0600) and never over an existing
+file: to repeat the run into the same path add `--force`, or pick a new name.
 
 It prints one line per connection (`connection=ok list_tables=ok catalog=ok
 profile=ok explain=ok review=ok search=ok`) and exits non-zero when a step

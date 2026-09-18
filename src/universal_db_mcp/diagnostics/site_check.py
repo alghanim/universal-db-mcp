@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,7 @@ def _check_connection(
             "hits": len(d["hits"]),
             "tables_searched": d["tables_searched"],
             "tables_not_searched": d.get("tables_not_searched"),
+            "connections_not_searched": d.get("connections_not_searched"),
             "budget_exhausted": d["budget_exhausted"],
         }
 
@@ -215,6 +217,19 @@ def render_summary(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_report(report: dict[str, Any], out: str | None) -> None:
-    if out:
-        Path(out).write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+def write_report(report: dict[str, Any], out: str | None, *, force: bool = False) -> None:
+    """Write the report privately (0600) and never over an existing file
+    unless `force`: a report is evidence an operator carries off-site, and
+    a path typo must not silently replace an earlier run."""
+    if not out:
+        return
+    path = Path(out)
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        raise SystemExit(f"refusing to overwrite {path}; pass --force or choose another --out") from None
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(report, indent=2, default=str))
+    if force:
+        os.chmod(path, 0o600)  # an existing file keeps its mode through O_CREAT; make it private

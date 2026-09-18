@@ -311,10 +311,10 @@ def main() -> int:
     ap.add_argument(
         "--i-know-this-sends-ddl", action="store_true",
         help="run the write-refusal probe (a CREATE TABLE sent past the SQL guard to every connection whose "
-        "server-side read-only is enforced). Implied for the default mock config; required for any other.",
+        "server-side read-only is enforced). Always explicit: a config file name never implies consent.",
     )
     args = ap.parse_args()
-    allow_ddl = args.i_know_this_sends_ddl or Path(args.config).name == "config.mockdbs.yaml"
+    allow_ddl = bool(args.i_know_this_sends_ddl)
     app_cfg, resolved = load_resolved(Path(args.config))
     app = AppContext(app_cfg, resolved)
     server = build_server(app)

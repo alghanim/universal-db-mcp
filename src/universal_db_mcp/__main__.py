@@ -46,7 +46,11 @@ def main(argv: list[str] | None = None) -> int:
         "codes and timings only (no row values), suitable to take off-site for diagnosis",
     )
     site.add_argument("--config", default=None)
-    site.add_argument("--out", default=None, help="write the JSON report here (stdout otherwise)")
+    site.add_argument(
+        "--out", default=None,
+        help="write the JSON report here (mode 0600, never over an existing file); stdout otherwise",
+    )
+    site.add_argument("--force", action="store_true", help="overwrite an existing --out file")
     site.add_argument("--sample-rows", type=int, default=200)
     site.add_argument("--review-tables", type=int, default=3)
 
@@ -170,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         report = run_site_check(config, sample_rows=args.sample_rows, review_tables=args.review_tables)
         if args.out:
-            write_report(report, args.out)
+            write_report(report, args.out, force=bool(args.force))
             print(render_summary(report))
             print(f"report written to {args.out}")
         else:

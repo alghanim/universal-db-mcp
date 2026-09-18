@@ -1072,6 +1072,28 @@ else
   rec upgrade_refuses_outdated_installer failed "could not derive an outdated installer copy from /trust/install_offline.sh (no PIP_FIND_LINKS line?)"
 fi
 
+# --- NEGATIVE: a pip-running installer without the current format marker is refused too
+grep -v "udbmcp-installer-format" /trust/install_offline.sh > /tmp/install_offline_nomarker.sh
+if grep -q "PIP_FIND_LINKS" /tmp/install_offline_nomarker.sh && ! grep -q "udbmcp-installer-format" /tmp/install_offline_nomarker.sh; then
+  install -m 755 /tmp/install_offline_nomarker.sh "$TRUST/install_offline.sh"
+  rm -f "$STATUS"
+  dpkg -i "$DEB" > /tmp/dpkg-nomarker.log 2>&1; rc=$?
+  cp /tmp/dpkg-nomarker.log "$EV/dpkg-upgrade-nomarker.log"
+  if [ "$rc" -ne 0 ] && grep -q "OUTDATED copy" /tmp/dpkg-nomarker.log && grep -q "udbmcp-installer-format" /tmp/dpkg-nomarker.log && [ ! -f "$STATUS" ]; then
+    rec upgrade_refuses_unmarked_installer passed "dpkg -i aborted at preinst: installer without the format marker refused (rc=$rc)"
+  else
+    rec upgrade_refuses_unmarked_installer failed "dpkg -i with a marker-less trusted installer did not fail closed (rc=$rc)"
+  fi
+  install -m 755 /trust/install_offline.sh "$TRUST/install_offline.sh"
+  if install_pkg recovery2; then
+    rec upgrade_after_marker_refresh passed "after restoring the marked installer the upgrade succeeded again"
+  else
+    rec upgrade_after_marker_refresh failed "upgrade after restoring the marked installer failed"
+  fi
+else
+  rec upgrade_refuses_unmarked_installer failed "could not derive a marker-less installer copy from /trust/install_offline.sh"
+fi
+
 # --- version ordering: this package must upgrade a legacy 0.1.0~<hash> install
 #     and any package with an older build stamp ---------------------------------
 NEWVER="$(dpkg-deb -f "$DEB" Version)"

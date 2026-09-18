@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# udbmcp-installer-format: 3
+# (the marker above is checked by the package's preinst/postinst: a trusted
+# copy of this installer that lacks the current format number predates a
+# change the package relies on and is refused; refresh it from the stick)
 # Stage B, step 2: install the verified bundle inside the air gap.
 # Network-independent: pip runs with --no-index against the bundle wheelhouse
 # only, with a hostile inherited environment neutralized (PIP_CONFIG_FILE,

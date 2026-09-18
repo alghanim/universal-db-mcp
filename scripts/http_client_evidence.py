@@ -120,20 +120,22 @@ def main() -> int:
     config_copy.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     env = dict(os.environ)
     env["UDBMCP_HTTP_BEARER_TOKEN_FILE"] = str(token_file)
-    server = subprocess.Popen(  # noqa: S603 - our own interpreter and config
-        [str(ROOT / ".venv/bin/python"), "-m", "universal_db_mcp", "serve", "--transport", "http",
-         "--config", str(config_copy)],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-    )
-    nginx = "udbmcp-tls-proxy"
-    subprocess.run(["docker", "rm", "-f", nginx], capture_output=True)  # noqa: S603, S607
-    subprocess.run(  # noqa: S603, S607 - fixed argv
-        ["docker", "run", "-d", "--name", nginx, "-p", f"127.0.0.1:{args.tls_port}:8443",
-         "-v", f"{work / 'nginx.conf'}:/etc/nginx/nginx.conf:ro", "-v", f"{certs}:/certs:ro",
-         "nginx:1.27-alpine"],
-        check=True, capture_output=True,
-    )
+    server: subprocess.Popen[str] | None = None
+    nginx = f"udbmcp-tls-proxy-{os.getpid()}"  # unique: a stale container of another run is never reused
+    stderr_path = work / "server.stderr"  # a file, so a chatty server can never block on a full pipe
     try:
+        with stderr_path.open("w", encoding="utf-8") as stderr_file:
+            server = subprocess.Popen(  # noqa: S603 - our own interpreter and config
+                [str(ROOT / ".venv/bin/python"), "-m", "universal_db_mcp", "serve", "--transport", "http",
+                 "--config", str(config_copy)],
+                env=env, stdout=subprocess.DEVNULL, stderr=stderr_file, text=True,
+            )
+        subprocess.run(  # noqa: S603, S607 - fixed argv
+            ["docker", "run", "-d", "--name", nginx, "-p", f"127.0.0.1:{args.tls_port}:8443",
+             "-v", f"{work / 'nginx.conf'}:/etc/nginx/nginx.conf:ro", "-v", f"{certs}:/certs:ro",
+             "nginx:1.27-alpine"],
+            check=True, capture_output=True,
+        )
         url = f"https://localhost:{args.tls_port}/mcp"
         ready = False
         for _ in range(60):
@@ -147,7 +149,7 @@ def main() -> int:
             time.sleep(1)
         out.append(f"== proxy + server ready: {ready} (url {url}, server on 127.0.0.1:{args.port}, token file 0600)")
         if not ready:
-            err = server.stderr.read() if server.stderr else ""
+            err = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
             out.append(f"   server stderr: {err[-400:]}")
         t0 = time.monotonic()
         try:
@@ -197,12 +199,14 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             out.append(f"== plain HTTP on the TLS port: refused ({type(exc).__name__})")
     finally:
+        # cleanup runs whatever failed above: the proxy container, the server, the scratch dir
         subprocess.run(["docker", "rm", "-f", nginx], capture_output=True)  # noqa: S603, S607
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server.kill()
+        if server is not None:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
         shutil.rmtree(work, ignore_errors=True)
     ev = ROOT / "test-evidence" / "http-transport"
     ev.mkdir(parents=True, exist_ok=True)

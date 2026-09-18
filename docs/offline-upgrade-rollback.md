@@ -154,7 +154,13 @@ sudo bash <bundle>/operations/rollback_offline.sh /opt/universal-db-mcp
 sudo systemctl restart universal-db-mcp
 ```
 
-Restores the previous venv. The venv swap is always performed; restoring the
+Restores the previous venv (both venvs are created with `python -m venv
+--copies`, so each carries its own copy of the interpreter and the rollback
+verifier can prove the tree is self-contained; an OS python update therefore
+does not reach the installed venv until the installer or the package is run
+again, which `doctor` reports as the `venv-interpreter` check by comparing
+the running interpreter with the base named in `pyvenv.cfg`). The venv swap
+is always performed; restoring the
 latest config/state backup OVERWRITES live state (which may hold post-upgrade
 edits made after that backup was taken), so it requires the explicit
 `--restore-config` flag. Without it the script reports the existing backup

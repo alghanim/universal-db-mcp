@@ -137,6 +137,16 @@ if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
   echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
   exit 1
 fi
+INSTALLER_FORMAT=3
+if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
+   && ! grep -q "^# udbmcp-installer-format: ${INSTALLER_FORMAT}\$" "$TRUST_DIR/install_offline.sh"; then
+  echo "FAIL: the trusted installer at $TRUST_DIR/install_offline.sh is an OUTDATED copy" >&2
+  echo "      (no 'udbmcp-installer-format: ${INSTALLER_FORMAT}' marker): this package relies on installer" >&2
+  echo "      behaviour that copy predates (build-then-switch venv, rollback). Refresh the trusted" >&2
+  echo "      tools from the release stick (sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh)," >&2
+  echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
+  exit 1
+fi
 echo "==> admin trust dir complete at $TRUST_DIR (the package never writes to it)"
 
 # --- step 2: the release public key must already be installed (fail closed) -

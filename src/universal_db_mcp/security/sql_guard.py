@@ -63,6 +63,15 @@ _DENIED_NODES = (
 
 # Unknown-function handling is strict (Anonymous => deny). These known names
 # are additionally denied by name even if a dialect maps them to a class.
+# SQL Server table hints that only relax locking for a read. Every other
+# hint (HOLDLOCK, SERIALIZABLE, REPEATABLEREAD, UPDLOCK, XLOCK, TABLOCK[X],
+# PAGLOCK, ROWLOCK, ...) takes or escalates locks and is refused.
+_ALLOWED_TABLE_HINTS = frozenset({"NOLOCK", "READUNCOMMITTED", "READPAST", "NOWAIT"})
+# Db2 sequence expressions: sqlglot's postgres reader cannot parse them (so
+# they are refused anyway); this names the refusal and survives a parser
+# that learns them.
+_DB2_SEQUENCE = re.compile(r"\b(?:NEXT|PREVIOUS)\s+VALUE\s+FOR\b|\b(?:NEXTVAL|PREVVAL)\s+FOR\b", re.I)
+
 _DANGEROUS_FUNCTIONS = {
     "load_extension",
     "readfile",
@@ -340,6 +349,11 @@ class GuardResult:
     ast: exp.Expression
     tables: list[ObjectRef] = field(default_factory=list)
     kind: str = "select"  # select | explain | show
+    # explain only: the inner statement exactly as the caller wrote it (the
+    # text this validation parsed). db_explain sends THIS to the engine, not
+    # a re-rendering of the AST, which would drop the clauses sqlglot does
+    # not carry (Db2 WITH UR / OPTIMIZE FOR n ROWS).
+    text: str | None = None
 
 
 def _deny(message: str) -> ToolFailure:
@@ -431,6 +445,8 @@ class SqlGuard:
         if not stripped:
             raise ToolFailure(ErrorCategory.VALIDATION, "empty statement")
         if self._engine == "db2":
+            if _DB2_SEQUENCE.search(stripped):
+                raise _deny("sequence expressions (NEXT VALUE FOR ...) are not permitted: they advance the sequence")
             stripped = self._strip_db2_read_tail(stripped)
         # Primary parse: the text exactly as submitted. Only if that fails do
         # we retry a view with format/pyformat placeholders (%s, %(name)s)
@@ -474,6 +490,23 @@ class SqlGuard:
         for node in root.walk():
             if isinstance(node, _DENIED_NODES):
                 raise _deny(f"statement contains a disallowed construct ({type(node).__name__})")
+            if isinstance(node, exp.NextValueFor):
+                # a read that advances a sequence is a write
+                raise _deny("sequence access (NEXT VALUE FOR) is not permitted: it advances the sequence")
+            if isinstance(node, exp.WithTableHint):
+                for hint in node.expressions:
+                    hint_name = hint.name if isinstance(hint, exp.Var | exp.Identifier | exp.Column) else hint.sql()
+                    if hint_name.upper() not in _ALLOWED_TABLE_HINTS:
+                        raise _deny(
+                            f"table hint '{hint_name}' is not permitted on a read-only connection "
+                            f"(only NOLOCK, READUNCOMMITTED, READPAST and NOWAIT are accepted)"
+                        )
+            if (
+                isinstance(node, exp.Column)
+                and self._engine in ("oracle", "db2")
+                and node.name.lower() in ("nextval", "currval")
+            ):
+                raise _deny(f"sequence pseudo-column '{node.name}' is not permitted: it advances or reads a sequence")
             if isinstance(node, exp.Select) and node.args.get("into"):
                 raise _deny("SELECT INTO is not permitted")
             if isinstance(node, (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)) and node.args.get(
@@ -576,7 +609,8 @@ class SqlGuard:
             m = re.match(r"^EXPLAIN(\s+QUERY\s+PLAN)?\s+(.+)$", text, re.I | re.S)
             if not m:
                 raise _deny("sqlite EXPLAIN requires: EXPLAIN [QUERY PLAN] <select>")
-            root = self._parse_single(m.group(2), "explain")
+            inner = m.group(2)
+            root = self._parse_single(inner, "explain")
         elif self._dialect in ("postgres", "clickhouse"):
             # PostgreSQL option syntax: EXPLAIN [(option [, ...])] statement
             # (e.g. EXPLAIN (FORMAT JSON) SELECT ...), plus the bare-token
@@ -592,14 +626,16 @@ class SqlGuard:
                 raise _deny(
                     "EXPLAIN ANALYZE executes the statement and is disabled by policy; use EXPLAIN without ANALYZE"
                 )
-            root = self._parse_single(m.group(3), "explain")
+            inner = m.group(3)
+            root = self._parse_single(inner, "explain")
         elif self._dialect == "mysql":
             m = re.match(r"^EXPLAIN\s+(ANALYZE\s+)?(?:FORMAT\s*=\s*(\w+)\s+)?(.+)$", text, re.I | re.S)
             if not m:
                 raise _deny("EXPLAIN requires: EXPLAIN [ANALYZE] [FORMAT=x] <statement>")
             if m.group(1) and not self._policy.allow_explain_analyze:
                 raise _deny("EXPLAIN ANALYZE is disabled by policy")
-            root = self._parse_single(m.group(3), "explain")
+            inner = m.group(3)
+            root = self._parse_single(inner, "explain")
         elif self._dialect in ("oracle", "tsql"):
             # No native "EXPLAIN <stmt>" on these engines: the tool accepts the
             # portable spelling and the connector captures the plan its own way
@@ -613,7 +649,8 @@ class SqlGuard:
                     "EXPLAIN ANALYZE is not available on this engine: plans are captured without "
                     "executing the statement; use EXPLAIN <statement>"
                 )
-            root = self._parse_single(m.group(2), "explain")
+            inner = m.group(2)
+            root = self._parse_single(inner, "explain")
         else:
             raise ToolFailure(
                 ErrorCategory.CAPABILITY,
@@ -623,7 +660,7 @@ class SqlGuard:
         if not isinstance(root, _ALLOWED_ROOTS):
             raise _deny("EXPLAIN requires a read statement inside")
         refs = self._walk_validate(root)
-        return GuardResult(ast=root, tables=refs, kind="explain")
+        return GuardResult(ast=root, tables=refs, kind="explain", text=inner.strip().rstrip(";").strip())
 
     def validate_show(self, sql: str) -> GuardResult:
         """Strict per-dialect allowlists for SHOW/DESCRIBE-style commands."""

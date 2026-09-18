@@ -142,6 +142,23 @@ then re-run this install."
     echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
     exit 1
 fi
+# The installer also carries a format marker ('# udbmcp-installer-format: N');
+# any pip-running copy without the current number is refused the same way
+# (build-then-switch venvs, --copies interpreters and rollback all depend on it).
+INSTALLER_FORMAT=3
+if [ -s "$INSTALLER" ] && grep -q "PIP_FIND_LINKS" "$INSTALLER" \
+   && ! grep -q "^# udbmcp-installer-format: ${INSTALLER_FORMAT}\$" "$INSTALLER"; then
+    fail "the trusted installer at $INSTALLER is an OUTDATED copy (no 'udbmcp-installer-format: ${INSTALLER_FORMAT}' marker).
+This package relies on installer behaviour that copy predates (it builds the new
+venv beside the running one and switches, so a failed upgrade never leaves a
+half-replaced install). Refresh the trusted tools from the release stick first:
+
+    sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh
+
+then re-run this install."
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
 
 echo "universal-db-mcp preinst: trust prerequisites present."
 echo "  verifier: $VERIFIER"

@@ -31,7 +31,12 @@
   comments (`/*! ... */`) denied; `SELECT INTO`, ATTACH, PRAGMA, SET denied.
 - Objects resolved conservatively against the connection's allowlist;
   unresolvable = denied under `default_deny_objects`.
-- EXPLAIN/SHOW/DESCRIBE via dedicated per-dialect policies only.
+- Sequence access denied (`NEXT VALUE FOR`, Oracle `NEXTVAL`/`CURRVAL`, Db2
+  `NEXTVAL FOR`): a read that advances a sequence is a write. T-SQL table
+  hints other than NOLOCK, READUNCOMMITTED, READPAST and NOWAIT denied (they
+  take or escalate locks).
+- EXPLAIN/SHOW/DESCRIBE via dedicated per-dialect policies only; the
+  validated statement text is what reaches the engine.
 - Bound parameters via driver facilities; identifiers validated and quoted
   by the adapter.
 
@@ -46,7 +51,11 @@ server-side. The executor never reuses a poisoned connection.
 ## Audit
 
 Fields: caller identity, connection id, action, timing, row count, policy
-outcome, SQL fingerprint (literals removed). Raw SQL text, parameters, and
+outcome, SQL fingerprint (literals removed). The federated tools run several
+statements under one request: each statement leaves its own record (action
+`<tool>:statement`, the same request id, its connection and fingerprint) in
+addition to the tool's own record, so the per-connection trail is as complete
+as `db_query`'s. Raw SQL text, parameters, and
 rows are stored only when explicitly enabled (off by default). Rotation by
 size. `audit_fail_closed: true` (default) means operations fail when the
 required audit record cannot be written.
