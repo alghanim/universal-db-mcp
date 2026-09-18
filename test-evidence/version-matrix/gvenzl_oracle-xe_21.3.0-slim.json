@@ -1,31 +1,31 @@
 {
   "label": "gvenzl/oracle-xe:21.3.0-slim",
   "engine": "oracle",
-  "probe_rev": "c820896",
-  "started_utc": "2026-09-16T20:38:43Z",
+  "probe_rev": "f5b733f",
+  "started_utc": "2026-09-18T12:26:04Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 2174,
+      "ms": 846,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 1138,
+      "ms": 381,
       "detail": "Oracle Database 21c Express Edition Release 21.0.0.0.0 - Pro"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 925,
+      "ms": 362,
       "detail": "SYSTEM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 5604,
+      "ms": 424,
       "detail": "[TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENTS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENT_PRIVS', kind"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 1369,
+      "ms": 25,
       "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EM"
     },
     {
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 1632,
+      "ms": 55,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 3804,
+      "ms": 891,
       "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C008302', columns=["
     },
     {
@@ -67,7 +67,7 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "SYS_C008301"
     },
     {
@@ -79,62 +79,62 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 1985,
+      "ms": 1163,
       "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 39,
+      "ms": 18,
       "detail": "VM_V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 89,
+      "ms": 35,
       "detail": "VM_F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 201,
+      "ms": 79,
       "detail": "catalog_estimate(all_tables.num_rows)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 773,
+      "ms": 360,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 1041,
+      "ms": 412,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 661,
+      "ms": 384,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 527,
+      "ms": 379,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 473,
+      "ms": 386,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
-      "status": "skipped",
-      "ms": 0,
-      "detail": "unsupported by design: Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build"
+      "status": "passed",
+      "ms": 773,
+      "detail": "['raw', 'rows', 'method']"
     }
   ],
   "server_version": "Oracle Database 21c Express Edition Release 21.0.0.0.0 - Pro",
@@ -159,9 +159,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:39:06Z",
+  "finished_utc": "2026-09-18T12:26:11Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }

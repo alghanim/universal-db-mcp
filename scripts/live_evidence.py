@@ -250,6 +250,38 @@ def discovery_evidence(server: Any, conn_ids: list[str], search_query: str) -> s
     except Exception as exc:  # noqa: BLE001
         out.append(f"  FAILED {type(exc).__name__}: {str(exc)[:240]}")
     out.append("")
+    out.append("== federated read (one aliased statement per connection, merged by shape)")
+    try:
+        queries = {
+            "mock_pg": "SELECT buoy_id AS id, callsign AS label FROM ocean.buoys",
+            "mock_mysql": "SELECT cupping_id AS id, taster AS label FROM testdb.cuppings",
+            "mock_db2": "SELECT CITIZEN_ID AS id, FULL_NAME AS label FROM MOI.CITIZENS",
+            "mock_oracle": "SELECT FLIGHT_ID AS id, FLIGHT_NO AS label FROM TRAVEL.FLIGHTS",
+            "mock_clickhouse": "SELECT duration_sec AS id, direction AS label FROM telecom.cdr LIMIT 3",
+        }
+        queries = {k: v for k, v in queries.items() if k in conn_ids}
+        fed = _call(server, "db_federated_query", {"queries": queries, "max_rows_per_connection": 3})
+        d = fed["data"]
+        merged = d.get("merged") or {}
+        out.append(
+            f"  run={d['connections_run']} failed={d['connections_failed']} merged_rows={len(merged.get('rows', []))} "
+            f"columns={merged.get('columns')} warnings={fed.get('warnings')}"
+        )
+        for r in (merged.get("rows") or [])[:6]:
+            out.append(f"     {r}")
+        j = _call(server, "db_federated_join", {
+            "left": {"connection": "mock_pg", "sql": "SELECT buoy_id, callsign FROM ocean.buoys"},
+            "right": {"connection": "mock_pg", "sql": "SELECT buoy_id, reading_id FROM ocean.readings"},
+            "on": [["buoy_id", "buoy_id"]], "max_rows": 5,
+        })
+        jd = j["data"]
+        out.append(
+            f"  join pg buoys x readings on buoy_id: rows={len(jd['rows'])} matched_left={jd['matched_left_rows']} "
+            f"unmatched_left={jd['unmatched_left_rows']} truncated={jd['truncated']} warnings={j.get('warnings')}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  FAILED {type(exc).__name__}: {str(exc)[:240]}")
+    out.append("")
     out.append("== relationship inference (all connections)")
     try:
         rel_env = _call(server, "db_infer_relationships", {})

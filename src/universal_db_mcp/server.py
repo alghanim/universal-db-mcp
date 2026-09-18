@@ -10,6 +10,7 @@ Stdout is protocol-only (stdio transport); application logs go to stderr.
 from __future__ import annotations
 
 import dataclasses
+import decimal
 import functools
 import getpass
 import json
@@ -81,6 +82,8 @@ _PROFILE_DEFAULT_SAMPLE = 10_000
 _PROFILE_MAX_TOP_COLUMNS = 20
 _SEARCH_MAX_SELECT = 8
 _DISCOVERY_INFER_MAX_TABLES = 500
+_FEDERATED_MAX_BUDGET_SECONDS = 300.0
+_FEDERATED_MAX_MERGED_ROWS = 5000
 _REVIEW_MAX_TABLES = 100
 _REVIEW_MIN_TABLE_SECONDS = 5.0
 _REVIEW_MAX_RECOMMENDATIONS = 200
@@ -1107,43 +1110,27 @@ def build_server(app: AppContext) -> MCPServer:
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         async with tool_span(app, "db_query", connection_id, sql=sql) as st:
-            connector, policy = _require_engine(app, connection_id)
-            guard = await guard_for(app, connector, policy)
-            validated = await anyio.to_thread.run_sync(guard.validate_select, sql)
-            row_limit = policy.clamp_row_limit(max_rows)
-            timeout = policy.clamp_timeout(timeout_seconds)
-            spec = QuerySpec(
-                sql=sql,
-                parameters=parameters,
-                max_rows=row_limit,
-                max_response_bytes=policy.max_response_bytes,
-                max_cell_bytes=policy.max_cell_bytes,
-                timeout_seconds=timeout,
-            )
-            st["connector"] = connector  # discarded if the request is cancelled mid-query
-            outcome = await run_query(app, connection_id, spec, f"query on '{connection_id}'")
-            sensitive = _sensitive_output_names(policy, validated.ast)
-            columns, rows = _apply_masking(policy, outcome.columns, outcome.rows, st, sensitive_names=sensitive)
-            st["row_count"] = len(rows)
+            read = await _guarded_read(app, st, connection_id, sql, parameters, max_rows, timeout_seconds)
+            st["row_count"] = len(read.rows)
             data = {
-                "columns": [{"name": n, "type": t} for n, t in columns],
-                "rows": rows,
+                "columns": [{"name": n, "type": t} for n, t in read.columns],
+                "rows": read.rows,
             }
-            warnings = list(outcome.warnings) + st["warnings"]
-            if outcome.truncated:
+            warnings = list(read.outcome.warnings) + st["warnings"]
+            if read.outcome.truncated:
                 warnings.append(
-                    f"result truncated: limits are rows<={row_limit}, "
-                    f"bytes<={policy.max_response_bytes}; fetch limits applied "
+                    f"result truncated: limits are rows<={read.row_limit}, "
+                    f"bytes<={read.policy.max_response_bytes}; fetch limits applied "
                     f"server-side, not after full retrieval"
                 )
             return _envelope(
                 st,
                 connection_id,
-                policy.engine,
+                read.policy.engine,
                 data,
                 warnings=warnings,
-                returned_row_count=len(rows),
-                truncated=outcome.truncated,
+                returned_row_count=len(read.rows),
+                truncated=read.outcome.truncated,
             )
 
     register(
@@ -1151,6 +1138,228 @@ def build_server(app: AppContext) -> MCPServer:
         "Execute one validated, bounded read statement with optional bound "
         "parameters; row/byte/timeout ceilings are enforced server-side.",
         db_query,
+    )
+
+    async def db_federated_query(
+        sql: str | None = None,
+        connections: list[str] | None = None,
+        queries: dict[str, str] | None = None,
+        parameters: list[Any] | dict[str, Any] | None = None,
+        max_rows_per_connection: int | None = None,
+        time_budget_seconds: float = 60.0,
+    ) -> dict[str, Any]:
+        async with tool_span(app, "db_federated_query") as st:
+            if bool(sql) == bool(queries):
+                raise ToolFailure(
+                    ErrorCategory.VALIDATION,
+                    "pass either sql (run on every listed connection) or queries (one statement per connection)",
+                )
+            if queries:
+                if connections:
+                    raise ToolFailure(ErrorCategory.VALIDATION, "connections is implied by the keys of queries")
+                plan = dict(queries)
+            else:
+                ids = connections if connections is not None else sorted(app.resolved)
+                plan = {cid: str(sql) for cid in ids}
+            if not plan:
+                raise ToolFailure(ErrorCategory.VALIDATION, "no connections selected")
+            unknown = [cid for cid in plan if cid not in app.resolved]
+            if unknown:
+                raise ToolFailure(ErrorCategory.VALIDATION, f"unknown connections: {unknown}")
+            budget = max(1.0, min(float(time_budget_seconds), _FEDERATED_MAX_BUDGET_SECONDS))
+            deadline = time.monotonic() + budget
+            results: list[dict[str, Any]] = []
+            byte_ceiling: int | None = None
+            used_bytes = 0
+            exhausted = False
+            for cid, statement in plan.items():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    exhausted = True
+                    st["warnings"].append(f"time budget of {budget:.0f}s exhausted before '{cid}' ran")
+                    break
+                t0 = time.monotonic()
+                try:
+                    read = await _guarded_read(
+                        app, st, cid, statement, parameters, max_rows_per_connection, min(remaining, budget)
+                    )
+                except Exception as exc:  # noqa: BLE001 - one failing connection is reported, not fatal
+                    results.append({"connection": cid, "error": scrub_exception(exc)})
+                    st["warnings"].append(f"'{cid}': {scrub_exception(exc)}")
+                    continue
+                entry = {
+                    "connection": cid,
+                    "engine": read.policy.engine,
+                    "columns": [{"name": n, "type": t} for n, t in read.columns],
+                    "rows": read.rows,
+                    "truncated": read.outcome.truncated,
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                }
+                byte_ceiling = (
+                    read.policy.max_response_bytes if byte_ceiling is None
+                    else min(byte_ceiling, read.policy.max_response_bytes)
+                )
+                used_bytes += len(json.dumps(entry, default=str))
+                if used_bytes > byte_ceiling and results:
+                    st["warnings"].append(
+                        "response byte ceiling (security.max_response_bytes) reached; later connections were not run"
+                    )
+                    exhausted = True
+                    break
+                results.append(entry)
+            ok = [r for r in results if "rows" in r]
+            merged: dict[str, Any] | None = None
+            if ok:
+                shapes = {tuple(c["name"].lower() for c in r["columns"]) for r in ok}
+                if len(shapes) == 1:
+                    names = ["connection", *[c["name"] for c in ok[0]["columns"]]]
+                    rows: list[list[Any]] = []
+                    for r in ok:
+                        for row in r["rows"]:
+                            rows.append([r["connection"], *row])
+                            if len(rows) >= _FEDERATED_MAX_MERGED_ROWS:
+                                break
+                        if len(rows) >= _FEDERATED_MAX_MERGED_ROWS:
+                            break
+                    merged = {"columns": names, "rows": rows, "truncated": sum(len(r["rows"]) for r in ok) > len(rows)}
+                else:
+                    st["warnings"].append(
+                        "column names differ between connections; no merged view (per-connection results only)"
+                    )
+            st["row_count"] = sum(len(r["rows"]) for r in ok)
+            return _envelope(
+                st, None, None,
+                {
+                    "results": results,
+                    "merged": merged,
+                    "connections_run": len(ok),
+                    "connections_failed": len(results) - len(ok),
+                    "budget_exhausted": exhausted,
+                    "note": "each statement is validated and bounded under its own connection's policy; masked "
+                    "columns are masked per connection before merging",
+                },
+                warnings=st["warnings"],
+            )
+
+    register(
+        "db_federated_query",
+        "Run one validated read statement on several connections (or one statement per connection) and "
+        "return per-connection results plus a merged view with a leading 'connection' column when the "
+        "column names agree. Each statement is guarded, bounded and masked under its own connection's policy; "
+        "one failing connection is a warning.",
+        db_federated_query,
+    )
+
+    async def db_federated_join(
+        left: dict[str, Any],
+        right: dict[str, Any],
+        on: list[list[str]],
+        join: Literal["inner", "left"] = "inner",
+        max_rows: int = 500,
+        max_rows_per_side: int | None = None,
+        case_insensitive_keys: bool = False,
+    ) -> dict[str, Any]:
+        async with tool_span(app, "db_federated_join") as st:
+            sides: dict[str, tuple[str, str]] = {}
+            for name, side in (("left", left), ("right", right)):
+                if not isinstance(side, dict) or not side.get("connection") or not side.get("sql"):
+                    raise ToolFailure(ErrorCategory.VALIDATION, f"{name} must be {{connection, sql}}")
+                if side["connection"] not in app.resolved:
+                    raise ToolFailure(ErrorCategory.VALIDATION, f"unknown connection '{side['connection']}'")
+                sides[name] = (str(side["connection"]), str(side["sql"]))
+            pairs = [(str(p[0]), str(p[1])) for p in on if isinstance(p, list | tuple) and len(p) == 2]
+            if not pairs or len(pairs) != len(on):
+                raise ToolFailure(
+                    ErrorCategory.VALIDATION, "on must be a non-empty list of [left_column, right_column] pairs"
+                )
+            cap = max(1, min(int(max_rows), _FEDERATED_MAX_MERGED_ROWS))
+            reads: dict[str, _GuardedRead] = {}
+            for name, (cid, statement) in sides.items():
+                reads[name] = await _guarded_read(app, st, cid, statement, None, max_rows_per_side, None)
+            lcols = [n for n, _t in reads["left"].columns]
+            rcols = [n for n, _t in reads["right"].columns]
+            for lc, rc in pairs:
+                if lc not in lcols:
+                    raise ToolFailure(ErrorCategory.VALIDATION, f"left result has no column '{lc}' (columns: {lcols})")
+                if rc not in rcols:
+                    raise ToolFailure(ErrorCategory.VALIDATION, f"right result has no column '{rc}' (columns: {rcols})")
+            li = [lcols.index(lc) for lc, _rc in pairs]
+            ri = [rcols.index(rc) for _lc, rc in pairs]
+
+            def key(row: list[Any], idx: list[int]) -> tuple[Any, ...] | None:
+                parts = []
+                for i in idx:
+                    v = row[i]
+                    if v is None or v == "<masked>":
+                        return None
+                    parts.append(_join_key(v, case_insensitive_keys))
+                return tuple(parts)
+
+            index: dict[tuple[Any, ...], list[list[Any]]] = {}
+            for row in reads["right"].rows:
+                k = key(row, ri)
+                if k is not None:
+                    index.setdefault(k, []).append(row)
+            out_rows: list[list[Any]] = []
+            matched_left = 0
+            unmatched_left = 0
+            truncated = False
+            empty_right = [None] * len(rcols)
+            for row in reads["left"].rows:
+                k = key(row, li)
+                matches = index.get(k, []) if k is not None else []
+                if matches:
+                    matched_left += 1
+                    for m in matches:
+                        if len(out_rows) >= cap:
+                            truncated = True
+                            break
+                        out_rows.append([*row, *m])
+                else:
+                    unmatched_left += 1
+                    if join == "left":
+                        if len(out_rows) >= cap:
+                            truncated = True
+                            break
+                        out_rows.append([*row, *empty_right])
+                if truncated:
+                    break
+            if any(read.outcome.truncated for read in reads.values()):
+                st["warnings"].append(
+                    "a side was truncated by its row or byte ceiling; the join is incomplete (raise max_rows_per_side "
+                    "or narrow the statements)"
+                )
+            if any(v == "<masked>" for r in reads["left"].rows for v in (r[i] for i in li)) or any(
+                v == "<masked>" for r in reads["right"].rows for v in (r[i] for i in ri)
+            ):
+                st["warnings"].append("join keys with masked values never match (sensitive columns are not join keys)")
+            st["row_count"] = len(out_rows)
+            return _envelope(
+                st, None, None,
+                {
+                    "columns": [f"left.{c}" for c in lcols] + [f"right.{c}" for c in rcols],
+                    "rows": out_rows,
+                    "join": join,
+                    "on": [list(p) for p in pairs],
+                    "left": {"connection": sides["left"][0], "rows": len(reads["left"].rows),
+                             "truncated": reads["left"].outcome.truncated},
+                    "right": {"connection": sides["right"][0], "rows": len(reads["right"].rows),
+                              "truncated": reads["right"].outcome.truncated},
+                    "matched_left_rows": matched_left,
+                    "unmatched_left_rows": unmatched_left,
+                    "truncated": truncated,
+                    "note": "hash join computed here from two guarded, bounded, masked result sets; keys compare "
+                    "as normalised text (numbers by value), nothing is written anywhere",
+                },
+                warnings=st["warnings"],
+            )
+
+    register(
+        "db_federated_join",
+        "Join two bounded read results from two connections (or the same one) on key columns, computed here: "
+        "inner or left join, row-capped, keys compared as normalised text. Each side is guarded, bounded and "
+        "masked under its own connection's policy; masked values never match.",
+        db_federated_join,
     )
 
     async def db_sample_table(
@@ -2063,6 +2272,68 @@ async def _profile_object(
         "primary_key": next((i.columns for i in indexes if i.primary), None),
         "findings": [f.as_dict() for f in findings],
     }
+
+
+
+@dataclasses.dataclass
+class _GuardedRead:
+    """One validated, bounded, masked read: what db_query returns before it
+    is wrapped, reused by the federated tools."""
+
+    policy: EffectivePolicy
+    columns: list[tuple[str, str]]
+    rows: list[list[Any]]
+    outcome: Any
+    row_limit: int
+
+
+async def _guarded_read(
+    app: AppContext,
+    st: dict[str, Any],
+    connection_id: str,
+    sql: str,
+    parameters: list[Any] | dict[str, Any] | None,
+    max_rows: int | None,
+    timeout_seconds: float | None,
+) -> _GuardedRead:
+    connector, policy = _require_engine(app, connection_id)
+    guard = await guard_for(app, connector, policy)
+    validated = await anyio.to_thread.run_sync(guard.validate_select, sql)
+    row_limit = policy.clamp_row_limit(max_rows)
+    timeout = policy.clamp_timeout(timeout_seconds)
+    spec = QuerySpec(
+        sql=sql,
+        parameters=parameters,
+        max_rows=row_limit,
+        max_response_bytes=policy.max_response_bytes,
+        max_cell_bytes=policy.max_cell_bytes,
+        timeout_seconds=timeout,
+    )
+    st["connector"] = connector  # discarded if the request is cancelled mid-query
+    outcome = await run_query(app, connection_id, spec, f"query on '{connection_id}'")
+    sensitive = _sensitive_output_names(policy, validated.ast)
+    columns, rows = _apply_masking(policy, outcome.columns, outcome.rows, st, sensitive_names=sensitive)
+    return _GuardedRead(policy=policy, columns=columns, rows=rows, outcome=outcome, row_limit=row_limit)
+
+
+def _join_key(value: Any, case_insensitive: bool) -> str:
+    """Normalise a join key so 5, 5.0, Decimal('5.00') and '5' from different
+    engines compare equal, while text stays text."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float | decimal.Decimal):
+        d = decimal.Decimal(str(value))
+        text = format(d.normalize(), "f") if d == d.to_integral() or True else str(d)
+        return text.rstrip("0").rstrip(".") if "." in text else text
+    text = str(value).strip()
+    if text.lstrip("-").replace(".", "", 1).isdigit():
+        try:
+            return _join_key(decimal.Decimal(text), case_insensitive)
+        except decimal.InvalidOperation:
+            pass
+    return text.lower() if case_insensitive else text
 
 
 def _redact_foreign_target(policy: EffectivePolicy, key: KeyInfo) -> dict[str, Any]:

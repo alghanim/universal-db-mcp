@@ -48,6 +48,8 @@ stable category:
 | `db_search_values` | a value searched across permitted tables of many connections without SQL; the query is literal text (`%`, `_` and `[` are escaped, never wildcards); per-table hits, time budget clamped to the policy, per-table timeout, response byte ceiling, system schemas and sensitive columns excluded; one unreachable connection is a warning, not a failure |
 | `db_infer_relationships` | declared foreign keys + inferred join candidates (name/type match, `<table>_id` convention) within and across connections, metadata only |
 | `db_review_schema` | optimization review of a schema or whole connection: every permitted table profiled on a bounded sample under one time budget (biggest tables first, paged), findings prioritized by severity with evidence and a suggestion; `sensitive` columns counted only |
+| `db_federated_query` | one validated read statement on several connections (or one statement per connection): per-connection results, each guarded, bounded and masked under its own policy, plus a merged view with a leading `connection` column when the column names agree; one failing connection is a warning; shared time and byte budgets |
+| `db_federated_join` | a client-side hash join of two bounded read results from two connections (or the same one) on key columns: inner or left, row-capped, keys compared as normalised text so `5`, `5.0` and `'5'` from different engines match; masked values never match; nothing is written |
 | `db_document_schema` | Markdown data dictionary of a schema or whole connection (paged): columns with declared and portable types, nullability, defaults, keys, indexes, comments, declared relationships; metadata only |
 
 ## Discovery tools for federated work (ETL, documentation, optimization)
@@ -87,6 +89,13 @@ without hand-written queries, then document or extract from them:
    `security.discovery_time_budget_seconds` budget, with a
    `recommendations` list sorted by severity. Its output is a review to
    act on, never a change: nothing in this server alters a database.
+8. `db_federated_query` and `db_federated_join` are the federated read
+   pass: the same question asked of every database at once (a customer id
+   searched in the CRM, the ERP and the billing system in one call, results
+   merged with the connection they came from), and a reconciliation join of
+   two result sets across databases computed in the server, bounded and
+   masked per connection. They read only; moving or loading data stays
+   outside this server by design.
 7. `db_document_schema` is the documentation pass in one call: a Markdown
    data dictionary rendered from the same catalog `db_get_catalog` returns,
    page by page, with declared relationships listed per page. No table data

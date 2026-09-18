@@ -98,7 +98,7 @@ connections:
 
                 tools = await session.list_tools()
                 names = {t.name for t in tools.tools}
-                record("tools_listed", len(names) == 27, f"{len(names)} tools")
+                record("tools_listed", len(names) == 29, f"{len(names)} tools")
 
                 res = await session.call_tool("db_list_connections", {})
                 record("list_connections", not res.is_error)

@@ -45,6 +45,8 @@ EXPECTED_TOOLS = {
     "db_infer_relationships",
     "db_review_schema",
     "db_document_schema",
+    "db_federated_query",
+    "db_federated_join",
 }
 
 

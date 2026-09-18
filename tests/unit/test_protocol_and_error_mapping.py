@@ -198,7 +198,7 @@ EXPECTED_TOOLS = {
     "db_get_relationships", "db_get_statistics", "db_validate_query", "db_query", "db_sample_table",
     "db_explain", "db_get_query_history",
     "db_list_indexes", "db_get_catalog", "db_profile_table", "db_search_values", "db_infer_relationships",
-    "db_review_schema", "db_document_schema",
+    "db_review_schema", "db_document_schema", "db_federated_query", "db_federated_join",
 }
 
 
