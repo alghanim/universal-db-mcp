@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import math
+import secrets
 import threading
 import time
 from collections.abc import Callable
@@ -258,9 +259,11 @@ class Db2Connector(DatabaseConnector):
             limitations=[
                 Limitation(
                     scope="explain",
-                    detail="EXPLAIN requires administrator-provisioned explain "
-                    "tables (SYSTOOLS.EXPLAIN_*); never auto-created here. Refused "
-                    "until provisioned.",
+                    detail="EXPLAIN PLAN needs administrator-provisioned explain tables "
+                    "(session schema or SYSTOOLS.EXPLAIN_*, created once with "
+                    "SYSPROC.SYSINSTALLOBJECTS('EXPLAIN','C',NULL,NULL)); never created here. "
+                    "Refused with that instruction until provisioned; the plan rows written for "
+                    "a call are deleted again.",
                 ),
                 Limitation(
                     scope="licensing",
@@ -678,6 +681,108 @@ class Db2Connector(DatabaseConnector):
                 pass
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
-        raise NotImplementedError(
-            "Db2 EXPLAIN requires administrator-provisioned explain tables; not provisioned automatically in this build"
+        """EXPLAIN PLAN into the explain tables, read back as operators.
+
+        Db2 writes the plan into EXPLAIN_* tables that a DBA provisions once
+        (`CALL SYSPROC.SYSINSTALLOBJECTS('EXPLAIN','C',NULL,NULL)`, usually
+        into SYSTOOLS); they are looked up in the session authorization id's
+        schema first, then SYSTOOLS, exactly as the engine does. Without them
+        the call fails with that instruction: nothing is created here. The
+        rows written for this call are deleted again; the statement is never
+        executed.
+        """
+        if analyze:
+            raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
+        queryno = secrets.randbelow(2_000_000_000) + 1
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                schema = self._explain_schema(conn)
+            except BaseException:
+                self._module.close(conn)
+                raise
+            if schema is None:
+                self._module.close(conn)
+        if schema is None:
+            # outside the driver-error translation: "unsupported here" is a
+            # capability statement, not a driver failure
+            raise NotImplementedError(
+                "Db2 explain tables are not provisioned for this account (no EXPLAIN_STATEMENT in the "
+                "session schema or SYSTOOLS); a DBA creates them once with "
+                "CALL SYSPROC.SYSINSTALLOBJECTS('EXPLAIN','C',NULL,NULL)"
+            )
+        with translated_driver_errors():
+            try:
+                q = self.quote_identifier(schema)
+                self._module.exec_immediate(conn, f"EXPLAIN PLAN SET QUERYNO = {int(queryno)} FOR {sql}")  # noqa: S608
+                stmt = self._module.prepare(
+                    conn,
+                    f"SELECT EXPLAIN_REQUESTER, EXPLAIN_TIME, SOURCE_NAME, SOURCE_SCHEMA, SOURCE_VERSION, "
+                    f"EXPLAIN_LEVEL, STMTNO, SECTNO, TOTAL_COST FROM {q}.EXPLAIN_STATEMENT "
+                    f"WHERE QUERYNO = ? AND EXPLAIN_LEVEL = 'P' ORDER BY EXPLAIN_TIME DESC",  # noqa: S608
+                )
+                self._module.execute(stmt, (queryno,))
+                heads = self._fetch_all(stmt)
+                if not heads:
+                    raise ConnectorError("Db2 EXPLAIN PLAN wrote no plan statement (explain tables present but empty)")
+                head = heads[0]
+                keys = tuple(head[:8])
+                stmt = self._module.prepare(
+                    conn,
+                    f"SELECT o.OPERATOR_ID, o.OPERATOR_TYPE, o.TOTAL_COST, o.IO_COST, o.CPU_COST, "
+                    f"s.OBJECT_SCHEMA, s.OBJECT_NAME, s.STREAM_COUNT "
+                    f"FROM {q}.EXPLAIN_OPERATOR o LEFT JOIN {q}.EXPLAIN_STREAM s "
+                    f"ON s.EXPLAIN_REQUESTER = o.EXPLAIN_REQUESTER AND s.EXPLAIN_TIME = o.EXPLAIN_TIME "
+                    f"AND s.SOURCE_NAME = o.SOURCE_NAME AND s.SOURCE_SCHEMA = o.SOURCE_SCHEMA "
+                    f"AND s.SOURCE_VERSION = o.SOURCE_VERSION AND s.EXPLAIN_LEVEL = o.EXPLAIN_LEVEL "
+                    f"AND s.STMTNO = o.STMTNO AND s.SECTNO = o.SECTNO AND s.TARGET_ID = o.OPERATOR_ID "
+                    f"AND s.OBJECT_NAME IS NOT NULL "
+                    f"WHERE o.EXPLAIN_REQUESTER = ? AND o.EXPLAIN_TIME = ? AND o.SOURCE_NAME = ? "
+                    f"AND o.SOURCE_SCHEMA = ? AND o.SOURCE_VERSION = ? AND o.EXPLAIN_LEVEL = ? "
+                    f"AND o.STMTNO = ? AND o.SECTNO = ? ORDER BY o.OPERATOR_ID",  # noqa: S608
+                )
+                self._module.execute(stmt, keys)
+                ops = self._fetch_all(stmt)
+                try:
+                    stmt = self._module.prepare(
+                        conn, f"DELETE FROM {q}.EXPLAIN_INSTANCE WHERE EXPLAIN_REQUESTER = ? AND EXPLAIN_TIME = ?"  # noqa: S608
+                    )
+                    self._module.execute(stmt, (keys[0], keys[1]))
+                except Exception:  # noqa: BLE001, S110 - scratch rows; a DBA can prune the explain tables
+                    pass
+            finally:
+                self._module.close(conn)
+        rows = [
+            {
+                "operator_id": r[0], "operator": _s(r[1]), "total_cost": r[2], "io_cost": r[3], "cpu_cost": r[4],
+                "object_schema": _s(r[5]) if r[5] else None, "object_name": _s(r[6]) if r[6] else None,
+                "stream_count": r[7],
+            }
+            for r in ops
+        ]
+        text = "\n".join(
+            f"{r['operator_id']:>3} {r['operator']:<8} cost={r['total_cost']}"
+            + (f" {r['object_schema']}.{r['object_name']}" if r["object_name"] else "")
+            for r in rows
         )
+        return {
+            "raw": text or None, "rows": rows, "total_cost": head[8],
+            "method": f"EXPLAIN PLAN into {schema}.EXPLAIN_* (timerons), not executed",
+        }
+
+    def _explain_schema(self, conn: Any) -> str | None:
+        """The schema whose explain tables Db2 would use for this session:
+        the session authorization id's, then SYSTOOLS."""
+        stmt = self._module.exec_immediate(
+            conn,
+            "SELECT TABSCHEMA FROM SYSCAT.TABLES WHERE TABNAME = 'EXPLAIN_STATEMENT' "
+            "AND TABSCHEMA IN (SESSION_USER, 'SYSTOOLS')",
+        )
+        found = {_s(r[0]) for r in self._fetch_all(stmt)}
+        stmt = self._module.exec_immediate(conn, "VALUES (SESSION_USER)")
+        me = str(_s(self._fetch_all(stmt)[0][0]))
+        if me in found:
+            return me
+        if "SYSTOOLS" in found:
+            return "SYSTOOLS"
+        return None

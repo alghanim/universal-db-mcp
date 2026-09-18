@@ -80,3 +80,16 @@ def test_the_clause_is_not_accepted_on_other_engines() -> None:
 def test_write_statement_with_a_tail_clause_is_still_refused() -> None:
     with pytest.raises(ToolFailure):
         _guard().validate_select("DELETE FROM APP.CUSTOMERS WITH UR")
+
+
+@pytest.mark.parametrize("engine", ["oracle", "mssql"])
+def test_explain_is_accepted_in_the_portable_spelling_on_oracle_and_sql_server(engine: str) -> None:
+    """Neither engine has a native EXPLAIN <stmt>; the tool accepts the
+    portable spelling and the connector captures the plan without executing
+    (Oracle EXPLAIN PLAN into PLAN_TABLE, SQL Server SET SHOWPLAN_ALL)."""
+    result = _guard(engine).validate_explain("EXPLAIN SELECT * FROM APP.CUSTOMERS WHERE ID = 1")
+    assert result.kind == "explain"
+    with pytest.raises(ToolFailure, match="not available on this engine"):
+        _guard(engine).validate_explain("EXPLAIN ANALYZE SELECT * FROM APP.CUSTOMERS")
+    with pytest.raises(ToolFailure):
+        _guard(engine).validate_explain("EXPLAIN DELETE FROM APP.CUSTOMERS")

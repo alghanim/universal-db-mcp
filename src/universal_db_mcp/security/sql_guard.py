@@ -600,6 +600,20 @@ class SqlGuard:
             if m.group(1) and not self._policy.allow_explain_analyze:
                 raise _deny("EXPLAIN ANALYZE is disabled by policy")
             root = self._parse_single(m.group(3), "explain")
+        elif self._dialect in ("oracle", "tsql"):
+            # No native "EXPLAIN <stmt>" on these engines: the tool accepts the
+            # portable spelling and the connector captures the plan its own way
+            # (Oracle EXPLAIN PLAN into PLAN_TABLE, SQL Server SET SHOWPLAN_ALL),
+            # never executing the statement. There is no ANALYZE variant.
+            m = re.match(r"^EXPLAIN\s+(?:(ANALYZE)\s+)?(.+)$", text, re.I | re.S)
+            if not m:
+                raise _deny("EXPLAIN requires: EXPLAIN <select statement>")
+            if m.group(1):
+                raise _deny(
+                    "EXPLAIN ANALYZE is not available on this engine: plans are captured without "
+                    "executing the statement; use EXPLAIN <statement>"
+                )
+            root = self._parse_single(m.group(2), "explain")
         else:
             raise ToolFailure(
                 ErrorCategory.CAPABILITY,

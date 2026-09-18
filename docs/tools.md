@@ -40,7 +40,7 @@ stable category:
 | `db_validate_query` | validation without execution + stated limitations |
 | `db_query` | validated, bounded read; masking applied |
 | `db_sample_table` | default 20 rows; masking/omission policy applied |
-| `db_explain` | non-executing plans only |
+| `db_explain` | non-executing plans only, spelled `EXPLAIN <select>` on every engine: native EXPLAIN on PostgreSQL, MySQL, ClickHouse and SQLite; Oracle through `EXPLAIN PLAN` into the session-private `PLAN_TABLE` (DBMS_XPLAN text plus rows); SQL Server through `SET SHOWPLAN_ALL` on a private connection (needs the SHOWPLAN permission, named when missing); Db2 through `EXPLAIN PLAN` into DBA-provisioned explain tables (session schema or SYSTOOLS; refused with the `SYSINSTALLOBJECTS` instruction when absent; the rows written are deleted again). `ANALYZE` variants stay disabled |
 | `db_get_query_history` | process-scoped, fingerprints only (see the identity note below) |
 | `db_list_indexes` | indexes + primary keys of one object or a whole schema; ClickHouse reports sorting keys and skipping indices; system catalogs excluded unless `include_system` or a system schema is named |
 | `db_get_catalog` | one-call paged catalog snapshot: columns with declared and portable types, primary/foreign keys, indexes, row estimates, sensitivity hints; no data read; system catalogs (Oracle dictionary views, Db2 SYSCAT, pg_catalog, ...) excluded unless `include_system` or a system schema is named |

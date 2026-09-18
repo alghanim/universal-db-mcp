@@ -341,9 +341,10 @@ class MssqlConnector(DatabaseConnector):
             limitations=[
                 Limitation(
                     scope="explain",
-                    detail="T-SQL plan capture (SET SHOWPLAN_XML) requires a "
-                    "separate batch and is not implemented in v1; plans are "
-                    "reportedly unsupported rather than approximated.",
+                    detail="Estimated plans come from SET SHOWPLAN_ALL on a private "
+                    "connection (nothing executes); the account needs the SHOWPLAN "
+                    "database permission (GRANT SHOWPLAN TO <user>), refused with that "
+                    "instruction otherwise.",
                 ),
                 Limitation(
                     scope="licensing",
@@ -709,6 +710,44 @@ class MssqlConnector(DatabaseConnector):
                 conn.close()
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
-        raise NotImplementedError(
-            "T-SQL plan capture requires SET SHOWPLAN_XML in a separate batch; not implemented in this build"
+        """Estimated plan through SET SHOWPLAN_ALL, on a private connection.
+
+        SHOWPLAN_ALL must be the only statement of its batch, so it is sent
+        as its own execute; the statement that follows returns the plan
+        rowset instead of running. The account needs the SHOWPLAN database
+        permission (db_owner and sysadmin have it; otherwise the DBA grants
+        `GRANT SHOWPLAN TO <user>`), which the error names when missing.
+        """
+        if analyze:
+            raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute("SET SHOWPLAN_ALL ON")
+                try:
+                    try:
+                        cur.execute(sql)
+                    except Exception as exc:  # noqa: BLE001
+                        if "SHOWPLAN" in str(exc).upper() and "PERMISSION" in str(exc).upper():
+                            raise ConnectorError(
+                                "SQL Server refused the plan: the account lacks the SHOWPLAN database permission "
+                                "(a DBA grants it with GRANT SHOWPLAN TO <user>; no data access is involved)"
+                            ) from exc
+                        raise
+                    cols = [d[0] for d in cur.description]
+                    rows = [dict(zip(cols, r, strict=False)) for r in cur.fetchall()]
+                finally:
+                    try:
+                        cur.execute("SET SHOWPLAN_ALL OFF")
+                    except Exception:  # noqa: BLE001, S110 - the private connection is closed right after
+                        pass
+            finally:
+                conn.close()
+        wanted = (
+            "StmtText", "NodeId", "Parent", "PhysicalOp", "LogicalOp", "EstimateRows", "EstimateIO", "EstimateCPU",
+            "TotalSubtreeCost", "Warnings",
         )
+        slim = [{k: (str(r[k]) if r.get(k) is not None else None) for k in wanted if k in r} for r in rows]
+        text = "\n".join(str(r.get("StmtText") or "") for r in rows)
+        return {"raw": text or None, "rows": slim, "method": "SET SHOWPLAN_ALL (estimated plan), not executed"}

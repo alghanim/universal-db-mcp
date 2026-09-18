@@ -91,6 +91,7 @@ SEEDS: dict[str, list[str]] = {
     ],
     "db2": [
         "CREATE SCHEMA VM",
+        "CALL SYSPROC.SYSINSTALLOBJECTS('EXPLAIN', 'C', CAST(NULL AS VARCHAR(128)), CAST(NULL AS VARCHAR(128)))",
         "CREATE TABLE VM.CUSTOMERS (ID INTEGER NOT NULL PRIMARY KEY, EMAIL VARCHAR(200), REGION VARCHAR(50), NOTE CLOB(1M), CREATED TIMESTAMP, BALANCE DECIMAL(12,2))",
         "CREATE TABLE VM.ORDERS (ID INTEGER NOT NULL PRIMARY KEY, CUSTOMER_ID INTEGER REFERENCES VM.CUSTOMERS(ID), TOTAL DECIMAL(12,2))",
         "CREATE INDEX VM.IX_ORDERS_CUSTOMER ON VM.ORDERS(CUSTOMER_ID)",
@@ -246,8 +247,8 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
             return value
         except NotImplementedError as exc:
             # a capability the connector declares unsupported on this engine
-            # (Oracle/Db2/SQL Server explain need admin-provisioned plan tables
-            # or a separate batch): not a compatibility failure
+            # (ClickHouse foreign keys, Db2 explain without provisioned explain
+            # tables): not a compatibility failure
             record["checks"].append({"check": name, "status": "skipped", "ms": int((time.monotonic() - t0) * 1000),
                                      "detail": f"unsupported by design: {str(exc)[:160]}"})
             return None

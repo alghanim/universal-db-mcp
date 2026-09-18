@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -406,9 +407,10 @@ class OracleConnector(DatabaseConnector):
             limitations=[
                 Limitation(
                     scope="explain",
-                    detail="EXPLAIN PLAN writes to a plan table and requires "
-                    "administrator-provisioned explain tables; disabled in v1 "
-                    "(never auto-created with the read-only identity).",
+                    detail="EXPLAIN PLAN writes into PLAN_TABLE, the session-private "
+                    "global temporary table every account has since 10g (nothing is "
+                    "provisioned or created); rows are deleted after read-back and the "
+                    "statement never executes.",
                 ),
                 Limitation(
                     scope="modes",
@@ -762,7 +764,50 @@ class OracleConnector(DatabaseConnector):
                 conn.close()
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
-        raise NotImplementedError("Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build")
+        """EXPLAIN PLAN into PLAN_TABLE, read back through DBMS_XPLAN.
+
+        Since Oracle 10g PLAN_TABLE is a public synonym for SYS.PLAN_TABLE$,
+        a global temporary table every session can write: nothing has to be
+        provisioned and the rows vanish when this private session closes.
+        The statement is never executed. A locked-down account that lacks
+        the synonym gets the database's own error, named as such.
+        """
+        if analyze:
+            raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
+        statement_id = "udbmcp_" + uuid.uuid4().hex[:20]
+        with translated_driver_errors():
+            conn = self._connect()
+            try:
+                with conn.cursor() as cur:
+                    # the statement id is our own hex token, not user text
+                    cur.execute(f"EXPLAIN PLAN SET STATEMENT_ID = '{statement_id}' FOR {sql}")  # noqa: S608
+                    cur.execute(
+                        "SELECT id, parent_id, depth, operation, options, object_owner, object_name, "
+                        "cardinality, bytes, cost, access_predicates, filter_predicates "
+                        "FROM plan_table WHERE statement_id = :1 ORDER BY id",
+                        [statement_id],
+                    )
+                    cols = [d[0].lower() for d in cur.description]
+                    rows = [dict(zip(cols, r, strict=False)) for r in cur.fetchall()]
+                    try:
+                        cur.execute(
+                            "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', :1, 'TYPICAL'))",
+                            [statement_id],
+                        )
+                        text = [r[0] for r in cur.fetchall()]
+                    except Exception:  # noqa: BLE001 - the structured rows are the contract; the text is a courtesy
+                        text = []
+                    try:
+                        cur.execute("DELETE FROM plan_table WHERE statement_id = :1", [statement_id])
+                    except Exception:  # noqa: BLE001, S110 - session-private GTT rows die with the session anyway
+                        pass
+            finally:
+                conn.close()
+        return {
+            "raw": "\n".join(text) if text else None,
+            "rows": rows,
+            "method": "EXPLAIN PLAN (PLAN_TABLE), not executed",
+        }
 
     def build_sample_query(self, schema: str | None, table: str, columns: list[str] | None, limit: int) -> str:
         cols = ", ".join(self.quote_identifier(c) for c in columns) if columns else "*"
