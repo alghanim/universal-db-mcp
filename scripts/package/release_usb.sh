@@ -51,7 +51,7 @@ case "$PUB" in /*) ;; *) PUB="$PROJECT/$PUB";; esac   # the gates bind-mount the
 [ -s "$KEY" ] && [ -s "$PUB" ] || { echo "FAIL: signing key or public key missing ($KEY, $PUB)" >&2; exit 1; }
 FP="$(openssl pkey -pubin -in "$PUB" -outform DER 2>/dev/null | shasum -a 256 | awk '{print $1}')"
 [ -n "$FP" ] || { echo "FAIL: $PUB is not a readable public key" >&2; exit 1; }
-KEY_NOTE=""; [ "$DEMO" -eq 0 ] || KEY_NOTE=" (DEMO KEY: not for a real site)"
+KEY_NOTE=""; [ "$DEMO" -eq 0 ] || KEY_NOTE=" (DEMO KEY PAIR from out/demo-keys)"
 echo "=== release public key sha256 $FP$KEY_NOTE"
 SHA="$(git rev-parse HEAD)"; SHA7="${SHA:0:7}"
 [ -z "$(git status --porcelain)" ] || { echo "FAIL: working tree not clean at $SHA7 (the bundle must carry the commit)" >&2; exit 1; }
@@ -91,7 +91,11 @@ cp docs/site-upgrade-runbook.md "$USB/UPGRADE-README.md"
   echo "release public key fingerprint (sha256 of the DER encoding; bootstrap.sh prints the same value):"
   echo "$FP"
   echo "built from commit $SHA"
-  [ "$DEMO" -eq 0 ] || echo "WARNING: signed with the DEMO key pair (out/demo-keys); a real site must not trust it"
+  [ "$DEMO" -eq 0 ] || {
+    echo "NOTE: signed with the DEMO key pair (out/demo-keys on the staging machine). Only a site whose installed"
+    echo "trust anchor is this demo public key accepts it. Before wider use generate a site-specific key pair"
+    echo "(UDBMCP_RELEASE_KEY / UDBMCP_PUBKEY) and rotate the site's anchor with bootstrap.sh --rotate-key."
+  }
 } > "$USB/RELEASE-KEY-FINGERPRINT.txt"
 ( cd "$USB" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | sort | xargs shasum -a 256 > SHA256SUMS \
   && shasum -a 256 -c SHA256SUMS | grep -c ': OK$' | sed 's/^/usb files verified: /' )
