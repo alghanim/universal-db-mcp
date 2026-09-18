@@ -1,0 +1,25 @@
+# Scale evidence: discovery tools against a 2,000-table schema (PostgreSQL fixture, database scaledb)
+date_utc: 2026-09-18T12:34:59Z
+policy: hard_query_timeout=60.0s discovery_time_budget=60.0s max_response_bytes=1048576 profile_max_sample_rows=50000
+
+== db_list_tables (cold metadata cache): 0.02s, response 6,058 bytes
+== db_list_tables (warm): 0.00s, response 6,057 bytes
+== db_get_catalog paged to the end: 11 pages of 200, 2002 tables, 2.82s total (0.26s per page)
+== db_profile_table wide (900 columns): 0.04s, response 29,532 bytes, warnings=['profiled the first 60 of 901 columns; pass columns=[...] to profile the others in further calls']
+   columns profiled: 60 (cap applies), findings=['statistics_missing', 'nullable_never_null', 'nullable_never_null', 'nullable_never_null', 'nullable_never_null', 'nullable_never_null']
+== db_profile_table tall (2,000,000 rows, sample 50,000): 0.08s, response 4,125 bytes
+   sample=50000 row_estimate=2000000 findings=['integer_range_fits_smaller_type', 'nullable_never_null', 'nullable_never_null', 'low_cardinality', 'nullable_never_null', 'nullable_never_null', 'nullable_never_null', 'sampled']
+== db_explain tall by customer_id: 0.01s, response 486 bytes
+   plan: Bitmap Heap Scan on tall  (cost=4.74..159.69 rows=40 width=44)
+  Recheck Cond: (customer_id = 42)
+  ->  Bitmap Index Scan on ix_tall_customer  (cost=0.00..4.73 
+== db_review_schema (max_tables=100, sample 1000): 1.34s, response 205,920 bytes, warnings=['profiled the first 60 of 901 columns; pass columns=[...] to profile the others in further calls']
+   reviewed=100/2002 by_code={'integer_range_fits_smaller_type': 1, 'nullable_never_null': 456, 'low_cardinality': 1, 'sampled': 1, 'statistics_missing': 99} budget_exhausted=False next_cursor=yes
+== db_document_schema (page 100): 0.20s, response 50,371 bytes
+   tables rendered=100 chars=48,341 next_cursor=yes
+== db_search_values 'label-7' (max_tables=500, budget 60s): 3.54s, response 21,188 bytes, warnings=['1502 permitted table(s) were not searched (max_tables=500); a needle in one of them is NOT reported: narrow with schemas or raise max_tables']
+   hits=100 tables_searched=500 not_searched=1502 budget_exhausted=False
+== db_search_values 'note 1999999', whole schema (2,002 tables, per_table_timeout 5s, budget 120s): 3.11s, response 595 bytes, warnings=['1502 permitted table(s) were not searched (max_tables=500); a needle in one of them is NOT reported: narrow with schemas or raise max_tables']
+   hits=0 tables_searched=500 not_searched=1502 budget_exhausted=False
+== db_infer_relationships (schema scale): 0.44s, response 340 bytes, warnings=["connection 'scale_pg': table limit 500 reached; narrow with schemas"]
+   relationships=0 tables_considered=500

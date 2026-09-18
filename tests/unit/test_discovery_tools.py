@@ -391,3 +391,23 @@ def test_qualified_name_splitting_respects_quotes(spelling: str, expected: tuple
     from universal_db_mcp.server import _split_qualified_name
 
     assert _split_qualified_name(None, spelling) == expected
+
+
+def test_search_says_how_many_permitted_tables_it_did_not_reach(server: Any) -> None:
+    """Scale run 2026-09-18: a needle in table 1,700 of 2,002 was reported as
+    'no hits' because the 500-table cap stopped the loop silently."""
+    env = _call(server, "db_search_values", {"query": "sku-1", "max_tables": 1, "match": "prefix"})
+    d = env["data"]
+    assert d["tables_searched"] == 1  # the cap counts searched tables; skipped ones do not consume it
+    assert d["tables_not_searched"] == 4 - d["tables_searched"] - d["tables_skipped_no_candidate_columns"]
+    assert d["tables_not_searched"] >= 1
+    assert any("were not searched" in w and "max_tables=1" in w for w in env["warnings"])
+
+
+def test_profile_says_when_the_column_cap_applied(server: Any, monkeypatch: Any) -> None:
+    import universal_db_mcp.server as srv_mod
+
+    monkeypatch.setattr(srv_mod, "_PROFILE_MAX_COLUMNS", 2)
+    env = _call(server, "db_profile_table", {"connection_id": "shop", "object_name": "customers", "sample_rows": 5})
+    assert len(env["data"]["columns"]) == 2
+    assert any("first 2 of 6 columns" in w for w in env["warnings"])

@@ -1,19 +1,19 @@
 {
   "label": "gvenzl/oracle-free:23-slim (thick)",
   "engine": "oracle",
-  "probe_rev": "02f7e46",
-  "started_utc": "2026-09-16T21:50:55Z",
+  "probe_rev": "1a66c3c",
+  "started_utc": "2026-09-18T12:35:11Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 318,
+      "ms": 277,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 30,
+      "ms": 27,
       "detail": "Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, "
     },
     {
@@ -25,7 +25,7 @@
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 117,
+      "ms": 107,
       "detail": "[TableSummary(schema='SYSTEM', name='AQ$_SCHEDULES', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='HELP', kind='table', row_estimate=Non"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 24,
+      "ms": 18,
       "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EM"
     },
     {
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 57,
+      "ms": 51,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 711,
+      "ms": 666,
       "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C008649', columns=["
     },
     {
@@ -79,62 +79,62 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 973,
+      "ms": 872,
       "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 9,
+      "ms": 8,
       "detail": "VM_V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 23,
+      "ms": 20,
       "detail": "VM_F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 48,
+      "ms": 46,
       "detail": "catalog_estimate(all_tables.num_rows)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 41,
+      "ms": 31,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 33,
+      "ms": 32,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 18,
+      "ms": 16,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 16,
+      "ms": 14,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 16,
+      "ms": 13,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
-      "status": "skipped",
-      "ms": 0,
-      "detail": "unsupported by design: Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build"
+      "status": "passed",
+      "ms": 81,
+      "detail": "['raw', 'rows', 'method']"
     }
   ],
   "server_version": "Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, ",
@@ -159,9 +159,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T21:50:57Z",
+  "finished_utc": "2026-09-18T12:35:13Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }

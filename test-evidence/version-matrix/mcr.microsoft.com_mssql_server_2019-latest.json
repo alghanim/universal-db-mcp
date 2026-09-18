@@ -1,19 +1,19 @@
 {
   "label": "mcr.microsoft.com/mssql/server:2019-latest",
   "engine": "mssql",
-  "probe_rev": "332b7e2",
-  "started_utc": "2026-09-17T00:43:06Z",
+  "probe_rev": "1a66c3c",
+  "started_utc": "2026-09-18T12:33:28Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 875,
+      "ms": 887,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 28,
+      "ms": 24,
       "detail": "Microsoft SQL Server 2019 (RTM-CU32-GDR) (KB5122772) - 15.0."
     },
     {
@@ -25,7 +25,7 @@
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 34,
+      "ms": 29,
       "detail": "[TableSummary(schema='dbo', name='customers', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='dbo', name='orders', kind='table', row_estimate=None, row_e"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 33,
+      "ms": 30,
       "detail": "[ColumnInfo(schema='dbo', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='dbo', table='customers', name='email', data_type='nv"
     },
     {
@@ -49,14 +49,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 19,
+      "ms": 17,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
       "ms": 55,
-      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83F21F"
+      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83FA15"
     },
     {
       "check": "index_on_fk_visible",
@@ -68,7 +68,7 @@
       "check": "primary_key_visible",
       "status": "passed",
       "ms": 0,
-      "detail": "PK__customer__3213E83FFEFCBA55"
+      "detail": "PK__customer__3213E83FDB43B1C1"
     },
     {
       "check": "composite_unique_index",
@@ -79,7 +79,7 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 22,
+      "ms": 21,
       "detail": "customers"
     },
     {
@@ -97,7 +97,7 @@
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 40,
+      "ms": 36,
       "detail": "catalog_estimate(sys.partitions)"
     },
     {
@@ -121,7 +121,7 @@
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "[['north', 100]]"
     },
     {
@@ -132,9 +132,9 @@
     },
     {
       "check": "explain",
-      "status": "skipped",
-      "ms": 0,
-      "detail": "unsupported by design: T-SQL plan capture requires SET SHOWPLAN_XML in a separate batch; not implemented in this build"
+      "status": "passed",
+      "ms": 3,
+      "detail": "['raw', 'rows', 'method']"
     }
   ],
   "server_version": "Microsoft SQL Server 2019 (RTM-CU32-GDR) (KB5122772) - 15.0.",
@@ -161,9 +161,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-17T00:43:07Z",
+  "finished_utc": "2026-09-18T12:33:29Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }

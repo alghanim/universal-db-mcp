@@ -1795,6 +1795,8 @@ def build_server(app: AppContext) -> MCPServer:
             per_table_timeout = max(1.0, min(float(per_table_timeout_seconds), 120.0))
             byte_ceiling: int | None = None
             hit_bytes = 0
+            candidates_total = 0  # permitted tables in scope, across the connections reached
+            considered = 0  # tables the loop actually looked at (searched or skipped)
             conn_ids = list(connections) if connections is not None else sorted(app.resolved.keys())
             for cid in conn_ids:
                 if cid not in app.resolved:
@@ -1838,12 +1840,14 @@ def build_server(app: AppContext) -> MCPServer:
                 elif not include_system:
                     tables = [t for t in tables if not is_system_object(policy.engine, t.schema, t.name)]
                 columns_by_schema: dict[str | None, list[Any]] = {}
+                candidates_total += len(tables)
                 for t in tables:
                     if searched >= table_cap:
                         break
                     if time.monotonic() > deadline:
                         exhausted = True
                         break
+                    considered += 1
                     if t.schema not in columns_by_schema:
                         try:
                             columns_by_schema[t.schema] = await run_meta(
@@ -1923,6 +1927,13 @@ def build_server(app: AppContext) -> MCPServer:
                     if exhausted:
                         break
             st["row_count"] = len(hits)
+            not_reached = max(0, candidates_total - considered)
+            if not_reached:
+                warnings.append(
+                    f"{not_reached} permitted table(s) were not searched (max_tables={table_cap}"
+                    + (", time budget" if exhausted else "")
+                    + "); a needle in one of them is NOT reported: narrow with schemas or raise max_tables"
+                )
             if exhausted:
                 warnings.append(f"time budget of {budget:.0f}s exhausted; results are partial")
             if warnings:
@@ -1932,6 +1943,7 @@ def build_server(app: AppContext) -> MCPServer:
                 {
                     "query": query, "match": match, "hits": hits,
                     "tables_searched": searched, "tables_skipped_no_candidate_columns": skipped,
+                    "tables_not_searched": not_reached,
                     "budget_exhausted": exhausted,
                     "note": "contains/prefix matching is case-insensitive on string columns; numeric columns "
                     "match only with match=exact and a numeric query; sensitive columns are never searched",
@@ -2165,6 +2177,11 @@ async def _profile_object(
         if bad:
             raise ToolFailure(ErrorCategory.VALIDATION, f"unknown columns: {bad}")
         all_cols = [c for c in all_cols if c.name in set(columns)]
+    if len(all_cols) > _PROFILE_MAX_COLUMNS:
+        st["warnings"].append(
+            f"profiled the first {_PROFILE_MAX_COLUMNS} of {len(all_cols)} columns; pass columns=[...] to profile "
+            "the others in further calls"
+        )
     all_cols = all_cols[:_PROFILE_MAX_COLUMNS]
     cap = int(policy.profile_max_sample_rows)
     requested = min(_PROFILE_DEFAULT_SAMPLE, cap) if sample_rows is None else int(sample_rows)

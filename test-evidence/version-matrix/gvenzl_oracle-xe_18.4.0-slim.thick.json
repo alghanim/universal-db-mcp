@@ -1,31 +1,31 @@
 {
   "label": "gvenzl/oracle-xe:18.4.0-slim (thick)",
   "engine": "oracle",
-  "probe_rev": "02f7e46",
-  "started_utc": "2026-09-16T21:50:32Z",
+  "probe_rev": "1a66c3c",
+  "started_utc": "2026-09-18T12:34:48Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 974,
+      "ms": 888,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 386,
+      "ms": 362,
       "detail": "Oracle Database 18c Express Edition Release 18.0.0.0.0 - Pro"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 337,
+      "ms": 335,
       "detail": "SYSTEM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 296,
+      "ms": 274,
       "detail": "[TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENTS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='AQ$_INTERNET_AGENT_PRIVS', kind"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 28,
+      "ms": 23,
       "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EM"
     },
     {
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 43,
+      "ms": 40,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 266,
+      "ms": 232,
       "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C007346', columns=["
     },
     {
@@ -79,19 +79,19 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 350,
+      "ms": 321,
       "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 40,
+      "ms": 36,
       "detail": "VM_V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 38,
+      "ms": 34,
       "detail": "VM_F_ONE"
     },
     {
@@ -103,38 +103,38 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 366,
+      "ms": 352,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 401,
+      "ms": 372,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 370,
+      "ms": 353,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 358,
+      "ms": 354,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 390,
+      "ms": 361,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
-      "status": "skipped",
-      "ms": 0,
-      "detail": "unsupported by design: Oracle EXPLAIN PLAN requires a provisioned plan table and is disabled in this build"
+      "status": "passed",
+      "ms": 662,
+      "detail": "['raw', 'rows', 'method']"
     }
   ],
   "server_version": "Oracle Database 18c Express Edition Release 18.0.0.0.0 - Pro",
@@ -159,9 +159,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T21:50:37Z",
+  "finished_utc": "2026-09-18T12:34:53Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }

@@ -1,31 +1,31 @@
 {
   "label": "icr.io/db2_community/db2:11.5.8.0",
   "engine": "db2",
-  "probe_rev": "02f7e46",
-  "started_utc": "2026-09-16T20:42:47Z",
+  "probe_rev": "1a66c3c",
+  "started_utc": "2026-09-18T12:29:49Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 902,
+      "ms": 1715,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 204,
+      "ms": 905,
       "detail": "DB2 v11.5.8.0"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 10,
+      "ms": 1052,
       "detail": "VM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 21,
+      "ms": 1040,
       "detail": "[TableSummary(schema='VM', name='CUSTOMERS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='VM', name='ORDERS', kind='table', row_estimate=None, row_est"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 17,
+      "ms": 1046,
       "detail": "[ColumnInfo(schema='VM', table='CUSTOMERS', name='ID', data_type='INTEGER', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='VM', table='CUSTOMERS', name='EMAIL', data_type='"
     },
     {
@@ -49,14 +49,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 10,
+      "ms": 1072,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 13,
-      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='reg', schema='VM', table='ORDERS'), IndexInfo(name='SQL260916204247710', columns=['ID"
+      "ms": 1081,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='reg', schema='VM', table='ORDERS'), IndexInfo(name='SQL260918122950350', columns=['ID"
     },
     {
       "check": "index_on_fk_visible",
@@ -67,8 +67,8 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 3,
-      "detail": "SQL260916204247650"
+      "ms": 1069,
+      "detail": "SQL260918122950320"
     },
     {
       "check": "composite_unique_index",
@@ -79,62 +79,62 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 12,
+      "ms": 1074,
       "detail": "CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 6,
+      "ms": 1050,
       "detail": "V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 46,
+      "ms": 1083,
       "detail": "F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 7,
+      "ms": 1078,
       "detail": "catalog_estimate(SYSCAT.TABLES.CARD)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 7,
+      "ms": 1074,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 17,
+      "ms": 1073,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 15,
+      "ms": 1061,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 8,
+      "ms": 1064,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 9,
+      "ms": 1077,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
-      "status": "skipped",
-      "ms": 0,
-      "detail": "unsupported by design: Db2 EXPLAIN requires administrator-provisioned explain tables; not provisioned automatically in this build"
+      "status": "passed",
+      "ms": 1080,
+      "detail": "['raw', 'rows', 'total_cost']"
     }
   ],
   "server_version": "DB2 v11.5.8.0",
@@ -160,9 +160,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:42:48Z",
+  "finished_utc": "2026-09-18T12:30:10Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }

@@ -1,19 +1,19 @@
 {
   "label": "icr.io/db2_community/db2:11.5.9.0",
   "engine": "db2",
-  "probe_rev": "02f7e46",
-  "started_utc": "2026-09-16T20:46:03Z",
+  "probe_rev": "1a66c3c",
+  "started_utc": "2026-09-18T12:33:12Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 941,
+      "ms": 1384,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 195,
+      "ms": 183,
       "detail": "DB2 v11.5.9.0"
     },
     {
@@ -25,7 +25,7 @@
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 21,
+      "ms": 16,
       "detail": "[TableSummary(schema='VM', name='CUSTOMERS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='VM', name='ORDERS', kind='table', row_estimate=None, row_est"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 16,
+      "ms": 14,
       "detail": "[ColumnInfo(schema='VM', table='CUSTOMERS', name='ID', data_type='INTEGER', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='VM', table='CUSTOMERS', name='EMAIL', data_type='"
     },
     {
@@ -49,14 +49,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 10,
+      "ms": 9,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 12,
-      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='reg', schema='VM', table='ORDERS'), IndexInfo(name='SQL260916204604180', columns=['ID"
+      "ms": 11,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='reg', schema='VM', table='ORDERS'), IndexInfo(name='SQL260918123313710', columns=['ID"
     },
     {
       "check": "index_on_fk_visible",
@@ -67,8 +67,8 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 3,
-      "detail": "SQL260916204604110"
+      "ms": 4,
+      "detail": "SQL260918123313670"
     },
     {
       "check": "composite_unique_index",
@@ -79,7 +79,7 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 12,
+      "ms": 11,
       "detail": "CUSTOMERS"
     },
     {
@@ -91,31 +91,31 @@
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 46,
+      "ms": 34,
       "detail": "F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "catalog_estimate(SYSCAT.TABLES.CARD)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 5,
+      "ms": 4,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 13,
+      "ms": 11,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 14,
+      "ms": 12,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
@@ -127,14 +127,14 @@
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 8,
+      "ms": 7,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
-      "status": "skipped",
-      "ms": 0,
-      "detail": "unsupported by design: Db2 EXPLAIN requires administrator-provisioned explain tables; not provisioned automatically in this build"
+      "status": "passed",
+      "ms": 37,
+      "detail": "['raw', 'rows', 'total_cost']"
     }
   ],
   "server_version": "DB2 v11.5.9.0",
@@ -160,9 +160,9 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:46:05Z",
+  "finished_utc": "2026-09-18T12:33:14Z",
   "summary": {
-    "passed": 21,
+    "passed": 22,
     "failed": []
   }
 }
