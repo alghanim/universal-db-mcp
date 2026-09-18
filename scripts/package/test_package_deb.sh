@@ -52,6 +52,16 @@
 #      treated like missing), and dpkg -i must abort at the preinst's
 #      non-empty check — with NO 'bundle verification PASSED' anywhere, no
 #      venv and no enabled service.
+#   7. UPGRADE case, its own container: install, then plant a marker in a
+#      wheel-tracked file of the installed venv (the previous release's code)
+#      and an admin edit in /etc/universal-db-mcp/config.yaml, install the SAME
+#      package again and assert the marker is gone (the trusted installer's
+#      --force-reinstall replaced the code; without it pip reports "already
+#      satisfied" and the site keeps running old code while dpkg reports
+#      success — seen live 2026-09-15) while the admin edit survives (dpkg
+#      conffile). Then swap the trusted installer for a copy WITHOUT
+#      --force-reinstall: the upgrade must be refused at preinst with the
+#      OUTDATED diagnostic; restore it and the upgrade must succeed again.
 #
 # Every check result is recorded; any failure fails the gate closed and the
 # evidence JSON is still written. Machine-readable evidence lands in
@@ -920,6 +930,143 @@ fi
 echo "[deb-gate-negative3] finished, FAILED=$FAILED"
 exit "$FAILED"
 NEGATIVE3_EOF
+cat > "$WORK/upgrade.sh" <<'UPGRADE_EOF'
+#!/bin/bash
+# Upgrade case: install -> simulate the previous release's code in the venv
+# -> install the same package again -> the code must be replaced and the
+# admin's config edit kept; then an OUTDATED trusted installer must be
+# refused, and the real one must succeed. Own container (pristine baseline).
+set -uo pipefail
+EV=/evidence
+TSV="$EV/upgrade-checks.tsv"
+: > "$TSV"
+FAILED=0
+DEB=/pkg/universal-db-mcp.deb
+VENV=/opt/universal-db-mcp/venv
+STATUS=/var/log/universal-db-mcp-install.status
+INSTALL_LOG=/var/log/universal-db-mcp-install.log
+CONFIG=/etc/universal-db-mcp/config.yaml
+TRUST=/usr/local/lib/udbmcp-trust
+export DEBIAN_FRONTEND=noninteractive
+
+rec() { # name status detail
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$TSV"
+  echo "[deb-gate-upgrade] [$2] $1: $3"
+  [ "$2" = "passed" ] || FAILED=1
+}
+
+install_pkg() { # install_pkg <label> -> 0 on dpkg success + worker success
+  local label="$1" rc st waited=0
+  rm -f "$STATUS"
+  dpkg -i "$DEB" > "/tmp/dpkg-$label.log" 2>&1; rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "dependency problems" "/tmp/dpkg-$label.log"; then
+    dpkg -i --force-depends "$DEB" >> "/tmp/dpkg-$label.log" 2>&1; rc=$?
+  fi
+  cp "/tmp/dpkg-$label.log" "$EV/dpkg-upgrade-$label.log"
+  [ "$rc" -eq 0 ] || return 1
+  if [ -f "$STATUS" ]; then
+    st=""
+    while [ "$waited" -lt 1800 ]; do
+      st="$(cat "$STATUS" 2>/dev/null || true)"
+      if [ "$st" = "success" ] || [ "$st" = "failed" ]; then break; fi
+      sleep 2; waited=$((waited + 2))
+    done
+    cp "$INSTALL_LOG" "$EV/deferred-install-upgrade-$label.log" 2>/dev/null || true
+    [ "$st" = "success" ] || return 2
+  fi
+  return 0
+}
+
+# --- admin trust bootstrap (from the trusted channel, never the package) ------
+if install -d -m 755 "$TRUST/lib" /etc/universal-db-mcp/keys \
+   && install -m 644 /trust/verify_bundle.py "$TRUST/" \
+   && install -m 644 /trust/profiles.py "$TRUST/" \
+   && install -m 755 /trust/install_offline.sh "$TRUST/" \
+   && install -m 644 /trust/os_packages.sh "$TRUST/lib/" \
+   && install -m 644 /pubkey.pem /etc/universal-db-mcp/keys/release.pub.pem; then
+  rec upgrade_trust_bootstrap passed "trusted tools + release pubkey installed at the admin paths"
+else
+  rec upgrade_trust_bootstrap failed "admin trust bootstrap failed"
+  exit 1
+fi
+
+# --- first install ------------------------------------------------------------
+if install_pkg first; then
+  rec upgrade_first_install passed "first dpkg -i + deferred worker succeeded"
+else
+  rec upgrade_first_install failed "first install failed (rc=$?): $(tail -c 400 "$INSTALL_LOG" 2>/dev/null | tr '\n' ' ')"
+  exit 1
+fi
+PKG_INIT="$(ls -d "$VENV"/lib/python3.*/site-packages/universal_db_mcp/__init__.py 2>/dev/null | head -1)"
+if [ -z "$PKG_INIT" ]; then
+  rec upgrade_marker_planted failed "installed package not found under $VENV/lib"
+  exit 1
+fi
+# --- simulate the previous release's code + an admin config edit --------------
+echo "# STALE-RELEASE-MARKER: code of the previous release" >> "$PKG_INIT"
+echo "# ADMIN-EDIT-MARKER: kept across upgrades (dpkg conffile)" >> "$CONFIG"
+rec upgrade_marker_planted passed "marker appended to $(basename "$(dirname "$PKG_INIT")")/__init__.py (a wheel-tracked file) and to $CONFIG"
+
+# --- second install of the SAME package -------------------------------------
+if install_pkg second; then
+  rec upgrade_second_install passed "second dpkg -i (upgrade of the same version) + deferred worker succeeded"
+else
+  rec upgrade_second_install failed "second install failed (rc=$?): $(tail -c 400 "$INSTALL_LOG" 2>/dev/null | tr '\n' ' ')"
+  exit 1
+fi
+if grep -q "STALE-RELEASE-MARKER" "$PKG_INIT"; then
+  rec upgrade_replaces_venv_code failed "the marker survived the upgrade: the venv still runs the previous release's code (pip 'already satisfied'); this is the 2026-09-15 incident"
+else
+  rec upgrade_replaces_venv_code passed "the upgrade replaced the installed package code (marker gone: --force-reinstall took effect)"
+fi
+if grep -q "ADMIN-EDIT-MARKER" "$CONFIG"; then
+  rec upgrade_keeps_admin_config passed "admin edit in $CONFIG preserved across the upgrade (conffile semantics)"
+else
+  rec upgrade_keeps_admin_config failed "admin edit in $CONFIG was lost by the upgrade"
+fi
+if "$VENV/bin/python" -m universal_db_mcp version > /tmp/version.txt 2>&1; then
+  rec upgrade_venv_runs passed "upgraded venv runs: $(tr '\n' ' ' < /tmp/version.txt | cut -c1-80)"
+else
+  rec upgrade_venv_runs failed "upgraded venv does not run: $(tail -c 200 /tmp/version.txt | tr '\n' ' ')"
+fi
+
+# --- NEGATIVE: an outdated trusted installer must be refused ------------------
+grep -v -- "--force-reinstall" /trust/install_offline.sh > /tmp/install_offline_outdated.sh
+if grep -q "PIP_FIND_LINKS" /tmp/install_offline_outdated.sh && ! grep -q -- "--force-reinstall" /tmp/install_offline_outdated.sh; then
+  install -m 755 /tmp/install_offline_outdated.sh "$TRUST/install_offline.sh"
+  echo "# STALE-RELEASE-MARKER-2" >> "$PKG_INIT"
+  rm -f "$STATUS"
+  dpkg -i "$DEB" > /tmp/dpkg-outdated.log 2>&1; rc=$?
+  cp /tmp/dpkg-outdated.log "$EV/dpkg-upgrade-outdated.log"
+  if [ "$rc" -ne 0 ] && grep -q "OUTDATED copy" /tmp/dpkg-outdated.log && [ ! -f "$STATUS" ]; then
+    rec upgrade_refuses_outdated_installer passed "dpkg -i aborted at preinst with the OUTDATED diagnostic (rc=$rc); no worker was started"
+  else
+    rec upgrade_refuses_outdated_installer failed "dpkg -i with an outdated trusted installer did not fail closed (rc=$rc, status file: $([ -f "$STATUS" ] && cat "$STATUS" || echo none))"
+  fi
+  # recovery: refresh the trusted installer (what the runbook's Step 1 does), upgrade again
+  install -m 755 /trust/install_offline.sh "$TRUST/install_offline.sh"
+  if install_pkg recovery && ! grep -q "STALE-RELEASE-MARKER-2" "$PKG_INIT"; then
+    rec upgrade_after_refresh passed "after refreshing the trusted installer the upgrade succeeded and replaced the code again"
+  else
+    rec upgrade_after_refresh failed "upgrade after refreshing the trusted installer failed or left the marker"
+  fi
+else
+  rec upgrade_refuses_outdated_installer failed "could not derive an outdated installer copy from /trust/install_offline.sh (no PIP_FIND_LINKS line?)"
+fi
+
+# --- doctor reports the installed release ------------------------------------
+if "$VENV/bin/python" -m universal_db_mcp doctor --config /usr/share/universal-db-mcp/bundle/config-templates/config.yaml \
+    > "$EV/doctor-upgrade.json" 2> "$EV/doctor-upgrade.stderr.txt" || true; then
+  if grep -q '"installed-release"' "$EV/doctor-upgrade.json" && grep -q 'source_rev' "$EV/doctor-upgrade.json"; then
+    rec upgrade_doctor_release_line passed "doctor reports the installed release (installed-release check with source_rev)"
+  else
+    rec upgrade_doctor_release_line failed "doctor output lacks the installed-release line"
+  fi
+fi
+
+echo "[deb-gate-upgrade] finished, FAILED=$FAILED"
+exit "$FAILED"
+UPGRADE_EOF
 echo "==> POSITIVE case: install + doctor + protocol probe (network: NONE, platform: linux/amd64)"
 set +e
 docker run --rm --network none --platform linux/amd64 \
@@ -938,6 +1085,25 @@ set -e
 merge_container_checks "$EVIDENCE_DIR/positive-checks.tsv" "$POS_RC" "positive"
 # Keep the per-run TSVs beside the logs for debugging; they are merged already.
 mv "$EVIDENCE_DIR/positive-checks.tsv" "$LOG_DIR/positive-checks.tsv" 2>/dev/null || true
+
+# -------------------------------------------------------------- upgrade case
+echo "==> UPGRADE case: install over install must replace the venv code; an outdated trusted installer must be refused"
+set +e
+docker run --rm --network none --platform linux/amd64 \
+  -v "$DEB":"$CONTAINER_DEB":ro \
+  -v "$PUBKEY":/pubkey.pem:ro \
+  -v "$PROJECT/scripts/verify_bundle.py":/trust/verify_bundle.py:ro \
+  -v "$PROJECT/scripts/profiles.py":/trust/profiles.py:ro \
+  -v "$PROJECT/scripts/install_offline.sh":/trust/install_offline.sh:ro \
+  -v "$PROJECT/scripts/lib/os_packages.sh":/trust/os_packages.sh:ro \
+  -v "$EVIDENCE_DIR":/evidence \
+  -v "$WORK/upgrade.sh":/gate/upgrade.sh:ro \
+  "$IMAGE" \
+  bash /gate/upgrade.sh > "$LOG_DIR/upgrade-container.log" 2>&1
+UPG_RC=$?
+set -e
+merge_container_checks "$EVIDENCE_DIR/upgrade-checks.tsv" "$UPG_RC" "upgrade"
+mv "$EVIDENCE_DIR/upgrade-checks.tsv" "$LOG_DIR/upgrade-checks.tsv" 2>/dev/null || true
 
 # ------------------------------------------------------------- negative case
 echo "==> NEGATIVE case: tampered-wheel repack must fail closed at postinst verification"
