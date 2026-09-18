@@ -1,0 +1,9 @@
+# HTTP transport: a real MCP client (mcp SDK streamable HTTP) over TLS through nginx to the server
+date_utc: 2026-09-18T12:59:17Z
+== proxy + server ready: True (url https://localhost:8443/mcp, server on 127.0.0.1:8795, token file 0600)
+== authenticated client over TLS: initialize ok (server=universal-db-mcp, protocol=2025-11-25), tools listed=29 (db_review_schema present=True), db_list_connections call ok=True, 0.07s
+== wrong token, direct POST initialize: HTTP 401 (refused before any tool ran)
+== no token, direct POST initialize: HTTP 401 (refused before any tool ran)
+== wrong token, SDK client: refused (MCP error: MCPError: Server returned an error response)
+== no token, SDK client: refused (MCP error: MCPError: Server returned an error response)
+== plain HTTP on the TLS port: refused by the proxy (400 plain HTTP request sent to HTTPS port)

@@ -1,0 +1,8 @@
+# MySQL NO_BACKSLASH_ESCAPES: db_search_values escaping must not depend on backslash semantics
+date_utc: 2026-09-18T12:51:14Z fixture: mysql:9 (udbmcp-mysql-db)
+global sql_mode during the test: ONLY_FULL_GROUP_BY,NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+  search 'osei': hits=2 (expected >=1) warnings=[]
+  search 'o_ei': hits=0 (expected 0) warnings=[]
+  search '100%': hits=0 (expected 0) warnings=[]
+  search 'a!b': hits=0 (expected 0) warnings=[]
+global sql_mode restored: True

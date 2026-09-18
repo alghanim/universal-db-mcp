@@ -40,6 +40,16 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("version", help="print version information")
 
+    site = sub.add_parser(
+        "site-check",
+        help="read-only first-run check of every configured connection; writes a JSON report with counts, "
+        "codes and timings only (no row values), suitable to take off-site for diagnosis",
+    )
+    site.add_argument("--config", default=None)
+    site.add_argument("--out", default=None, help="write the JSON report here (stdout otherwise)")
+    site.add_argument("--sample-rows", type=int, default=200)
+    site.add_argument("--review-tables", type=int, default=3)
+
     configure = sub.add_parser(
         "configure-agents",
         help="register the MCP server into detected AI-agent harnesses (ask-before-write)",
@@ -146,6 +156,27 @@ def main(argv: list[str] | None = None) -> int:
         report = run_doctor(config, connectivity=args.connectivity)
         print(json.dumps(report, indent=2))
         return 0 if report["healthy"] else 1
+
+    if args.command == "site-check":
+        import json
+
+        from universal_db_mcp.agents.core import resolve_harness_config_path
+        from universal_db_mcp.diagnostics.site_check import render_summary, run_site_check, write_report
+
+        config = (
+            args.config
+            or os.environ.get("UDBMCP_CONFIG")
+            or resolve_harness_config_path(dict(os.environ), Path.home())
+        )
+        report = run_site_check(config, sample_rows=args.sample_rows, review_tables=args.review_tables)
+        if args.out:
+            write_report(report, args.out)
+            print(render_summary(report))
+            print(f"report written to {args.out}")
+        else:
+            print(json.dumps(report, indent=2, default=str))
+            print(render_summary(report), file=sys.stderr)
+        return 0 if report["ok"] else 1
 
     if args.command == "serve":
         return _serve(args)

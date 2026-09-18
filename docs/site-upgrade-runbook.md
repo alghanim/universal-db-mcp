@@ -257,6 +257,22 @@ sudo -u udbmcp /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp doctor 
 /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp doctor --config ~/.universal-db-mcp/config.yaml
 ```
 
+Then run the site check: one read-only pass over every connection through
+the same tools an agent uses (connection, listing, catalog, profile, plan,
+review, search), which writes a JSON report made of counts, codes, names
+and timings only, never a row value, so it can leave the site:
+
+```bash
+sudo -u udbmcp /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp site-check \
+  --config /etc/universal-db-mcp/config.yaml --out /tmp/udbmcp-site-check.json
+```
+
+It prints one line per connection (`connection=ok list_tables=ok catalog=ok
+profile=ok explain=ok review=ok search=ok`) and exits non-zero when a step
+failed; `explain=SKIPPED` on Db2 means the DBA has not provisioned explain
+tables, which is expected and harmless. Bring `/tmp/udbmcp-site-check.json`
+back for diagnosis; it is safe to share.
+
 Then start a new Claude Code session and ask it to run `db_test_connection`
 on each connection. The reply carries a `session` block: Db2 shows
 `isolation: ur` and `lock_timeout_seconds: 5`, PostgreSQL and MySQL show

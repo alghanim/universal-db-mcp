@@ -146,6 +146,31 @@ over the unit's env fallback. Per-harness agent spawns keep using stdio and
 are unaffected (the override only supplies the token PATH; the token value is
 never carried in an environment variable).
 
+### Reverse proxy and TLS in front of the HTTP listener
+
+The listener binds loopback and validates the `Host` header against its own
+address (DNS-rebinding protection; a client that connects by another name
+is answered `421 Invalid Host header`). A TLS-terminating reverse proxy in
+front of it must therefore forward the LISTENER's address as `Host`, not the
+client's, and keep the bearer token header as it is:
+
+```nginx
+location / {
+  proxy_pass http://127.0.0.1:8765;
+  proxy_http_version 1.1;
+  proxy_set_header Host 127.0.0.1:8765;   # the listener's own address, not $host
+  proxy_set_header Connection "";
+  proxy_buffering off;                     # the MCP stream is server-sent events
+  proxy_read_timeout 300s;
+}
+```
+
+Evidence: `scripts/http_client_evidence.py` drives exactly this layout
+(self-signed nginx in Docker, the MCP SDK's streamable HTTP client with a
+bearer token) and records `test-evidence/http-transport/results.txt`:
+initialize, 29 tools listed, a tool call, and HTTP 401 for a wrong or
+missing token before any tool runs.
+
 ## Container mode
 
 Before starting, two prerequisites the bundle does **not** satisfy on its own:
