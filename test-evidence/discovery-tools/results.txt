@@ -1,5 +1,5 @@
 # Discovery tools: live run through the MCP server against the local fixtures
-date_utc: 2026-09-18T13:02:05Z
+date_utc: 2026-09-18T13:43:21Z
 
 == mock_clickhouse
   catalog: 3 tables; cdr: pk=['started_at', 'caller_msisdn'] cols=9 idx=1 fks=[]
@@ -84,9 +84,7 @@ date_utc: 2026-09-18T13:02:05Z
   document: 4 tables rendered, 2111 chars, sections=5 next_cursor=no
 
 == cross-connection search
-  query='gulf' hits=2 tables_searched=13 warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
-     mock_db2.MOI.RESIDENCY_PERMITS matched=['SPONSOR_NAME']
-     mock_pg.ocean.buoys matched=['region']
+  query='user12@' hits=0 tables_searched=13 warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
   literal query '100%': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
   literal query 'gu_f': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
 
