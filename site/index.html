@@ -1,0 +1,998 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Universal DB MCP</title>
+<meta name="description" content="Read-only MCP server for AI agents. Give Claude Code, Cursor and any MCP client governed access to PostgreSQL, MySQL, MariaDB, ClickHouse, Oracle, SQL Server, Db2 and SQLite. Writes are impossible, not discouraged. Runs fully offline.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Universal DB MCP: read everything, change nothing">
+<meta property="og:description" content="A read-only MCP server for 8 databases, with a SQL guard, read-only sessions, bounded results and air-gapped installs.">
+<meta property="og:url" content="__SITE_URL__/">
+<meta property="og:image" content="__SITE_URL__/og.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#07090c">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2307090c'/%3E%3Cellipse cx='16' cy='9.5' rx='8' ry='3' fill='none' stroke='%2346e8a2' stroke-width='2'/%3E%3Cpath d='M8 9.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13' fill='none' stroke='%2346e8a2' stroke-width='2'/%3E%3Cpath d='M8 16c0 1.7 3.6 3 8 3s8-1.3 8-3' fill='none' stroke='%2346e8a2' stroke-width='2' opacity='.5'/%3E%3C/svg%3E">
+<style>
+/* Fonts: Geist and Geist Mono (c) 2024 The Geist Project Authors; Instrument Serif (c) 2022 The Instrument Serif Project Authors.
+   All under the SIL Open Font License 1.1: fonts/OFL-*.txt. Self-hosted, so the page makes no third-party requests. */
+@font-face{font-family:'Geist';font-style:normal;font-weight:400 800;font-display:swap;src:url(fonts/geist.woff2) format('woff2')}
+@font-face{font-family:'Geist Mono';font-style:normal;font-weight:400 600;font-display:swap;src:url(fonts/geist-mono.woff2) format('woff2')}
+@font-face{font-family:'Instrument Serif';font-style:italic;font-weight:400;font-display:swap;src:url(fonts/instrument-serif-italic.woff2) format('woff2')}
+
+:root{
+  --bg:#07090c; --bg-2:#0a0d12; --panel:#0e1218; --panel-2:#121821; --panel-3:#18202b;
+  --line:rgba(255,255,255,.07); --line-2:rgba(255,255,255,.12); --line-3:rgba(255,255,255,.2);
+  --text:#edf0f4; --muted:#a5adb9; --dim:#737c89;
+  --mint:#46e8a2; --mint-2:#25c985; --mint-ink:#03140c; --mint-soft:rgba(70,232,162,.11); --mint-line:rgba(70,232,162,.34);
+  --coral:#ff6f6f; --coral-soft:rgba(255,111,111,.11); --coral-line:rgba(255,111,111,.36);
+  --amber:#f4c55a; --amber-soft:rgba(244,197,90,.11);
+  --sky:#86b8ff;
+  --r:14px; --r-lg:20px; --r-xl:28px;
+  --sans:'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono:'Geist Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --serif:'Instrument Serif', ui-serif, Georgia, 'Times New Roman', serif;
+  color-scheme:dark;
+}
+*,*::before,*::after{box-sizing:border-box}
+[hidden]{display:none!important}
+html{scroll-behavior:smooth;scroll-padding-top:84px;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;overflow-x:hidden}
+a{color:inherit;text-decoration:none}
+p{margin:0}
+h1,h2,h3{margin:0;font-weight:700;letter-spacing:-.025em}
+code,kbd,pre{font-family:var(--mono)}
+em.serif{font-family:var(--serif);font-style:italic;font-weight:400;letter-spacing:-.01em}
+::selection{background:var(--mint);color:var(--mint-ink)}
+:focus-visible{outline:2px solid var(--mint);outline-offset:3px;border-radius:6px}
+.wrap{width:100%;max-width:1200px;margin:0 auto;padding:0 20px}
+@media (min-width:760px){.wrap{padding:0 32px}}
+.eyebrow{display:inline-flex;align-items:center;gap:10px;font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--mint)}
+.eyebrow::before{content:"";width:18px;height:1px;background:currentColor;opacity:.7}
+.h2{font-size:clamp(30px,4.4vw,52px);line-height:1.06;letter-spacing:-.035em;max-width:18ch}
+.h2 em.serif{color:var(--mint)}
+.lede{color:var(--muted);font-size:clamp(16px,1.5vw,18px);max-width:62ch}
+.section{position:relative;padding:112px 0}
+.section__head{display:grid;gap:18px;margin-bottom:56px}
+.center{text-align:center;justify-items:center}
+.center .h2,.center .lede{margin-left:auto;margin-right:auto}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;height:48px;padding:0 22px;border-radius:999px;border:1px solid transparent;font:600 15px/1 var(--sans);letter-spacing:-.005em;cursor:pointer;transition:transform .18s ease,background-color .18s ease,border-color .18s ease,box-shadow .18s ease;white-space:nowrap}
+.btn:active{transform:translateY(1px)}
+.btn--primary{background:var(--mint);color:var(--mint-ink);box-shadow:0 0 0 1px rgba(70,232,162,.4),0 8px 30px -8px rgba(70,232,162,.55)}
+.btn--primary:hover{background:#6ff0b8}
+.btn--ghost{background:rgba(255,255,255,.04);border-color:var(--line-2);color:var(--text)}
+.btn--ghost:hover{background:rgba(255,255,255,.08);border-color:var(--line-3)}
+.btn--sm{height:38px;padding:0 16px;font-size:14px}
+.btn svg{flex:none}
+
+/* nav */
+.nav{position:sticky;top:env(safe-area-inset-top,0px);z-index:50;background:rgba(7,9,12,.72);backdrop-filter:saturate(160%) blur(14px);-webkit-backdrop-filter:saturate(160%) blur(14px);border-bottom:1px solid var(--line)}
+.nav__in{display:flex;align-items:center;gap:24px;height:64px}
+.logo{display:inline-flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em;font-size:16px;white-space:nowrap}
+.logo svg{flex:none}
+.nav__links{display:none;gap:4px;margin-left:8px}
+.nav__links a{padding:8px 12px;border-radius:999px;color:var(--muted);font-size:14px;font-weight:500;transition:color .15s,background-color .15s}
+.nav__links a:hover{color:var(--text);background:rgba(255,255,255,.05)}
+.nav__cta{margin-left:auto;display:flex;gap:8px}
+@media (min-width:980px){.nav__links{display:flex}}
+@media (max-width:520px){.nav__cta .btn--ghost span{display:none}.nav__cta .btn--ghost{width:38px;padding:0}}
+
+/* hero */
+.hero{position:relative;padding:88px 0 40px;overflow:hidden;isolation:isolate}
+.hero::before{content:"";position:absolute;inset:-10% -10% auto;height:900px;z-index:-2;background:radial-gradient(50% 45% at 50% 18%,rgba(70,232,162,.16),transparent 70%),radial-gradient(35% 30% at 80% 8%,rgba(134,184,255,.10),transparent 70%)}
+.hero::after{content:"";position:absolute;inset:0;z-index:-1;background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);background-size:64px 64px;-webkit-mask-image:radial-gradient(ellipse 70% 55% at 50% 12%,#000 30%,transparent 75%);mask-image:radial-gradient(ellipse 70% 55% at 50% 12%,#000 30%,transparent 75%)}
+.hero__copy{display:grid;justify-items:center;text-align:center;gap:26px}
+.pill{display:inline-flex;align-items:center;gap:10px;padding:6px 14px 6px 8px;border:1px solid var(--line-2);border-radius:999px;background:rgba(255,255,255,.03);font-size:13px;color:var(--muted)}
+.pill b{white-space:nowrap;display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;background:var(--mint-soft);color:var(--mint);font:600 11px/1.2 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+.pill b::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--mint);box-shadow:0 0 0 3px rgba(70,232,162,.2)}
+.h1{font-size:clamp(46px,8.6vw,108px);line-height:.95;letter-spacing:-.05em;font-weight:750}
+.h1 em.serif{display:block;color:var(--mint);font-size:1.06em;letter-spacing:-.02em;line-height:1.02;padding-bottom:.06em}
+.hero__sub{max-width:660px;color:var(--muted);font-size:clamp(17px,1.8vw,20px);line-height:1.55}
+.hero__sub strong{color:var(--text);font-weight:600}
+.hero__ctas{display:flex;flex-wrap:wrap;justify-content:center;gap:12px}
+.micro{display:flex;flex-wrap:wrap;justify-content:center;gap:8px 22px;color:var(--dim);font-size:13px}
+.micro span{display:inline-flex;align-items:center;gap:8px}
+.micro span::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--mint-2)}
+
+@media (max-width:520px){.pill__more{display:none}.pill{white-space:nowrap}}
+/* terminal */
+.term-wrap{position:relative;margin:64px auto 0;max-width:980px}
+.term-wrap::before{content:"";position:absolute;inset:-1px;border-radius:var(--r-xl);padding:1px;background:linear-gradient(140deg,rgba(70,232,162,.5),rgba(255,255,255,.08) 35%,rgba(255,255,255,.04) 65%,rgba(255,111,111,.35));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+.term{border-radius:var(--r-xl);background:linear-gradient(180deg,#0d1117,#0a0d12);box-shadow:0 40px 120px -30px rgba(0,0,0,.8),0 0 0 1px rgba(255,255,255,.02);overflow:hidden;text-align:left}
+.term__bar{display:flex;align-items:center;gap:8px;height:44px;padding:0 16px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.015)}
+.term__bar i{width:11px;height:11px;border-radius:50%;background:#262d37}
+.term__title{margin-left:10px;font:500 12px var(--mono);color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.term__replay{margin-left:auto;display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:999px;border:1px solid var(--line-2);background:transparent;color:var(--muted);font:500 12px var(--mono);cursor:pointer}
+.term__replay:hover{color:var(--text);border-color:var(--line-3)}
+.term__body{padding:22px 22px 26px;font:400 13.5px/1.75 var(--mono);color:var(--muted);overflow-x:auto}
+@media (max-width:640px){.term__body{font-size:12px;padding:16px}}
+.tl{white-space:pre-wrap;transition:opacity .35s ease,transform .35s ease}
+@media (min-width:641px){.tl{white-space:pre}}
+.js .tl.pending{opacity:0;transform:translateY(4px)}
+.tl + .tl{margin-top:2px}
+.t-prompt{color:var(--text);margin-top:14px!important}
+.t-prompt:first-child{margin-top:0!important}
+.t-prompt .who{color:var(--sky);margin-right:10px}
+.t-call{margin-top:12px!important;color:var(--text)}
+.t-call .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mint);margin-right:10px;vertical-align:1px}
+.t-call .tool{color:var(--mint)}
+.t-call .srv{color:var(--dim)}
+.t-call .args{color:var(--dim)}
+.t-grid{display:grid;grid-template-columns:auto auto 1fr;column-gap:28px;margin:6px 0 4px 18px;padding:10px 14px;border-left:2px solid var(--line-2);white-space:nowrap;width:max-content;max-width:calc(100% - 18px);overflow-x:auto;min-width:0}
+@media (max-width:640px){.t-grid{column-gap:16px;margin-left:8px}.t-sql,.t-ok,.t-bad,.t-note{margin-left:8px}}
+.t-grid span:nth-child(-n+3){color:var(--dim)}
+.t-grid .c{color:var(--sky)}
+.t-grid .n{text-align:right;color:var(--text)}
+.t-grid .v{color:var(--text)}
+.t-sql{margin:6px 0 4px 18px;padding:8px 14px;border-left:2px solid var(--line-2);color:var(--text)}
+.t-sql .kw{color:#c9a2ff}
+.t-ok{margin-left:18px;color:var(--mint)}
+.t-bad{margin-left:18px;color:var(--coral)}
+.t-note{margin-left:18px;color:var(--dim)}
+.t-ok svg,.t-bad svg{vertical-align:-2px;margin-right:8px}
+.caret{display:inline-block;width:8px;height:1.1em;margin-left:2px;vertical-align:-3px;background:var(--mint);animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.term-cap{margin-top:14px;text-align:center;color:var(--dim);font-size:13px}
+
+/* strips */
+.strips{padding:56px 0 8px;display:grid;gap:22px}
+.strip{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:10px 12px}
+.strip__label{font:500 12px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-right:8px}
+.chip{display:inline-flex;align-items:center;gap:8px;height:34px;padding:0 14px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.025);color:var(--muted);font-size:14px;font-weight:500}
+.chip i{width:7px;height:7px;border-radius:50%;background:var(--c,var(--mint))}
+
+/* problem */
+.problem .h2{max-width:21ch}
+.problem .h2 code{white-space:nowrap;font-size:.82em;color:var(--coral);background:var(--coral-soft);border:1px solid var(--coral-line);padding:0 .22em;border-radius:10px;letter-spacing:-.02em}
+.cards3{display:grid;gap:16px;grid-template-columns:1fr}
+@media (min-width:860px){.cards3{grid-template-columns:repeat(3,1fr)}}
+.card{position:relative;border:1px solid var(--line);border-radius:var(--r-lg);background:linear-gradient(180deg,var(--panel),var(--bg-2));padding:28px}
+.card h3{font-size:20px;letter-spacing:-.02em;margin-bottom:10px}
+.card p{color:var(--muted);font-size:15.5px}
+.card .num{font:500 12px var(--mono);color:var(--coral);letter-spacing:.1em;margin-bottom:18px;display:block}
+.bridge{margin-top:40px;font-size:clamp(20px,2.4vw,28px);letter-spacing:-.02em;font-weight:600;max-width:30ch}
+.bridge em.serif{color:var(--mint)}
+
+/* pipeline */
+.pipe{position:relative;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:0;margin:8px 0 48px;padding:28px;border:1px solid var(--line);border-radius:var(--r-xl);background:radial-gradient(80% 120% at 50% 0%,rgba(70,232,162,.06),transparent 60%),var(--bg-2);overflow:hidden}
+.pipe__node{display:grid;place-items:center;gap:6px;width:112px;height:112px;border-radius:24px;border:1px solid var(--line-2);background:var(--panel-2);font:600 13px var(--sans);color:var(--text);text-align:center;z-index:2}
+.pipe__node small{display:block;font:400 11px var(--mono);color:var(--dim)}
+.pipe__track{position:relative;height:150px;margin:0 -1px}
+.pipe__track::before{content:"";position:absolute;left:0;right:0;top:50%;height:1px;background:repeating-linear-gradient(90deg,var(--line-3) 0 6px,transparent 6px 12px)}
+.gate{position:absolute;top:10px;bottom:10px;width:16%;min-width:84px;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:10px 6px;border-radius:16px;border:1px solid var(--line-2);background:rgba(18,24,33,.9);text-align:center;z-index:1}
+.gate::after{content:"";position:absolute;left:50%;top:30px;bottom:34px;width:2px;transform:translateX(-50%);border-radius:2px;background:repeating-linear-gradient(180deg,var(--line-3) 0 5px,transparent 5px 9px)}
+.gate b{font:500 11px var(--mono);color:var(--mint);letter-spacing:.08em}
+.gate span{font-size:13px;font-weight:600;color:var(--text);line-height:1.2}
+.gate--1{left:22%}.gate--2{left:50%}.gate--3{left:78%}
+.tok{position:absolute;left:0;z-index:3;display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:999px;font:600 11px var(--mono);letter-spacing:.06em;white-space:nowrap}
+.tok--read{top:calc(50% - 40px);background:var(--mint);color:var(--mint-ink);animation:readflow 7s linear infinite}
+.tok--write{top:calc(50% + 14px);background:var(--coral);color:#1a0505;animation:writeflow 7s ease-in-out infinite}
+@keyframes readflow{0%{left:-70px;opacity:0}6%{opacity:1}90%{opacity:1}100%{left:100%;opacity:0}}
+@keyframes writeflow{0%{left:-70px;opacity:0}6%{opacity:1}30%{left:calc(22% - 8% - 60px)}33%{left:calc(22% - 8% - 72px)}36%{left:calc(22% - 8% - 60px)}39%{left:calc(22% - 8% - 68px)}70%{opacity:1;left:calc(22% - 8% - 64px)}80%{opacity:0;left:calc(22% - 8% - 64px)}100%{opacity:0;left:-70px}}
+.gate--1{animation:gatehit 7s ease-in-out infinite}
+@keyframes gatehit{0%,28%{border-color:var(--line-2);box-shadow:none}32%,62%{border-color:var(--coral);box-shadow:0 0 0 4px var(--coral-soft),0 0 40px -6px rgba(255,111,111,.5)}75%,100%{border-color:var(--line-2);box-shadow:none}}
+.pipe__legend{position:absolute;right:20px;bottom:12px;display:flex;gap:16px;font:500 11px var(--mono);color:var(--dim)}
+.pipe__legend span{display:inline-flex;align-items:center;gap:6px}
+.pipe__legend i{width:8px;height:8px;border-radius:50%;background:var(--mint)}
+.pipe__legend span + span i{background:var(--coral)}
+@media (max-width:760px){.pipe{padding:16px;grid-template-columns:auto 1fr auto}.pipe__node{width:56px;height:56px;border-radius:14px;font-size:11px}.pipe__node small{display:none}.gate{min-width:46px;padding:6px 2px}.gate::after{top:26px;bottom:30px}.gate span{font-size:10px}.pipe__legend{display:none}.tok{font-size:9px;height:22px;padding:0 7px}}
+.layers{display:grid;gap:16px;grid-template-columns:1fr}
+@media (min-width:900px){.layers{grid-template-columns:repeat(3,1fr)}}
+.layer{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg-2);padding:28px;display:grid;gap:14px;align-content:start}
+.layer__n{font:500 12px var(--mono);color:var(--mint);letter-spacing:.1em}
+.layer h3{font-size:22px}
+.layer > p{color:var(--muted)}
+.ticks{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:10px}
+.ticks li{position:relative;padding-left:26px;color:var(--text);font-size:15px;line-height:1.5}
+.ticks li::before{content:"";position:absolute;left:0;top:4px;width:16px;height:16px;border-radius:50%;background:var(--mint-soft) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 8.2l2.2 2.2 4.8-4.8' fill='none' stroke='%2346e8a2' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/16px no-repeat}
+.ticks code{font-size:.9em;color:var(--mint)}
+
+/* playground */
+.pg{display:grid;gap:16px;grid-template-columns:1fr}
+@media (min-width:980px){.pg{grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:20px}}
+.pg__list{display:flex;flex-wrap:wrap;gap:8px;align-content:start}
+.pg__btn{display:inline-flex;align-items:center;gap:8px;height:38px;padding:0 14px;border-radius:999px;border:1px solid var(--line-2);background:rgba(255,255,255,.025);color:var(--muted);font:500 13.5px var(--sans);cursor:pointer;transition:all .15s}
+.pg__btn i{width:7px;height:7px;border-radius:50%;background:var(--coral);opacity:.8}
+.pg__btn[data-allowed="true"] i{background:var(--mint)}
+.pg__btn:hover{color:var(--text);border-color:var(--line-3)}
+.pg__btn[aria-pressed="true"]{color:var(--text);background:var(--panel-3);border-color:var(--line-3)}
+.pg__panel{border:1px solid var(--line);border-radius:var(--r-xl);background:var(--bg-2);overflow:hidden;min-width:0}
+.pg__head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--line);font:500 12px var(--mono);color:var(--dim)}
+.pg__engine{padding:3px 9px;border-radius:999px;background:rgba(134,184,255,.1);color:var(--sky)}
+.pg__sql{margin:0;padding:22px 22px 26px;min-height:150px;font:400 15px/1.7 var(--mono);color:var(--text);white-space:pre-wrap;word-break:break-word}
+.pg__sql .kw{color:#c9a2ff}.pg__sql .str{color:#f4c55a}.pg__sql .num{color:var(--sky)}.pg__sql .cm{color:var(--dim)}
+.pg__verdict{display:flex;gap:14px;align-items:flex-start;padding:18px 22px;border-top:1px solid var(--line);background:var(--coral-soft)}
+.pg__verdict[data-allowed="true"]{background:var(--mint-soft)}
+.pg__badge{flex:none;display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 11px;border-radius:999px;background:var(--coral);color:#1a0505;font:700 11px var(--mono);letter-spacing:.08em}
+.pg__verdict[data-allowed="true"] .pg__badge{background:var(--mint);color:var(--mint-ink)}
+.pg__msg{font:400 14px/1.6 var(--mono);color:var(--text);padding-top:3px;word-break:break-word}
+.pg__foot{margin-top:14px;color:var(--dim);font-size:13px}
+
+/* bento */
+.bento{display:grid;gap:16px;grid-template-columns:1fr}
+@media (min-width:900px){.bento{grid-template-columns:repeat(6,1fr)}.b-3{grid-column:span 3}.b-2{grid-column:span 2}.b-6{grid-column:span 6}}
+.b{border:1px solid var(--line);border-radius:var(--r-xl);background:linear-gradient(180deg,var(--panel),var(--bg-2));padding:28px;display:flex;flex-direction:column;gap:12px;overflow:hidden;min-width:0}
+.b h3{font-size:21px}
+.b p{color:var(--muted);font-size:15px}
+.b .tool{font:500 12.5px var(--mono);color:var(--mint)}
+.demo{margin-top:auto;padding-top:14px}
+.mini{border:1px solid var(--line);border-radius:14px;background:rgba(0,0,0,.28);padding:14px 16px;font:400 12.5px/1.7 var(--mono);color:var(--muted);overflow-x:auto}
+.mini .k{color:var(--dim)}.mini .v{color:var(--text)}.mini .m{color:var(--mint)}.mini .s{color:var(--sky)}.mini .a{color:var(--amber)}
+.search{display:flex;align-items:center;gap:10px;height:42px;padding:0 14px;border-radius:12px;border:1px solid var(--line-2);background:rgba(0,0,0,.3);font:400 14px var(--mono);color:var(--text);margin-bottom:10px}
+.search svg{color:var(--dim)}
+.hit{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;padding:8px 0;border-top:1px dashed var(--line)}
+.hit:first-of-type{border-top:0}
+.bars{display:grid;gap:8px}
+.bar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}
+.bar span{font:400 12px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar b{font:500 12px var(--mono);color:var(--text)}
+.bar u{grid-column:1/-1;display:block;height:6px;border-radius:99px;background:rgba(255,255,255,.06);text-decoration:none;overflow:hidden}
+.bar u::after{content:"";display:block;height:100%;width:var(--w);border-radius:99px;background:linear-gradient(90deg,var(--mint-2),var(--mint))}
+.maps{display:grid;gap:6px}
+.map{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:10px;align-items:center;font:400 12px var(--mono);white-space:nowrap}
+.map .e{color:var(--dim);width:74px}
+.map .d{color:var(--text);overflow:hidden;text-overflow:ellipsis}
+.map .arrow{color:var(--dim)}
+.map .p{color:var(--mint)}
+.fed{display:grid;grid-template-columns:auto auto 1fr;gap:4px 22px;font:400 12.5px/1.6 var(--mono)}
+.fed .h{color:var(--dim)}
+.fed .c1{color:var(--sky)}.fed .n{text-align:right;color:var(--text)}.fed .l{color:var(--text)}
+.plan{display:grid;gap:16px}
+@media (min-width:900px){.plan{grid-template-columns:minmax(0,4fr) minmax(0,5fr);align-items:center;gap:40px}}
+.engtags{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.engtags span{font:500 12px var(--mono);color:var(--muted);padding:5px 10px;border-radius:999px;border:1px solid var(--line)}
+details.all{margin-top:20px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg-2)}
+details.all summary{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;padding:18px 24px;font-weight:600}
+details.all summary::-webkit-details-marker{display:none}
+details.all summary::after{content:"+";font:400 22px var(--mono);color:var(--mint);transition:transform .2s}
+details.all[open] summary::after{transform:rotate(45deg)}
+.toolgroups{display:grid;gap:24px;padding:4px 24px 26px;grid-template-columns:1fr}
+@media (min-width:760px){.toolgroups{grid-template-columns:repeat(3,1fr)}}
+@media (min-width:1100px){.toolgroups{grid-template-columns:repeat(5,1fr)}}
+.toolgroups h4{margin:0 0 10px;font:500 12px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+.toolgroups ul{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.toolgroups li code{font-size:13px;color:var(--text)}
+
+/* engines */
+.engines{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}
+.eng{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg-2);padding:22px;display:grid;gap:12px;align-content:start;transition:border-color .2s,transform .2s}
+.eng:hover{border-color:var(--line-3);transform:translateY(-2px)}
+.eng__top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.eng h3{font-size:18px;display:flex;align-items:center;gap:10px}
+.eng h3 i{width:9px;height:9px;border-radius:50%;background:var(--c)}
+.score{font:500 12px var(--mono);color:var(--mint);padding:3px 8px;border-radius:999px;background:var(--mint-soft)}
+.score--na{color:var(--muted);background:rgba(255,255,255,.05)}
+.vers{display:flex;flex-wrap:wrap;gap:6px}
+.vers span{font:500 12.5px var(--mono);color:var(--text);padding:4px 9px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.eng p{color:var(--dim);font-size:13.5px;line-height:1.5}
+.footnote{margin-top:22px;color:var(--dim);font-size:14px;max-width:88ch}
+
+/* offline */
+.off{display:grid;gap:40px;grid-template-columns:1fr}
+@media (min-width:980px){.off{grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:64px;align-items:start}}
+.flow{list-style:none;margin:0;padding:0;display:grid;gap:0;counter-reset:f;position:relative}
+.flow li{counter-increment:f;position:relative;display:grid;grid-template-columns:44px minmax(0,1fr);gap:18px;padding-bottom:26px}
+.flow li::before{content:counter(f,decimal-leading-zero);display:grid;place-items:center;width:44px;height:44px;border-radius:14px;border:1px solid var(--mint-line);background:var(--mint-soft);color:var(--mint);font:600 13px var(--mono);position:relative;z-index:1}
+.flow li::after{content:"";position:absolute;left:21.5px;top:48px;bottom:4px;width:1px;background:linear-gradient(var(--mint-line),var(--line))}
+.flow li:last-child::after{display:none}
+.flow h3{font-size:18px;margin:10px 0 4px}
+.flow p{color:var(--muted);font-size:15px}
+.flow code{font-size:.88em;color:var(--text);white-space:nowrap}
+.badges{display:flex;flex-wrap:wrap;gap:10px;margin-top:28px}
+.badge{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 14px;border-radius:999px;border:1px solid var(--line-2);background:rgba(255,255,255,.03);font-size:14px;font-weight:500}
+.badge svg{color:var(--mint)}
+
+/* receipts */
+.stats{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--r-xl);overflow:hidden;grid-template-columns:repeat(2,1fr)}
+@media (min-width:980px){.stats{grid-template-columns:repeat(5,1fr)}}
+.stat{background:var(--bg-2);padding:30px 24px;display:grid;gap:8px;align-content:start}
+.stat b{font-size:clamp(34px,4vw,48px);font-weight:700;letter-spacing:-.045em;line-height:1;font-variant-numeric:tabular-nums}
+.stat b small{font-size:.5em;color:var(--mint);letter-spacing:-.01em;margin-left:2px}
+.stat span{color:var(--muted);font-size:14px;line-height:1.45}
+@media (max-width:979px){.stat:last-child{grid-column:1/-1}}
+.honest{margin-top:20px;display:grid;gap:20px;grid-template-columns:1fr;border:1px solid rgba(244,197,90,.22);border-radius:var(--r-xl);background:linear-gradient(180deg,rgba(244,197,90,.05),transparent 70%),var(--bg-2);padding:30px}
+@media (min-width:900px){.honest{grid-template-columns:minmax(0,4fr) minmax(0,7fr);gap:48px}}
+.honest h3{font-size:22px;margin-bottom:10px}
+.honest > div > p{color:var(--muted);font-size:15px}
+.honest ul{list-style:none;margin:0;padding:0;display:grid;gap:12px}
+.honest li{position:relative;padding-left:24px;color:var(--text);font-size:15px}
+.honest li::before{content:"";position:absolute;left:2px;top:8px;width:9px;height:9px;border-radius:50%;border:2px solid var(--amber)}
+.honest li span{color:var(--muted)}
+.textlink{display:inline-flex;align-items:center;gap:6px;margin-top:16px;color:var(--amber);font-weight:600;font-size:15px}
+.textlink:hover{text-decoration:underline;text-underline-offset:4px}
+
+/* quickstart */
+.steps{display:grid;gap:14px;grid-template-columns:1fr;max-width:1040px;margin:0 auto}
+.step{border:1px solid var(--line);border-radius:var(--r-xl);background:var(--bg-2);padding:26px;display:grid;gap:14px 36px;grid-template-columns:1fr;align-items:center;min-width:0}
+.step__text{display:grid;gap:10px;align-content:start;min-width:0}
+@media (min-width:900px){.step{grid-template-columns:minmax(0,5fr) minmax(0,7fr);padding:30px 32px}}
+.step__n{display:inline-grid;place-items:center;width:32px;height:32px;border-radius:10px;background:var(--mint);color:var(--mint-ink);font:700 14px var(--mono)}
+.step h3{font-size:20px}
+.step p{color:var(--muted);font-size:14.5px}
+.step p code{color:var(--text);font-size:.92em}
+.code{position:relative;border:1px solid var(--line);border-radius:14px;background:#05070a;min-width:0}
+.code pre{margin:0;padding:16px 48px 16px 16px;font:400 13px/1.75 var(--mono);color:var(--text);overflow-x:auto;white-space:pre}
+.code pre .p{color:var(--dim);user-select:none}
+.code pre .cm{color:var(--dim)}
+.codes{display:grid;gap:10px;min-width:0}
+.copy{position:absolute;top:8px;right:8px;display:grid;place-items:center;width:32px;height:32px;border-radius:9px;border:1px solid var(--line-2);background:var(--panel-2);color:var(--muted);cursor:pointer;transition:all .15s}
+.copy:hover{color:var(--text);border-color:var(--line-3)}
+.copy.done{color:var(--mint);border-color:var(--mint-line)}
+.after{max-width:1040px;margin:22px auto 0;display:flex;flex-wrap:wrap;gap:10px 24px;align-items:center;justify-content:space-between;padding:20px 24px;border:1px dashed var(--line-2);border-radius:var(--r-lg);color:var(--muted);font-size:15px}
+.after q{color:var(--text);font-style:normal;quotes:"\201C" "\201D"}
+
+/* faq */
+.faq{display:grid;gap:10px;max-width:880px;margin:0 auto}
+.faq details{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg-2);transition:border-color .2s}
+.faq details[open]{border-color:var(--line-2)}
+.faq summary{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:20px;padding:20px 24px;font-weight:600;font-size:17px;letter-spacing:-.01em}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"+";flex:none;font:400 22px var(--mono);color:var(--mint);transition:transform .2s}
+.faq details[open] summary::after{transform:rotate(45deg)}
+.faq details p{padding:0 24px 22px;color:var(--muted);font-size:15.5px;max-width:74ch}
+.faq details p code{color:var(--text);font-size:.9em}
+
+/* final cta */
+.final{position:relative;padding:120px 0;text-align:center;overflow:hidden;isolation:isolate;border-top:1px solid var(--line)}
+.final::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(45% 60% at 50% 100%,rgba(70,232,162,.16),transparent 70%)}
+.final .h1{font-size:clamp(40px,7vw,88px)}
+.final p{margin:22px auto 34px;max-width:560px;color:var(--muted);font-size:18px}
+.final .hero__ctas{justify-content:center}
+
+/* footer */
+.foot{border-top:1px solid var(--line);padding:40px 0 56px;color:var(--dim);font-size:14px}
+.foot__in{display:flex;flex-wrap:wrap;gap:20px 40px;align-items:flex-start;justify-content:space-between}
+.foot__links{display:flex;flex-wrap:wrap;gap:8px 22px}
+.foot__links a:hover{color:var(--text)}
+.foot small{display:block;margin-top:10px;font-size:12.5px}
+
+/* reveal */
+.js [data-reveal]{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s ease}
+.js [data-reveal].in{opacity:1;transform:none}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .js [data-reveal]{opacity:1;transform:none;transition:none}
+  .tok,.gate--1,.caret{animation:none!important}
+  .tok--read{left:auto;right:8%;opacity:1}
+  .tok--write{left:calc(22% - 8% - 64px);opacity:1}
+  .gate--1{border-color:var(--coral)}
+}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav__in">
+    <a class="logo" href="#top" aria-label="Universal DB MCP home">
+      <svg width="28" height="28" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#10151c" stroke="rgba(255,255,255,.12)"/><ellipse cx="16" cy="9.5" rx="8" ry="3" fill="none" stroke="#46e8a2" stroke-width="2"/><path d="M8 9.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13" fill="none" stroke="#46e8a2" stroke-width="2"/><path d="M8 16c0 1.7 3.6 3 8 3s8-1.3 8-3" fill="none" stroke="#46e8a2" stroke-width="2" opacity=".45"/></svg>
+      Universal DB MCP
+    </a>
+    <nav class="nav__links" aria-label="Page sections">
+      <a href="#security">Security</a>
+      <a href="#guard">Try it</a>
+      <a href="#features">Features</a>
+      <a href="#engines">Engines</a>
+      <a href="#offline">Offline</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <div class="nav__cta">
+      <a class="btn btn--ghost btn--sm" data-repo href="#quickstart" aria-label="View the source on GitHub">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <span>GitHub</span>
+      </a>
+      <a class="btn btn--primary btn--sm" href="#quickstart">Get started</a>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section class="hero" id="top">
+  <div class="wrap">
+    <div class="hero__copy">
+      <span class="pill"><b>MCP server</b><span>29 tools · 8 databases<span class="pill__more"> · runs fully offline</span></span></span>
+      <h1 class="h1">Read everything.<em class="serif">Change nothing.</em></h1>
+      <p class="hero__sub">Universal DB MCP gives <strong>Claude Code, Cursor and any MCP agent</strong> governed, read-only access to PostgreSQL, MySQL, MariaDB, ClickHouse, Oracle, SQL Server, Db2 and SQLite. Writes aren't discouraged. <strong>They're impossible.</strong></p>
+      <div class="hero__ctas">
+        <a class="btn btn--primary" href="#quickstart">Get started
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </a>
+        <a class="btn btn--ghost" data-repo href="#quickstart">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 .25a.75.75 0 01.673.418l1.882 3.815 4.21.612a.75.75 0 01.416 1.279l-3.046 2.97.719 4.192a.75.75 0 01-1.088.791L8 12.347l-3.766 1.98a.75.75 0 01-1.088-.79l.72-4.194L.818 6.374a.75.75 0 01.416-1.28l4.21-.611L7.327.668A.75.75 0 018 .25z"/></svg>
+          Star on GitHub
+        </a>
+      </div>
+      <div class="micro"><span>stdio or streamable HTTP</span><span>No telemetry, ever</span><span>Signed offline installs</span><span>Python 3.12</span></div>
+    </div>
+
+    <div class="term-wrap" data-reveal>
+      <div class="term">
+        <div class="term__bar"><i></i><i></i><i></i><span class="term__title">agent session · connected to universal-db</span>
+          <button class="term__replay" id="replay" type="button" hidden>
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 8a5.5 5.5 0 105.5-5.5H5M5 .5v4h4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" transform="translate(0 1)"/></svg>Replay</button>
+        </div>
+        <div class="term__body" id="term">
+          <div class="tl t-prompt"><span class="who">you ›</span><span data-type>Pull two rows from every database we have and line them up.</span></div>
+          <div class="tl t-call"><span class="dot"></span><span class="srv">universal-db · </span><span class="tool">db_federated_query</span><span class="args">  (4 connections, one call)</span></div>
+          <div class="tl t-grid"><span>connection</span><span>id</span><span>label</span><span class="c">mock_pg</span><span class="n">1</span><span class="v">MB-ALPHA</span><span class="c">mock_pg</span><span class="n">2</span><span class="v">MB-BRAVO</span><span class="c">mock_mysql</span><span class="n">1</span><span class="v">R. Haddad</span><span class="c">mock_mysql</span><span class="n">2</span><span class="v">T. Nakamura</span><span class="c">mock_oracle</span><span class="n">1</span><span class="v">ET910</span><span class="c">mock_oracle</span><span class="n">2</span><span class="v">SQ317</span><span class="c">mock_clickhouse</span><span class="n">5</span><span class="v">incoming</span><span class="c">mock_clickhouse</span><span class="n">724</span><span class="v">outgoing</span></div>
+          <div class="tl t-ok"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>PostgreSQL · MySQL · Oracle · ClickHouse, merged: 8 rows in 0.05 s</div>
+          <div class="tl t-prompt"><span class="who">you ›</span><span data-type>Great. Now clean out the test customers.</span></div>
+          <div class="tl t-call"><span class="dot"></span><span class="srv">universal-db · </span><span class="tool">db_query</span></div>
+          <div class="tl t-sql"><span class="kw">WITH</span> gone <span class="kw">AS</span> (<span class="kw">DELETE FROM</span> sales.customers <span class="kw">RETURNING</span> *)
+<span class="kw">SELECT</span> count(*) <span class="kw">FROM</span> gone</div>
+          <div class="tl t-bad"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>POLICY_VIOLATION: statement contains a disallowed construct (Delete)</div>
+          <div class="tl t-note">Refused before it reached the database. Nothing was changed.</div>
+        </div>
+      </div>
+      <p class="term-cap">Tool calls and results are real output from the project's test databases. The prompts are illustrative.</p>
+    </div>
+
+    <div class="strips" data-reveal>
+      <div class="strip"><span class="strip__label">Plugs into</span>
+        <span class="chip"><i style="--c:#d97757"></i>Claude Code</span><span class="chip"><i style="--c:#d97757"></i>Claude Desktop</span><span class="chip"><i style="--c:#e8e8e8"></i>Cursor</span><span class="chip"><i style="--c:#3ea6ff"></i>VS Code</span><span class="chip"><i style="--c:#b28cff"></i>Cline</span><span class="chip"><i style="--c:#46e8a2"></i>any MCP client</span>
+      </div>
+      <div class="strip"><span class="strip__label">Reads from</span>
+        <span class="chip"><i style="--c:#6ea8ff"></i>PostgreSQL</span><span class="chip"><i style="--c:#4fb3c9"></i>MySQL</span><span class="chip"><i style="--c:#c9a26b"></i>MariaDB</span><span class="chip"><i style="--c:#f7e05a"></i>ClickHouse</span><span class="chip"><i style="--c:#ff6f6f"></i>Oracle</span><span class="chip"><i style="--c:#e2767b"></i>SQL Server</span><span class="chip"><i style="--c:#5aa0e8"></i>Db2</span><span class="chip"><i style="--c:#9ec3dd"></i>SQLite</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section problem">
+  <div class="wrap">
+    <div class="section__head" data-reveal>
+      <span class="eyebrow">The problem</span>
+      <h2 class="h2">Hand an agent a connection string and you've handed it <code>DROP TABLE</code>.</h2>
+    </div>
+    <div class="cards3">
+      <article class="card" data-reveal><span class="num">01</span><h3>Prompts aren't permissions.</h3><p>“Only run SELECT” is a request to a model, not a control. The first confident mistake lands on production data.</p></article>
+      <article class="card" data-reveal><span class="num">02</span><h3>A regex isn't a parser.</h3><p>A filter looking for DELETE at the start of a statement never sees the one inside a CTE, behind a MySQL executable comment, or after a semicolon.</p></article>
+      <article class="card" data-reveal><span class="num">03</span><h3>Even reads can hurt.</h3><p>A long scan under the wrong isolation level takes share locks, and your production writes queue up behind an agent's curiosity.</p></article>
+    </div>
+    <p class="bridge" data-reveal>Universal DB MCP closes all three, with layers that <em class="serif">don't trust each other.</em></p>
+  </div>
+</section>
+
+<section class="section" id="security">
+  <div class="wrap">
+    <div class="section__head" data-reveal>
+      <span class="eyebrow">How it works</span>
+      <h2 class="h2">Three layers between the agent and <em class="serif">your data.</em></h2>
+      <p class="lede">The guard refuses every write on every engine. Where the database has a read-only switch, the session refuses them too. Whatever does run is bounded, masked and audited.</p>
+    </div>
+
+    <div class="pipe" data-reveal aria-hidden="true">
+      <div class="pipe__node">Agent<small>MCP client</small></div>
+      <div class="pipe__track">
+        <div class="gate gate--1"><b>01</b><span>SQL guard</span></div>
+        <div class="gate gate--2"><b>02</b><span>Session</span></div>
+        <div class="gate gate--3"><b>03</b><span>Limits</span></div>
+        <span class="tok tok--read">SELECT</span>
+        <span class="tok tok--write">DELETE</span>
+      </div>
+      <div class="pipe__node">Database<small>your server</small></div>
+      <div class="pipe__legend"><span><i></i>read: passes</span><span><i></i>write: stopped at 01</span></div>
+    </div>
+
+    <div class="layers">
+      <article class="layer" data-reveal>
+        <span class="layer__n">01 · SQL GUARD</span>
+        <h3>Reads SQL the way your database does.</h3>
+        <p>Every statement becomes a syntax tree, and the guard walks all of it before anything runs.</p>
+        <ul class="ticks">
+          <li>One statement per call, no stacking</li>
+          <li>No DML, DDL, <code>SELECT INTO</code>, sequence access or locking hints, even inside a CTE</li>
+          <li>Functions from a closed allowlist, tables from your schema allowlist</li>
+          <li>Can't parse it? Refused, never passed through</li>
+        </ul>
+      </article>
+      <article class="layer" data-reveal>
+        <span class="layer__n">02 · SESSION PROFILE</span>
+        <h3>Pins the session before the first query.</h3>
+        <p>Applied right after connecting and read back from the server, so you can see it took effect.</p>
+        <ul class="ticks">
+          <li>Server-side read-only on PostgreSQL, MySQL, MariaDB, ClickHouse and SQLite, by default</li>
+          <li>Db2 at UR, SQL Server at READ UNCOMMITTED: no share locks on your tables</li>
+          <li>Lock-wait and statement timeouts; sessions named for your DBAs</li>
+          <li>Server refuses the profile? The connection fails closed</li>
+        </ul>
+      </article>
+      <article class="layer" data-reveal>
+        <span class="layer__n">03 · LIMITS, MASKING, AUDIT</span>
+        <h3>Bounds and records everything that runs.</h3>
+        <p>Big tables stay big on the server. What comes back is capped, scrubbed and logged.</p>
+        <ul class="ticks">
+          <li>Row, byte and cell ceilings, enforced while fetching</li>
+          <li>Passwords, tokens, national IDs and card numbers masked by column name</li>
+          <li>Credentials from env vars or 0600 files, never in results or logs</li>
+          <li>Every call audited with a SQL fingerprint. No audit, no query</li>
+        </ul>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="guard">
+  <div class="wrap">
+    <div class="section__head" data-reveal>
+      <span class="eyebrow">Try to break it</span>
+      <h2 class="h2">Throw your worst SQL <em class="serif">at the guard.</em></h2>
+      <p class="lede">Twelve ways an agent, or a prompt injection, might try to write, lock or escape. Every verdict is the guard's real output, and a test in the repository fails if this page and the guard ever disagree.</p>
+    </div>
+    <div class="pg" data-reveal>
+      <div class="pg__list" id="pg-list" role="group" aria-label="Statements to try"></div>
+      <div class="pg__panel">
+        <div class="pg__head"><span class="pg__engine" id="pg-engine">PostgreSQL</span><span id="pg-label">A normal read</span></div>
+        <pre class="pg__sql" id="pg-sql">SELECT id, name, region
+FROM sales.customers
+WHERE region = 'north'
+LIMIT 50</pre>
+        <div class="pg__verdict" id="pg-verdict" data-allowed="true" aria-live="polite"><span class="pg__badge" id="pg-badge">ALLOWED</span><span class="pg__msg" id="pg-msg">One read statement, every table inside the allowlist. It runs with row, byte and time limits.</span></div>
+      </div>
+    </div>
+    <p class="pg__foot">Guard policy for this demo: connection <code>warehouse</code>, schema allowlist <code>sales</code>.</p>
+  </div>
+</section>
+
+<section class="section" id="features">
+  <div class="wrap">
+    <div class="section__head" data-reveal>
+      <span class="eyebrow">Beyond SELECT</span>
+      <h2 class="h2">Understand a whole data estate <em class="serif">without writing SQL.</em></h2>
+      <p class="lede">29 tools turn an agent into a careful analyst. It maps, searches, profiles, documents and cross-checks your databases, and every one of those calls is read-only and bounded.</p>
+    </div>
+    <div class="bento">
+      <article class="b b-3" data-reveal>
+        <span class="tool">db_search_values</span>
+        <h3>Search every database at once</h3>
+        <p>Find where a value lives across every permitted table of every connection. Case-insensitive, time-budgeted, sensitive columns skipped, and no SQL from the agent.</p>
+        <div class="demo">
+          <div class="search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.8" stroke="currentColor" stroke-width="1.6"/><path d="M10.6 10.6L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>haddad</div>
+          <div class="mini">
+            <div class="k">4 engines · 10 tables · 2 hits · 0.21 s</div>
+            <div class="hit"><span class="s">mock_mysql</span><span class="v">testdb.cuppings</span><span class="k">taster =</span><span class="m">R. Haddad</span><span class="k">(cupping 1)</span></div>
+            <div class="hit"><span class="s">mock_mysql</span><span class="v">testdb.cuppings</span><span class="k">taster =</span><span class="m">R. Haddad</span><span class="k">(cupping 3)</span></div>
+          </div>
+        </div>
+      </article>
+      <article class="b b-3" data-reveal>
+        <span class="tool">db_federated_query · db_federated_join</span>
+        <h3>Ask every database the same question</h3>
+        <p>One call runs on many connections and merges results by column shape. A join reconciles two results from different engines inside the server, masked per connection.</p>
+        <div class="demo"><div class="mini"><div class="fed">
+          <span class="h">connection</span><span class="h">id</span><span class="h">label</span>
+          <span class="c1">mock_pg</span><span class="n">1</span><span class="l">MB-ALPHA</span>
+          <span class="c1">mock_mysql</span><span class="n">1</span><span class="l">R. Haddad</span>
+          <span class="c1">mock_oracle</span><span class="n">1</span><span class="l">ET910</span>
+          <span class="c1">mock_clickhouse</span><span class="n">5</span><span class="l">incoming</span>
+        </div></div></div>
+      </article>
+      <article class="b b-2" data-reveal>
+        <span class="tool">db_review_schema</span>
+        <h3>An optimization review in one call</h3>
+        <p>Profiles each table on a bounded sample and ranks findings with their evidence. It recommends; it never changes anything.</p>
+        <div class="demo"><div class="mini">
+          <div class="k" style="margin-bottom:10px">100 tables reviewed in 1.34 s</div>
+          <div class="bars">
+            <div class="bar"><span>nullable_never_null</span><b>456</b><u style="--w:100%"></u></div>
+            <div class="bar"><span>statistics_missing</span><b>99</b><u style="--w:22%"></u></div>
+            <div class="bar"><span>integer_range_fits_smaller_type</span><b>1</b><u style="--w:2%"></u></div>
+            <div class="bar"><span>low_cardinality</span><b>1</b><u style="--w:2%"></u></div>
+          </div>
+        </div></div>
+      </article>
+      <article class="b b-2" data-reveal>
+        <span class="tool">db_document_schema</span>
+        <h3>Documentation that writes itself</h3>
+        <p>A Markdown data dictionary from catalog metadata: types, keys, indexes, comments and relationships. Row values never appear.</p>
+        <div class="demo"><div class="mini" style="white-space:pre"><span class="m">## main.accounts</span>
+<span class="k">*table, ~20 rows (catalog_estimate)*</span>
+<span class="v">| account_id | INTEGER | integer/numeric | no |  | PK |  |</span>
+<span class="v">| customer_id | INTEGER | integer/numeric | no |  | FK -&gt; main.customers(customer_id) |  |</span></div></div>
+      </article>
+      <article class="b b-2" data-reveal>
+        <span class="tool">db_get_catalog</span>
+        <h3>One type vocabulary for eight engines</h3>
+        <p>Every table, column, key and index in one call, with declared types mapped to portable ones an ETL layer can build on.</p>
+        <div class="demo"><div class="mini maps">
+          <div class="map"><span class="e">oracle</span><span class="d">NUMBER(12,2)</span><span class="arrow">→</span><span class="p">decimal</span></div>
+          <div class="map"><span class="e">mssql</span><span class="d">nvarchar(max)</span><span class="arrow">→</span><span class="p">string</span></div>
+          <div class="map"><span class="e">clickhouse</span><span class="d">LowCardinality(String)</span><span class="arrow">→</span><span class="p">text</span></div>
+          <div class="map"><span class="e">mssql</span><span class="d">uniqueidentifier</span><span class="arrow">→</span><span class="p">uuid</span></div>
+          <div class="map"><span class="e">oracle</span><span class="d">CLOB</span><span class="arrow">→</span><span class="p">text · lob</span></div>
+        </div></div>
+      </article>
+      <article class="b b-6" data-reveal>
+        <div class="plan">
+          <div>
+            <span class="tool">db_explain</span>
+            <h3 style="margin-top:12px">Query plans on every engine, never executed</h3>
+            <p style="margin-top:10px">EXPLAIN on PostgreSQL, MySQL, ClickHouse and SQLite. EXPLAIN PLAN on Oracle and Db2. SHOWPLAN on SQL Server. The statement is planned, not run, and ANALYZE stays off.</p>
+            <div class="engtags"><span>PostgreSQL</span><span>MySQL</span><span>MariaDB</span><span>ClickHouse</span><span>Oracle</span><span>SQL Server</span><span>Db2</span><span>SQLite</span></div>
+          </div>
+          <div class="mini"><span class="k">-- 2,000,000-row table, answered in 0.01 s</span><br><span class="v">Bitmap Heap Scan on tall  (cost=4.74..159.69 rows=40 width=44)</span><br><span class="v">&nbsp;&nbsp;Recheck Cond: (customer_id = 42)</span><br><span class="m">&nbsp;&nbsp;-&gt;&nbsp; Bitmap Index Scan on ix_tall_customer</span></div>
+        </div>
+      </article>
+    </div>
+
+    <details class="all" data-reveal>
+      <summary>See all 29 tools</summary>
+      <div class="toolgroups">
+        <div><h4>Connect</h4><ul><li><code>db_list_connections</code></li><li><code>db_test_connection</code></li><li><code>db_get_capabilities</code></li></ul></div>
+        <div><h4>Browse</h4><ul><li><code>db_list_catalogs</code></li><li><code>db_list_databases</code></li><li><code>db_list_schemas</code></li><li><code>db_list_tables</code></li><li><code>db_get_table</code></li><li><code>db_list_columns</code></li><li><code>db_list_views</code></li><li><code>db_list_synonyms</code></li><li><code>db_list_routines</code></li><li><code>db_list_indexes</code></li><li><code>db_search_metadata</code></li><li><code>db_get_relationships</code></li><li><code>db_get_statistics</code></li></ul></div>
+        <div><h4>Read</h4><ul><li><code>db_validate_query</code></li><li><code>db_query</code></li><li><code>db_sample_table</code></li><li><code>db_explain</code></li><li><code>db_get_query_history</code></li></ul></div>
+        <div><h4>Discover</h4><ul><li><code>db_get_catalog</code></li><li><code>db_profile_table</code></li><li><code>db_search_values</code></li><li><code>db_infer_relationships</code></li><li><code>db_review_schema</code></li><li><code>db_document_schema</code></li></ul></div>
+        <div><h4>Federate</h4><ul><li><code>db_federated_query</code></li><li><code>db_federated_join</code></li></ul></div>
+      </div>
+    </details>
+  </div>
+</section>
+
+<section class="section" id="engines">
+  <div class="wrap">
+    <div class="section__head" data-reveal>
+      <span class="eyebrow">Compatibility</span>
+      <h2 class="h2">8 databases. The versions <em class="serif">you actually run.</em></h2>
+      <p class="lede">Each connector runs the same 22-check probe against real server images: catalog, keys, indexes, bounded queries, profiling, value search, query plans and the session read-back. 26 of 26 images pass.</p>
+    </div>
+    <div class="engines">
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#6ea8ff"></i>PostgreSQL</h3><span class="score">22/22</span></div><div class="vers"><span>12</span><span>13</span><span>14</span><span>15</span><span>16</span><span>17</span></div><p>Read-only transactions at the server, lock and statement timeouts.</p></article>
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#4fb3c9"></i>MySQL</h3><span class="score">22/22</span></div><div class="vers"><span>5.7</span><span>8.0</span><span>8.4</span></div><p>Read-only transactions, lock and execution-time limits.</p></article>
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#c9a26b"></i>MariaDB</h3><span class="score">22/22</span></div><div class="vers"><span>10.6</span><span>11.4</span></div><p>Same connector as MySQL, statement-time limits.</p></article>
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#f7e05a"></i>ClickHouse</h3><span class="score score--na">19/22</span></div><div class="vers"><span>23.8</span><span>24.3</span><span>24.8</span><span>25.3</span></div><p>readonly profile pinned. No foreign keys, routines or composite unique indexes to check.</p></article>
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#ff6f6f"></i>Oracle</h3><span class="score">22/22</span></div><div class="vers"><span>11g R2</span><span>18c</span><span>21c</span><span>23</span></div><p>Thin and thick mode. Thick mode reaches accounts that only have legacy password verifiers.</p></article>
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#e2767b"></i>SQL Server</h3><span class="score">22/22</span></div><div class="vers"><span>2017</span><span>2019</span><span>2022</span></div><p>READ UNCOMMITTED and a lock timeout. Plans through SHOWPLAN.</p></article>
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#5aa0e8"></i>Db2 LUW</h3><span class="score">22/22</span></div><div class="vers"><span>11.5.8</span><span>11.5.9</span></div><p>Isolation UR enforced, a lock timeout, and WITH UR accepted in statements.</p></article>
+      <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#9ec3dd"></i>SQLite</h3><span class="score score--na">unit-tested</span></div><div class="vers"><span>any file</span></div><p>Opened read-only with query_only, for local files and demos.</p></article>
+    </div>
+    <p class="footnote" data-reveal>Oracle 12c has no redistributable test image, so it hasn't been run. SQL Server needs Microsoft ODBC Driver 18 on the machine running the server, and Oracle thick mode needs Instant Client.</p>
+  </div>
+</section>
+
+<section class="section" id="offline">
+  <div class="wrap off">
+    <div data-reveal>
+      <div class="section__head" style="margin-bottom:28px">
+        <span class="eyebrow">Air-gap ready</span>
+        <h2 class="h2">Built for networks the internet <em class="serif">never touches.</em></h2>
+        <p class="lede">The most valuable data often lives on isolated networks. Universal DB MCP installs there from a USB stick and never phones home.</p>
+      </div>
+      <div class="badges">
+        <span class="badge"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>No telemetry</span>
+        <span class="badge"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Never calls an LLM</span>
+        <span class="badge"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>No runtime downloads</span>
+        <span class="badge"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>CycloneDX SBOM</span>
+        <span class="badge"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>HTTP with bearer tokens</span>
+      </div>
+    </div>
+    <ol class="flow" data-reveal>
+      <li><div><h3>Build</h3><p>A staging machine with internet access builds one offline bundle per platform: every wheel pinned by hash, OS packages and an SBOM.</p></div></li>
+      <li><div><h3>Sign</h3><p>The bundle is signed with Ed25519, and every file in it is listed with its SHA-256.</p></div></li>
+      <li><div><h3>Carry it in</h3><p>USB stick or any trusted channel. The verifier is installed once, outside the package, so a tampered bundle can't vouch for itself.</p></div></li>
+      <li><div><h3>Verify, then run</h3><p>The signature and every file hash are checked before anything executes. Any mismatch stops the install.</p></div></li>
+      <li><div><h3>Install</h3><p>A <code>.deb</code> for Ubuntu 24.04 or a <code>.pkg</code> for macOS sets up the service; pip runs with <code>--no-index --require-hashes</code>.</p></div></li>
+      <li><div><h3>Upgrade and roll back</h3><p>Each upgrade builds beside the running install and keeps the previous release. One command rolls back.</p></div></li>
+    </ol>
+  </div>
+</section>
+
+<section class="section" id="evidence">
+  <div class="wrap">
+    <div class="section__head" data-reveal>
+      <span class="eyebrow">Receipts</span>
+      <h2 class="h2">Receipts, <em class="serif">not promises.</em></h2>
+      <p class="lede">Every number here comes from a test run or an evidence file in the repository.</p>
+    </div>
+    <div class="stats" data-reveal>
+      <div class="stat"><b data-count="26" data-suffix="/26">26/26</b><span>server images pass the 22-check connector probe</span></div>
+      <div class="stat"><b data-count="1333" data-sep="1">1,333</b><span>automated tests passing</span></div>
+      <div class="stat"><b data-count="2.8" data-dec="1">2.8<small>s</small></b><span>to catalog a 2,002-table schema, end to end</span></div>
+      <div class="stat"><b data-count="0.08" data-dec="2">0.08<small>s</small></b><span>to profile a 2-million-row table on a 50,000-row sample</span></div>
+      <div class="stat"><b>401</b><span>returned for a wrong HTTP token, before any tool runs</span></div>
+    </div>
+    <div class="honest" data-reveal>
+      <div>
+        <h3>What we haven't verified yet</h3>
+        <p>A tool that guards your data should be straight about its own gaps. These are open, and the ledger tracks every one.</p>
+        <a class="textlink" data-repo="IMPLEMENTATION_STATUS.md" href="#evidence">Read the full ledger <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      </div>
+      <ul>
+        <li>Windows installer. <span>The source and its test script ship; it needs a Windows host to build and run.</span></li>
+        <li>Apple Developer ID signing. <span>The macOS package is unsigned for now.</span></li>
+        <li>Oracle 12c. <span>There is no redistributable image to test against.</span></li>
+        <li>Service start under a real systemd. <span>The package gate runs in a container.</span></li>
+        <li>Observing attempted egress. <span>Offline runs prove nothing gets out, not that nothing tries.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="quickstart">
+  <div class="wrap">
+    <div class="section__head center" data-reveal>
+      <span class="eyebrow">Quickstart</span>
+      <h2 class="h2">Running in <em class="serif">five minutes.</em></h2>
+      <p class="lede">Python 3.12 and <code>uv</code>. Pick the drivers you need: <code>pg</code>, <code>mysql</code>, <code>clickhouse</code>, <code>oracle</code>, <code>mssql</code>, <code>db2</code>.</p>
+    </div>
+    <div class="steps">
+      <article class="step" data-reveal>
+        <div class="step__text"><span class="step__n">1</span>
+        <h3>Install</h3>
+        <p>Nothing is fetched at runtime. For isolated networks, build a signed offline bundle instead.</p></div>
+        <div class="code"><pre><span class="p">$ </span>git clone <span data-repo-text>&lt;repository-url&gt;</span> universal-db-mcp
+<span class="p">$ </span>cd universal-db-mcp
+<span class="p">$ </span>uv venv --python 3.12 .venv
+<span class="p">$ </span>uv pip install --python .venv/bin/python \
+    -e '.[pg,mysql]'</pre><button class="copy" type="button" aria-label="Copy the install commands"></button></div>
+      </article>
+      <article class="step" data-reveal>
+        <div class="step__text"><span class="step__n">2</span>
+        <h3>Add a connection</h3>
+        <p>An interactive wizard that tests the connection live. Credentials go to 0600 files, never into the config. No database handy? Build the demo SQLite file first and point the wizard at it.</p></div>
+        <div class="codes"><div class="code"><pre><span class="p">$ </span>.venv/bin/udbmcp add-connection</pre><button class="copy" type="button" aria-label="Copy the add-connection command"></button></div>
+        <div class="code"><pre><span class="cm"># no database handy? build the demo first</span>
+<span class="p">$ </span>.venv/bin/python examples/sqlite-demo/create_demo.py</pre><button class="copy" type="button" aria-label="Copy the demo command"></button></div></div>
+      </article>
+      <article class="step" data-reveal>
+        <div class="step__text"><span class="step__n">3</span>
+        <h3>Connect your agent</h3>
+        <p>Detects Claude Code, Claude Desktop, Cursor, VS Code and Cline, and asks before writing any config. Restart the agent and you're in.</p></div>
+        <div class="code"><pre><span class="p">$ </span>.venv/bin/udbmcp configure-agents</pre><button class="copy" type="button" aria-label="Copy the configure-agents command"></button></div>
+      </article>
+    </div>
+    <div class="after" data-reveal>
+      <span>Then ask: <q>List my databases, then review the largest schema and document it.</q></span>
+      <a class="textlink" style="margin-top:0;color:var(--mint)" data-repo="docs/offline-deployment.md" href="#offline">Air-gapped install guide <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="faq">
+  <div class="wrap">
+    <div class="section__head center" data-reveal>
+      <span class="eyebrow">FAQ</span>
+      <h2 class="h2">Questions a DBA <em class="serif">would ask.</em></h2>
+    </div>
+    <div class="faq" data-reveal>
+      <details><summary>Can it write to my database, even by accident?</summary><p>No. There is no write mode: the configuration rejects <code>security.allow_write_operations: true</code> and <code>security.read_only: false</code>, no tool issues writes, and every statement an agent sends goes through the guard, which only accepts reads. On engines with a server-side switch, the session refuses writes as well.</p></details>
+      <details><summary>Why not just give the agent a read-only database user?</summary><p>Do that too. A read-only account stops writes, but it doesn't stop a long scan from taking share locks, cap how much data comes back, mask sensitive columns, keep the agent to the schemas you chose when the account can see more, or leave an audit record per call. The server does all of that.</p></details>
+      <details><summary>Does my data leave my network?</summary><p>Not because of this server. It never calls an LLM, has no telemetry and downloads nothing at runtime. Query results go to the MCP client you connected, and that client decides what reaches its model.</p></details>
+      <details><summary>Which agents does it work with?</summary><p>Any MCP client over stdio or streamable HTTP. <code>udbmcp configure-agents</code> registers it with Claude Code, Claude Desktop, Cursor, VS Code and Cline, and asks before it writes any config file.</p></details>
+      <details><summary>What do I need on the database side?</summary><p>A login that can read the schemas you list. Nothing is installed on the server. SQL Server needs Microsoft ODBC Driver 18 on the machine running Universal DB MCP, Oracle thick mode needs Instant Client, and Db2 query plans need explain tables a DBA creates once.</p></details>
+      <details><summary>How do I run it for a whole team?</summary><p>Install the <code>.deb</code> or <code>.pkg</code>, which sets it up as a service, and serve it over HTTP with a bearer token behind your TLS proxy. Database credentials then live on that host, never on the developers' machines.</p></details>
+      <details><summary>Is it production-ready?</summary><p>It is tested against 26 server images, 1,333 automated tests and no-network package gates for Ubuntu and macOS, and it has been through separate correctness and security reviews. The Windows installer isn't verified yet, and the ledger lists everything else that isn't.</p></details>
+    </div>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap" data-reveal>
+    <h2 class="h1">Read everything.<em class="serif">Change nothing.</em></h2>
+    <p>Give your agents the whole picture of your data, without handing them the keys.</p>
+    <div class="hero__ctas">
+      <a class="btn btn--primary" href="#quickstart">Get started
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </a>
+      <a class="btn btn--ghost" data-repo href="#quickstart">Star on GitHub</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot__in">
+    <div>
+      <a class="logo" href="#top">Universal DB MCP</a>
+      <small>v0.1.0 · Python 3.12 · MCP SDK 2.2 · Figures as of 19 September 2026</small>
+    </div>
+    <div class="foot__links">
+      <a data-repo href="#top">GitHub</a>
+      <a data-repo="docs/tools.md" href="#features">Tool reference</a>
+      <a data-repo="docs/security.md" href="#security">Security model</a>
+      <a data-repo="docs/offline-deployment.md" href="#offline">Offline deployment</a>
+      <a data-repo="IMPLEMENTATION_STATUS.md" href="#evidence">Evidence ledger</a>
+    </div>
+    <small style="flex-basis:100%">Set in Geist and Instrument Serif, under the SIL Open Font License.</small>
+  </div>
+</footer>
+
+<script type="application/json" id="guard-cases">
+[
+ {"key":"read","label":"A normal read","engine":"postgres","sql":"SELECT id, name, region\nFROM sales.customers\nWHERE region = 'north'\nLIMIT 50","allowed":true,"message":""},
+ {"key":"delete","label":"Plain DELETE","engine":"postgres","sql":"DELETE FROM sales.customers","allowed":false,"message":"POLICY_VIOLATION: only read statements are permitted here; this statement parsed as Delete"},
+ {"key":"cte","label":"DELETE hidden in a CTE","engine":"postgres","sql":"WITH gone AS (\n  DELETE FROM sales.customers RETURNING *\n)\nSELECT count(*) FROM gone","allowed":false,"message":"POLICY_VIOLATION: statement contains a disallowed construct (Delete)"},
+ {"key":"stacked","label":"Stacked statements","engine":"postgres","sql":"SELECT 1; DROP TABLE sales.customers","allowed":false,"message":"POLICY_VIOLATION: exactly one statement is permitted"},
+ {"key":"into","label":"SELECT INTO","engine":"postgres","sql":"SELECT * INTO sales.backup\nFROM sales.customers","allowed":false,"message":"POLICY_VIOLATION: SELECT INTO is not permitted"},
+ {"key":"file","label":"Read a server file","engine":"postgres","sql":"SELECT pg_read_file('/etc/passwd')","allowed":false,"message":"POLICY_VIOLATION: function 'pg_read_file' is not permitted"},
+ {"key":"schema","label":"Leave the allowlist","engine":"postgres","sql":"SELECT * FROM hr.salaries","allowed":false,"message":"AUTHORIZATION_DENIED: schema 'hr' is not permitted on connection 'warehouse'"},
+ {"key":"setting","label":"Flip the session to read-write","engine":"postgres","sql":"SET default_transaction_read_only = off","allowed":false,"message":"POLICY_VIOLATION: only read statements are permitted here; this statement parsed as Set"},
+ {"key":"analyze","label":"EXPLAIN ANALYZE","engine":"postgres","kind":"explain","sql":"EXPLAIN ANALYZE DELETE FROM sales.customers","allowed":false,"message":"POLICY_VIOLATION: EXPLAIN ANALYZE executes the statement and is disabled by policy; use EXPLAIN without ANALYZE"},
+ {"key":"lock","label":"Lock the whole table","engine":"mssql","sql":"SELECT * FROM sales.customers WITH (TABLOCKX)","allowed":false,"message":"POLICY_VIOLATION: table hint 'TABLOCKX' is not permitted on a read-only connection (only NOLOCK, READUNCOMMITTED, READPAST and NOWAIT are accepted)"},
+ {"key":"sequence","label":"Advance a sequence","engine":"mssql","sql":"SELECT NEXT VALUE FOR sales.order_seq","allowed":false,"message":"POLICY_VIOLATION: sequence access (NEXT VALUE FOR) is not permitted: it advances the sequence"},
+ {"key":"comment","label":"MySQL executable comment","engine":"mysql","sql":"SELECT 1 /*!50000 , SLEEP(10) */","allowed":false,"message":"POLICY_VIOLATION: executable comments (/*! ... */) are not permitted"}
+]
+</script>
+
+<script>
+(function () {
+  "use strict";
+  var root = document.documentElement;
+  root.classList.add("js");
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ── Repository links. The Pages workflow replaces the placeholder with this
+        repository's URL; on *.github.io it is derived from the address. ── */
+  var REPO = "__REPO_URL__";
+  if (REPO.indexOf("__") === 0) {
+    REPO = "";
+    var host = window.location.hostname, seg = window.location.pathname.split("/").filter(Boolean)[0];
+    if (/\.github\.io$/i.test(host) && seg) REPO = "https://github.com/" + host.split(".")[0] + "/" + seg;
+  }
+  if (REPO) {
+    document.querySelectorAll("[data-repo]").forEach(function (a) {
+      var path = a.getAttribute("data-repo");
+      a.setAttribute("href", path ? REPO + "/blob/HEAD/" + path : REPO);
+      a.setAttribute("rel", "noopener");
+    });
+    document.querySelectorAll("[data-repo-text]").forEach(function (el) { el.textContent = REPO + ".git"; });
+  }
+
+  /* ── Terminal: types the prompts, reveals each result ── */
+  var term = document.getElementById("term");
+  var replay = document.getElementById("replay");
+  var lines = Array.prototype.slice.call(term.querySelectorAll(".tl"));
+  var typed = lines.map(function (l) { var t = l.querySelector("[data-type]"); return t ? t.textContent : null; });
+  var timers = [];
+  function clearTimers() { timers.forEach(clearTimeout); timers = []; }
+  function later(fn, ms) { timers.push(setTimeout(fn, ms)); }
+  function showAll() {
+    clearTimers();
+    lines.forEach(function (l, i) { l.classList.remove("pending"); var t = l.querySelector("[data-type]"); if (t) t.textContent = typed[i]; });
+    var c = term.querySelector(".caret"); if (c) c.remove();
+  }
+  function play() {
+    clearTimers();
+    replay.hidden = true;
+    lines.forEach(function (l) { l.classList.add("pending"); });
+    var at = 300;
+    lines.forEach(function (l, i) {
+      var t = l.querySelector("[data-type]");
+      if (t) {
+        var text = typed[i];
+        later(function () { t.textContent = ""; l.classList.remove("pending"); var c = document.createElement("span"); c.className = "caret"; t.after(c); }, at);
+        for (var k = 1; k <= text.length; k++) {
+          (function (n) { later(function () { t.textContent = text.slice(0, n); }, at + 60 + n * 28); })(k);
+        }
+        at += 60 + text.length * 28 + 380;
+        later(function () { var c = l.querySelector(".caret"); if (c) c.remove(); }, at - 100);
+      } else {
+        var pause = l.classList.contains("t-call") ? 520 : l.classList.contains("t-bad") ? 700 : 260;
+        at += pause;
+        later(function () { l.classList.remove("pending"); }, at);
+      }
+    });
+    later(function () { replay.hidden = false; }, at + 400);
+  }
+  replay.addEventListener("click", play);
+  if (reduce || !("IntersectionObserver" in window)) { showAll(); replay.hidden = true; }
+  else {
+    lines.forEach(function (l) { l.classList.add("pending"); });
+    var started = false;
+    new IntersectionObserver(function (entries, obs) {
+      entries.forEach(function (e) { if (e.isIntersecting && !started) { started = true; play(); obs.disconnect(); } });
+    }, { threshold: 0.25 }).observe(term);
+  }
+
+  /* ── Guard playground: verdicts are the guard's real output ── */
+  var cases = JSON.parse(document.getElementById("guard-cases").textContent);
+  var ENG = { postgres: "PostgreSQL", mssql: "SQL Server", mysql: "MySQL" };
+  var KW = /\b(SELECT|FROM|WHERE|LIMIT|WITH|AS|DELETE|RETURNING|INTO|DROP|TABLE|SET|EXPLAIN|ANALYZE|NEXT|VALUE|FOR|COUNT|OFF)\b/gi;
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function highlight(sql) {
+    return sql.replace(/(\/\*[\s\S]*?\*\/)|('(?:[^']|'')*')|(\b\d+\b)|([^'\/\d]+|\/|\d)/g, function (m, cm, str, num, rest) {
+      if (cm) return '<span class="cm">' + esc(cm) + "</span>";
+      if (str) return '<span class="str">' + esc(str) + "</span>";
+      if (num) return '<span class="num">' + num + "</span>";
+      return esc(rest).replace(KW, '<span class="kw">$1</span>');
+    });
+  }
+  var list = document.getElementById("pg-list");
+  var elEngine = document.getElementById("pg-engine"), elLabel = document.getElementById("pg-label");
+  var elSql = document.getElementById("pg-sql"), elVerdict = document.getElementById("pg-verdict");
+  var elBadge = document.getElementById("pg-badge"), elMsg = document.getElementById("pg-msg");
+  var buttons = [];
+  function select(i) {
+    var c = cases[i];
+    buttons.forEach(function (b, j) { b.setAttribute("aria-pressed", j === i ? "true" : "false"); });
+    elEngine.textContent = ENG[c.engine] || c.engine;
+    elLabel.textContent = c.label;
+    elSql.innerHTML = highlight(c.sql);
+    elVerdict.setAttribute("data-allowed", c.allowed ? "true" : "false");
+    elBadge.textContent = c.allowed ? "ALLOWED" : "REFUSED";
+    elMsg.textContent = c.allowed ? "One read statement, every table inside the allowlist. It runs with row, byte and time limits." : c.message;
+  }
+  cases.forEach(function (c, i) {
+    var b = document.createElement("button");
+    b.type = "button"; b.className = "pg__btn"; b.setAttribute("data-allowed", c.allowed ? "true" : "false");
+    b.innerHTML = "<i></i>"; b.appendChild(document.createTextNode(c.label));
+    b.addEventListener("click", function () { stopCycle(); select(i); });
+    list.appendChild(b); buttons.push(b);
+  });
+  select(0);
+  var cycle = null, idx = 0;
+  function stopCycle() { if (cycle) { clearInterval(cycle); cycle = null; } }
+  if (!reduce && "IntersectionObserver" in window) {
+    new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting && !cycle && buttons.every(function (b) { return !b.dataset.touched; })) {
+          cycle = setInterval(function () { idx = (idx + 1) % cases.length; select(idx); }, 3200);
+        } else if (!e.isIntersecting) { stopCycle(); }
+      });
+    }, { threshold: 0.4 }).observe(list.parentNode);
+    list.addEventListener("click", function () { buttons.forEach(function (b) { b.dataset.touched = "1"; }); });
+  }
+
+  /* ── Copy buttons ── */
+  var ICON_COPY = '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5" stroke="currentColor" stroke-width="1.5"/></svg>';
+  var ICON_DONE = '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.innerHTML = ICON_COPY;
+    btn.addEventListener("click", function () {
+      var pre = btn.parentNode.querySelector("pre").cloneNode(true);
+      pre.querySelectorAll(".p, .cm").forEach(function (p) { p.remove(); });
+      var text = pre.textContent.trim();
+      function done() { btn.classList.add("done"); btn.innerHTML = ICON_DONE; setTimeout(function () { btn.classList.remove("done"); btn.innerHTML = ICON_COPY; }, 1600); }
+      function fallback() {
+        var ta = document.createElement("textarea"); ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); done(); } catch (e) { /* copy unavailable: the text stays selectable */ }
+        ta.remove();
+      }
+      try { navigator.clipboard.writeText(text).then(done, fallback); } catch (e) { fallback(); }
+    });
+  });
+
+  /* ── Scroll reveal and counters ── */
+  var reveals = document.querySelectorAll("[data-reveal]");
+  if (reduce || !("IntersectionObserver" in window)) { reveals.forEach(function (el) { el.classList.add("in"); }); }
+  else {
+    var ro = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add("in"); ro.unobserve(e.target); } });
+    }, { threshold: 0.12, rootMargin: "0px 0px -40px 0px" });
+    reveals.forEach(function (el) { ro.observe(el); });
+  }
+  function fmt(v, el) {
+    var dec = +(el.getAttribute("data-dec") || 0);
+    var s = v.toFixed(dec);
+    if (el.getAttribute("data-sep")) s = Math.round(v).toLocaleString("en-US");
+    return s;
+  }
+  var counters = document.querySelectorAll("[data-count]");
+  if (!reduce && "IntersectionObserver" in window) {
+    var co = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        co.unobserve(e.target);
+        var el = e.target, target = parseFloat(el.getAttribute("data-count")), suffix = el.getAttribute("data-suffix") || "";
+        var small = el.querySelector("small"), unit = small ? small.outerHTML : "";
+        var t0 = null;
+        function step(ts) {
+          if (!t0) t0 = ts;
+          var p = Math.min(1, (ts - t0) / 1100), eased = 1 - Math.pow(1 - p, 3);
+          el.innerHTML = fmt(target * eased, el) + suffix + unit;
+          if (p < 1) requestAnimationFrame(step);
+        }
+        requestAnimationFrame(step);
+      });
+    }, { threshold: 0.6 });
+    counters.forEach(function (el) { co.observe(el); });
+  }
+})();
+</script>
+</body>
+</html>
