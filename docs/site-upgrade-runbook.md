@@ -253,8 +253,9 @@ use the same mode: thick mode is process-wide.
 ```bash
 # the installed code is this stick's release
 sudo python3 -c 'import json; print(json.load(open("/opt/universal-db-mcp/manifest.json"))["source_rev"])'; echo "expected to start with: $SHA"
-grep -c db_review_schema /opt/universal-db-mcp/venv/lib/python3.12/site-packages/universal_db_mcp/server.py
-#   -> greater than 0: the new code is in the installed venv, not only in the package
+grep -c db_federated_query /opt/universal-db-mcp/venv/lib/python3.12/site-packages/universal_db_mcp/server.py
+#   -> greater than 0: THIS release's code is in the installed venv, not only in the package
+#   (db_federated_query is new here; db_review_schema shipped in the previous release)
 
 # the service
 systemctl status universal-db-mcp --no-pager | head -5
@@ -287,13 +288,46 @@ Then start a new Claude Code session and ask it to run `db_test_connection`
 on each connection. The reply carries a `session` block: Db2 shows
 `isolation: ur` and `lock_timeout_seconds: 5`, PostgreSQL and MySQL show
 `read_only_verified: true`, SQL Server shows `read_uncommitted`. Ask for
-`db_review_schema` on one connection: it is one of the two new tools and
-returns prioritized findings with evidence.
+`db_review_schema` on one connection: it returns prioritized findings with
+evidence. The tool list should now hold 29 tools.
 
 ## What changed for an existing site (read before the first query)
 
-Full list in `docs/offline-upgrade-rollback.md`; the ones that can surprise
-you:
+Full list in `docs/offline-upgrade-rollback.md`. New in THIS release:
+
+- **Two federated tools** (`db_federated_query`, `db_federated_join`) bring
+  the tool count from 27 to 29. They read several connections in one call
+  and merge or join the results in the server; each side stays bounded and
+  masked under its own connection's policy, and each statement gets its own
+  audit record (`db_federated_query:statement`).
+- **`db_explain` now works on every engine.** Oracle writes the plan into
+  the session's plan table and deletes it again, SQL Server uses
+  `SET SHOWPLAN_ALL` on a private connection (the account needs the
+  SHOWPLAN permission; the error names it), and Db2 uses explain tables a
+  DBA provisions once with
+  `CALL SYSPROC.SYSINSTALLOBJECTS('EXPLAIN','C',NULL,NULL)`. Without those
+  tables Db2 explain is refused with that instruction, and `site-check`
+  reports `explain=SKIPPED`, which is expected. Spelling is
+  `EXPLAIN <select>` on every engine.
+- **`db_explain` refuses a non-empty `parameters` argument** instead of
+  silently ignoring it: inline the literal values in the statement.
+- **The guard refuses two more constructs**: sequence access
+  (`NEXT VALUE FOR`, Oracle `NEXTVAL`/`CURRVAL`) and SQL Server table hints
+  other than `NOLOCK`, `READUNCOMMITTED`, `READPAST` and `NOWAIT`. A saved
+  query that used `UPDLOCK` or `TABLOCK` will now be denied.
+- **`db_search_values` reports what it did not reach**: `tables_not_searched`
+  and `connections_not_searched` say when a budget ended the search, so
+  "no hits" is never mistaken for "not present".
+- **Upgrades are now reversible by design**: the trusted installer builds
+  the new environment beside the running one and switches, keeping
+  `/opt/universal-db-mcp/venv.previous` with an integrity manifest for the
+  rollback script below.
+- **The package refuses an outdated trusted installer**: any copy without
+  the `udbmcp-installer-format: 3` marker (or without `--force-reinstall`)
+  aborts the install at preinst with an `OUTDATED copy` diagnostic. Step 1
+  of this runbook is what clears it.
+
+Carried over from the previous release, still worth knowing:
 
 - **Every read-only connection now gets a server session profile**: Db2 runs
   at `UR`, SQL Server at `READ UNCOMMITTED`, PostgreSQL and MySQL are put
@@ -309,7 +343,7 @@ you:
 - **`db_get_catalog` and `db_list_indexes` no longer list system catalogs**
   (Oracle dictionary views, Db2 SYSCAT) unless asked with `include_system`.
 - **`schema.table` object names work everywhere** (they were denied before).
-- **Two new tools**: `db_review_schema` and `db_document_schema`.
+- **Two tools added then**: `db_review_schema` and `db_document_schema`.
 
 ## Rollback (to the previous stick's release)
 
