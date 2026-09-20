@@ -306,16 +306,22 @@ class OracleConnector(DatabaseConnector):
         except Exception as exc:
             text = str(exc)
             if "DPY-3015" in text:
-                # Seen live 2026-09-15: an account carrying ONLY the legacy 10G
-                # verifier. Thin mode supports 11G/12C verifiers only, so name
-                # both the server-side and the client-side remedy.
+                # Seen live 2026-09-15 (account carrying ONLY the 10G verifier)
+                # and 2026-09-20 (Oracle 12c account carrying 10G 11G 12C, where
+                # sec_case_sensitive_logon=FALSE made the server authenticate
+                # with 10G anyway). Thin mode implements 11G/12C only, so name
+                # what to check and both remedies.
                 raise ConnectorError(
-                    f"oracle refused this account's password verifier ({text.strip()[:120]}). "
-                    "Thin mode supports 11G and 12C verifiers only. Either ask the DBA to run "
-                    "ALTER USER <user> IDENTIFIED BY <new password> so a modern verifier is "
-                    "generated (sec_case_sensitive_logon must not be FALSE), or set "
-                    "options.thick_mode: true with an administrator-supplied Oracle Instant "
-                    "Client (options.lib_dir), which still accepts the 10G verifier."
+                    f"oracle authenticated this session with the legacy 10G verifier, which thin mode "
+                    f"does not implement ({text.strip()[:120]}). Check both: "
+                    "SELECT password_versions FROM dba_users WHERE username = '<user>' (only '10G' means "
+                    "the account has no modern verifier), and SHOW PARAMETER sec_case_sensitive_logon "
+                    "(FALSE forces the 10G path even when the account carries 11G and 12C). The client-side "
+                    "fix for every case is options.thick_mode: true with an administrator-supplied Oracle "
+                    "Instant Client, which still accepts the old protocol and needs no server change. "
+                    "Server-side alternatives, both of which affect other clients: ALTER USER <user> "
+                    "IDENTIFIED BY <new password> to generate a modern verifier, or "
+                    "ALTER SYSTEM SET sec_case_sensitive_logon = TRUE."
                 ) from exc
             raise
         self._configure_session(conn)

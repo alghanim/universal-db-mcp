@@ -130,6 +130,10 @@ def test_thin_mode_verifier_error_names_both_remedies(
     assert "DPY-3015" in text
     assert "thick_mode" in text, "client-side remedy must be named"
     assert "ALTER USER" in text or "password reset" in text, "server-side remedy must be named"
+    # a site on 12c hit this with password_versions = '10G 11G 12C' because
+    # sec_case_sensitive_logon was FALSE: the message must send the operator to
+    # both checks, not just the account's verifiers
+    assert "password_versions" in text and "sec_case_sensitive_logon" in text
 
 
 def test_legacy_sid_connect_descriptor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

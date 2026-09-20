@@ -6,22 +6,42 @@ TLS. Related: `docs/driver-matrix.md`, `docs/offline-deployment.md`.
 
 ## 1. `DPY-3015: password verifier type 0x939 is not supported`
 
-The account carries **only the 10G password verifier**. python-oracledb in
-Thin mode (our default) supports the 11G and 12C verifiers only. Verifier
-`0x939` is 10G; it is not a wrong password and not a network problem.
+The server is authenticating this session with the legacy 10G verifier, and
+python-oracledb in Thin mode (our default) implements the 11G and 12C
+verifiers only. It is not a wrong password and not a network problem.
 
-Confirm on the server:
+**Two different server states produce it**, so check both before choosing a
+remedy:
 
 ```sql
+-- 1. what the account carries
 SELECT username, password_versions FROM dba_users WHERE username = '<USER>';
--- '10G' alone  -> Thin mode will refuse this account
--- '11G 12C'    -> Thin mode is fine
+--    '10G' alone        -> the account has no modern verifier
+--    '10G 11G 12C'      -> the account is fine; the server is choosing 10G, see 2
+
+-- 2. whether the server forces the old, case-insensitive logon path
+SHOW PARAMETER sec_case_sensitive_logon
+--    FALSE -> the server authenticates with the 10G verifier whatever the
+--             account carries, and Thin mode is refused. Reported from a
+--             site running Oracle 12c, 2026-09-20.
 ```
+
+A third possibility, when both look right: the server's `sqlnet.ora` pins
+`SQLNET.ALLOWED_LOGON_VERSION_SERVER` low (8 or 10). That file is not
+visible through `v$parameter`; it lives in `$ORACLE_HOME/network/admin/`
+on the database host.
+
+Thick mode (remedy B) fixes every one of these cases without a server
+change, because Oracle's own client still speaks the old protocol.
 
 Two remedies, either is sufficient.
 
-**A. Server side (preferred, no client change).** The DBA regenerates the
-password hash:
+**A. Server side (no client change, but it affects every application on
+that database).** If `sec_case_sensitive_logon` is FALSE, the DBA sets it
+back to TRUE (`ALTER SYSTEM SET sec_case_sensitive_logon = TRUE`), which
+makes passwords case-sensitive again for every client and locks out any
+account that still carries only a 10G verifier. If instead the account has
+no modern verifier, the DBA regenerates the password hash:
 
 ```sql
 SHOW PARAMETER sec_case_sensitive_logon    -- must NOT be FALSE
