@@ -22,8 +22,9 @@ SELECT username, password_versions FROM dba_users WHERE username = '<USER>';
 -- 2. whether the server forces the old, case-insensitive logon path
 SHOW PARAMETER sec_case_sensitive_logon
 --    FALSE -> the server authenticates with the 10G verifier whatever the
---             account carries, and Thin mode is refused. Reported from a
---             site running Oracle 12c, 2026-09-20.
+--             account carries, and Thin mode is refused. Confirmed at a site
+--             on Oracle 12c, 2026-09-20: password_versions = '10G 11G 12C'
+--             and sec_case_sensitive_logon = FALSE gave DPY-3015.
 ```
 
 A third possibility, when both look right: the server's `sqlnet.ora` pins
