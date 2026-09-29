@@ -97,7 +97,9 @@ def test_validate_explain_keeps_the_statement_text_as_written() -> None:
     assert r.kind == "explain" and r.text == "SELECT * FROM APP.CUSTOMERS OPTIMIZE FOR 10 ROWS WITH UR"
     r = _guard("sqlite").validate_explain("EXPLAIN QUERY PLAN SELECT 1 -- note")
     assert r.text == "SELECT 1 -- note"
-    r = _guard("postgres").validate_explain("EXPLAIN (FORMAT JSON) SELECT a FROM app.t")
+    # (EXPLAIN options are no longer dropped from the text: the guard's F89
+    # re-renders the accepted ones and refuses FORMAT JSON on PostgreSQL)
+    r = _guard("postgres").validate_explain("EXPLAIN SELECT a FROM app.t")
     assert r.text == "SELECT a FROM app.t"
 
 

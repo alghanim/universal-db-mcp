@@ -1,0 +1,6 @@
+# pip for CI's venv, which `uv sync` creates without one: the offline bundle
+# builder's tests run `python -m pip download`. ci.yml installs it with
+# --require-hashes and audits it; Dependabot bumps the pin and its hashes.
+pip==26.2.1 \
+    --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e \
+    --hash=sha256:f6ad667e89a1fe78046c8f13232b247200f5258d7828f3f7883d660878e0813f

@@ -4,6 +4,10 @@
 mcp==2.2.0
 PyYAML==6.0.3
 sqlglot==30.18.0
+# The HTTP transport subclasses uvicorn's h11 protocol and reads h11 state
+# (http_protocol.py): pinned here, not left to whatever mcp allows.
+uvicorn==0.53.0
+h11==0.16.0
 
 # Connector wheels (lazy-imported; missing wheels must be declared in the
 # bundle manifest rather than skipped silently):

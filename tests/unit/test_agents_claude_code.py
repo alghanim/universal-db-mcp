@@ -101,7 +101,7 @@ def test_installed_unconfigured_plan_and_apply(tmp_path: Path) -> None:
     assert entry == {
         "type": "stdio",
         "command": "/opt/universal-db-mcp/venv/bin/python",
-        "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+        "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
         "env": {"UDBMCP_CONFIG": "/etc/universal-db-mcp/config.yaml"},
     }
     assert result.entry == entry
@@ -307,6 +307,7 @@ def test_project_scope_existing_mcp_json_is_updated_with_backup(tmp_path: Path) 
     # User scope created, project scope updated in place.
     data = _read(proj_cfg)
     assert data["mcpServers"][SERVER_KEY]["args"] == [
+        "-I",
         "-m",
         "universal_db_mcp",
         "serve",

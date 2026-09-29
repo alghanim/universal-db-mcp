@@ -21,13 +21,15 @@
  9. deb postrm: ``dpkg -P`` left the postinst-installed unit behind.
 10. systemd unit: ``ProtectSystem=strict`` + ``ReadWritePaths=`` of directories
     that may not exist -> 226/NAMESPACE on the manual unit install.
-11. launchd: the daemon's logs under /var/log/universal-db-mcp were never rotated.
+11. launchd: the daemon's logs under /var/log/universal-db-mcp were never rotated. The newsyslog
+    rule added for it ran as root over the service account's directory, and launchd opens them as
+    root too (re-attack round 3, test_hardening_2026_09_29_root_jobs): they are in a directory only
+    root can write now, and the daemon caps them itself.
 """
 
 from __future__ import annotations
 
 import asyncio
-import getpass
 import json
 import os
 import plistlib
@@ -149,34 +151,41 @@ def test_validate_query_operation_is_an_advertised_enum(app_and_server: tuple[An
 # 3 -------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("exc", [KeyError("getpwuid(): uid not found: 12345"), OSError("no such user")])
-def test_identity_falls_back_to_uid_when_getuser_raises(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
-    def boom() -> str:
-        raise exc
-
-    monkeypatch.setattr(getpass, "getuser", boom)
-    getuid = getattr(os, "getuid", None)
-    expected = f"uid:{getuid()}" if getuid is not None else "unknown"
-    assert _process_identity() == expected
+# The identity no longer comes from getpass.getuser(), which reads USER/LOGNAME
+# first (2026-09-27 F72): these tests used to make getuser() raise, and now
+# take the passwd entry of the effective UID away instead.
 
 
-def test_identity_is_unknown_without_getuser_or_getuid(monkeypatch: pytest.MonkeyPatch) -> None:
-    def boom() -> str:
-        raise KeyError("unmapped uid")
+def _unmapped(uid: int) -> Any:
+    raise KeyError(f"getpwuid(): uid not found: {uid}")
 
-    monkeypatch.setattr(getpass, "getuser", boom)
-    monkeypatch.delattr(os, "getuid", raising=False)  # the Windows shape
+
+@_POSIX
+def test_identity_falls_back_to_uid_without_a_passwd_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwuid", _unmapped)
+    assert _process_identity() == f"uid:{os.geteuid()}"
+
+
+def test_identity_is_unknown_without_an_os_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    import universal_db_mcp.server as server_module
+
+    def no_token() -> str:
+        raise OSError("no process token")
+
+    monkeypatch.delattr(os, "geteuid", raising=False)  # the Windows shape
+    monkeypatch.setattr(server_module, "_windows_account", no_token)
     assert _process_identity() == "unknown"
 
 
+@_POSIX
 def test_app_context_builds_with_an_unmapped_uid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The CLI reported a raising getuser() as CONFIG_ERROR: the AppContext must
-    construct and audit under the numeric identity instead."""
+    """The CLI reported a UID without a passwd entry as CONFIG_ERROR: the
+    AppContext must construct and audit under the numeric identity instead."""
+    import pwd
 
-    def boom() -> str:
-        raise KeyError("unmapped uid")
-
-    monkeypatch.setattr(getpass, "getuser", boom)
+    monkeypatch.setattr(pwd, "getpwuid", _unmapped)
     db = tmp_path / "demo.db"
     db.touch()
     cfg_path = tmp_path / "config.yaml"
@@ -188,7 +197,7 @@ def test_app_context_builds_with_an_unmapped_uid(tmp_path: Path, monkeypatch: py
     )
     cfg, resolved = load_resolved(cfg_path)
     app = AppContext(cfg, resolved)
-    assert app.identity.startswith("uid:") or app.identity == "unknown"
+    assert app.identity == f"uid:{os.geteuid()}"
 
 
 # 4 -------------------------------------------------------------------------
@@ -511,42 +520,31 @@ def test_systemd_unit_lets_systemd_create_its_writable_directories() -> None:
 _XML_COMMENT = re.compile(rb"<!--.*?-->", re.S)
 
 
-def test_newsyslog_rotation_matches_the_launchd_log_paths() -> None:
-    entries = [ln for ln in _read(NEWSYSLOG).splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    assert len(entries) == 1, entries
-    fields = entries[0].split()
-    # logfilename owner:group mode count size when flags
-    assert len(fields) == 7, fields
-    pattern, owner, mode, count, size, when, flags = fields
-    assert pattern == "/var/log/universal-db-mcp/*.log"
-    assert owner == "_udbmcp:_udbmcp"
-    assert mode == "640" and count == "7" and size == "10240" and when == "*"
-    assert "G" in flags, "a glob logfilename needs the G flag (newsyslog.conf(5))"
-    assert "J" in flags
+def test_the_launchd_logs_are_where_only_root_can_write_and_no_root_job_rotates_them() -> None:
+    assert not NEWSYSLOG.exists(), "newsyslog runs as root and follows the links _udbmcp puts in its directory"
     plist = plistlib.loads(_XML_COMMENT.sub(b"", PLIST.read_bytes()))
     for key in ("StandardOutPath", "StandardErrorPath"):
         path = plist[key]
         assert isinstance(path, str)
-        assert path.startswith("/var/log/universal-db-mcp/") and path.endswith(".log"), path
+        # launchd opens them as root, following a link: never in the directory _udbmcp owns
+        # (test_hardening_2026_09_29_root_jobs)
+        assert path.startswith("/Library/Logs/universal-db-mcp/") and path.endswith(".log"), path
 
 
-def test_pkg_postinstall_installs_newsyslog_config_best_effort() -> None:
+def test_pkg_postinstall_removes_the_newsyslog_rule_an_earlier_release_installed() -> None:
     text = _read(PKG_POSTINSTALL)
     code = _code_lines(text)
-    assert 'NEWSYSLOG_SRC="$PREFIX/share/udbmcp.newsyslog.conf"' in code
     assert 'NEWSYSLOG_DST="/etc/newsyslog.d/udbmcp.conf"' in code
-    # the step runs after the log directory exists and before the daemon starts
-    step = text.split('NEWSYSLOG_DST="/etc/newsyslog.d/udbmcp.conf"', 1)[1].split("# --- step 7", 1)[0]
+    assert "NEWSYSLOG_SRC" not in code
+    # the step runs before the daemon starts and fails closed
+    step = text.split('NEWSYSLOG_DST="/etc/newsyslog.d/udbmcp.conf"', 1)[1].split("\n# --- step ", 1)[0]
     block = _code_lines(step)
-    assert 'install -m 0644 -o root -g wheel "$NEWSYSLOG_SRC" "$NEWSYSLOG_DST"' in block
-    assert "fail " not in block and "fail(" not in block, "rotation is best-effort: never abort the install"
-    assert block.count("WARNING") == 2, "both failure branches degrade to a loud warning"
+    assert 'for stale in "$NEWSYSLOG_DST" "$PREFIX/share/udbmcp.newsyslog.conf"; do' in block
+    assert 'rm -f -- "$stale" || fail ' in block
+    assert "install -" not in block and "WARNING" not in block
     _bash_n(PKG_POSTINSTALL)
 
 
-def test_build_pkg_stages_the_newsyslog_config_into_the_payload() -> None:
-    text = _read(BUILD_PKG)
-    assert "packaging/launchd/udbmcp.newsyslog.conf" in text
-    assert 'install -m 0644 "$NEWSYSLOG_SRC" "$SHARE_DEST/udbmcp.newsyslog.conf"' in text
-    assert NEWSYSLOG.is_file()
+def test_build_pkg_stages_no_newsyslog_rule() -> None:
+    assert "newsyslog" not in _code_lines(_read(BUILD_PKG))
     _bash_n(BUILD_PKG)

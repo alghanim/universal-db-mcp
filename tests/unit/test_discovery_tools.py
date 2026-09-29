@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers_sqlite import connector_reads_dbstat
 
 from universal_db_mcp.config import load_resolved
 from universal_db_mcp.server import AppContext, build_server
@@ -276,8 +277,9 @@ def test_review_schema_profiles_every_table_and_prioritizes_findings(server: Any
     codes = {r["code"] for r in data["recommendations"]}
     # the seed's only foreign key is indexed, so the unindexed-key rule cannot
     # fire here (it is pinned in test_discovery_logic); the review must carry
-    # the metadata finding on order_items and the sampling notice
-    assert {"no_primary_key", "sampled"} <= codes
+    # the metadata finding on order_items and the sampling notice (which needs
+    # a row estimate; see helpers_sqlite for the builds that have none)
+    assert {"no_primary_key", "sampled"} <= codes if connector_reads_dbstat() else "no_primary_key" in codes
     assert any(r["table"] == "order_items" and r["code"] == "no_primary_key" for r in data["recommendations"])
     ranks = [{"high": 0, "medium": 1, "low": 2, "info": 3}[r["severity"]] for r in data["recommendations"]]
     assert ranks == sorted(ranks), "recommendations must be ordered by severity"

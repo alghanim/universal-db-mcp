@@ -101,6 +101,19 @@ esac
 # no ${var,,} expansion, and /usr/bin/env bash is 3.2 on macOS admins' boxes).
 DATABASE_LC="$(printf '%s' "$DATABASE" | tr '[:upper:]' '[:lower:]')"
 
+# The certificate must name the host the CLIENT dials: the connector always
+# sets SSLClientHostnameValidation=Basic, which matches HOSTNAME against the
+# certificate's subjectAltName (an IP address needs an IP SAN).
+CERT_HOST="${HOST:-${CLIENT_HOST:-127.0.0.1}}"
+case "$CERT_HOST" in
+  ''|*[!A-Za-z0-9.:-]*) die "host '$CERT_HOST' is not a DNS name or an IP address" ;;
+esac
+case "$CERT_HOST" in
+  *:*)       CERT_SAN_KIND="ipaddr" ;;
+  *[!0-9.]*) CERT_SAN_KIND="dnsname" ;;
+  *)         CERT_SAN_KIND="ipaddr" ;;
+esac
+
 # ----------------------------------------------------------------- host mode
 # A native LUW instance is configured ON that host by the administrator with
 # the same recipe. This script deliberately does not SSH anywhere (the
@@ -126,11 +139,13 @@ if [ -n "$HOST" ]; then
   echo
   echo "  # 2. Key database + self-signed cert. Try '-cert -create' first; older"
   echo "  #    GSKit 8 builds that reject it use the legacy '-cert -selfsign' verb"
-  echo "  #    instead (with GSKit 9 the binary is gsk9certutil_64):"
+  echo "  #    instead (with GSKit 9 the binary is gsk9certutil_64). The certificate"
+  echo "  #    names ${CERT_HOST} (CN and subjectAltName): the client validates the"
+  echo "  #    host name it dials against it (SSLClientHostnameValidation=Basic):"
   echo "  export LD_LIBRARY_PATH=\"\$HOME/udbmcp-icu70:\$HOME/sqllib/lib64/gskit:\${LD_LIBRARY_PATH:-}\""
   echo "  \$HOME/sqllib/gskit/bin/gsk8capicmd_64 -keydb -create -db \$HOME/${KEYDB_NAME} -pw '<keydb-password>' -stash"
-  echo "  \$HOME/sqllib/gskit/bin/gsk8capicmd_64 -cert -create -db \$HOME/${KEYDB_NAME} -pw '<keydb-password>' -label ${LABEL} -size 2048 -expire 3650 -dn CN=udbmcp-test \\"
-  echo "    || \$HOME/sqllib/gskit/bin/gsk8capicmd_64 -cert -selfsign -db \$HOME/${KEYDB_NAME} -pw '<keydb-password>' -label ${LABEL} -size 2048 -expire 3650 -dn CN=udbmcp-test"
+  echo "  \$HOME/sqllib/gskit/bin/gsk8capicmd_64 -cert -create -db \$HOME/${KEYDB_NAME} -pw '<keydb-password>' -label ${LABEL} -size 2048 -expire 3650 -dn CN=${CERT_HOST} -san_${CERT_SAN_KIND} ${CERT_HOST} \\"
+  echo "    || \$HOME/sqllib/gskit/bin/gsk8capicmd_64 -cert -selfsign -db \$HOME/${KEYDB_NAME} -pw '<keydb-password>' -label ${LABEL} -size 2048 -expire 3650 -dn CN=${CERT_HOST} -san_${CERT_SAN_KIND} ${CERT_HOST}"
   echo
   echo "  # 3. DBM configuration + instance restart:"
   echo "  source \$HOME/sqllib/db2profile"
@@ -303,6 +318,7 @@ info "Ensuring key database \$HOME/${KEYDB_NAME} and label '${LABEL}' exist"
 docker exec -u "$INSTANCE_USER" \
   -e GSK_ENV="$GSK_ENV" -e GSKCMD="$GSKCMD" -e GSK_MODE="$GSK_MODE" \
   -e KDB="$KEYDB_NAME" -e STASH="$STASH_NAME" -e LABEL="$LABEL" -e KDB_PW="$PASSWORD" \
+  -e CERT_HOST="$CERT_HOST" -e CERT_SAN_KIND="$CERT_SAN_KIND" \
   "$CONTAINER" bash -c '
     eval "$GSK_ENV"
     if [ ! -f "$HOME/$KDB" ]; then
@@ -313,15 +329,17 @@ docker exec -u "$INSTANCE_USER" \
     fi
     if "$GSKCMD" -cert -list -db "$HOME/$KDB" -pw "$KDB_PW" 2>/dev/null | grep -q "$LABEL"; then
       echo "    certificate label \"$LABEL\" already present — reusing"
+      echo "    (a certificate that does not name $CERT_HOST in its subjectAltName is refused by"
+      echo "     host-name validation: delete the label with -cert -delete and re-run to reissue it)"
     else
       # GSKit 8 vs 9 verb differences: gsk9certutil and current GSKit 8 builds
       # accept "-cert -create", but the GSKit 8 shipped in some Db2 images
       # rejects it and only accepts the legacy "-cert -selfsign". Probe with
       # -create first and fall back so either binary succeeds. Fail-closed:
       # if both verbs fail the run aborts (docker exec exits non-zero).
-      if "$GSKCMD" -cert -create -db "$HOME/$KDB" -pw "$KDB_PW" -label "$LABEL" -size 2048 -expire 3650 -dn CN=udbmcp-test; then
+      if "$GSKCMD" -cert -create -db "$HOME/$KDB" -pw "$KDB_PW" -label "$LABEL" -size 2048 -expire 3650 -dn "CN=$CERT_HOST" "-san_$CERT_SAN_KIND" "$CERT_HOST"; then
         echo "    creating self-signed certificate (-cert -create)"
-      elif "$GSKCMD" -cert -selfsign -db "$HOME/$KDB" -pw "$KDB_PW" -label "$LABEL" -size 2048 -expire 3650 -dn CN=udbmcp-test; then
+      elif "$GSKCMD" -cert -selfsign -db "$HOME/$KDB" -pw "$KDB_PW" -label "$LABEL" -size 2048 -expire 3650 -dn "CN=$CERT_HOST" "-san_$CERT_SAN_KIND" "$CERT_HOST"; then
         echo "    creating self-signed certificate (-cert -selfsign fallback)"
       else
         echo "    ERROR: both -cert -create and -cert -selfsign failed" >&2
@@ -427,4 +445,4 @@ EOF
 
 echo
 echo "Done. Verify with the ibm_db one-liner from docs/db2-tls-setup.md:"
-echo "  python3 -c \"import ibm_db; print(ibm_db.connect('DATABASE=${DATABASE};HOSTNAME=<host>;PORT=${SSL_PORT};PROTOCOL=TCPIP;UID=<user>;PWD=<pw>;SECURITY=SSL;SSLServerCertificate=${CERT_OUT};','',''))\""
+echo "  python3 -c \"import ibm_db; print(ibm_db.connect('DATABASE=${DATABASE};HOSTNAME=${CERT_HOST};PORT=${SSL_PORT};PROTOCOL=TCPIP;UID=<user>;PWD=<pw>;SECURITY=SSL;SSLServerCertificate=${CERT_OUT};SSLClientHostnameValidation=Basic;','',''))\""

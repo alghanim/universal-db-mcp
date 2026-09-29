@@ -1,11 +1,12 @@
 # Scale evidence config (staging only): the local PostgreSQL fixture's
 # `scaledb` database, 2,000 narrow tables + a 900-column table + a
 # 2,000,000-row table in schema `scale`. Read-only account, default policy.
+# Paths are relative to this file's directory, the repository root.
 application:
   airgapped: true
   transport: stdio
-  metadata_cache_path: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/metadata-scale.sqlite
-  audit_path: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/audit-scale.jsonl
+  metadata_cache_path: out/mockdb-state/metadata-scale.sqlite
+  audit_path: out/mockdb-state/audit-scale.jsonl
   audit_fail_closed: true
   telemetry_enabled: false
 security:
@@ -29,6 +30,6 @@ connections:
     port: 5433
     database: scaledb
     username_env: UDBMCP_DEMO_PG_USER
-    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/pg.pw
+    password_file: out/mockdb-secrets/pg.pw
     read_only: true
     allowed_schemas: [scale]

@@ -332,6 +332,8 @@ def test_add_connection_cli_port_zero_is_config_error(
     assert rc != 0
     assert "CONFIG_ERROR" in err, "a raw pydantic traceback is not a fail-closed diagnostic"
     assert "Traceback" not in err
+    # the connection is validated before any credential is written
+    assert not (home / ".universal-db-mcp" / "secrets").exists()
 
 
 def test_add_connection_cli_missing_password_file_is_config_error(

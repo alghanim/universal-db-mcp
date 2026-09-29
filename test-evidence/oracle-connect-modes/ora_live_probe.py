@@ -1,10 +1,13 @@
+import os
 import sys
+
 sys.path.insert(0, "src")
 from universal_db_mcp.config import ConnectionConfig, ResolvedConnection, SecurityConfig
 from universal_db_mcp.connectors.oracle import OracleConnector
 from universal_db_mcp.security.policy import EffectivePolicy
 
-SP = "/private/tmp/claude-501/-Users-ag-work-Projects-universalDB-MCP/79f568f7-b5dc-4ffc-9aaf-933230e6f531/scratchpad"
+# Scratch directory holding tns/tnsnames.ora (alias PRODDB) and ora_system.pw
+SP = os.environ.get("ORA_PROBE_SCRATCH", "<scratch>")
 TRAVEL_PW = "out/mockdb-secrets/oracle.pw"
 
 def check(label, user, pwfile, database, options):

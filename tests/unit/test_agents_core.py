@@ -335,10 +335,14 @@ def test_cli_fail_closed_state_prints_block_and_never_applies(
     stub = StubAdapter(status=AgentStatus.UNKNOWN_STATE_FAIL_CLOSED)
     _install_stub(monkeypatch, stub)
 
+    # Asked to apply (--yes), a harness that failed closed fails the run
+    # (exit 2), as one whose adapter raised does.
     rc = main(["configure-agents", "--yes"])
 
-    assert rc == 0
-    out = capsys.readouterr().out
+    assert rc == 2
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "CONFIG_ERROR" in captured.err and STUB_TARGET_NAME in captured.err
     assert stub.apply_calls == []  # never even offered, even with --yes
     assert not (fake_home / ".cline" / STUB_SETTINGS).exists()
     assert "FAIL CLOSED" in out
@@ -351,11 +355,18 @@ def test_cli_missing_adapter_degrades_without_writing(
     monkeypatch.setitem(registry.ADAPTER_MODULES, STUB_TARGET_NAME, "universal_db_mcp.agents.nonexistent_adapter_zz")
     monkeypatch.setattr(registry, "HARNESS_NAMES", (STUB_TARGET_NAME,))
 
+    # Plain detection reports it and succeeds; asked to apply (--yes), the
+    # run fails (exit 2), because a harness that could not be evaluated must
+    # not read as success. Either way nothing is written.
+    assert main(["configure-agents"]) == 0
+    assert "adapter-unavailable" in capsys.readouterr().out
+
     rc = main(["configure-agents", "--yes"])
 
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "adapter-unavailable" in out
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "adapter-unavailable" in captured.out
+    assert "CONFIG_ERROR" in captured.err and STUB_TARGET_NAME in captured.err
     assert not (fake_home / ".cline" / STUB_SETTINGS).exists()
 
 

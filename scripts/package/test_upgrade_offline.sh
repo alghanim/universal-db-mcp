@@ -7,14 +7,15 @@
 # verify -> stage -> re-verify -> os-packages -> venv switch -> post-switch
 # doctor sequence against a NEWLY SIGNED second bundle:
 #
-#   1. acquire a signed linux-x86_64-ubuntu24.04-cp312 bundle v1 (reuse the
-#      existing out/bundle release or build one with an EPHEMERAL key, exactly
-#      like scripts/test_airgap.sh and the deb gate) and verify it through the
-#      trusted-channel verifier BEFORE anything runs;
-#   2. build bundle v2: a clone of v1 with a distinct source_rev in
-#      manifest.json, freshly regenerated SHA256SUMS and a NEW detached
-#      Ed25519 SIGNATURE (i.e. a genuinely new signed release, not a reused
-#      artifact) — verified host-side before it is mounted;
+#   1. acquire a signed linux-x86_64-ubuntu24.04-cp312 bundle (reuse the
+#      existing out/bundle release, verified with UDBMCP_PUBKEY when given,
+#      or build one), clone it as v1 re-signed with an EPHEMERAL key pair made
+#      for this run only (never a release or demo key), and verify v1 through
+#      the trusted-channel verifier BEFORE anything runs;
+#   2. build bundle v2: a clone of v1 with a distinct source_rev and the next
+#      release_seq in manifest.json, freshly regenerated SHA256SUMS and a NEW
+#      detached Ed25519 SIGNATURE (i.e. a genuinely newer signed release, not
+#      a reused artifact) — verified host-side before it is mounted;
 #   3. POSITIVE case, docker --network none --platform linux/amd64:
 #      - admin trust bootstrap at the documented paths (trusted channel
 #        mounted at /trust, NEVER the bundle itself);
@@ -28,6 +29,8 @@
 #        manifest), doctor and protocol_probe against the UPGRADED venv, and
 #        that the bundle's OS packages are still dpkg-"installed" (the
 #        version-aware helper handled them during the upgrade);
+#      - anti-rollback: upgrade_offline.sh with the OLDER v1 is refused
+#        ("rollback refused") and the installed manifest stays v2's;
 #      - rollback_offline.sh: verify-then-use restore of the demoted venv and
 #        a protocol probe against it.
 #
@@ -39,8 +42,9 @@
 #   - the container has no systemd as PID 1, so the guarded systemctl
 #     stop/start calls in upgrade_offline.sh are exercised only as no-ops;
 #   - "new bundle" here differs from v1 by a re-signed manifest (new
-#     source_rev) with an identical wheelhouse — sufficient to prove the
-#     verify/stage/re-verify/switch flow consumed a NEW signed release;
+#     source_rev, next release_seq) with an identical wheelhouse —
+#     sufficient to prove the verify/stage/re-verify/switch flow consumed a
+#     NEW signed release;
 #     a wheel-content change would not alter any decision the upgrade makes.
 set -euo pipefail
 
@@ -186,52 +190,32 @@ else
   exit 1
 fi
 
-# ------------------------------------------------ acquire signed bundle v1
-BUNDLE_V1="${UDBMCP_BUNDLE:-}"
-PUBKEY="${UDBMCP_PUBKEY:-}"
-BOOTSTRAP_KEYS="$OUT/upgrade-gate-bootstrap"
-SIGNING_KEY="${UDBMCP_RELEASE_KEY:-}"
-
-if [ -z "$BUNDLE_V1" ]; then
-  BUNDLE_V1="$(ls -d "$OUT"/bundle/universal-db-mcp-* 2>/dev/null | head -1 || true)"
-fi
-
-if [ -n "$BUNDLE_V1" ]; then
-  # Reuse path: the existing bundle was signed with the demo release key pair
-  # (out/demo-keys/). Without a matching pubkey the bundle cannot be
-  # authenticity-checked — refuse (fail closed).
-  if [ -z "$PUBKEY" ] && [ -f "$OUT/demo-keys/udbmcp-release-demo.pub.pem" ]; then
-    PUBKEY="$OUT/demo-keys/udbmcp-release-demo.pub.pem"
-  fi
-  if [ -z "$PUBKEY" ] && [ -f "$BOOTSTRAP_KEYS/release-pubkey.pem" ]; then
-    PUBKEY="$BOOTSTRAP_KEYS/release-pubkey.pem"
-  fi
-  if [ -z "$PUBKEY" ]; then
-    record bundle_v1_source failed "reusing bundle $BUNDLE_V1 but no public key available; set UDBMCP_PUBKEY (trusted channel) or remove the bundle to force an ephemeral-key rebuild"
-    exit 1
-  fi
-  # The private half of the same key is needed to sign the NEW bundle v2.
-  if [ -z "$SIGNING_KEY" ] && [ -f "$OUT/demo-keys/udbmcp-release-demo.pem" ]; then
-    SIGNING_KEY="$OUT/demo-keys/udbmcp-release-demo.pem"
-  fi
-  record bundle_v1_source passed "reusing existing bundle: $BUNDLE_V1"
-else
-  echo "==> no existing linux bundle; building one (staging machine, network allowed here)"
-  mkdir -p "$BOOTSTRAP_KEYS"
-  if [ -n "$SIGNING_KEY" ] && [ -f "$SIGNING_KEY" ]; then
-    echo "==> signing bundle with UDBMCP_RELEASE_KEY"
-  else
-    SIGNING_KEY="$BOOTSTRAP_KEYS/ephemeral-signing-key.pem"
-    echo "==> UDBMCP_RELEASE_KEY not set; generating an EPHEMERAL signing key (local test convenience, not a release trust anchor)"
-    "$PY" - "$SIGNING_KEY" <<'PY'
+# ------------------------------------------------------ ephemeral signing key
+# Both bundles are re-signed with a key pair generated for THIS run only,
+# inside $WORK (removed by the EXIT trap). The gate never loads a release or
+# demo private key: re-signing a doctored manifest (a bumped release_seq) with
+# a key some site trusts would mint an installable release. As a guard, the
+# generated key is refused if it matches a configured production anchor
+# (UDBMCP_PUBKEY, or this host's installed release key).
+SIGNING_KEY="$WORK/ephemeral-signing-key.pem"
+PUBKEY="$WORK/ephemeral-release-pubkey.pem"
+require ephemeral_key "could not generate an ephemeral signing key distinct from the production anchors" -- \
+  "$PY" - "$SIGNING_KEY" "$PUBKEY" "${UDBMCP_PUBKEY:-}" /etc/universal-db-mcp/keys/release.pub.pem <<'PY'
+import hashlib
 import sys
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+
+def fingerprint(public_key) -> str:
+    der = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()
+
+
 key = Ed25519PrivateKey.generate()
-key_path = Path(sys.argv[1])
+key_path, pub_path = Path(sys.argv[1]), Path(sys.argv[2])
 key_path.write_bytes(
     key.private_bytes(
         serialization.Encoding.PEM,
@@ -240,110 +224,125 @@ key_path.write_bytes(
     )
 )
 key_path.chmod(0o600)
+pub_path.write_bytes(
+    key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+)
+fp = fingerprint(key.public_key())
+for anchor in (Path(a) for a in sys.argv[3:] if a):
+    if anchor.is_file() and fingerprint(serialization.load_pem_public_key(anchor.read_bytes())) == fp:
+        sys.exit(f"refusing to sign with a key that matches the production anchor {anchor}")
+print(f"ephemeral release key sha256 {fp} (this run only)")
 PY
+
+# resign_clone <src> <dst> <v1|v2>: copy a bundle and sign it with the
+# ephemeral key. v1 keeps its manifest and SHA256SUMS; v2 gets a distinct
+# source_rev and the NEXT release_seq (a genuinely newer signed release, or the
+# upgrade's anti-rollback check refuses it), with SHA256SUMS regenerated by the
+# builder's recipe. v2 prints its new source_rev.
+resign_clone() {
+  if cp -cR "$1" "$2" 2>/dev/null; then :; else
+    rm -rf "$2"; cp -R "$1" "$2"
   fi
-  PUBKEY="$BOOTSTRAP_KEYS/release-pubkey.pem"
-  "$PY" - "$SIGNING_KEY" "$PUBKEY" <<'PY'
+  "$PY" - "$2" "$SIGNING_KEY" "$3" <<'PY'
+import hashlib
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-key = serialization.load_pem_private_key(Path(sys.argv[1]).read_bytes(), password=None)
-Path(sys.argv[2]).write_bytes(
-    key.public_key().public_bytes(
-        serialization.Encoding.PEM,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-)
+bundle, signing_key, mode = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+sums_path = bundle / "SHA256SUMS"
+if mode == "v2":
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    old = (manifest.get("source_rev"), manifest.get("release_seq"))
+    manifest["source_rev"] = "upgrade-gate-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    manifest["release_seq"] = int(manifest.get("release_seq") or 0) + 1
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    # Same SHA256SUMS recipe as scripts/prepare_offline_bundle.py (sorted, full
+    # coverage, manifest/SIGNATURE excluded) so the trusted verifier accepts it.
+    sums = []
+    for f in sorted(bundle.rglob("*")):
+        if f.is_file() and f.name not in ("SHA256SUMS", "SIGNATURE"):
+            rel = f.relative_to(bundle)
+            sums.append(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {rel}")
+    sums_path.write_text("\n".join(sums) + "\n")
+key = load_pem_private_key(signing_key.read_bytes(), password=None)
+(bundle / "SIGNATURE").write_bytes(key.sign(sums_path.read_bytes()))
+if mode == "v2":
+    print(manifest["source_rev"])
+    print(f"old source_rev/release_seq: {old}; new release_seq {manifest['release_seq']}", file=sys.stderr)
 PY
+}
+
+# ------------------------------------------------ acquire bundle v1
+# The source is an existing linux bundle (UDBMCP_BUNDLE, or out/bundle) or one
+# built here. With UDBMCP_PUBKEY (the trusted-channel key it was released
+# under) a reused bundle is verified first; either way the gate installs only
+# re-signed CLONES, never the source itself.
+SOURCE_BUNDLE="${UDBMCP_BUNDLE:-}"
+if [ -z "$SOURCE_BUNDLE" ]; then
+  SOURCE_BUNDLE="$(ls -d "$OUT"/bundle/universal-db-mcp-* 2>/dev/null | head -1 || true)"
+fi
+
+if [ -n "$SOURCE_BUNDLE" ]; then
+  SOURCE_NOTE="its release signature not checked (no UDBMCP_PUBKEY); only re-signed clones are installed"
+  if [ -n "${UDBMCP_PUBKEY:-}" ]; then
+    require bundle_source_verified "trusted verifier rejected the reused bundle with UDBMCP_PUBKEY" -- \
+      "$PY" "$TRUSTED_VERIFIER" --bundle "$SOURCE_BUNDLE" --pubkey "$UDBMCP_PUBKEY" --allow-platform-mismatch \
+      --no-installed-manifest
+    SOURCE_NOTE="verified with UDBMCP_PUBKEY first"
+  fi
+  record bundle_v1_source passed "reusing existing bundle: $SOURCE_BUNDLE ($SOURCE_NOTE)"
+else
+  echo "==> no existing linux bundle; building one (staging machine, network allowed here)"
   require bundle_v1_build "prepare_offline_bundle.py failed" -- \
     "$PY" "$PROJECT/scripts/prepare_offline_bundle.py" \
     --out "$OUT/bundle" \
     --source-rev "$(date -u +%Y%m%d%H%M%S)" \
     --signing-key "$SIGNING_KEY"
-  BUNDLE_V1="$(ls -d "$OUT"/bundle/universal-db-mcp-* | head -1)"
-  record bundle_v1_source passed "built signed bundle: $BUNDLE_V1"
+  SOURCE_BUNDLE="$(ls -d "$OUT"/bundle/universal-db-mcp-* | head -1)"
+  record bundle_v1_source passed "built signed bundle: $SOURCE_BUNDLE"
 fi
 
-[ -f "$BUNDLE_V1/SIGNATURE" ] || { record bundle_v1_signed failed "bundle has no SIGNATURE: $BUNDLE_V1 (unsigned bundles are never installed)"; exit 1; }
-[ -n "$SIGNING_KEY" ] && [ -f "$SIGNING_KEY" ] || {
-  record bundle_v2_signing_key failed \
-    "no signing key available to sign bundle v2 (set UDBMCP_RELEASE_KEY, or keep out/demo-keys/udbmcp-release-demo.pem next to the demo-signed bundle); the upgrade gate must upgrade to a NEWLY SIGNED bundle, so it fails closed here"
-  exit 1
-}
+[ -f "$SOURCE_BUNDLE/SIGNATURE" ] || { record bundle_v1_signed failed "bundle has no SIGNATURE: $SOURCE_BUNDLE (unsigned bundles are never installed)"; exit 1; }
+BUNDLE_V1="$WORK/bundle-v1"
+require bundle_v1_resigned "re-signing the v1 clone with the ephemeral key failed" -- \
+  resign_clone "$SOURCE_BUNDLE" "$BUNDLE_V1" v1
 
 # ------------------------------------------------- verify the SOURCE bundle first
 # Trust invariant (1): nothing downstream may proceed before a trusted-channel
 # verify_bundle.py --pubkey run has passed. --allow-platform-mismatch is the
 # documented staging-side mode (this host may be macOS/arm64); the ENFORCING
 # verification happens in the container, on the bundle's own platform, before
-# and inside install/upgrade.
+# and inside install/upgrade. Every gate verification passes
+# --no-installed-manifest: a release installed on the machine running the
+# gate never decides it.
 require bundle_v1_verified "trusted verifier rejected bundle v1" -- \
-  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE_V1" --pubkey "$PUBKEY" --allow-platform-mismatch
+  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE_V1" --pubkey "$PUBKEY" --allow-platform-mismatch --no-installed-manifest
 
 update_context bundle_v1 "$BUNDLE_V1"
+update_context bundle_source "$SOURCE_BUNDLE"
 update_context pubkey "$PUBKEY"
 
 # ------------------------------------------------------------- build bundle v2
-# A clone of v1 with a distinct source_rev, regenerated SHA256SUMS and a NEW
-# detached signature: a genuinely new signed release for the upgrade to consume.
+# A clone of v1 with a distinct source_rev, the next release_seq, regenerated
+# SHA256SUMS and a NEW detached signature: a genuinely newer signed release
+# for the upgrade to consume.
 BUNDLE_V2="$WORK/bundle-v2"
-echo "==> building bundle v2 (re-signed clone with a new source_rev)"
-if cp -cR "$BUNDLE_V1" "$BUNDLE_V2" 2>/dev/null; then :; else
-  rm -rf "$BUNDLE_V2"; cp -R "$BUNDLE_V1" "$BUNDLE_V2"
-fi
-V2_REV="$("$PY" - "$BUNDLE_V2" "$SIGNING_KEY" <<'PY'
-import hashlib
-import json
-import subprocess
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-bundle, signing_key = Path(sys.argv[1]), Path(sys.argv[2])
-manifest_path = bundle / "manifest.json"
-manifest = json.loads(manifest_path.read_text())
-old_rev = manifest.get("source_rev")
-manifest["source_rev"] = "upgrade-gate-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-manifest_path.write_text(json.dumps(manifest, indent=2))
-
-# Same SHA256SUMS recipe as scripts/prepare_offline_bundle.py (sorted, full
-# coverage, manifest/SIGNATURE excluded) so the trusted verifier accepts it.
-sums = []
-for f in sorted(bundle.rglob("*")):
-    if f.is_file() and f.name not in ("SHA256SUMS", "SIGNATURE"):
-        rel = f.relative_to(bundle)
-        sums.append(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {rel}")
-sums_path = bundle / "SHA256SUMS"
-sums_path.write_text("\n".join(sums) + "\n")
-
-# Same signing recipe as prepare_offline_bundle.sign_sha256sums (openssl first,
-# loud cryptography fallback).
-sig_path = bundle / "SIGNATURE"
-sig_path.unlink(missing_ok=True)
-sig = subprocess.run(
-    ["openssl", "pkeyutl", "-sign", "-inkey", str(signing_key), "-rawin",
-     "-in", str(sums_path), "-out", str(sig_path)],
-    capture_output=True,
-)
-if sig.returncode != 0:
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-    key = load_pem_private_key(signing_key.read_bytes(), password=None)
-    sig_path.write_bytes(key.sign(sums_path.read_bytes()))
-print(manifest["source_rev"])
-print(f"old source_rev: {old_rev}", file=sys.stderr)
-PY
-)" || { record bundle_v2_built failed "v2 re-sign failed; see upgrade gate output"; exit 1; }
+echo "==> building bundle v2 (re-signed clone with a new source_rev and release_seq)"
+V2_REV="$(resign_clone "$BUNDLE_V1" "$BUNDLE_V2" v2)" \
+  || { record bundle_v2_built failed "v2 re-sign failed; see upgrade gate output"; exit 1; }
 update_context bundle_v2 "$BUNDLE_V2"
 update_context bundle_v2_source_rev "$V2_REV"
 
 [ -n "$V2_REV" ] || { record bundle_v2_built failed "v2 has no source_rev"; exit 1; }
-record bundle_v2_built passed "re-signed clone with source_rev=$V2_REV (new SIGNATURE over regenerated SHA256SUMS)"
+record bundle_v2_built passed "re-signed clone with source_rev=$V2_REV and the next release_seq (new SIGNATURE over regenerated SHA256SUMS)"
 
 require bundle_v2_verified "trusted verifier rejected the NEW bundle v2" -- \
-  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE_V2" --pubkey "$PUBKEY" --allow-platform-mismatch
+  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE_V2" --pubkey "$PUBKEY" --allow-platform-mismatch --no-installed-manifest
 
 # ------------------------------------------------------------- baseline image
 # Offline path: load the baseline image from the bundle if not already local
@@ -518,6 +517,19 @@ if [ -n "$OSP" ] \
 else
   rec os_packages_after_upgrade failed "declared OS package '$OSP' not installed after the upgrade"
 fi
+
+# --- anti-rollback: the older signed v1 is refused over the installed v2 ------
+V2_REV_IN="$(python3 -c "import json;print(json.load(open('$V2/manifest.json'))['source_rev'])")"
+if bash "$TRUST/upgrade_offline.sh" "$V1" "$TARGET" /var/backups/universal-db-mcp \
+    > /tmp/downgrade.log 2>&1; then
+  rec downgrade_refused failed "upgrade_offline.sh ACCEPTED the older bundle v1 over the installed v2; log: /evidence/downgrade.log"
+elif grep -q "FAIL: rollback refused" /tmp/downgrade.log \
+    && [ "$(python3 -c "import json;print(json.load(open('$TARGET/manifest.json'))['source_rev'])")" = "$V2_REV_IN" ]; then
+  rec downgrade_refused passed "upgrade_offline.sh refused v1 over v2 ('rollback refused'); the installed manifest is still v2's"
+else
+  rec downgrade_refused failed "downgrade to v1 failed without the rollback refusal, or the installed manifest changed: $(tail -c 300 /tmp/downgrade.log | tr '\n' ' ')"
+fi
+cp /tmp/downgrade.log "$EV/downgrade.log" 2>/dev/null || true
 
 # --- rollback: verify-then-use restore of the demoted venv --------------------
 if bash "$TRUST/rollback_offline.sh" "$TARGET" /var/backups/universal-db-mcp \

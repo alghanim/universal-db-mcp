@@ -198,6 +198,8 @@ def test_missing_bearer_is_401(http_server: tuple[Any, Any]) -> None:
     response = _post(build_http_app(cfg, server, TOKEN), _headers(token=None), INITIALIZE)
     assert response.status_code == 401
     assert response.headers.get("www-authenticate", "").startswith("Bearer")
+    # uvicorn then closes the connection instead of waiting for another request
+    assert response.headers.get("connection") == "close"
 
 
 def test_wrong_bearer_is_401(http_server: tuple[Any, Any]) -> None:

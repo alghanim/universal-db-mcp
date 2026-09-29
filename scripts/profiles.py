@@ -1,9 +1,10 @@
 """Target-profile registry for the offline bundle builder and verifier.
 
 Single source of truth for every parameter that varies per install target:
-the pip download tags, the manifest "target" block, the staged OS-package
-closure and the baseline container image. scripts/prepare_offline_bundle.py
-and scripts/verify_bundle.py both read from PROFILES.
+the pip download tags, the platform its dependency lock is resolved for, the
+manifest "target" block, the staged OS-package closure and the baseline
+container image. scripts/prepare_offline_bundle.py and scripts/verify_bundle.py
+both read from PROFILES.
 
 The linux-x86_64-ubuntu24.04-cp312 entry is byte-identical to the parameters
 that were previously hardcoded in the builder, so the shipped profile is
@@ -30,6 +31,10 @@ class Profile:
     python_version: str
     abi: str
     pip_platforms: tuple[str, ...]  # passed as repeated --platform flags
+    # `uv pip compile --python-platform` target the profile's hashed lock
+    # (requirements/locks/<name>.txt) is resolved for; the builder downloads
+    # exactly that lock
+    lock_platform: str
     # manifest.json "target" block
     manifest_target: dict[str, str]
     # which running systems/machines this target matches (used by the verifier)
@@ -53,6 +58,7 @@ _PROFILES = (
         python_version="3.12",
         abi="cp312",
         pip_platforms=("manylinux2014_x86_64",),
+        lock_platform="x86_64-manylinux2014",
         manifest_target={"os": "ubuntu-24.04", "arch": "x86_64", "python": "3.12", "abi": "cp312"},
         host_systems=("Linux",),
         host_machines=("x86_64", "AMD64"),
@@ -65,6 +71,7 @@ _PROFILES = (
         python_version="3.12",
         abi="cp312",
         pip_platforms=("win_amd64",),
+        lock_platform="x86_64-pc-windows-msvc",
         manifest_target={"os": "windows", "arch": "x86_64", "python": "3.12", "abi": "cp312"},
         host_systems=("Windows",),
         host_machines=("AMD64", "x86_64"),
@@ -77,6 +84,7 @@ _PROFILES = (
         python_version="3.12",
         abi="cp312",
         pip_platforms=("macosx_11_0_arm64", "macosx_14_0_arm64"),
+        lock_platform="aarch64-apple-darwin",
         manifest_target={"os": "macos", "arch": "arm64", "python": "3.12", "abi": "cp312"},
         host_systems=("Darwin",),
         host_machines=("arm64",),

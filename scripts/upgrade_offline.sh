@@ -7,9 +7,30 @@
 # are installed version-aware via the shared dpkg helper, so driver security
 # fixes actually reach the target. OS packages are installed BEFORE the venv
 # switch, so a dpkg failure aborts without touching the running venv.
+#
+# Anti-rollback: a bundle that is an OLDER release than the installed one
+# ($TARGET/manifest.json) is refused by the verifier. An intended rollback
+# passes --allow-downgrade (or UDBMCP_ALLOW_DOWNGRADE=1).
 set -euo pipefail
+# Every python this script starts runs as root. -I keeps an interpreter from
+# reading PYTHON* variables, but not the ensurepip child `-m venv` starts
+# (venv runs the new interpreter without -I), and a PYTHONPYCACHEPREFIX would
+# have root write, then read, bytecode wherever it names: the caller's are
+# dropped here, before any python runs.
+for _var in $(compgen -e); do case "$_var" in PYTHON*) unset "$_var" ;; esac; done
 
-NEW_BUNDLE="${1:?usage: upgrade_offline.sh <new-bundle-dir> [target-dir] [backup-root]}"
+ALLOW_DOWNGRADE=0
+[ "${UDBMCP_ALLOW_DOWNGRADE:-}" != "1" ] || ALLOW_DOWNGRADE=1
+positional=()
+for arg in "$@"; do
+  case "$arg" in
+    --allow-downgrade) ALLOW_DOWNGRADE=1 ;;
+    *) positional+=("$arg") ;;
+  esac
+done
+set -- ${positional[@]+"${positional[@]}"}
+
+NEW_BUNDLE="${1:?usage: upgrade_offline.sh <new-bundle-dir> [target-dir] [backup-root] [--allow-downgrade]}"
 TARGET="${2:-/opt/universal-db-mcp}"
 BACKUP="${3:-/var/backups/universal-db-mcp}"
 ORIG_BUNDLE="$NEW_BUNDLE"  # reported at the end; $NEW_BUNDLE is redirected to staging
@@ -75,6 +96,21 @@ fi
 # shellcheck source=lib/os_packages.sh
 source "$LIB_DIR/os_packages.sh"
 
+# --- leave the operator's working directory ----------------------------------
+# `python -m` and `python -c` put the working directory first on sys.path, and
+# the pythons below run as root: a pip.py or venv/ lying where the operator
+# stands (often the stick or the unpacked bundle) would be imported as root.
+# The path inputs are made absolute first; everything after this runs from /.
+abs_path() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$1" ;; esac; }
+NEW_BUNDLE="$(abs_path "$NEW_BUNDLE")"
+TARGET="$(abs_path "$TARGET")"
+BACKUP="$(abs_path "$BACKUP")"
+PUBKEY="$(abs_path "$PUBKEY")"
+VERIFIER="$(abs_path "$VERIFIER")"
+[ -z "${UDBMCP_STAGING_DIR:-}" ] || UDBMCP_STAGING_DIR="$(abs_path "$UDBMCP_STAGING_DIR")"
+[ -z "${UDBMCP_CONFIG:-}" ] || UDBMCP_CONFIG="$(abs_path "$UDBMCP_CONFIG")"
+cd /
+
 # How to run the trusted verifier. On the documented channel it is installed
 # with `install -m 644` (a Python file), so it is executed via python3; a
 # non-Python executable verifier (e.g. a compiled helper or /bin/sh script) is
@@ -83,17 +119,23 @@ source "$LIB_DIR/os_packages.sh"
 # the directory presents the exec bit but is mounted noexec, so exec'ing the
 # file directly fails with rc=126 'bad interpreter' AFTER [ -x ] succeeded.
 # Either way it comes from the trusted path validated above — never from the
-# bundle. $VEXEC is deliberately unquoted at the call sites (it is either
-# empty, or the single word "python3") so the same expression works under the
-# $sudo_ok prefix.
+# bundle. -I keeps the verifier (run as root) from reading PYTHON* variables,
+# the user site or the working directory; it puts its own directory on
+# sys.path for profiles.py. -S keeps it from reading the interpreter's
+# site-packages, whose .pth files can put any directory on sys.path or run
+# code (an admin's `sudo pip install -e` writes one pointing into a home
+# directory); the verifier needs only the standard library. Every python this
+# script runs as root outside a venv does the same. $VEXEC is deliberately
+# unquoted at the call sites (it is either empty, or "python3 -I -S") so the
+# same expression works under the $sudo_ok prefix.
 VEXEC=""
 if [ -x "$VERIFIER" ]; then
   case "$(head -n 1 "$VERIFIER" 2>/dev/null)" in
-    *"python"*) VEXEC="python3" ;;
+    *"python"*) VEXEC="python3 -I -S" ;;
     *) VEXEC="" ;;
   esac
 else
-  VEXEC="python3"
+  VEXEC="python3 -I -S"
 fi
 
 # Privilege: the OS-package step always requires root; the rest of the script
@@ -112,28 +154,123 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
 fi
 
+# >>> directories root alone can change: identical in install_offline.sh, upgrade_offline.sh and load_images_offline.sh
+# What this script makes as root and uses later (the private copy of the
+# bundle, root's temporary files) must sit where no other account can rename
+# it away and put its own in its place: in a directory that, like every
+# directory above it, is a real directory owned by root (the account the
+# privileged steps run as) that group and others cannot write, or a
+# root-owned sticky one such as /var/tmp, where nobody else can rename what
+# root makes there.
+PRIV_UID="$($sudo_ok id -u)"
+real_dir() {
+  # $1: a directory; prints its real path (no link on the way), nothing when it cannot be entered
+  $sudo_ok sh -c 'cd -P -- "$1" 2>/dev/null && pwd -P' sh "$1" || true
+}
+not_roots_alone() {
+  # $1: a real path; prints the first of it and the directories above it that is not root's
+  # alone (nothing when every one is)
+  local dir="$1"
+  while :; do
+    [ -n "$($sudo_ok find "$dir" -maxdepth 0 -type d \( -user 0 -o -user "$PRIV_UID" \) \
+      \( -perm -1000 -o ! -perm -0020 ! -perm -0002 \) -print 2>/dev/null)" ] || { printf '%s' "$dir"; return 0; }
+    [ "$dir" != / ] || return 0
+    dir="$(dirname "$dir")"
+  done
+}
+staging_base() {
+  # $1: the staging base (UDBMCP_STAGING_DIR or /var/tmp), created as root when missing; $2: what
+  # was not done when it is refused. Prints its real path, checked once it exists.
+  local base untrusted
+  # umask 022: what is created here is root's alone whatever the caller's umask
+  $sudo_ok sh -c 'umask 022 && mkdir -p -- "$1"' sh "$1" 2>/dev/null || true
+  base="$(real_dir "$1")"
+  [ -n "$base" ] || { echo "FAIL: the staging directory $1 cannot be created or entered. $2" >&2; return 1; }
+  untrusted="$(not_roots_alone "$base")"
+  [ -z "$untrusted" ] || {
+    echo "FAIL: the private copy of the bundle would be made in $base, and $untrusted is not root's alone" >&2
+    echo "      (not a real directory owned by root, or group or others can write it and it is not" >&2
+    echo "      sticky): another account could put its own copy in place of the verified one. Point" >&2
+    echo "      UDBMCP_STAGING_DIR at a directory that, like every directory above it, root alone can" >&2
+    echo "      write (the default /var/tmp is one). $2" >&2
+    return 1
+  }
+  printf '%s\n' "$base"
+}
+# sudo -E and a plain su keep the caller's TMPDIR, where root's temporary
+# files are made (bash's here-documents, python -m venv's copy of pip, pip's
+# own, podman's copy of an image), and python's tempfile takes TEMP, then TMP,
+# when TMPDIR is unset. Each is kept only when it is root's alone, and then as
+# the real path that was checked: a link on the way could be re-pointed later.
+# Otherwise it is unset; with none left, root's temporary files go to the
+# system's own directory (/tmp).
+for tmp_var in TMPDIR TEMP TMP; do
+  tmp_real=""
+  [ -z "${!tmp_var:-}" ] || tmp_real="$(real_dir "${!tmp_var}")"
+  if [ -n "$tmp_real" ] && [ -z "$(not_roots_alone "$tmp_real")" ]; then
+    export "$tmp_var=$tmp_real"
+  else
+    [ -z "${!tmp_var:-}" ] ||
+      echo "NOTE: $tmp_var (${!tmp_var}) is not root's alone; root's temporary files are not made there"
+    unset "$tmp_var"
+  fi
+done
+private_copy() {
+  # $1: the verified bundle; $2: the directory mktemp -d made for its copy; $3: what was not done
+  # when the copy is refused. Copies the bundle to $2/bundle and prints that path.
+  # The copy gets a name of its own inside $2, never $2 itself, and keeps neither the owners nor
+  # the modes of the bundle: `cp -a BUNDLE/. $2/` gave $2 the bundle directory's mode (0777 on
+  # world-writable media) and, as root, its owner once it was done, and every file its owner, so
+  # whoever could write the bundle path could change the copy after it was verified. $2 stays
+  # root's, mode 700, throughout, so nobody else reaches what cp makes below it before the chmod
+  # (which also covers a cp that gives a directory the source's mode, unmasked).
+  local copy="$2/bundle" found
+  $sudo_ok chmod 700 "$2" && $sudo_ok cp -RP -- "$1"/. "$copy" && $sudo_ok chmod -R go-rwx "$copy" || {
+    echo "FAIL: the private copy of the bundle could not be made in $2. $3" >&2
+    return 1
+  }
+  # cp -P copies a link as a link, which would still lead where whoever can write the bundle path
+  # decides: a bundle holds regular files and directories only (the verifier refuses anything
+  # else as well).
+  found="$($sudo_ok find "$2" ! -type f ! -type d -print)" && [ -z "$found" ] || {
+    echo "FAIL: the private copy holds what is not a regular file or directory; a bundle holds regular files and directories only: $found" >&2
+    echo "      $3" >&2
+    return 1
+  }
+  # and what is there is root's alone
+  found="$($sudo_ok find "$2" \( ! -user "$PRIV_UID" -o -perm -0020 -o -perm -0002 \) -print)" &&
+    [ -z "$found" ] && [ -n "$($sudo_ok find "$2" -maxdepth 0 -perm 0700 -print)" ] || {
+    echo "FAIL: the private copy is not root's alone (another account owns it, or group or others can write it): ${found:-$2}" >&2
+    echo "      $3" >&2
+    return 1
+  }
+  printf '%s\n' "$copy"
+}
+# <<< directories root alone can change
+
 # Proof-of-verification gate (same control as install_offline.sh, commit
 # security review 2026-09-12: the upgrade path lacked it): a verifier that
 # exits 0 WITHOUT printing the canonical PASS line — or that prints a FAIL
 # diagnostic — must abort the upgrade. Output is echoed through so the admin
-# sees the canonical diagnostics either way.
+# sees the canonical diagnostics either way. Both runs also check the release
+# order against the installed manifest (anti-rollback).
+ROLLBACK_ARGS=(--installed-manifest "$TARGET/manifest.json")
+[ "$ALLOW_DOWNGRADE" -eq 0 ] || ROLLBACK_ARGS+=(--allow-downgrade)
 verify_with_proof() {
-  # $1: the bundle directory to verify
+  # $1: the bundle directory to verify. The output is kept in the shell, never
+  # in a file: root would open one by name, through whatever link another
+  # account put in its place.
   local vout vrc=0
-  vout="$(mktemp "${TMPDIR:-/tmp}/udbmcp-upgrade-verify.XXXXXX")"
-  $sudo_ok $VEXEC "$VERIFIER" --bundle "$1" --pubkey "$PUBKEY" >"$vout" 2>&1 || vrc=$?
-  cat "$vout"
+  vout="$($sudo_ok $VEXEC "$VERIFIER" --bundle "$1" --pubkey "$PUBKEY" "${ROLLBACK_ARGS[@]}" 2>&1)" || vrc=$?
+  printf '%s\n' "$vout"
   if [ "$vrc" -ne 0 ]; then
     echo "FAIL: trusted verifier exited $vrc; the bundle is untrusted: upgrade ABORTED." >&2
-    rm -f "$vout"
     exit 1
   fi
-  if grep -q '^FAIL:' "$vout" || ! grep -q 'bundle verification PASSED' "$vout"; then
+  if [[ $'\n'"$vout" == *$'\n'FAIL:* ]] || [[ "$vout" != *'bundle verification PASSED'* ]]; then
     echo "FAIL: trusted verifier exited 0 but did not print 'bundle verification PASSED' (or printed a FAIL line); without explicit proof of verification the bundle is treated as untrusted: upgrade ABORTED." >&2
-    rm -f "$vout"
     exit 1
   fi
-  rm -f "$vout"
 }
 
 verify_with_proof "$NEW_BUNDLE"
@@ -142,10 +279,11 @@ verify_with_proof "$NEW_BUNDLE"
 # Same race install_offline.sh closes: the tree is hashed once, then pip and
 # dpkg read it for tens of seconds in a privileged context. Stage, re-verify,
 # and never touch the original again.
-STAGING_BASE="${UDBMCP_STAGING_DIR:-/var/tmp}"  # mktemp -d always creates the dir mode 700
-$sudo_ok mkdir -p "$STAGING_BASE"
-STAGING="$($sudo_ok mktemp -d "$STAGING_BASE/udbmcp-upgrade.XXXXXX")"
-cleanup_staging() { ${sudo_ok:+sudo }rm -rf -- "$STAGING" 2>/dev/null || true; }
+# The staging base is root's alone (above); mktemp -d makes the private directory the copy is
+# made in (private_copy, above).
+STAGING_BASE="$(staging_base "${UDBMCP_STAGING_DIR:-/var/tmp}" "Upgrade ABORTED.")" || exit 1
+STAGING_DIR="$($sudo_ok mktemp -d "$STAGING_BASE/udbmcp-upgrade.XXXXXX")"
+cleanup_staging() { ${sudo_ok:+sudo }rm -rf -- "$STAGING_DIR" 2>/dev/null || true; }
 # A kill between the two switch renames below leaves NO venv in place; the
 # exit trap restores venv.previous so the service can start again without
 # manual help (rollback_offline.sh tolerates the window too, but recovery
@@ -158,9 +296,8 @@ restore_previous_venv_on_interrupt() {
 }
 on_exit() { restore_previous_venv_on_interrupt; cleanup_staging; }
 trap on_exit EXIT
-$sudo_ok chmod 700 "$STAGING"
 echo "==> staging a private copy of the verified bundle (closes the verify-then-use race)"
-$sudo_ok cp -a "$NEW_BUNDLE"/. "$STAGING/"
+STAGING="$(private_copy "$NEW_BUNDLE" "$STAGING_DIR" "Upgrade ABORTED.")" || exit 1
 verify_with_proof "$STAGING"
 NEW_BUNDLE="$STAGING"
 
@@ -173,8 +310,11 @@ BACKUP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="$BACKUP/pre-upgrade-$BACKUP_STAMP"
 mkdir -p "$BACKUP_DIR"
 cp -a /etc/universal-db-mcp "$BACKUP_DIR/" 2>/dev/null || true
+# cp -a: the service account owns that directory and may have made the name a
+# link (to a file only root can read) or a FIFO; it is copied as what it is,
+# never read through (rollback_offline.sh restores a regular file only).
 [ -f /var/lib/universal-db-mcp/metadata.sqlite ] && \
-  cp /var/lib/universal-db-mcp/metadata.sqlite "$BACKUP_DIR/" || true
+  cp -a /var/lib/universal-db-mcp/metadata.sqlite "$BACKUP_DIR/" || true
 
 echo "==> installing the bundle's OS packages (dpkg only, no apt, no network)"
 PY=python3.12
@@ -183,7 +323,7 @@ PY="$(command -v "$PY")"
 udbmcp_install_os_packages "$NEW_BUNDLE" "$PY" "$sudo_ok"
 
 echo "==> building new venv alongside current (atomic switch on success)"
-"$PY" -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"'
+"$PY" -I -S -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"'
 $sudo_ok mkdir -p "$TARGET"
 # Re-run hygiene: an earlier attempt aborted between venv creation and the
 # doctor check (pip failure, smoke-check failure, kill) leaves a full
@@ -194,10 +334,10 @@ $sudo_ok mkdir -p "$TARGET"
 $sudo_ok rm -rf "$TARGET"/venv.new-* 2>/dev/null || true
 NEWVENV="$TARGET/venv.new-$(date -u +%Y%m%dT%H%M%SZ)"
 # --copies: see install_offline.sh; keeps rollback_offline.sh's containment gate satisfied
-$sudo_ok "$PY" -m venv --copies "$NEWVENV"
+$sudo_ok "$PY" -I -S -m venv --copies "$NEWVENV"
 $sudo_ok env PIP_CONFIG_FILE=/dev/null PIP_DISABLE_PIP_VERSION_CHECK=1 \
   PIP_NO_INDEX=1 PIP_FIND_LINKS="$NEW_BUNDLE/wheelhouse" \
-  "$NEWVENV/bin/python" -m pip --isolated --disable-pip-version-check install \
+  "$NEWVENV/bin/python" -I -m pip --isolated --disable-pip-version-check install \
   --no-index --no-cache-dir \
   --find-links="$NEW_BUNDLE/wheelhouse" \
   --only-binary=:all: --require-hashes \
@@ -214,7 +354,7 @@ $sudo_ok find "$NEWVENV" -type f -exec chmod 644 {} +
 $sudo_ok find "$NEWVENV/bin" -type f -exec chmod 755 {} +
 
 echo "==> smoke check + doctor on the NEW venv before switching"
-$sudo_ok "$NEWVENV/bin/python" -m universal_db_mcp version
+$sudo_ok "$NEWVENV/bin/python" -I -m universal_db_mcp version
 # Both doctor runs go through $sudo_ok like every other privileged step: the
 # config is root:udbmcp 0640, so a non-root operator's unprivileged doctor
 # cannot even read it and the upgrade aborted with "doctor failed" on a
@@ -227,6 +367,61 @@ fi
 
 echo "==> switching (old venv kept for rollback; depth 1)"
 if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl stop universal-db-mcp || true; fi
+# An older release's root site check (sudo udbmcp site-check or doctor) could
+# leave the audit log, its .lock sidecar or a rotated backup in the log
+# directory owned by root. This release no longer repairs them at run time, so
+# under audit_fail_closed the service would refuse every audited call: hand
+# them back while it is stopped, as the .deb and the .pkg do. udbmcp owns the
+# directory, so each entry is opened without following links and checked on
+# the open descriptor (a regular file, one link, owned by root) before
+# fchown: a symlink, or a name that is a second link to another file, is left
+# alone. Best effort: a failure warns and never aborts the upgrade.
+LOG_DIR=/var/log/universal-db-mcp
+if [ -d "$LOG_DIR" ] && id udbmcp >/dev/null 2>&1; then
+  # >>> hand root-owned audit files back: identical in the deb postinst, the pkg postinstall, install_offline.sh and upgrade_offline.sh
+  $sudo_ok "$PY" -I -S - "$LOG_DIR" udbmcp <<'PYEOF' || echo "WARNING: could not hand root-owned audit files in $LOG_DIR back to the service account" >&2
+import os
+import pwd
+import stat
+import sys
+
+ROOT = 0
+log_dir, account = sys.argv[1], sys.argv[2]
+owner = pwd.getpwnam(account)
+try:
+    # Logs moved to another volume and linked back: the link is followed only
+    # when root owns it and the directory it is in, so no other account made or
+    # can re-point it. Where it leads is opened like the name itself.
+    if os.path.islink(log_dir):
+        if os.lstat(log_dir).st_uid != ROOT or os.stat(os.path.dirname(os.path.abspath(log_dir))).st_uid != ROOT:
+            sys.exit(f"{log_dir}: a symlink another account could have made or re-pointed")
+        log_dir = os.path.realpath(log_dir)
+    dir_fd = os.open(log_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError as exc:
+    sys.exit(f"{log_dir}: {exc.strerror}")
+try:
+    for name in sorted(os.listdir(dir_fd)):
+        if not name.startswith("audit.jsonl"):
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError:
+            continue  # a symlink, or gone
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == ROOT:
+                os.fchmod(fd, 0o600)  # the audit writer's own mode: it opens the file read-write
+                os.fchown(fd, owner.pw_uid, owner.pw_gid)
+                print(f"==> {log_dir}/{name} was owned by root; handed back to {account}")
+        finally:
+            os.close(fd)
+except OSError as exc:
+    sys.exit(f"{log_dir}: {exc.strerror}")
+finally:
+    os.close(dir_fd)
+PYEOF
+  # <<< hand root-owned audit files back
+fi
 if [ -d "$TARGET/venv" ]; then
   $sudo_ok rm -rf "$TARGET/venv.previous"   # rollback depth is one release
   $sudo_ok rm -f "$TARGET/venv.previous.sha256"   # manifest of the discarded release

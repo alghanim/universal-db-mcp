@@ -1,5 +1,6 @@
 [build-system]
-requires = ["hatchling"]
+# 1.27: PEP 639 license expression and license-files
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,12 +9,20 @@ version = "0.1.0"
 description = "Universal Database MCP Server - air-gapped deployment ready"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "Proprietary" }
-authors = [{ name = "Platform Engineering" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "universal-db-mcp maintainers" }]
 dependencies = [
     "mcp>=2.2.0,<3",
     "PyYAML>=6.0.2,<7",
-    "sqlglot>=30,<31",
+    # the SQL guard is tested on this parser series only (the bundle pins 30.18.0)
+    "sqlglot~=30.18.0",
+    # the HTTP transport subclasses uvicorn's h11 protocol and reads h11 state
+    # (http_protocol.py): held to the reviewed releases, not whatever mcp allows
+    "uvicorn>=0.52.4,<0.54",
+    "h11>=0.16,<0.17",
+    # security floor: mcp's pyjwt[crypto] (and PyMySQL[rsa]) accept older releases
+    "cryptography>=50",
 ]
 
 [project.optional-dependencies]
@@ -25,8 +34,12 @@ dev = [
     "build>=1.2",
 ]
 pg = ["psycopg[binary]>=3.2,<4"]
-mysql = ["PyMySQL>=1.1,<2"]
-clickhouse = ["clickhouse-connect>=0.8,<2"]
+# 1.2.0 is the tested pin (CVE-2024-36039 is fixed from 1.1.1); ed25519 and rsa
+# carry the MariaDB ed25519 and MySQL 8 caching_sha2 auth plugins; PyNaCl 1.6.2
+# fixes CVE-2025-69277, which PyMySQL[ed25519] alone would let an install keep
+mysql = ["PyMySQL[ed25519,rsa]>=1.2.0,<2", "PyNaCl>=1.6.2"]
+# the stream-budget meter wraps a clickhouse-connect 1.8 seam (connectors/clickhouse.py)
+clickhouse = ["clickhouse-connect>=1.8,<1.9"]
 oracle = ["oracledb>=4,<5"]
 mssql = ["pyodbc>=5.1,<6"]
 db2 = ["ibm-db>=3.2,<4"]
@@ -56,6 +69,18 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "S", "ASYNC"]
 ignore = ["S101"]  # assert in tests
+
+[tool.uv]
+# `uv sync` builds this project in an isolated environment: use the build
+# backend requirements/locks/build.txt pins, not the newest on the index
+build-constraint-dependencies = [
+    "hatchling==1.32.4",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.6.0",
+    "tomlkit==0.15.1",
+    "trove-classifiers==2026.9.21.13",
+]
 
 [tool.mypy]
 python_version = "3.12"

@@ -135,16 +135,26 @@ is what it does (inside the container, as the instance owner, e.g.
    ```
 2. **Key database + self-signed certificate** — use
    `$HOME/sqllib/gskit/bin/gsk8capicmd_64` (GSKit 8 images) or
-   `gsk9certutil_64` (GSKit 9):
+   `gsk9certutil_64` (GSKit 9). The certificate must name the host the
+   CLIENT dials, in its subjectAltName: the connector always sets
+   `SSLClientHostnameValidation=Basic`, which matches the configured `host`
+   against the SAN (a DNS SAN for a name, an IP SAN for an address). The
+   script derives `<host>` and the SAN kind from `--host` or `--client-host`:
    ```bash
    gsk8capicmd_64 -keydb -create -db $HOME/server.kdb -pw '<keydb-password>' -stash
    # Try '-cert -create' first (GSKit 9 and current GSKit 8 builds); older
    # GSKit 8 builds reject it and only accept the legacy '-cert -selfsign'.
+   # For an IP address use -san_ipaddr <host> instead of -san_dnsname <host>.
    gsk8capicmd_64 -cert -create -db $HOME/server.kdb -pw '<keydb-password>' \
-       -label udbmcp_self -size 2048 -expire 3650 -dn CN=udbmcp-test \
+       -label udbmcp_self -size 2048 -expire 3650 -dn CN=<host> -san_dnsname <host> \
      || gsk8capicmd_64 -cert -selfsign -db $HOME/server.kdb -pw '<keydb-password>' \
-       -label udbmcp_self -size 2048 -expire 3650 -dn CN=udbmcp-test
+       -label udbmcp_self -size 2048 -expire 3650 -dn CN=<host> -san_dnsname <host>
    ```
+   A certificate issued by an earlier version of this runbook
+   (`CN=udbmcp-test`, no SAN) is refused by the client with `SQL20576N`.
+   Reissue it: delete the label (`gsk8capicmd_64 -cert -delete -db
+   $HOME/server.kdb -pw '<keydb-password>' -label udbmcp_self`), re-run this
+   step and step 4, and redeploy the extracted certificate.
 3. **Registry variable + DBM configuration + instance restart**. Setting
    `SSL_SVCENAME` alone is **not** enough: Db2 only opens the SSL listener
    when the `DB2COMM` registry variable includes `SSL`. Keep `TCPIP` in the
@@ -226,11 +236,33 @@ connections:
 empty list as "the administrator did not restrict schemas"
 (`EffectivePolicy.schema_allowed` in `src/universal_db_mcp/security/policy.py`),
 so the agent can list and query every schema the Db2 account has access to.
-Always name the schemas you intend to expose (the script-generated block may
-still print `[]`; replace it before pasting).
+Always name the schemas you intend to expose (the script-generated block
+prints `[UDBMCP_RO]`: replace it with yours before pasting). An entry is read
+as an unquoted name, so `[udbmcp_ro]` admits the upper-case schema
+`UDBMCP_RO`; where the catalog also holds a quoted lower-case namesake, list
+both spellings to admit both (`docs/security.md`).
 
-The connector appends `SECURITY=SSL` and `SSLServerCertificate=<ca_file>` to
-the connection string when `tls.enabled` is true.
+The connector appends `SECURITY=SSL`, `SSLServerCertificate=<ca_file>` and
+`SSLClientHostnameValidation=Basic` to the connection string when
+`tls.enabled` is true, so `host` must be a name (or address) the
+certificate's subjectAltName carries.
+
+Before each TLS connect, the connector checks that the server answers: a TCP
+connect, a TLS handshake that does not verify the certificate, and one DRDA
+`EXCSAT` request carrying no credentials, all within `connect_timeout_seconds`
+(at least 1 s). The Db2 client then makes the real connect and verifies the
+certificate. The server may log the probe as a connection closed after
+`EXCSAT`. A timeout is refused as `CONNECTION_ERROR` naming the step that did
+not complete (see Troubleshooting); a TLS connection pointed at the plaintext
+port, which used to hang for good, now fails that way. A peer that answers the
+probe and then stalls the client's own connect still hangs that connect,
+bounded only by the MCP server's stuck-connect budget
+(`docs/architecture.md`).
+
+With `allowed_schemas` set, agents must schema-qualify every table in a
+statement (`SELECT * FROM UDBMCP_RO.T`). `SYSIBM.SYSDUMMY1` is readable on
+every connection without opening `SYSIBM`; write it qualified, because Db2
+binds a bare `SYSDUMMY1` to `CURRENT SCHEMA`.
 
 ## Verification
 
@@ -250,7 +282,7 @@ blocking, and success here is what un-blocks the live-capability verification
 recorded in `docs/driver-matrix.md`:
 
 ```console
-python3 -c "import ibm_db; print(ibm_db.connect('DATABASE=SAMPLE;HOSTNAME=127.0.0.1;PORT=50001;PROTOCOL=TCPIP;UID=<user>;PWD=<pw>;SECURITY=SSL;SSLServerCertificate=/etc/universal-db-mcp/certs/db2-server.crt;','',''))"
+python3 -c "import ibm_db; print(ibm_db.connect('DATABASE=SAMPLE;HOSTNAME=127.0.0.1;PORT=50001;PROTOCOL=TCPIP;UID=<user>;PWD=<pw>;SECURITY=SSL;SSLServerCertificate=/etc/universal-db-mcp/certs/db2-server.crt;SSLClientHostnameValidation=Basic;','',''))"
 ```
 
 A returned connection handle (no `SQL30082N`) means the TLS path accepts
@@ -272,3 +304,7 @@ the SQLSTATE / reason code), not silently left as `not_run`.
 | `SQL30082N reason 17` still appears over TLS | A udbmcp build older than the 2026-09-15 credential-passing fix sends no credentials at all, so upgrade first. Otherwise the client is not actually negotiating SSL (missing `tls.enabled` / connector fell back to plaintext / SSL listener never opened so the client hit the plaintext port), or the certificate label in `SSL_SVR_LABEL` does not exist in the keydb | First confirm the listener is up (previous rows). Then confirm `SSL_SVR_LABEL` matches a label listed by `gsk8capicmd_64 -cert -list -db $HOME/server.kdb -pw ...`; confirm the YAML has `tls.enabled: true` and `ca_file` pointing at the extracted `server.crt`. |
 | `SQL30081N` / protocol error right after enabling SSL | Client connecting with TLS to the plaintext port or vice versa | Match port to protocol: plaintext port <-> no `tls`, SSL port <-> `tls.enabled: true`. |
 | Certificate verification failure on the client (`verify_server: true`) | `ca_file` does not match the server certificate (old extraction, wrong host's cert) | Re-extract with `-cert -extract -format ascii` from the keydb actually referenced by `SSL_SVR_KEYDB` and redeploy the file. |
+| `SQL20576N` reason 1 | The certificate's subjectAltName does not match `HOSTNAME` (the configured `host`); the connector sets `SSLClientHostnameValidation=Basic`. Typical for a certificate issued as `CN=udbmcp-test` without a SAN | Reissue the certificate with `-dn CN=<host>` and `-san_dnsname <host>` (or `-san_ipaddr` for an address), as in step 2, and redeploy it. |
+| `CONNECTION_ERROR: ... did not accept a TCP connection within N s (connect_timeout_seconds)` | The host, the port or a firewall | Check the address and the network path. |
+| `CONNECTION_ERROR: ... did not complete a TLS handshake within N s ...` | Usually the port is not `SSL_SVCENAME` (TLS against the plaintext port), or the server is unresponsive | Point `port` at `SSL_SVCENAME`. |
+| `CONNECTION_ERROR: ... did not answer DRDA after its TLS handshake within N s ...` | A TLS proxy, or the Db2 instance behind it, is not answering | Check the proxy and the instance. |

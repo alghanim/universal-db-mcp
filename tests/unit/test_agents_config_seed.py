@@ -12,7 +12,9 @@ falls back to it.
 from __future__ import annotations
 
 import json
+import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -55,6 +57,7 @@ def test_readable_system_config_is_advertised(tmp_path: Path, monkeypatch: pytes
     assert agents_core.resolve_harness_config_path({}, _fake_home(tmp_path)) == str(system)
 
 
+@pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root may read any file")
 def test_unreadable_system_config_falls_back_to_per_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

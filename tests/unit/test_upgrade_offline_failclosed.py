@@ -282,7 +282,7 @@ def test_verification_precedes_every_state_mutating_step() -> None:
     before the running installation is touched."""
     text = UPGRADE.read_text(encoding="utf-8")
     verify_new = text.index('verify_with_proof "$NEW_BUNDLE"')
-    stage_copy = text.index('cp -a "$NEW_BUNDLE"/. "$STAGING/"')
+    stage_copy = text.index('STAGING="$(private_copy "$NEW_BUNDLE" "$STAGING_DIR" "Upgrade ABORTED.")"')
     verify_staging = text.index('verify_with_proof "$STAGING"')
     os_packages = text.index("udbmcp_install_os_packages ")
     demote = text.index('mv "$TARGET/venv" "$TARGET/venv.previous"')

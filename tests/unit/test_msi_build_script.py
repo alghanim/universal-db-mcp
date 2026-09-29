@@ -42,6 +42,7 @@ python3 and the repo checkout.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -143,13 +144,15 @@ exit 0
 
 def _make_signed_bundle(root: Path) -> tuple[Path, Path]:
     """A minimal but well-formed SIGNED windows-x86_64 bundle (release
-    1.2.3) plus its sibling trusted-tools/ copy (stub verifier + admin
+    1.2.3, release_seq 1790000000: a commit timestamp, the bundle builder's
+    default) plus its sibling trusted-tools/ copy (stub verifier + admin
     pubkey, distributed on the trusted channel OUTSIDE the bundle)."""
     bundle = root / "bundle"
     for sub in ("wheelhouse", "config-templates", "requirements", "installers"):
         (bundle / sub).mkdir(parents=True)
     (bundle / "manifest.json").write_text(
-        '{"release": "1.2.3", "target": {"os": "windows", "arch": "x86_64", "python": "cp312"}}\n',
+        '{"release": "1.2.3", "release_seq": 1790000000, '
+        '"target": {"os": "windows", "arch": "x86_64", "python": "cp312"}}\n',
         encoding="utf-8",
     )
     (bundle / "SIGNATURE").write_text("signature\n", encoding="utf-8")
@@ -168,6 +171,8 @@ def _make_signed_bundle(root: Path) -> tuple[Path, Path]:
         "import sys\n"
         'args = sys.argv[1:]\n'
         'assert "--bundle" in args and "--pubkey" in args, args\n'
+        # a release gate: the build machine's installed release never decides it
+        'assert "--no-installed-manifest" in args, args\n'
         'print("bundle verification PASSED")\n',
         encoding="utf-8",
     )
@@ -319,15 +324,16 @@ def test_build_msi_happy_path_produces_msi_and_heat_equivalent_fragment(
     assert "-define" in args and "CustomActionScriptsDir=" in args, (
         "wix build must receive -define CustomActionScriptsDir for the deferred actions"
     )
-    # step 4 of the script: the SIGNED manifest release is substituted into
-    # the .wxs preprocessor variables. If -define ProductVersion is dropped
-    # or broken, udbmcp.wxs silently falls back to its <?ifndef> default
-    # (0.1.0) and still compiles — corrupting MajorUpgrade/upgrade detection
-    # while every other gate stays green.
-    assert "ProductVersion=1.2.3" in args, (
-        "wix build must receive -define ProductVersion=<signed manifest release> "
-        "(1.2.3 here); the wxs <?ifndef ProductVersion> fallback would otherwise "
-        "ship 0.1.0 and break MajorUpgrade"
+    # step 4 of the script: the SIGNED manifest's release_seq becomes the
+    # ProductVersion (see test_build_msi_orders_product_versions_by_release_seq).
+    # If -define ProductVersion is dropped or broken, udbmcp.wxs silently
+    # falls back to its <?ifndef> default (0.1.0) and still compiles —
+    # corrupting MajorUpgrade/upgrade detection while every other gate stays
+    # green.
+    assert "ProductVersion=107.177.15232" in args.splitlines(), (
+        "wix build must receive -define ProductVersion=<signed manifest release_seq as "
+        "major.minor.build> (107.177.15232 for 1790000000); the wxs <?ifndef ProductVersion> "
+        "fallback would otherwise ship 0.1.0 and break MajorUpgrade"
     )
     staged = env["capture"] / "custom"
     assert staged.is_dir(), "the custom action scripts were not staged for the compile"
@@ -337,6 +343,68 @@ def test_build_msi_happy_path_produces_msi_and_heat_equivalent_fragment(
         assert shipped.read_bytes() == (CUSTOM_DIR / name).read_bytes(), (
             f"staged {name} differs from the reviewed packaging/msi/custom/{name}"
         )
+
+
+def _set_release_seq(bundle: Path, seq: object) -> None:
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    if seq is None:
+        manifest.pop("release_seq", None)
+    else:
+        manifest["release_seq"] = seq
+    (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("seq", "version"),
+    [
+        (0, "1.0.0"),
+        (65535, "1.0.65535"),
+        (65536, "1.1.0"),
+        (16777215, "1.255.65535"),
+        (16777216, "2.0.0"),
+        (1790000000, "107.177.15232"),
+        (4278190079, "255.255.65535"),
+    ],
+)
+def test_build_msi_orders_product_versions_by_release_seq(
+    build_env: dict[str, Path], seq: int, version: str
+) -> None:
+    """Every MSI was ProductVersion 0.1.0 (the release string). An older MSI
+    ran its own verify action, which cannot refuse an older release, so any
+    of them installed over a newer one. The version is now the signed
+    release_seq (the verifier's anti-rollback order; by default a commit
+    timestamp) written in the three fields MSI compares, major at most 255,
+    minor 255, build 65535: 1 + seq // 2**24, seq // 2**16 % 256, seq % 2**16.
+    Later releases get higher versions, and every one is above 0.1.0, so the
+    older MSIs' MajorUpgrade (DowngradeErrorMessage) refuses to install over
+    it. The release string stays in the file name."""
+    env = build_env
+    _set_release_seq(env["bundle"], seq)
+    proc = _run_build(env["bundle"], env["pubkey"], env["dist"], capture=env["capture"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    args = (env["capture"] / "wix-args.txt").read_text(encoding="utf-8").splitlines()
+    assert f"ProductVersion={version}" in args
+    fields = tuple(int(f) for f in version.split("."))
+    assert fields > (0, 1, 0) and fields[0] <= 255 and fields[1] <= 255 and fields[2] <= 65535
+    assert fields == (1 + seq // 2**24, seq // 2**16 % 256, seq % 2**16)
+    assert (env["dist"] / "universal-db-mcp-1.2.3-win-x86_64.msi").is_file()
+
+
+@pytest.mark.parametrize(
+    "seq",
+    [None, "1790000000", True, -1, 1.5, 4278190080],
+    ids=["missing", "string", "bool", "negative", "float", "above-255.255.65535"],
+)
+def test_build_msi_fails_closed_without_a_release_seq_it_can_order(
+    build_env: dict[str, Path], seq: object
+) -> None:
+    env = build_env
+    _set_release_seq(env["bundle"], seq)
+    proc = _run_build(env["bundle"], env["pubkey"], env["dist"], capture=env["capture"])
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "FAIL" in out and "release_seq" in out, out
+    assert list(env["dist"].glob("*.msi")) == []
 
 
 def test_harvest_is_deterministic(build_env: dict[str, Path]) -> None:

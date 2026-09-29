@@ -248,14 +248,24 @@ def test_wxs_uses_launch_not_launchcondition() -> None:
     assert not _iter_local(root, "LaunchCondition"), (
         "LaunchCondition is a WiX v3 element (WIX0005); use <Launch>"
     )
-    launches = _iter_local(root, "Launch")
-    assert len(launches) == 1, "exactly one Launch prerequisite is expected"
+    launches = [el for el in _iter_local(root, "Launch") if "CPYTHON312" in (el.get("Condition") or "")]
+    assert len(launches) == 1, "exactly one Launch holds the CPython prerequisite"
     launch = launches[0]
     assert launch.get("Condition") == "Installed OR CPYTHON312", (
         "the Launch condition must keep the Installed-OR short circuit so "
         "uninstall/repair work even if Python was later removed"
     )
-    assert launch.get("Message"), "the Launch refusal must carry a remediation message"
+    # the others refuse a UDBMCP_ALLOW_DOWNGRADE value other than 1, either
+    # property from anyone but an administrator, and an account value that
+    # would break out of its quotes on the custom actions' command lines
+    others = [el.get("Condition") for el in _iter_local(root, "Launch") if el is not launch]
+    assert others == [
+        'NOT UDBMCP_ALLOW_DOWNGRADE OR UDBMCP_ALLOW_DOWNGRADE="1"',
+        "AdminUser OR NOT (UDBMCP_SERVICE_ACCOUNT OR UDBMCP_ALLOW_DOWNGRADE)",
+        'NOT (UDBMCP_SERVICE_ACCOUNT >< UdbmcpQuoteChar OR UDBMCP_SERVICE_ACCOUNT >> "\\")',
+    ], others
+    for el in _iter_local(root, "Launch"):
+        assert el.get("Message"), "a Launch refusal must carry a remediation message"
 
 
 def test_wxs_uses_common_app_data_standard_directory() -> None:

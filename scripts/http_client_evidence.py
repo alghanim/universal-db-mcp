@@ -82,6 +82,25 @@ async def _mcp_round_trip(url: str, token: str | None, ca_file: str) -> dict:
                 }
 
 
+def evidence_config(config: Path, port: int) -> dict:
+    """The config the evidence server runs with: *config* with
+    application.http_host/http_port/transport overridden for the loopback
+    listener. The copy lives in a temp directory, so the paths the original
+    gives relative to itself (config.mockdbs.yaml's secret files and state)
+    are made absolute against the original's directory first: the one
+    load_config uses, where a symlinked *config* sits, not its target."""
+    import yaml  # the config is YAML
+
+    from universal_db_mcp.config import _resolve_relative_paths
+
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
+    _resolve_relative_paths(cfg, Path(os.path.abspath(config)).parent)
+    cfg.setdefault("application", {})["http_host"] = "127.0.0.1"
+    cfg["application"]["http_port"] = int(port)
+    cfg["application"]["transport"] = "http"
+    return cfg
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.mockdbs.yaml")
@@ -110,14 +129,10 @@ def main() -> int:
         check=True, capture_output=True,
     )
     (work / "nginx.conf").write_text(NGINX_CONF % {"port": args.port}, encoding="utf-8")
-    import yaml  # the config is YAML; only application.http_host/http_port are overridden
+    import yaml
 
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-    cfg.setdefault("application", {})["http_host"] = "127.0.0.1"
-    cfg["application"]["http_port"] = int(args.port)
-    cfg["application"]["transport"] = "http"
     config_copy = work / "config.yaml"
-    config_copy.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    config_copy.write_text(yaml.safe_dump(evidence_config(Path(args.config), args.port)), encoding="utf-8")
     env = dict(os.environ)
     env["UDBMCP_HTTP_BEARER_TOKEN_FILE"] = str(token_file)
     server: subprocess.Popen[str] | None = None

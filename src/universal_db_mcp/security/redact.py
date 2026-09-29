@@ -96,6 +96,17 @@ def scrub_exception(exc: BaseException) -> str:
     return redact_text(f"{type(exc).__name__}: {exc}".replace("\n", " "))[:500]
 
 
+# Quoted literals in the unrolled form: the old (?:[^']|'')* pushed one
+# backtrack frame per character of an unterminated literal (~150 bytes each,
+# ~300 MB for a 2M-character statement). This form matches the same text.
+_SQ_LITERAL = re.compile(r"'[^']*(?:''[^']*)*'")
+_DQ_LITERAL = re.compile(r'"[^"]*(?:""[^"]*)*"')
+# The SQL guard refuses statements over 64 KiB, so no longer statement ever
+# runs; only this prefix (plus the full length) is fingerprinted, which bounds
+# the work done on the event loop for hostile input.
+_FINGERPRINT_MAX_CHARS = 65536
+
+
 def sql_fingerprint(sql: str) -> str:
     """Stable fingerprint of a statement with literal values removed.
 
@@ -103,10 +114,12 @@ def sql_fingerprint(sql: str) -> str:
     with ``?`` by a conservative scanner, then hashed. Raw SQL text is never
     stored when ``audit_sql_text`` is false (the default).
     """
-    s = re.sub(r"'(?:[^']|'')*'", "?", sql)
-    s = re.sub(r'"(?:[^"]|"")*"', "?", s)
+    s = _SQ_LITERAL.sub("?", sql[:_FINGERPRINT_MAX_CHARS])
+    s = _DQ_LITERAL.sub("?", s)
     s = re.sub(r"\b\d+(?:\.\d+)?\b", "?", s)
     s = re.sub(r"\s+", " ", s).strip().lower()
+    if len(sql) > _FINGERPRINT_MAX_CHARS:
+        s += f" [{len(sql)} chars]"
     return "sha256:" + hashlib.sha256(s.encode()).hexdigest()
 
 

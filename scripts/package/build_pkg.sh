@@ -118,12 +118,14 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 # The verifier comes from the trusted channel (repo copy, or an explicit
-# override) — NEVER from inside the bundle being verified.
+# override) — NEVER from inside the bundle being verified. A release installed
+# on this build machine never decides the build (--no-installed-manifest).
 VERIFIER="${UDBMCP_VERIFIER:-$PROJECT/scripts/verify_bundle.py}"
 [ -f "$VERIFIER" ] || fail "trusted verifier not found: $VERIFIER (set UDBMCP_VERIFIER)"
 
 log "==> trusted-channel verification of source bundle (fail closed)"
-if ! "$PYTHON_BIN" "$VERIFIER" --bundle "$BUNDLE_DIR" --pubkey "$PUBKEY" --allow-platform-mismatch >>"$LOG_FILE" 2>&1; then
+if ! "$PYTHON_BIN" "$VERIFIER" --bundle "$BUNDLE_DIR" --pubkey "$PUBKEY" --allow-platform-mismatch \
+    --no-installed-manifest >>"$LOG_FILE" 2>&1; then
   fail "verify_bundle.py FAILED for $BUNDLE_DIR; refusing to stage any payload (see $LOG_FILE)"
 fi
 log "    verify_bundle.py PASSED"
@@ -135,6 +137,15 @@ case "$VERSION" in
   ""|*[!A-Za-z0-9.]*) fail "invalid release version in manifest: '$VERSION'" ;;
 esac
 log "    release: $VERSION"
+
+# The payload's release_seq goes into the pkg scripts: preinstall refuses an
+# OLDER release before the Installer writes any of the payload, and the
+# downgrade flag names the release it authorises. Empty for a bundle without
+# one (the verifier orders such a release in postinstall).
+RELEASE_SEQ="$("$PYTHON_BIN" -c 'import json, sys
+seq = json.load(open(sys.argv[1])).get("release_seq")
+print(seq if type(seq) is int and seq >= 0 else "")' "$BUNDLE_DIR/manifest.json")"
+log "    release_seq: ${RELEASE_SEQ:-<none>}"
 
 PROFILE="$("$PYTHON_BIN" -c 'import json, sys
 print(json.load(open(sys.argv[1])).get("profile", ""))' "$BUNDLE_DIR/manifest.json")"
@@ -216,11 +227,16 @@ APP_SRC="$PROJECT/packaging/macos-app/configure_agents_app.sh"
 SHARE_DEST="$ROOT/usr/local/universal-db-mcp/share"
 mkdir -p "$SHARE_DEST"
 install -m 0755 "$APP_SRC" "$SHARE_DEST/configure_agents_app.sh"
-# newsyslog rotation for the daemon's launchd logs; postinstall installs it
-# (best-effort) at /etc/newsyslog.d/udbmcp.conf.
-NEWSYSLOG_SRC="$PROJECT/packaging/launchd/udbmcp.newsyslog.conf"
-[ -f "$NEWSYSLOG_SRC" ] || fail "newsyslog rotation config missing at $NEWSYSLOG_SRC"
-install -m 0644 "$NEWSYSLOG_SRC" "$SHARE_DEST/udbmcp.newsyslog.conf"
+
+# --- pkg scripts, with the payload's release_seq written in ---
+SCRIPTS_STAGE="$WORK/scripts"
+mkdir -p "$SCRIPTS_STAGE"
+for f in preinstall postinstall; do
+  [ "$(grep -cx 'PAYLOAD_RELEASE_SEQ=""' "$SCRIPTS_DIR/$f")" = 1 ] \
+    || fail "pkg $f must hold exactly one PAYLOAD_RELEASE_SEQ=\"\" line for the release_seq"
+  sed "s/^PAYLOAD_RELEASE_SEQ=\"\"\$/PAYLOAD_RELEASE_SEQ=\"$RELEASE_SEQ\"/" "$SCRIPTS_DIR/$f" >"$SCRIPTS_STAGE/$f"
+  chmod 0755 "$SCRIPTS_STAGE/$f"
+done
 
 # --- pkgbuild: component package ---
 CORE_PKG="$WORK/core.pkg"
@@ -229,7 +245,7 @@ PKGBUILD_ARGS=(
   --root "$ROOT"
   --identifier com.udbmcp.universal-db-mcp
   --version "$VERSION"
-  --scripts "$SCRIPTS_DIR"
+  --scripts "$SCRIPTS_STAGE"
   --ownership recommended
 )
 log "    pkgbuild ${PKGBUILD_ARGS[*]} $CORE_PKG"

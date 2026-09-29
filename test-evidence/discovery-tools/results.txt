@@ -1,5 +1,5 @@
 # Discovery tools: live run through the MCP server against the local fixtures
-date_utc: 2026-09-18T13:43:21Z
+date_utc: 2026-09-29T04:59:20Z
 
 == mock_clickhouse
   catalog: 3 tables; cdr: pk=['started_at', 'caller_msisdn'] cols=9 idx=1 fks=[]
@@ -34,7 +34,7 @@ date_utc: 2026-09-18T13:43:21Z
   document: 3 tables rendered, 2628 chars, sections=4 next_cursor=no
 
 == mock_mssql
-  FAILED ToolError: Error executing tool db_get_catalog: CONNECTION_ERROR: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see
+  FAILED ToolError: Error executing tool db_get_catalog: CONNECTION_ERROR: ConnectorError: RuntimeError: <redacted> is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ 
 
 == mock_mysql
   catalog: 2 tables; cuppings: pk=['cupping_id'] cols=5 idx=2 fks=['cuppings_ibfk_1']
@@ -84,9 +84,9 @@ date_utc: 2026-09-18T13:43:21Z
   document: 4 tables rendered, 2111 chars, sections=5 next_cursor=no
 
 == cross-connection search
-  query='user12@' hits=0 tables_searched=13 warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
-  literal query '100%': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
-  literal query 'gu_f': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
+  query='user12@' hits=0 tables_searched=13 warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: <redacted> is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
+  literal query '100%': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: <redacted> is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
+  literal query 'gu_f': hits=0 (wildcard characters are data; 'gulf' rows must not match) warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: <redacted> is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
 
 == federated read (one aliased statement per connection, merged by shape)
   run=5 failed=0 merged_rows=15 columns=['connection', 'id', 'label'] warnings=[]
@@ -99,7 +99,7 @@ date_utc: 2026-09-18T13:43:21Z
   join pg buoys x readings on buoy_id: rows=5 matched_left=1 unmatched_left=0 truncated=True warnings=[]
 
 == relationship inference (all connections)
-  relationships=8 by kind={'declared': 7, 'inferred_name_type': 1} warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: 'ODBC Driver 18 for SQL Server' is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
+  relationships=8 by kind={'declared': 7, 'inferred_name_type': 1} warnings=["connection 'mock_mssql' skipped: ConnectorError: RuntimeError: <redacted> is not installed on this machine (installed SQL Server ODBC drivers: none); it is an administrator-supplied OS package (see bundle os-packages/ and docs/offline-deployment.md) or select the installed one via options.odbc_driver. The application cannot download it."]
      declared: mock_db2.RESIDENCY_PERMITS['CITIZEN_ID'] -> mock_db2.CITIZENS['CITIZEN_ID'] confidence=1.0
      declared: mock_db2.VEHICLE_REGISTRATIONS['CITIZEN_ID'] -> mock_db2.CITIZENS['CITIZEN_ID'] confidence=1.0
      declared: mock_mysql.cuppings['batch_id'] -> mock_mysql.roastery_batches['batch_id'] confidence=1.0

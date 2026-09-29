@@ -136,6 +136,26 @@ def test_mysql_roundtrip(mysql_conn) -> None:  # type: ignore[no-untyped-def]
     assert out.rows == [[1]]
 
 
+@pytest.mark.integration
+def test_mysql_never_lists_the_views_of_other_sessions_statements(mysql_conn) -> None:  # type: ignore[no-untyped-def]
+    """information_schema is open by default, and its PROCESSLIST shows the
+    statement every session of the shared account is running (INNODB_TRX's
+    trx_query likewise, with PROCESS): never listed, so never resolved. Nor
+    are INNODB_FT_INDEX_CACHE and _TABLE, the indexed words of whichever
+    table innodb_ft_aux_table names."""
+    connector = registry.build_connector(mysql_conn, make_policy(mysql_conn))  # type: ignore[arg-type]
+    listed = {(t.schema.lower(), t.name.lower()) for t in connector.list_tables(None, {"table", "view"}, None)}
+    assert ("information_schema", "tables") in listed and ("information_schema", "innodb_ft_config") in listed
+    never = {"processlist", "innodb_trx", "innodb_ft_index_cache", "innodb_ft_index_table"}
+    assert not {("information_schema", n) for n in never} & listed
+
+
+def _after_the_databases_own(schemas: list[str | None], system: set[str]) -> bool:
+    """Every entry of a ``system`` schema follows every other entry."""
+    flags = [s in system for s in schemas]
+    return any(flags) and flags == sorted(flags)
+
+
 # ------------------------------------------------------------------- clickhouse
 
 
@@ -176,6 +196,37 @@ def test_oracle_roundtrip(oracle_conn) -> None:  # type: ignore[no-untyped-def]
     assert out.rows == [[1]]
 
 
+@pytest.mark.integration
+def test_oracle_lists_an_opened_dictionary_after_the_databases_own(oracle_conn) -> None:  # type: ignore[no-untyped-def]
+    """With SYS opened, its ~2000 objects sorted before the account's own, so
+    db_list_tables' first pages held no user table."""
+    policy = EffectivePolicy.build(SecurityConfig(allowed_system_schemas=["information_schema", "sys"]), oracle_conn)
+    connector = registry.build_connector(oracle_conn, policy)  # type: ignore[arg-type]
+    listed = connector.list_tables(None, {"table", "view"}, None)
+    assert _after_the_databases_own([t.schema for t in listed], {"SYS"}), [t.schema for t in listed[:5]]
+
+
+@pytest.mark.integration
+def test_oracle_asks_the_session_what_a_bare_dual_names(oracle_conn) -> None:  # type: ignore[no-untyped-def]
+    """The guard lets every statement read a bare DUAL as SYS.DUAL; a DUAL of
+    the login schema's own would be read in its place. The connector asks
+    the session that runs the statement (none here, so the dummy table
+    answers), and the question itself is valid SQL on the server."""
+    from universal_db_mcp.connectors import oracle as oracle_module
+
+    connector = registry.build_connector(oracle_conn, make_policy(oracle_conn))  # type: ignore[arg-type]
+    out = connector.execute_query(QuerySpec(sql="SELECT dummy FROM DUAL", max_rows=5))
+    assert out.rows == [["X"]]
+    raw = connector._connect()  # type: ignore[attr-defined]
+    try:
+        with raw.cursor() as cur:
+            cur.execute(oracle_module._SHADOWED_DUAL)
+            schema, login, owned = cur.fetchone()
+    finally:
+        raw.close()
+    assert schema == login and owned == 0, (schema, login, owned)
+
+
 # ------------------------------------------------------------------------ mssql
 
 
@@ -196,6 +247,18 @@ def test_mssql_roundtrip(mssql_conn) -> None:  # type: ignore[no-untyped-def]
     assert out.rows == [[1]]
 
 
+@pytest.mark.integration
+def test_mssql_lists_the_allowed_information_schema(mssql_conn) -> None:  # type: ignore[no-untyped-def]
+    """information_schema.tables never lists the INFORMATION_SCHEMA views;
+    allowed by default (security.allowed_system_schemas), they are listed
+    from the catalog so the resolver permits them. sys stays hidden."""
+    _skip_if_driver_missing("mssql")
+    connector = registry.build_connector(mssql_conn, make_policy(mssql_conn))  # type: ignore[arg-type]
+    listed = {(t.schema, t.name.upper()) for t in connector.list_tables(None, {"table", "view"}, None)}
+    assert ("INFORMATION_SCHEMA", "TABLES") in listed
+    assert not [s for s, _n in listed if s == "sys"]
+
+
 # -------------------------------------------------------------------------- db2
 
 
@@ -214,6 +277,14 @@ def test_db2_roundtrip(db2_conn) -> None:  # type: ignore[no-untyped-def]
     assert health.healthy, health.detail
     out = connector.execute_query(QuerySpec(sql="SELECT 1 FROM SYSIBM.SYSDUMMY1", max_rows=5))
     assert out.rows == [[1]]
+
+
+@pytest.mark.integration
+def test_db2_lists_an_opened_system_schema_after_the_databases_own(db2_conn) -> None:  # type: ignore[no-untyped-def]
+    policy = EffectivePolicy.build(SecurityConfig(allowed_system_schemas=["sysibm", "syscat"]), db2_conn)
+    connector = registry.build_connector(db2_conn, policy)  # type: ignore[arg-type]
+    listed = connector.list_tables(None, {"table", "view"}, None)
+    assert _after_the_databases_own([t.schema for t in listed], {"SYSIBM", "SYSCAT"}), [t.schema for t in listed[:5]]
 
 
 # ------------------------------------------------- themed fixture data (Gate C round 2)
@@ -264,6 +335,47 @@ def test_mysql_roastery_data(mysql_conn) -> None:  # type: ignore[no-untyped-def
     light = connector.execute_query(
         QuerySpec(sql="SELECT COUNT(*) FROM roastery_batches WHERE roast_level = 'light'", max_rows=5))
     assert light.rows == [[2]]
+
+
+@pytest.mark.integration
+def test_postgres_capped_null_record_and_json_stay_null(postgres_conn) -> None:  # type: ignore[no-untyped-def]
+    """Review round 4: the value cap turned a NULL anonymous record into a
+    one-field row ('[]'); NULL json and jsonb must stay NULL too."""
+    connector = registry.build_connector(postgres_conn, make_policy(postgres_conn))  # type: ignore[arg-type]
+    out = connector.execute_query(QuerySpec(
+        sql="SELECT CASE WHEN n = 1 THEN (1, 'a') END AS r, CASE WHEN n = 1 THEN '{\"k\": 1}'::jsonb END AS jb, "
+        "CASE WHEN n = 1 THEN '\"x\"'::json END AS j, n FROM (VALUES (1), (2)) AS v(n) ORDER BY n",
+        max_rows=5,
+    ))
+    assert out.rows[1] == [None, None, None, 2], out.rows
+    assert out.rows[0][2] == "x" and out.rows[0][3] == 1
+
+
+@pytest.mark.integration
+def test_clickhouse_values_that_decode_past_the_budget_are_refused(clickhouse_conn) -> None:  # type: ignore[no-untyped-def]
+    """Review round 4: 7.9M empty strings (8 MB on the wire, within the
+    stream budget) grew the server by 190 MB; they are refused before the
+    driver builds them."""
+    from universal_db_mcp.connectors.base import ConnectorError
+
+    connector = registry.build_connector(clickhouse_conn, make_policy(clickhouse_conn))  # type: ignore[arg-type]
+    sql = (
+        "SELECT arrayMap(o -> arrayMap(x -> x, splitByChar(',', repeat(',', 987499))), "
+        "splitByChar(',', repeat(',', 7))) AS a"
+    )
+    with pytest.raises(ConnectorError) as exc:
+        connector.execute_query(QuerySpec(sql=sql, max_rows=1))
+    assert exc.value.category == "LIMIT_EXCEEDED" and "decodes to more than" in str(exc.value)
+
+
+@pytest.mark.integration
+def test_clickhouse_lists_the_allowed_information_schema(clickhouse_conn) -> None:  # type: ignore[no-untyped-def]
+    """security.allowed_system_schemas defaults to [information_schema]: the
+    resolver permits only listed objects, so the listing must carry it."""
+    connector = registry.build_connector(clickhouse_conn, make_policy(clickhouse_conn))  # type: ignore[arg-type]
+    listed = connector.list_tables(None, {"table", "view"}, None)
+    assert {"information_schema", "INFORMATION_SCHEMA"} <= {t.schema for t in listed}
+    assert "system" not in {t.schema for t in listed}
 
 
 @pytest.mark.integration

@@ -9,9 +9,12 @@ enters the report, so the JSON can leave the site for diagnosis.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import os
+import stat
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -220,16 +223,50 @@ def render_summary(report: dict[str, Any]) -> str:
 def write_report(report: dict[str, Any], out: str | None, *, force: bool = False) -> None:
     """Write the report privately (0600) and never over an existing file
     unless `force`: a report is evidence an operator carries off-site, and
-    a path typo must not silently replace an earlier run."""
+    a path typo must not silently replace an earlier run.
+
+    Nothing at `out` is ever followed or written through. Without `force`
+    the file is created exclusively. With `force` the report goes to a new
+    temp file beside `out` that then replaces it, and an existing `out` must
+    be a regular file this user owns: a symlink planted at a shared path
+    such as /tmp is refused, so no other file is truncated or chmodded."""
     if not out:
         return
     path = Path(out)
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
+    data = json.dumps(report, indent=2, default=str)
+    if not force:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            raise SystemExit(f"refusing to overwrite {path}; pass --force or choose another --out") from None
+        except OSError as exc:
+            raise SystemExit(f"cannot write {path}: {exc}") from None
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        return
     try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError:
-        raise SystemExit(f"refusing to overwrite {path}; pass --force or choose another --out") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(report, indent=2, default=str))
-    if force:
-        os.chmod(path, 0o600)  # an existing file keeps its mode through O_CREAT; make it private
+        st = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(st.st_mode):
+            raise SystemExit(f"refusing to overwrite {path}: not a regular file (a symlink?); choose another --out")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            raise SystemExit(f"refusing to overwrite {path}: it belongs to another user; choose another --out")
+    try:
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    except OSError as exc:
+        raise SystemExit(f"cannot write {path}: {exc}") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fh.fileno(), 0o600)
+            fh.write(data)
+        os.replace(tmp, path)  # replaces a link swapped in meanwhile, never follows it
+    except BaseException as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        if isinstance(exc, OSError):
+            raise SystemExit(f"cannot write {path}: {exc}") from None
+        raise

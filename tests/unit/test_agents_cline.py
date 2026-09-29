@@ -49,7 +49,7 @@ def _backups(home: Path) -> list[Path]:
 def _expected_entry(env: dict[str, str], home: Path) -> dict[str, Any]:
     return {
         "command": env["UDBMCP_VENV_PYTHON"],
-        "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+        "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
         "env": {"UDBMCP_CONFIG": env["UDBMCP_CONFIG"]},
         "disabled": False,
         "autoApprove": [],

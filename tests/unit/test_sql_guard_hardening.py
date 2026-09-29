@@ -52,6 +52,10 @@ DENIED_CASES = [
     # sqlite default-deny bypass via main./temp. qualification (empty resolver)
     ("sqlite", "SELECT * FROM main.secret_table"),
     ("sqlite", "SELECT * FROM temp.secret_table"),
+    # the SQLite catalog holds every table's DDL (DEFAULT literals included):
+    # no sqlite_* exemption under default-deny, even when the resolver lists it
+    ("sqlite", "SELECT * FROM sqlite_schema"),
+    ("sqlite", "SELECT sql FROM sqlite_master"),
 ]
 
 
@@ -67,7 +71,6 @@ def test_denied(engine: str, sql: str) -> None:
 ALLOWED_CASES = [
     ("sqlite", "SELECT * FROM customers"),
     ("sqlite", "SELECT * FROM main.customers"),
-    ("sqlite", "SELECT * FROM sqlite_schema"),
     # engine -> dialect mapping keeps mssql/db2 usable
     ("mssql", "SELECT 1"),
     ("db2", "SELECT 1 FROM SYSIBM.SYSDUMMY1"),

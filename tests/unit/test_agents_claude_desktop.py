@@ -8,7 +8,9 @@ fixture so detection never depends on the machine running the tests.
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +26,7 @@ ENV: dict[str, str] = {
 
 EXPECTED_ENTRY: dict[str, Any] = {
     "command": "/opt/universal-db-mcp/venv/bin/python",
-    "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+    "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
     "env": {"UDBMCP_CONFIG": "/etc/universal-db-mcp/config.yaml"},
 }
 
@@ -36,6 +38,14 @@ LINUX_DIR = ".config/Claude"
 def _hermetic_app_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a real /Applications/Claude.app influence these tests."""
     monkeypatch.setattr(claude_desktop, "SYSTEM_APP_PATHS", ())
+
+
+@pytest.fixture
+def darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run as on macOS, whatever OS runs the suite: the adapter picks the
+    canonical config directory (and the ~/Applications probe) from
+    ``sys.platform``, and CI runs on Linux."""
+    monkeypatch.setattr(sys, "platform", "darwin")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -57,7 +67,7 @@ def config_file(home: Path, rel: str = MAC_DIR) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_macos_path_is_canonical_default_on_darwin(tmp_path: Path) -> None:
+def test_macos_path_is_canonical_default_on_darwin(tmp_path: Path, darwin: None) -> None:
     home = tmp_path / "home"
     home.mkdir()
     assert claude_desktop.config_path(ENV, home) == home / MAC_DIR / "claude_desktop_config.json"
@@ -113,7 +123,7 @@ def test_not_installed_when_no_config_dir_and_no_app(tmp_path: Path) -> None:
     assert not (home / "Library").exists()
 
 
-def test_installed_via_app_bundle_without_config_dir(tmp_path: Path) -> None:
+def test_installed_via_app_bundle_without_config_dir(tmp_path: Path, darwin: None) -> None:
     home = tmp_path / "home"
     (home / "Applications" / "Claude.app").mkdir(parents=True)
 
@@ -213,6 +223,7 @@ def test_apply_writes_correct_shape_and_backup(tmp_path: Path) -> None:
     # No secrets: only the launch command and the UDBMCP_CONFIG path.
     assert set(data["mcpServers"]["universal-db"]["env"]) == {"UDBMCP_CONFIG"}
     assert data["mcpServers"]["universal-db"]["args"] == [
+        "-I",
         "-m",
         "universal_db_mcp",
         "serve",
@@ -221,7 +232,7 @@ def test_apply_writes_correct_shape_and_backup(tmp_path: Path) -> None:
     ]
 
 
-def test_apply_creates_file_when_config_absent(tmp_path: Path) -> None:
+def test_apply_creates_file_when_config_absent(tmp_path: Path, darwin: None) -> None:
     home = tmp_path / "home"
     make_config_dir(home)
 
@@ -253,7 +264,7 @@ def test_apply_adds_mcp_servers_key_when_missing(tmp_path: Path) -> None:
     assert backups[0].read_text(encoding="utf-8") == before
 
 
-def test_apply_is_idempotent_on_second_run(tmp_path: Path) -> None:
+def test_apply_is_idempotent_on_second_run(tmp_path: Path, darwin: None) -> None:
     home = tmp_path / "home"
     make_config_dir(home)
 
@@ -346,6 +357,7 @@ def test_null_mcp_servers_fails_closed(tmp_path: Path) -> None:
     assert not list(target.parent.glob("*.bak.*"))
 
 
+@pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root may read any file")
 def test_unreadable_config_fails_closed(tmp_path: Path) -> None:
     home = tmp_path / "home"
     target = config_file(home)

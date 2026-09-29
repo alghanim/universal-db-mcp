@@ -242,9 +242,11 @@ fi
 # ------------------------------------------------- verify the SOURCE bundle first
 # Trust invariant (1): nothing downstream may proceed before a trusted-channel
 # verify_bundle.py --pubkey run has passed. The pkg build re-verifies too; this
-# is the gate's independent confirmation on the staging side.
+# is the gate's independent confirmation on the staging side. Every gate
+# verification passes --no-installed-manifest: this Mac may have the service
+# installed, and its installed release never decides the gate.
 require source_bundle_verified "trusted verifier rejected the source bundle" -- \
-  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY"
+  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" --no-installed-manifest
 
 # Record gate context early so even an early failure yields a complete
 # evidence document (installer_run defaults to the honest "not_run").
@@ -328,7 +330,7 @@ fi
 # signed bundle the admin's trusted channel already cleared. Uses the trusted
 # repo verifier, NEVER the payload's own copy (trust invariant 1).
 require payload_signature_verified "trusted verifier rejected the payload bundle" -- \
-  "$PY" "$TRUSTED_VERIFIER" --bundle "$PBUNDLE" --pubkey "$PUBKEY"
+  "$PY" "$TRUSTED_VERIFIER" --bundle "$PBUNDLE" --pubkey "$PUBKEY" --no-installed-manifest
 
 # ------------------------------------------------- no key material in the package
 # Trust invariant (2): the release pubkey is distributed out-of-band; nothing
@@ -392,7 +394,7 @@ else
   exit 1
 fi
 TAMPER_RC=0
-TAMPER_OUT="$("$PY" "$TRUSTED_VERIFIER" --bundle "$TAMPERED_BUNDLE" --pubkey "$PUBKEY" 2>&1)" || TAMPER_RC=$?
+TAMPER_OUT="$("$PY" "$TRUSTED_VERIFIER" --bundle "$TAMPERED_BUNDLE" --pubkey "$PUBKEY" --no-installed-manifest 2>&1)" || TAMPER_RC=$?
 printf '%s\n' "$TAMPER_OUT" >> "$TAMPER_LOG"
 if [ "$TAMPER_RC" -ne 0 ] && printf '%s\n' "$TAMPER_OUT" | grep -q "signature verification FAILED"; then
   record tampered_payload_rejected passed "trusted verifier rejected the tampered payload COPY (rc=$TAMPER_RC) with the canonical 'signature verification FAILED' diagnostic (log: ${TAMPER_LOG#$PROJECT/})"

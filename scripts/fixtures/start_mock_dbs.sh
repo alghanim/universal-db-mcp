@@ -10,13 +10,32 @@
 #   mysql       127.0.0.1:3307  (coffee roastery)       user udbmcp_ro / udbmcp_ro_pw
 #   clickhouse  127.0.0.1:8124  (telecom CDRs)          user default  / udbmcp_ro_pw
 #   oracle      127.0.0.1:1522  (air travellers)        user travel   / Travel_Pass_1
-#   mssql       127.0.0.1:1434  (hospital)              user sa       / UdbmcpMssql_2022
+#   mssql       127.0.0.1:1434  (hospital)              user udbmcp_ro / UdbmcpReader_2022 (db_datareader + SHOWPLAN)
 #   db2         127.0.0.1:50002 (ministry of interior)  user db2inst1 / udbmcp_db2_1
+#
+# config.mockdbs.yaml takes each user name from UDBMCP_DEMO_<ENGINE>_USER (the
+# script ends by printing the exports) and each password from
+# out/mockdb-secrets/<engine>.pw, which this script writes.
+# SQL Server's sa (UdbmcpMssql_2022) only seeds; the MCP never logs in as it.
+# The reader's SHOWPLAN grant lets db_explain read plans; it gives no data access.
 set -uo pipefail
 
 PROJECT="$(cd "$(dirname "$0")/../.." && pwd)"
 SEEDS="$PROJECT/scripts/fixtures/seed"
+SECRETS="$PROJECT/out/mockdb-secrets"
 NET="udbmcp-mockdb"
+
+# Password files for the mock configs, 0600: the server refuses secret files
+# that group or other can read. Keep them in step with the table above.
+write_secret() { # engine password
+  (umask 077 && mkdir -p "$SECRETS" && printf '%s' "$2" > "$SECRETS/$1.pw") && chmod 600 "$SECRETS/$1.pw"
+}
+write_secret pg udbmcp_ro_pw
+write_secret mysql udbmcp_ro_pw
+write_secret clickhouse udbmcp_ro_pw
+write_secret oracle Travel_Pass_1
+write_secret mssql UdbmcpReader_2022
+write_secret db2 udbmcp_db2_1
 
 docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
 
@@ -73,7 +92,9 @@ start mssql-db mcr.microsoft.com/mssql/server:2022-latest "1434:1433" --platform
   && wait_ready mssql-db '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "UdbmcpMssql_2022" -C -Q "SELECT 1" -b' 300 \
   && docker cp "$SEEDS/mssql_hospital.sql" udbmcp-mssql-db:/tmp/seed.sql \
   && docker exec udbmcp-mssql-db /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "UdbmcpMssql_2022" -C -i /tmp/seed.sql >/dev/null 2>&1 \
-  && echo "[mssql-db] seeded (hospital admissions)"
+  && docker exec udbmcp-mssql-db /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "UdbmcpMssql_2022" -C -b -d HospitalDB -Q \
+       "CREATE LOGIN udbmcp_ro WITH PASSWORD = N'UdbmcpReader_2022'; CREATE USER udbmcp_ro FOR LOGIN udbmcp_ro; ALTER ROLE db_datareader ADD MEMBER udbmcp_ro; GRANT SHOWPLAN TO udbmcp_ro;" >/dev/null 2>&1 \
+  && echo "[mssql-db] seeded (hospital admissions; reader login udbmcp_ro)"
 
 # --- Db2 11.5.9 (ministry of interior) ------------------------------------------
 # The image's own DBNAME bootstrap can fail its backup step; create the db
@@ -112,3 +133,8 @@ docker cp "$SEEDS/db2_moi.sql" udbmcp-db2-db:/tmp/seed.sql \
 echo
 echo "=== running themed fixtures ==="
 docker ps --filter name=udbmcp- --format "{{.Names}}\t{{.Ports}}\t{{.Status}}"
+
+echo
+echo "=== user names config.mockdbs.yaml reads (export before serving) ==="
+echo "export UDBMCP_DEMO_PG_USER=udbmcp_ro UDBMCP_DEMO_MYSQL_USER=udbmcp_ro UDBMCP_DEMO_CH_USER=default"
+echo "export UDBMCP_DEMO_ORA_USER=travel UDBMCP_DEMO_MSSQL_USER=udbmcp_ro UDBMCP_DEMO_DB2_USER=db2inst1"

@@ -23,8 +23,9 @@ a signed bundle.
 #    /usr/local/lib/udbmcp-trust) from docs/offline-deployment.md.
 sudo env UDBMCP_RELEASE_PUBKEY=/etc/universal-db-mcp/keys/release.pub.pem \
   bash <trusted-channel>/upgrade_offline.sh <new-bundle-dir> /opt/universal-db-mcp
-# 3. validate (doctor has no default config path and sudo strips
-#    UDBMCP_CONFIG, so pass --config explicitly)
+# 3. validate (sudo strips UDBMCP_CONFIG, and without it doctor picks the
+#    config configure-agents would: the system config if this account can
+#    read it, else its per-user one; so pass --config explicitly)
 sudo -u udbmcp /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp doctor \
   --config /etc/universal-db-mcp/config.yaml
 sudo systemctl restart universal-db-mcp
@@ -37,7 +38,16 @@ Properties:
   recorded BEFORE the rename (an upgrade interrupted between the two
   operations still leaves a verifiable tree).
 - Configuration and metadata cache are backed up to
-  `/var/backups/universal-db-mcp/pre-upgrade-<ts>/`.
+  `/var/backups/universal-db-mcp/pre-upgrade-<ts>/`, with `cp -a`, so a
+  link the service account left at `metadata.sqlite` is copied as a link
+  and never read through. Anything there that is neither a regular file nor
+  a link to one (a FIFO, a dangling link) is not backed up.
+- Like `install_offline.sh`, the script verifies the bundle, copies it into
+  a private root-only directory (`<UDBMCP_STAGING_DIR or
+  /var/tmp>/udbmcp-upgrade.XXXXXX/bundle`), verifies the copy again and uses
+  only the copy; it refuses a staging base that is not root's alone, and
+  unsets a `TMPDIR`, `TEMP` or `TMP` that is not
+  (`docs/offline-deployment.md`, Native mode install).
 - An upgrade killed BETWEEN the two venv switch renames (the only window with
   no venv in place) is recovered automatically: the script's exit trap
   restores `venv.previous`, so the service can start again without manual
@@ -49,7 +59,60 @@ Properties:
   debris from an earlier failed attempt.)
 - Dependencies are installed ONLY from the new bundle's hashed wheelhouse.
 - `upgrade_offline.sh` REQUIRES `UDBMCP_RELEASE_PUBKEY` and verifies the new
-  bundle's signature before touching anything. `rollback_offline.sh` does NOT
+  bundle's signature before touching anything. It also refuses a bundle whose
+  signed `release_seq` is lower than the installed release's
+  (`/opt/universal-db-mcp/manifest.json`): `FAIL: rollback refused ...`. An
+  intended downgrade passes `--allow-downgrade` (or
+  `UDBMCP_ALLOW_DOWNGRADE=1`); the `.deb` takes
+  `sudo UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <older .deb>`. Refresh the trusted
+  tools from the new release first: a verifier from before `release_seq`
+  existed cannot check the order, and the `.deb` refuses it.
+- The trusted verifier checks the release order even when its caller names
+  no installed manifest: run on the bundle's install target without
+  `--installed-manifest` (and without `--no-installed-manifest` or
+  `--allow-platform-mismatch`), it compares with this platform's installed
+  release (`/opt/universal-db-mcp/manifest.json`,
+  `/usr/local/universal-db-mcp/manifest.json`, or
+  `C:\Program Files\UniversalDB MCP\manifest.json`). This also covers a
+  bundle whose profile a later verifier no longer knows, when its signed
+  target operating system and architecture match the installed release's
+  target or this host's platform. So a `.pkg` or `.msi` built before this
+  release, whose install script calls the verifier without the option, is
+  refused as a downgrade, but only once the site's trust dir holds this
+  release's `verify_bundle.py` and `profiles.py` (`bootstrap.sh` on Linux,
+  `bootstrap_trust_macos.sh` or the manual copy on macOS, the
+  `C:\Program Files\udbmcp-trust` copy on Windows). Such an installer cannot
+  pass `--allow-downgrade`: to install one deliberately, an administrator
+  moves the installed manifest aside first, and the install records it again.
+- On macOS a `.pkg` built before this release has no release check in its
+  preinstall, so it is refused only in its postinstall, after the Installer
+  has written its payload (`/usr/local/universal-db-mcp/bundle/`,
+  `/usr/local/universal-db-mcp/share/` and
+  `/Library/LaunchDaemons/com.udbmcp.server.plist`), which it does not put
+  back. The older plist lacks the `NumberOfFiles` 65536 limits and
+  `UDBMCP_HTTP_LOG_FILE`: re-install the current release's `.pkg` to restore
+  them (the refusal says so). This release's `.pkg` refuses an older payload
+  in its preinstall, before anything lands, and the MSI rolls back as a
+  transaction.
+- Container mode: `load_images_offline.sh` keeps a release record,
+  `/var/lib/universal-db-mcp/release.json` (an absolute
+  `UDBMCP_RELEASE_RECORD` overrides it), and refuses an older bundle unless
+  given `--allow-downgrade` or `UDBMCP_ALLOW_DOWNGRADE=1`. The record, its
+  directory and every directory above it must be root's alone (see
+  `docs/offline-deployment.md`, Container mode).
+- While the service is stopped, the upgrade hands root-owned `audit.jsonl*`
+  files in `/var/log/universal-db-mcp` (the log, its `.lock` sidecar and
+  rotated backups; regular files with a single link) back to `udbmcp` with
+  mode 0600 and prints each one. An older release's root `site-check` or
+  `doctor` could leave them behind and make every audited call fail closed;
+  no manual `chown` is needed any more. The step is best effort (a WARNING,
+  never an abort). `install_offline.sh` does the same when re-run.
+- Every script unsets `PYTHON*` variables at start and works from `/`; the
+  root-side interpreter and pip runs are isolated (`-I`). `TMPDIR`, `TEMP`
+  and `TMP` are kept only when root alone can change them
+  (`upgrade_offline.sh`) or unset (`rollback_offline.sh`). (`upgrade_offline.sh`
+  still runs its two `doctor` checks without `-I`; with the variables unset and
+  `/` as the working directory, nothing from the caller reaches them.) `rollback_offline.sh` does NOT
   verify a bundle signature — the original signed bundle is not present on
   the host at rollback time, so no check on that path can re-anchor the
   payload to the bundle signature; its guarantee is the integrity-manifest
@@ -59,7 +122,7 @@ Properties:
 
 Every connection now applies a session safety profile right after it
 connects (`docs/session-safety.md`). The defaults change what an EXISTING
-deployment does after this upgrade, and two of them are fail-closed, so a
+deployment does after this upgrade, and most of them are fail-closed, so a
 connection that worked before can be refused afterwards until the config
 says otherwise. Read this before upgrading a production site.
 
@@ -154,6 +217,11 @@ sudo bash <bundle>/operations/rollback_offline.sh /opt/universal-db-mcp
 sudo systemctl restart universal-db-mcp
 ```
 
+After a rollback, `/opt/universal-db-mcp/manifest.json` still names the
+release rolled back FROM, so installing the older bundle again is a downgrade
+and needs `--allow-downgrade` (or `UDBMCP_ALLOW_DOWNGRADE=1` for `dpkg -i`);
+the next upgrade to a newer release needs nothing special.
+
 Restores the previous venv (both venvs are created with `python -m venv
 --copies`, so each carries its own copy of the interpreter and the rollback
 verifier can prove the tree is self-contained; an OS python update therefore
@@ -167,7 +235,12 @@ edits made after that backup was taken), so it requires the explicit
 and leaves the live configuration untouched (venv-only rollback). With it,
 the backup is validated through the restored venv before anything is
 displaced, and the live configuration is moved aside (never deleted) to
-`/var/backups/universal-db-mcp/pre-rollback-<ts>/`:
+`/var/backups/universal-db-mcp/pre-rollback-<ts>/`. The live metadata cache
+is renamed to `metadata.sqlite.pre-rollback` beside it, and the backup cache
+is installed as a new file (mode 0600, owned by the state directory's
+owner) renamed into place, never written through a link; a backup cache
+that is a link or not a regular file is skipped with a `WARN` (it is a
+cache: the service rebuilds it):
 
 ```bash
 sudo bash <bundle>/operations/rollback_offline.sh /opt/universal-db-mcp --restore-config
@@ -201,8 +274,15 @@ documented residual) and rewrite the external anchor on success.
 
 Security updates enter the air gap the same way as releases: a refreshed
 signed bundle built on the staging machine with re-scanned SBOM/vulnerability
-data. Record the scan date; do not assume offline scan databases stay
-current. Never "hotfix" dependencies inside the air gap by downloading.
+data, on a release stick whose signed `SHA256SUMS` the site checks with its
+installed key before anything from the stick runs
+(`docs/site-upgrade-runbook.md`). The installed `bootstrap.sh` also refuses
+a stick older than the release whose trust tools it installed
+(`trust-bootstrap-linux/RELEASE`), unless given `--allow-downgrade`. Record
+the scan date; do not assume offline
+scan databases stay current. Never "hotfix" dependencies inside the air gap by
+downloading. `SECURITY.md` says how vulnerabilities are reported and which
+releases receive fixes.
 
 ## Evidence expectations
 

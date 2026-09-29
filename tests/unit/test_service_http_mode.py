@@ -161,8 +161,9 @@ def test_msi_service_provisions_token_only_if_absent_or_empty() -> None:
     text = _read(REPO_ROOT / "packaging" / "msi" / "custom" / "service.ps1")
     assert "http-token" in text
     assert "secrets.token_hex(32)" in text
-    # empty leftover regenerated, existing non-empty token preserved
-    assert "is empty; regenerating it" in text
+    # empty leftover regenerated (like any token it cannot trust, see
+    # tests/unit/test_hardening_2026_09_27_msi.py), a trusted one preserved
+    assert "$problem = 'is empty'" in text and '"; regenerating it"' in text
     assert "$needToken = $false" in text
 
 

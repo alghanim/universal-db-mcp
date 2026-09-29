@@ -24,6 +24,23 @@
 #                              now-unpacked payload via verify_bundle.py
 #                              --pubkey BEFORE anything in it is executed.
 # Verify-then-execute is inherited from that installer, not re-implemented.
+#
+# WHAT VOUCHES FOR THIS SCRIPT ITSELF
+# The maintainer scripts (this one, postinst, prerm, postrm) are
+# NOT covered by the bundle signature: it covers only the payload, and dpkg
+# runs preinst as root from the .deb's control archive before any payload
+# exists. The .deb as a whole, maintainer scripts included, is covered by the
+# release stick's SHA256SUMS, which release_usb.sh signs with the release key
+# (SHA256SUMS.sig). That signature vouches for the .deb only when tools the
+# site ALREADY trusts check it with the key the site already holds, BEFORE
+# anything from the stick runs: the bootstrap.sh an earlier bootstrap
+# installed (sudo bash /usr/local/lib/udbmcp-trust/bootstrap.sh --stick
+# <stick>), or, on a site that has none yet, the installed verifier
+# (verify_bundle.py --verify-file) or /usr/bin/openssl run by hand. A plain
+# `sha256sum -c SHA256SUMS` proves nothing (the list can be regenerated), and
+# the stick's own trust-bootstrap-linux/bootstrap.sh is the stick checking
+# itself. A .deb that was not checked that way runs whatever preinst it
+# carries, and nothing in this file can prevent that.
 # ---------------------------------------------------------------------------
 set -eu
 

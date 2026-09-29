@@ -6,12 +6,15 @@
 # mock fixtures terminate on loopback with self-signed/no TLS. A production
 # config MUST keep require_remote_tls: true (the server refuses plaintext
 # remote connections otherwise) and per-connection tls.ca_file pins.
+#
+# Paths are relative to this file's directory, the repository root. The
+# fixture script writes the out/mockdb-secrets/*.pw files (0600) read below.
 
 application:
   airgapped: true
   transport: stdio
-  metadata_cache_path: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/metadata.sqlite
-  audit_path: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/audit.jsonl
+  metadata_cache_path: out/mockdb-state/metadata.sqlite
+  audit_path: out/mockdb-state/audit.jsonl
   audit_max_bytes: 52428800
   audit_max_backups: 5
   audit_fail_closed: true
@@ -20,7 +23,7 @@ application:
   # transport: http
   http_host: "127.0.0.1"
   http_port: 8765
-  # http_bearer_token_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-state/http.token
+  # http_bearer_token_file: out/mockdb-state/http.token
 
 security:
   read_only: true
@@ -46,7 +49,7 @@ connections:
     port: 5433
     database: postgres
     username_env: UDBMCP_DEMO_PG_USER
-    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/pg.pw
+    password_file: out/mockdb-secrets/pg.pw
     read_only: true
 
   mock_mysql:
@@ -55,7 +58,7 @@ connections:
     port: 3307
     database: testdb
     username_env: UDBMCP_DEMO_MYSQL_USER
-    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/mysql.pw
+    password_file: out/mockdb-secrets/mysql.pw
     read_only: true
 
   mock_clickhouse:
@@ -64,7 +67,7 @@ connections:
     port: 8124
     database: default
     username_env: UDBMCP_DEMO_CH_USER
-    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/clickhouse.pw
+    password_file: out/mockdb-secrets/clickhouse.pw
     read_only: true
 
   mock_oracle:
@@ -73,7 +76,7 @@ connections:
     port: 1522
     database: FREEPDB1
     username_env: UDBMCP_DEMO_ORA_USER
-    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/oracle.pw
+    password_file: out/mockdb-secrets/oracle.pw
     read_only: true
 
   mock_mssql:
@@ -82,7 +85,7 @@ connections:
     port: 1434
     database: HospitalDB
     username_env: UDBMCP_DEMO_MSSQL_USER
-    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/mssql.pw
+    password_file: out/mockdb-secrets/mssql.pw
     read_only: true
 
   mock_db2:
@@ -92,5 +95,5 @@ connections:
     port: 50002
     database: TESTDB
     username_env: UDBMCP_DEMO_DB2_USER
-    password_file: /Users/ag-work/Projects/universalDB-MCP/out/mockdb-secrets/db2.pw
+    password_file: out/mockdb-secrets/db2.pw
     read_only: true

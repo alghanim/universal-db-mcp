@@ -6,11 +6,30 @@
 # here — the payload itself is verified in postinstall via the trusted
 # verifier (the same verify-then-execute boundary as install_offline.sh).
 # Nothing in this script executes any payload file; it only stats/reads the
-# admin-installed trust material and the python.org CPython installation.
+# admin-installed trust material, the python.org CPython installation and the
+# INSTALLED release's manifest.json (anti-rollback, parsed as JSON only).
 #
 # Fail closed: every failed check exits 1 so the macOS Installer aborts
 # before a single payload byte lands on disk.
 set -euo pipefail
+
+# The OS tools only: nothing below may resolve from a user-writable prefix
+# such as /opt/homebrew/bin.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+# The one-shot downgrade flag postinstall honours authorises one install
+# attempt. An attempt that stops here never reaches postinstall, so it uses
+# the flag up on its way out instead of leaving it armed for a later package.
+PREFIX="/usr/local/universal-db-mcp"
+CONFIG_DIR="/etc/universal-db-mcp"
+DOWNGRADE_FLAG="$CONFIG_DIR/allow-downgrade"
+trap '[ "$?" -eq 0 ] || rm -f "$DOWNGRADE_FLAG" 2>/dev/null || true' EXIT
+
+# The payload's release_seq, written here by scripts/package/build_pkg.sh from
+# the signed manifest. Empty in the repository copy, and for a bundle without
+# one (the verifier orders such a release in postinstall).
+PAYLOAD_RELEASE_SEQ=""
 
 # Fixed per-machine paths (non-relocatable package; absolute paths are
 # load-bearing). They match docs/offline-deployment.md ("Trust bootstrap")
@@ -88,49 +107,286 @@ if [ ! -s "$PUBKEY" ]; then
   exit 1
 fi
 
-# --- runtime prerequisite: CPython 3.12 available to ALL users ---------------
-# The venv is built in postinstall by the launchd service context, so the
-# interpreter must be a per-machine (all-users) install — a per-user
-# ~/Library install is invisible to it and to the _udbmcp service account.
-# The python.org macOS installer provides exactly that:
-#   - /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
-#   - /usr/local/bin/python3 (symlink to the framework binary)
-# A Homebrew CPython 3.12 (brew install python@3.12) also qualifies: on
-# Apple Silicon it lives at the machine-wide, world-executable prefix
-# /opt/homebrew (on Intel at /usr/local/bin/python3.12). These are FIXED
-# absolute paths explicitly validated here — never a PATH search, which
-# could resolve to a per-user interpreter the service account cannot see.
+# --- runtime prerequisite: CPython 3.12 for ALL users, owned by root ---------
+# The venv is built in postinstall for the launchd service, so the interpreter
+# must be a per-machine (all-users) install: a per-user ~/Library install is
+# invisible to it and to the _udbmcp service account.
+# >>> root-owned CPython 3.12: this block is identical in preinstall and postinstall
+# Root runs the selected interpreter BEFORE the payload is verified: the
+# trusted verifier runs under it, the venv is copied from it, and its stdlib
+# loads into every root-side python here. Whoever can write to that
+# installation therefore runs code as root (a .pth file dropped into an
+# admin-writable Homebrew site-packages turned a tampered bundle into
+# "bundle verification PASSED"). So no candidate is executed until its whole
+# installation, resolved through symlinks, and every directory above it are
+# owned by root and writable by root only (group write only for wheel, gid 0,
+# and no ACL), and none of its symlinks leads out of it. That proves who owns
+# each file, not what a .pth file in site-packages names (a directory, or an
+# import line, outside the installation), so every root-side run of the
+# interpreter is also -I -S: site.py never reads site-packages at all.
+# The candidates are FIXED all-users paths, never a PATH search, which could
+# find a per-user interpreter the _udbmcp service account cannot see:
+#   - the python.org 3.12 installer's framework, and /usr/local/bin/python3,
+#     its symlink. That installer leaves the framework writable by the admin
+#     group, so preparing the host includes the fix printed below;
+#   - Homebrew (Apple Silicon /opt/homebrew, Intel /usr/local), accepted only
+#     when the whole Homebrew prefix is root's: its python imports
+#     <prefix>/lib/python3.12/site-packages and its _ssl/_hashlib load the
+#     openssl@3 keg through <prefix>/opt.
 FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
 USR_LOCAL_PY="/usr/local/bin/python3"
 BREW_ARM_PY="/opt/homebrew/bin/python3.12"
 BREW_INTEL_PY="/usr/local/bin/python3.12"
+FIND="/usr/bin/find"
 
-py_ok() {
-  # Accept a candidate only if it really is CPython 3.12 (a stale
-  # /usr/local/bin/python3 pointing at another version must not pass).
-  "$1" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null
+# Physical path of $1 with every symlink resolved (macOS before 13 ships no
+# realpath(1), and its readlink(1) has no -f).
+resolve_path() {
+  local path="$1" dir link hops=0
+  while :; do
+    dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+    path="${dir%/}/$(basename "$path")"
+    [ -L "$path" ] || break
+    link="$(readlink "$path")" || return 1
+    case "$link" in
+      /*) path="$link" ;;
+      *) path="${dir%/}/$link" ;;
+    esac
+    hops=$((hops + 1))
+    [ "$hops" -lt 40 ] || return 1
+  done
+  printf '%s\n' "$path"
 }
 
-if [ -f "$FRAMEWORK_PY" ] && py_ok "$FRAMEWORK_PY"; then
-  PY_OK=1
-  SELECTED_PY="$FRAMEWORK_PY"
-elif [ -x "$USR_LOCAL_PY" ] && py_ok "$USR_LOCAL_PY"; then
-  PY_OK=1
-  SELECTED_PY="$USR_LOCAL_PY"
-  echo "NOTE: $FRAMEWORK_PY not found; using $USR_LOCAL_PY ($( "$USR_LOCAL_PY" -V 2>&1 ))." >&2
-  echo "      Prefer the python.org framework install so the interpreter is" >&2
-  echo "      unambiguously per-machine." >&2
-elif [ -x "$BREW_ARM_PY" ] && py_ok "$BREW_ARM_PY"; then
-  PY_OK=1
-  SELECTED_PY="$BREW_ARM_PY"
-elif [ -x "$BREW_INTEL_PY" ] && py_ok "$BREW_INTEL_PY"; then
-  PY_OK=1
-  SELECTED_PY="$BREW_INTEL_PY"
-else
-  PY_OK=0
-fi
+# The first entry of the tree $1 (itself included) that is not owned by root,
+# that another account can write, or that carries an ACL (an "everyone allow
+# write" entry survives chmod go-w). Symlinks are skipped here: the directory
+# that holds them is checked, and escaping_symlink checks where they lead. A
+# tree find cannot read reports itself.
+untrusted_in_tree() {
+  local hit
+  hit="$("$FIND" "$1" ! -type l \( ! -user 0 -o -perm -0002 -o \( -perm -0020 ! -group 0 \) -o -acl \) \
+    -print -quit 2>/dev/null)" || hit="${hit:-$1}"
+  printf '%s' "$hit"
+}
 
-if [ "$PY_OK" -ne 1 ]; then
+# $1 when that one directory is not root's alone. A sticky directory such as
+# /tmp may be writable: nobody else can rename what root owns inside it. An
+# ACL is refused either way.
+untrusted_dir() {
+  local hit
+  hit="$("$FIND" "$1" -maxdepth 0 \( ! -user 0 -o -acl -o \( ! -perm -1000 \( -perm -0002 -o \
+    \( -perm -0020 ! -group 0 \) \) \) \) -print 2>/dev/null)" || hit="$1"
+  printf '%s' "$hit"
+}
+
+NL=$'\n'
+
+# Prints "<why>\n<fix>" for the first symlink in the tree $1 that does not
+# stay inside the trees $2...: chown -R and chmod -R do not follow symlinks
+# and the checks above skip them, so a stdlib module or extension linked out
+# of the installation (to a file another account can write, or to one it
+# creates later) would still run as root, -I -S or not. A link passes when it
+# resolves to something that exists and its text, walked from the link's
+# directory, stays on root's ground: '..' only before the first name (a '..'
+# after a name climbs out of wherever that name leads) and the end inside the
+# trees. A link that ends on another link is safe because that one is
+# checked too. Link texts are read in batches, one per line, and walked with
+# shell builtins (a Homebrew prefix holds tens of thousands of links), so a
+# name or link text with a line break is refused before any is read.
+escaping_symlink() {
+  local tree="$1" link rest part path named inside t i n=0 at=0
+  local -a links=() targets=()
+  shift
+  link="$("$FIND" "$tree" \( -name "*$NL*" -o -lname "*$NL*" \) -print -quit 2>/dev/null)" || link="$tree"
+  if [ -n "$link" ]; then
+    printf '%s\n%s' "$tree holds a name or a symlink text with a line break, or could not be read" "reinstall it"
+    return
+  fi
+  while IFS= read -r link; do links[n]="$link"; n=$((n + 1)); done < <("$FIND" "$tree" -type l -print 2>/dev/null)
+  while [ "$at" -lt "$n" ]; do
+    while IFS= read -r t; do targets[${#targets[@]}]="$t"; done < <(readlink "${links[@]:at:1000}")
+    at=$((at + 1000))
+  done
+  if [ "${#targets[@]}" -ne "$n" ]; then
+    printf '%s\n%s' "the symlinks in $tree could not be read" "reinstall it"
+    return
+  fi
+  for ((i = 0; i < n; i++)); do
+    link="${links[i]}"
+    rest="${targets[i]}"
+    case "$rest" in /*) path="" ;; *) path="${link%/*}" ;; esac
+    named=0
+    inside=0
+    while [ -n "$rest" ]; do
+      part="${rest%%/*}"
+      if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+      case "$part" in
+        "" | .) ;;
+        ..) if [ "$named" -ne 0 ]; then named=2; break; fi; path="${path%/*}" ;;
+        *) named=1; path="$path/$part" ;;
+      esac
+    done
+    if [ "$named" -ne 2 ]; then
+      for t in "$@"; do
+        case "${path:-/}" in "$t" | "$t"/*) inside=1 ;; esac
+      done
+    fi
+    if [ "$inside" -eq 0 ] || [ ! -e "$link" ]; then
+      printf '%s\n%s' "$link is a symlink to ${targets[i]}, which leads out of $* or to nothing: chown -R and chmod -R do not follow it, and root would load whatever it leads to" \
+        "sudo rm $link"
+      return
+    fi
+  done
+}
+
+# Returns 0 when each tree in $@, every directory above it and wherever its
+# symlinks lead are root's alone. Otherwise returns 1 with UNTRUSTED_WHY
+# saying which path is the problem and UNTRUSTED_FIX the command that
+# repairs it. The check only stats files and reads links.
+root_only_trees() {
+  local tree dir hit
+  for tree in "$@"; do
+    dir="$tree"
+    while [ "$dir" != "/" ]; do
+      dir="$(dirname "$dir")"
+      hit="$(untrusted_dir "$dir")"
+      if [ -n "$hit" ]; then
+        UNTRUSTED_WHY="$hit is not owned by root, or another account can write to it (write bits or an ACL)"
+        UNTRUSTED_FIX="sudo chown root:wheel $hit; sudo chmod go-w $hit; sudo chmod -N $hit"
+        return 1
+      fi
+    done
+    hit="$(untrusted_in_tree "$tree")"
+    if [ -n "$hit" ]; then
+      UNTRUSTED_WHY="$hit is not owned by root, or another account can write to it (write bits or an ACL)"
+      UNTRUSTED_FIX="sudo chown -R root:wheel $tree; sudo chmod -R go-w $tree; sudo chmod -R -N $tree"
+      return 1
+    fi
+    hit="$(escaping_symlink "$tree" "$@")"
+    if [ -n "$hit" ]; then
+      UNTRUSTED_WHY="${hit%%"$NL"*}"
+      UNTRUSTED_FIX="${hit#*"$NL"}"
+      return 1
+    fi
+  done
+}
+
+# Returns 0 with PY_REAL set to the resolved binary when the installation of
+# candidate $1 is root's alone. Otherwise returns 1 with UNTRUSTED_WHY and
+# UNTRUSTED_FIX set (see root_only_trees). The candidate is never executed
+# here.
+root_only_python() {
+  local bin prefix root site cfg
+  PY_REAL=""
+  UNTRUSTED_WHY="$1 does not resolve to a file"
+  UNTRUSTED_FIX="reinstall CPython 3.12"
+  bin="$(resolve_path "$1")" || return 1
+  prefix="$(dirname "$(dirname "$bin")")"
+  # A virtual environment loads its stdlib from the "home" its pyvenv.cfg
+  # names, which is not what the checks below cover.
+  for cfg in "$(dirname "$bin")/pyvenv.cfg" "$prefix/pyvenv.cfg"; do
+    if [ -e "$cfg" ]; then
+      UNTRUSTED_WHY="$cfg makes it a virtual environment, whose standard library lives elsewhere"
+      UNTRUSTED_FIX="point the installer at CPython 3.12 itself, not at a virtual environment"
+      return 1
+    fi
+  done
+  case "$bin" in
+    */Cellar/*) root="${bin%%/Cellar/*}" ;;
+    */Python.framework/*) root="${bin%%/Python.framework/*}/Python.framework" ;;
+    *) root="$prefix" ;;
+  esac
+  set -- "$root"
+  if [ -e "$prefix/lib/python3.12/site-packages" ]; then
+    site="$(resolve_path "$prefix/lib/python3.12/site-packages")" || return 1
+    case "$site" in
+      "$root" | "$root"/*) ;;
+      *) set -- "$root" "$site" ;;
+    esac
+  fi
+  root_only_trees "$@" || return 1
+  PY_REAL="$bin"
+}
+
+# Sets PY to the resolved binary of the first candidate that is root's alone
+# and is CPython 3.12. A refused candidate is never run; the first one refused
+# is kept in REFUSED_PY/REFUSED_WHY/REFUSED_FIX.
+select_root_python() {
+  local candidate
+  PY=""
+  REFUSED_PY=""
+  REFUSED_WHY=""
+  REFUSED_FIX=""
+  for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY" "$BREW_ARM_PY" "$BREW_INTEL_PY"; do
+    [ -x "$candidate" ] || continue
+    if ! root_only_python "$candidate"; then
+      if [ -z "$REFUSED_PY" ]; then
+        REFUSED_PY="$candidate"
+        REFUSED_WHY="$UNTRUSTED_WHY"
+        REFUSED_FIX="$UNTRUSTED_FIX"
+      fi
+      continue
+    fi
+    if "$PY_REAL" -I -S -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
+      PY="$PY_REAL"
+      return 0
+    fi
+  done
+  return 1
+}
+
+report_refused_python() {
+  echo "FAIL: refusing to run $REFUSED_PY as root: $REFUSED_WHY." >&2
+  echo "      The installer runs this interpreter as root before the payload is" >&2
+  echo "      verified, so its whole installation and every directory above it must" >&2
+  echo "      be owned by root and writable by root only, and none of its symlinks" >&2
+  echo "      may lead out of it. Fix it with:" >&2
+  echo "" >&2
+  echo "        $REFUSED_FIX" >&2
+  echo "" >&2
+  echo "      The supported interpreter is the python.org 3.12 installer" >&2
+  echo "      (https://www.python.org/downloads/macos/); it leaves" >&2
+  echo "      /Library/Frameworks/Python.framework writable by the admin group, so run:" >&2
+  echo "        sudo chown -R root:wheel /Library/Frameworks/Python.framework; sudo chmod -R go-w /Library/Frameworks/Python.framework; sudo chmod -R -N /Library/Frameworks/Python.framework" >&2
+  echo "      after installing it. Then re-run this installer." >&2
+}
+# <<< root-owned CPython 3.12
+
+# >>> one-shot downgrade flag: identical in preinstall and postinstall
+# The Installer drops the caller's environment, so an intended downgrade is
+# asked for with a flag file naming the release_seq of the package it
+# authorises: a flag left by an earlier attempt cannot authorise another
+# package. It counts only when root alone wrote it: a regular file with one
+# link, owned by root, in a directory (resolved) that root alone can write
+# (a sticky world-writable one is no exemption here: anyone can hard-link a
+# root-owned file under the flag's name there), below directories that are
+# root's alone.
+if [ -n "$PAYLOAD_RELEASE_SEQ" ]; then
+  ALLOW_DOWNGRADE_CMD="echo $PAYLOAD_RELEASE_SEQ | sudo tee $DOWNGRADE_FLAG"
+else
+  ALLOW_DOWNGRADE_CMD="sudo touch $DOWNGRADE_FLAG"
+fi
+downgrade_authorised() {
+  local dir flag
+  dir="$(cd "$(dirname "$DOWNGRADE_FLAG")" 2>/dev/null && pwd -P)" || return 1
+  flag="$dir/$(basename "$DOWNGRADE_FLAG")"
+  [ -n "$("$FIND" "$flag" -maxdepth 0 -type f -links 1 -user 0 -print 2>/dev/null)" ] || return 1
+  [ -n "$("$FIND" "$dir" -maxdepth 0 -user 0 ! -perm -0002 ! \( -perm -0020 ! -group 0 \) ! -acl \
+    -print 2>/dev/null)" ] || return 1
+  while [ "$dir" != "/" ]; do
+    dir="$(dirname "$dir")"
+    [ -z "$(untrusted_dir "$dir")" ] || return 1
+  done
+  [ "$(head -c 64 "$flag" | tr -d '[:space:]')" = "$PAYLOAD_RELEASE_SEQ" ]
+}
+# <<< one-shot downgrade flag
+
+if ! select_root_python; then
+  if [ -n "$REFUSED_PY" ]; then
+    report_refused_python
+    exit 1
+  fi
   echo "FAIL: CPython 3.12 (all-users install) not found." >&2
   echo "" >&2
   echo "Checked:" >&2
@@ -139,17 +395,42 @@ if [ "$PY_OK" -ne 1 ]; then
   echo "  $BREW_ARM_PY" >&2
   echo "  $BREW_INTEL_PY" >&2
   echo "" >&2
-  echo "Install one of:" >&2
-  echo "  - the official macOS 64-bit universal2 installer for Python 3.12" >&2
-  echo "    from https://www.python.org/downloads/macos/ (per-machine," >&2
-  echo "    lands in /Library/Frameworks), or" >&2
-  echo "  - 'brew install python@3.12' (machine-wide Homebrew prefix)." >&2
-  echo "Then re-run this installer. Per-user installs (~/Library/Python)" >&2
+  echo "Install the official macOS 64-bit universal2 installer for Python 3.12" >&2
+  echo "from https://www.python.org/downloads/macos/ (per-machine, lands in" >&2
+  echo "/Library/Frameworks), make it root's alone:" >&2
+  echo "" >&2
+  echo "  sudo chown -R root:wheel /Library/Frameworks/Python.framework; sudo chmod -R go-w /Library/Frameworks/Python.framework; sudo chmod -R -N /Library/Frameworks/Python.framework" >&2
+  echo "" >&2
+  echo "and re-run this installer. A Homebrew python@3.12 qualifies only when the" >&2
+  echo "whole Homebrew prefix is owned by root. Per-user installs (~/Library/Python)" >&2
   echo "and version managers do NOT satisfy this requirement: the service" >&2
   echo "runs as the _udbmcp account and cannot see them." >&2
   exit 1
 fi
 
-echo "preinstall: trust prerequisites and CPython 3.12 present; payload" >&2
-echo "preinstall: will be signature-verified in postinstall before use." >&2
+# --- anti-rollback, before the payload lands --------------------------------
+# postinstall's verifier refuses an OLDER release than the installed one, but
+# by then the Installer has written this package's plist and share/ files over
+# the newer ones (the older plist would take effect at the next boot, over the
+# newer venv). The payload's release_seq is known here, so an older package
+# stops before any of it lands. The verifier stays the authority for the rest
+# (releases that predate release_seq, an unreadable installed manifest).
+INSTALLED_MANIFEST="$PREFIX/manifest.json"
+if [ -n "$PAYLOAD_RELEASE_SEQ" ] && [ -f "$INSTALLED_MANIFEST" ]; then
+  INSTALLED_SEQ="$("$PY" -I -S -c 'import json, sys
+seq = json.load(open(sys.argv[1], encoding="utf-8")).get("release_seq")
+print(seq if type(seq) is int and seq >= 0 else "")' "$INSTALLED_MANIFEST" 2>/dev/null)" || INSTALLED_SEQ=""
+  if [ -n "$INSTALLED_SEQ" ] && [ "$PAYLOAD_RELEASE_SEQ" -lt "$INSTALLED_SEQ" ] && ! downgrade_authorised; then
+    echo "FAIL: this package is release_seq $PAYLOAD_RELEASE_SEQ, OLDER than the installed release_seq $INSTALLED_SEQ" >&2
+    echo "      ($INSTALLED_MANIFEST); nothing was installed. To install it anyway, run" >&2
+    echo "" >&2
+    echo "        $ALLOW_DOWNGRADE_CMD" >&2
+    echo "" >&2
+    echo "      and run the installer again (the flag authorises this release, once)." >&2
+    exit 1
+  fi
+fi
+
+echo "preinstall: trust prerequisites present; CPython 3.12 at $PY (owned by root);" >&2
+echo "preinstall: the payload will be signature-verified in postinstall before use." >&2
 exit 0

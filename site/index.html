@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Universal DB MCP</title>
-<meta name="description" content="Read-only MCP server for AI agents. Give Claude Code, Cursor and any MCP client governed access to PostgreSQL, MySQL, MariaDB, ClickHouse, Oracle, SQL Server, Db2 and SQLite. Writes are impossible, not discouraged. Runs fully offline.">
+<meta name="description" content="Read-only MCP server for AI agents. Give Claude Code, Cursor and any MCP client governed access to PostgreSQL, MySQL, MariaDB, ClickHouse, Oracle, SQL Server, Db2 and SQLite. Writes through it are refused, not discouraged. Runs fully offline. Open source, Apache-2.0.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Universal DB MCP: read everything, change nothing">
 <meta property="og:description" content="A read-only MCP server for 8 databases, with a SQL guard, read-only sessions, bounded results and air-gapped installs.">
@@ -396,7 +396,7 @@ details.all[open] summary::after{transform:rotate(45deg)}
     <div class="hero__copy">
       <span class="pill"><b>MCP server</b><span>29 tools · 8 databases<span class="pill__more"> · runs fully offline</span></span></span>
       <h1 class="h1">Read everything.<em class="serif">Change nothing.</em></h1>
-      <p class="hero__sub">Universal DB MCP gives <strong>Claude Code, Cursor and any MCP agent</strong> governed, read-only access to PostgreSQL, MySQL, MariaDB, ClickHouse, Oracle, SQL Server, Db2 and SQLite. Writes aren't discouraged. <strong>They're impossible.</strong></p>
+      <p class="hero__sub">Universal DB MCP gives <strong>Claude Code, Cursor and any MCP agent</strong> governed, read-only access to PostgreSQL, MySQL, MariaDB, ClickHouse, Oracle, SQL Server, Db2 and SQLite. Writes through it aren't discouraged. <strong>They're refused.</strong></p>
       <div class="hero__ctas">
         <a class="btn btn--primary" href="#quickstart">Get started
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -406,7 +406,7 @@ details.all[open] summary::after{transform:rotate(45deg)}
           Star on GitHub
         </a>
       </div>
-      <div class="micro"><span>stdio or streamable HTTP</span><span>No telemetry, ever</span><span>Signed offline installs</span><span>Python 3.12</span></div>
+      <div class="micro"><span>stdio or streamable HTTP</span><span>No telemetry, ever</span><span>Signed offline installs</span><span>Open source, Apache-2.0</span></div>
     </div>
 
     <div class="term-wrap" data-reveal>
@@ -486,7 +486,7 @@ details.all[open] summary::after{transform:rotate(45deg)}
         <ul class="ticks">
           <li>One statement per call, no stacking</li>
           <li>No DML, DDL, <code>SELECT INTO</code>, sequence access or locking hints, even inside a CTE</li>
-          <li>Functions from a closed allowlist, tables from your schema allowlist</li>
+          <li>Functions from a closed allowlist; tables schema-qualified and inside your allowlist</li>
           <li>Can't parse it? Refused, never passed through</li>
         </ul>
       </article>
@@ -498,7 +498,8 @@ details.all[open] summary::after{transform:rotate(45deg)}
           <li>Server-side read-only on PostgreSQL, MySQL, MariaDB, ClickHouse and SQLite, by default</li>
           <li>Db2 at UR, SQL Server at READ UNCOMMITTED: no share locks on your tables</li>
           <li>Lock-wait and statement timeouts; sessions named for your DBAs</li>
-          <li>Server refuses the profile? The connection fails closed</li>
+          <li>Server refuses read-only or the isolation level? The connection fails closed</li>
+          <li>String, quoting and dialect settings held where the guard parsed them, so the server reads the statement the guard checked</li>
         </ul>
       </article>
       <article class="layer" data-reveal>
@@ -506,8 +507,8 @@ details.all[open] summary::after{transform:rotate(45deg)}
         <h3>Bounds and records everything that runs.</h3>
         <p>Big tables stay big on the server. What comes back is capped, scrubbed and logged.</p>
         <ul class="ticks">
-          <li>Row, byte and cell ceilings, enforced while fetching</li>
-          <li>Passwords, tokens, national IDs and card numbers masked by column name</li>
+          <li>Row, byte and cell ceilings, applied while fetching, not after</li>
+          <li>Passwords, tokens, national IDs and card numbers masked by where each value comes from, through aliases, CTEs and UNIONs</li>
           <li>Credentials from env vars or 0600 files, never in results or logs</li>
           <li>Every call audited with a SQL fingerprint. No audit, no query</li>
         </ul>
@@ -531,7 +532,7 @@ details.all[open] summary::after{transform:rotate(45deg)}
 FROM sales.customers
 WHERE region = 'north'
 LIMIT 50</pre>
-        <div class="pg__verdict" id="pg-verdict" data-allowed="true" aria-live="polite"><span class="pg__badge" id="pg-badge">ALLOWED</span><span class="pg__msg" id="pg-msg">One read statement, every table inside the allowlist. It runs with row, byte and time limits.</span></div>
+        <div class="pg__verdict" id="pg-verdict" data-allowed="true" aria-live="polite"><span class="pg__badge" id="pg-badge">ALLOWED</span><span class="pg__msg" id="pg-msg">One read statement, every table schema-qualified inside the allowlist. It runs with row, byte and time limits.</span></div>
       </div>
     </div>
     <p class="pg__foot">Guard policy for this demo: connection <code>warehouse</code>, schema allowlist <code>sales</code>.</p>
@@ -611,7 +612,7 @@ LIMIT 50</pre>
           <div>
             <span class="tool">db_explain</span>
             <h3 style="margin-top:12px">Query plans on every engine, never executed</h3>
-            <p style="margin-top:10px">EXPLAIN on PostgreSQL, MySQL, ClickHouse and SQLite. EXPLAIN PLAN on Oracle and Db2. SHOWPLAN on SQL Server. The statement is planned, not run, and ANALYZE stays off.</p>
+            <p style="margin-top:10px">EXPLAIN on PostgreSQL, MySQL, ClickHouse and SQLite. EXPLAIN PLAN on Oracle and Db2. SHOWPLAN on SQL Server. The statement is planned, not run, and EXPLAIN ANALYZE is refused whatever the configuration says. On ClickHouse, which evaluates subqueries while it plans, planning gets a 1,000-row read ceiling, or a warning where the account's profile refuses one. A MySQL TREE or JSON plan that could show a masked value is withheld, because MySQL prints the values it reads while planning.</p>
             <div class="engtags"><span>PostgreSQL</span><span>MySQL</span><span>MariaDB</span><span>ClickHouse</span><span>Oracle</span><span>SQL Server</span><span>Db2</span><span>SQLite</span></div>
           </div>
           <div class="mini"><span class="k">-- 2,000,000-row table, answered in 0.01 s</span><br><span class="v">Bitmap Heap Scan on tall  (cost=4.74..159.69 rows=40 width=44)</span><br><span class="v">&nbsp;&nbsp;Recheck Cond: (customer_id = 42)</span><br><span class="m">&nbsp;&nbsp;-&gt;&nbsp; Bitmap Index Scan on ix_tall_customer</span></div>
@@ -649,7 +650,7 @@ LIMIT 50</pre>
       <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#5aa0e8"></i>Db2 LUW</h3><span class="score">22/22</span></div><div class="vers"><span>11.5.8</span><span>11.5.9</span></div><p>Isolation UR enforced, a lock timeout, and WITH UR accepted in statements.</p></article>
       <article class="eng" data-reveal><div class="eng__top"><h3><i style="--c:#9ec3dd"></i>SQLite</h3><span class="score score--na">unit-tested</span></div><div class="vers"><span>any file</span></div><p>Opened read-only with query_only, for local files and demos.</p></article>
     </div>
-    <p class="footnote" data-reveal>Oracle 12c has no redistributable test image, so it hasn't been run. SQL Server needs Microsoft ODBC Driver 18 on the machine running the server, and Oracle thick mode needs Instant Client.</p>
+    <p class="footnote" data-reveal>Oracle 12c has no redistributable test image, so it hasn't been run. SQL Server needs Microsoft ODBC Driver 18 on the machine running the server, and Oracle thick mode needs Instant Client. On ClickHouse, only the account's profile (<code>max_memory_usage</code>) bounds the server's own memory, so set one.</p>
   </div>
 </section>
 
@@ -671,11 +672,11 @@ LIMIT 50</pre>
     </div>
     <ol class="flow" data-reveal>
       <li><div><h3>Build</h3><p>A staging machine with internet access builds one offline bundle per platform: every wheel pinned by hash, OS packages and an SBOM.</p></div></li>
-      <li><div><h3>Sign</h3><p>The bundle is signed with Ed25519, and every file in it is listed with its SHA-256.</p></div></li>
-      <li><div><h3>Carry it in</h3><p>USB stick or any trusted channel. The verifier is installed once, outside the package, so a tampered bundle can't vouch for itself.</p></div></li>
+      <li><div><h3>Sign</h3><p>The bundle is signed with Ed25519, and every file in it is listed with its SHA-256. So is every file on the release stick, installer scripts included.</p></div></li>
+      <li><div><h3>Carry it in</h3><p>USB stick or any trusted channel. Before anything on the stick runs, the site checks its signed file list with the release key it already trusts, using the host's own openssl or the bootstrap an earlier release installed. On Ubuntu the bootstrap then copies the <code>.deb</code> packages to a root-only folder and checks them again, and <code>dpkg</code> installs those copies, never the stick's. It also refuses a stick older than the release it last installed.</p></div></li>
       <li><div><h3>Verify, then run</h3><p>The signature and every file hash are checked before anything executes. Any mismatch stops the install.</p></div></li>
       <li><div><h3>Install</h3><p>A <code>.deb</code> for Ubuntu 24.04 or a <code>.pkg</code> for macOS sets up the service; pip runs with <code>--no-index --require-hashes</code>.</p></div></li>
-      <li><div><h3>Upgrade and roll back</h3><p>Each upgrade builds beside the running install and keeps the previous release. One command rolls back.</p></div></li>
+      <li><div><h3>Upgrade and roll back</h3><p>Each upgrade builds beside the running install and keeps the previous release. One command rolls back, and from this release on the installers and the container image loader refuse to replace a newer release unless you ask for it.</p></div></li>
     </ol>
   </div>
 </section>
@@ -689,7 +690,7 @@ LIMIT 50</pre>
     </div>
     <div class="stats" data-reveal>
       <div class="stat"><b data-count="26" data-suffix="/26">26/26</b><span>server images pass the 22-check connector probe</span></div>
-      <div class="stat"><b data-count="1333" data-sep="1">1,333</b><span>automated tests passing</span></div>
+      <div class="stat"><b data-count="11393" data-sep="1">11,393</b><span>automated tests passing</span></div>
       <div class="stat"><b data-count="2.8" data-dec="1">2.8<small>s</small></b><span>to catalog a 2,002-table schema, end to end</span></div>
       <div class="stat"><b data-count="0.08" data-dec="2">0.08<small>s</small></b><span>to profile a 2-million-row table on a 50,000-row sample</span></div>
       <div class="stat"><b>401</b><span>returned for a wrong HTTP token, before any tool runs</span></div>
@@ -706,6 +707,8 @@ LIMIT 50</pre>
         <li>Oracle 12c. <span>There is no redistributable image to test against.</span></li>
         <li>Service start under a real systemd. <span>The package gate runs in a container.</span></li>
         <li>Observing attempted egress. <span>Offline runs prove nothing gets out, not that nothing tries.</span></li>
+        <li>A CI run on GitHub Actions. <span>The workflow has been replayed locally; it hasn't run on GitHub yet.</span></li>
+        <li>This build on the version matrix and the package gates. <span>The recorded runs predate the fixes from the latest security review; they are due before the next release.</span></li>
       </ul>
     </div>
   </div>
@@ -758,13 +761,14 @@ LIMIT 50</pre>
       <h2 class="h2">Questions a DBA <em class="serif">would ask.</em></h2>
     </div>
     <div class="faq" data-reveal>
-      <details><summary>Can it write to my database, even by accident?</summary><p>No. There is no write mode: the configuration rejects <code>security.allow_write_operations: true</code> and <code>security.read_only: false</code>, no tool issues writes, and every statement an agent sends goes through the guard, which only accepts reads. On engines with a server-side switch, the session refuses writes as well.</p></details>
+      <details><summary>Can it write to my database, even by accident?</summary><p>Not through the server. There is no write mode: the configuration rejects <code>security.allow_write_operations: true</code>, <code>security.read_only: false</code> and a connection's <code>read_only: false</code>, no tool writes your data, and every statement an agent sends goes through the guard, which only accepts reads. On engines with a server-side switch, the session refuses writes as well. Query plans are the one thing written, and never into your tables: on Db2, <code>db_explain</code> has <code>EXPLAIN PLAN</code> write plan rows into the explain tables a DBA provisions and deletes them again, and on Oracle it writes to the session-private <code>PLAN_TABLE</code> and deletes its rows. The statement being planned has passed the guard and is never executed. One caveat: in stdio mode the server runs as your user, so an agent that can also run shell commands could read the stored credentials and connect on its own. Give each connection a SELECT-only login (on Db2, plus INSERT, SELECT and DELETE on the explain tables if you want plans), or run the server over HTTP under a service account.</p></details>
       <details><summary>Why not just give the agent a read-only database user?</summary><p>Do that too. A read-only account stops writes, but it doesn't stop a long scan from taking share locks, cap how much data comes back, mask sensitive columns, keep the agent to the schemas you chose when the account can see more, or leave an audit record per call. The server does all of that.</p></details>
       <details><summary>Does my data leave my network?</summary><p>Not because of this server. It never calls an LLM, has no telemetry and downloads nothing at runtime. Query results go to the MCP client you connected, and that client decides what reaches its model.</p></details>
       <details><summary>Which agents does it work with?</summary><p>Any MCP client over stdio or streamable HTTP. <code>udbmcp configure-agents</code> registers it with Claude Code, Claude Desktop, Cursor, VS Code and Cline, and asks before it writes any config file.</p></details>
-      <details><summary>What do I need on the database side?</summary><p>A login that can read the schemas you list. Nothing is installed on the server. SQL Server needs Microsoft ODBC Driver 18 on the machine running Universal DB MCP, Oracle thick mode needs Instant Client, and Db2 query plans need explain tables a DBA creates once.</p></details>
+      <details><summary>What do I need on the database side?</summary><p>A SELECT-only login that can read the schemas you list (on SQL Server, <code>db_datareader</code> plus <code>SHOWPLAN</code>, never <code>db_owner</code>). Nothing is installed on the server. SQL Server needs Microsoft ODBC Driver 18 on the machine running Universal DB MCP, Oracle thick mode needs Instant Client, Db2 query plans need explain tables a DBA creates once, with INSERT, SELECT and DELETE on them for the login, and a ClickHouse account needs a settings profile with <code>max_memory_usage</code>, the only bound on the server's own memory.</p></details>
+      <details><summary>Does masking stop an agent from learning a sensitive value?</summary><p>It stops the value coming back in a result, wherever the statement moves it: aliases, CTEs, UNIONs, derived tables and whole-row references are traced, and anything that can't be traced is masked. Views that show other sessions' SQL (process lists, statement caches, audit trails) are refused on every connection, whatever system schemas you open, because their statement text and bind values would carry what masking hides. So are column statistics (histograms, low and high values) and stored credentials. It doesn't stop inference: a <code>WHERE</code>, <code>ORDER BY</code> or <code>GROUP BY</code> on a masked column can still reveal what it holds. For columns that must stay secret, use column-level grants or a view without them. Masking is the second line.</p></details>
       <details><summary>How do I run it for a whole team?</summary><p>Install the <code>.deb</code> or <code>.pkg</code>, which sets it up as a service, and serve it over HTTP with a bearer token behind your TLS proxy. Database credentials then live on that host, never on the developers' machines.</p></details>
-      <details><summary>Is it production-ready?</summary><p>It is tested against 26 server images, 1,333 automated tests and no-network package gates for Ubuntu and macOS, and it has been through separate correctness and security reviews. The Windows installer isn't verified yet, and the ledger lists everything else that isn't.</p></details>
+      <details><summary>Is it production-ready?</summary><p>It is tested against 26 server images, 11,393 automated tests and no-network package gates for Ubuntu and macOS, and it has been through separate correctness and security reviews; the ledger records what the latest review's 95 findings changed and what stays open. The Windows installer isn't verified yet, the version matrix and package gates are due a re-run on this build, and the ledger lists everything else that isn't verified.</p></details>
     </div>
   </div>
 </section>
@@ -788,7 +792,7 @@ LIMIT 50</pre>
   <div class="wrap foot__in">
     <div>
       <a class="logo" href="#top">Universal DB MCP</a>
-      <small>v0.1.0 · Python 3.12 · MCP SDK 2.2 · Figures as of 19 September 2026</small>
+      <small>v0.1.0 · Python 3.12 · MCP SDK 2.2 · Test count as of 29 September 2026; version matrix, timings and HTTP figures as of 18 September 2026</small>
     </div>
     <div class="foot__links">
       <a data-repo href="#top">GitHub</a>
@@ -796,8 +800,10 @@ LIMIT 50</pre>
       <a data-repo="docs/security.md" href="#security">Security model</a>
       <a data-repo="docs/offline-deployment.md" href="#offline">Offline deployment</a>
       <a data-repo="IMPLEMENTATION_STATUS.md" href="#evidence">Evidence ledger</a>
+      <a data-repo="SECURITY.md" href="#top">Report a vulnerability</a>
+      <a data-repo="LICENSE" href="#top">License (Apache-2.0)</a>
     </div>
-    <small style="flex-basis:100%">Set in Geist and Instrument Serif, under the SIL Open Font License.</small>
+    <small style="flex-basis:100%">Open source under the Apache License 2.0. Set in Geist and Instrument Serif, under the SIL Open Font License.</small>
   </div>
 </footer>
 
@@ -814,7 +820,7 @@ LIMIT 50</pre>
  {"key":"analyze","label":"EXPLAIN ANALYZE","engine":"postgres","kind":"explain","sql":"EXPLAIN ANALYZE DELETE FROM sales.customers","allowed":false,"message":"POLICY_VIOLATION: EXPLAIN ANALYZE executes the statement and is disabled by policy; use EXPLAIN without ANALYZE"},
  {"key":"lock","label":"Lock the whole table","engine":"mssql","sql":"SELECT * FROM sales.customers WITH (TABLOCKX)","allowed":false,"message":"POLICY_VIOLATION: table hint 'TABLOCKX' is not permitted on a read-only connection (only NOLOCK, READUNCOMMITTED, READPAST and NOWAIT are accepted)"},
  {"key":"sequence","label":"Advance a sequence","engine":"mssql","sql":"SELECT NEXT VALUE FOR sales.order_seq","allowed":false,"message":"POLICY_VIOLATION: sequence access (NEXT VALUE FOR) is not permitted: it advances the sequence"},
- {"key":"comment","label":"MySQL executable comment","engine":"mysql","sql":"SELECT 1 /*!50000 , SLEEP(10) */","allowed":false,"message":"POLICY_VIOLATION: executable comments (/*! ... */) are not permitted"}
+ {"key":"comment","label":"MySQL executable comment","engine":"mysql","sql":"SELECT 1 /*!50000 , SLEEP(10) */","allowed":false,"message":"POLICY_VIOLATION: executable comments (/*! ... */, /*M! ... */) are not permitted"}
 ]
 </script>
 
@@ -914,7 +920,7 @@ LIMIT 50</pre>
     elSql.innerHTML = highlight(c.sql);
     elVerdict.setAttribute("data-allowed", c.allowed ? "true" : "false");
     elBadge.textContent = c.allowed ? "ALLOWED" : "REFUSED";
-    elMsg.textContent = c.allowed ? "One read statement, every table inside the allowlist. It runs with row, byte and time limits." : c.message;
+    elMsg.textContent = c.allowed ? "One read statement, every table schema-qualified inside the allowlist. It runs with row, byte and time limits." : c.message;
   }
   cases.forEach(function (c, i) {
     var b = document.createElement("button");

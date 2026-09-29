@@ -1,14 +1,33 @@
 # Example configuration for universal-db-mcp.
 # Copy to /etc/universal-db-mcp/config.yaml and edit for your deployment.
 # All addresses/paths here are examples, not real infrastructure.
+# Keep that copy readable by the service account only (root:udbmcp, mode
+# 0640): `udbmcp configure-agents` registers it for every user who can read
+# it, and the .deb installs it root:root 0644.
 #
-# Schema rules: unknown fields are rejected; secrets are referenced, never
-# inlined (username_env / password_env / password_file).
+# Schema rules: unknown fields and mapping keys given twice are rejected;
+# secrets are referenced, never inlined (username_env / password_env /
+# username_file / password_file). Relative paths resolve against this file's
+# directory. There is no write mode: security.read_only: false,
+# allow_write_operations: true and a connection's read_only: false are
+# rejected at load.
 
 application:
   airgapped: true
   transport: stdio            # stdio | http
+  # The cache holds the permitted-object lists the SQL guard trusts: it must
+  # be owned by the server's account, mode 0600, in a directory others cannot
+  # write, or caching is disabled (live catalog reads; nothing fails).
   metadata_cache_path: /var/lib/universal-db-mcp/metadata.sqlite
+  # Auditing is never off: left unset, it defaults to the platform state
+  # directory (/var/log/universal-db-mcp/audit.jsonl for a config in
+  # /etc/universal-db-mcp, %ProgramData%\UniversalDB MCP\logs\audit.jsonl for
+  # the Windows machine-wide config, ~/.universal-db-mcp/audit.jsonl
+  # otherwise; a home directory that is / or relative derives no default, and
+  # the config then fails to load until audit_path is set). Keep it on a local
+  # filesystem with file locking: processes sharing it serialize on
+  # <audit_path>.lock, and a record waits at most 10 s for it (1 s once a
+  # record of this process has given up, until one gets the lock again).
   audit_path: /var/log/universal-db-mcp/audit.jsonl
   audit_max_bytes: 52428800   # rotate at 50 MiB
   audit_max_backups: 5
@@ -22,7 +41,7 @@ application:
   http_host: "127.0.0.1"      # restrictive default; put an internal reverse
                               # proxy in front for shared deployments
   http_port: 8765
-  # http_bearer_token_file: /run/secrets/udbmcp_http_token
+  # http_bearer_token_file: /run/secrets/udbmcp_http_token   # 0600, at least 32 characters
 
 security:
   read_only: true
@@ -33,14 +52,58 @@ security:
   max_cell_bytes: 8192
   default_query_timeout_seconds: 30
   hard_query_timeout_seconds: 60
+  # Driver calls in flight, abandoned ones included (except up to 10 connects
+  # parked after their database server stopped answering). From 3 up, one
+  # database server (engine, host, port; an Oracle tns_alias is its alias and
+  # tns_admin, a MySQL unix_socket its socket) gets at most
+  # max_concurrent_queries - 1 of them: to run N calls to one server in
+  # parallel, set N + 1.
   max_concurrent_queries: 4
   require_remote_tls: true
+  # true: every object a statement or tool names must resolve in the
+  # policy-scoped catalog listing, spelled as the catalog spells it
+  # (PostgreSQL, Oracle, Db2, ClickHouse), and a bare name only where the
+  # session looks bare names up in the listed table's schema first
+  # (PostgreSQL, Oracle, SQL Server, Db2). false: objects need not be listed
+  # (synonyms, objects the listing misses). With allowed_schemas set,
+  # statements still need names qualified with an allowed schema, and the
+  # metadata tools still resolve bare names only inside it. On Oracle, SQL
+  # Server and Db2 every name is also looked up as a synonym (Db2: an alias)
+  # and each object its chain names is checked as if written, so a bare
+  # ALL_USERS is refused unless SYS is opened. Without allowed_schemas,
+  # PostgreSQL still binds a bare name the policy does not list, so a bare
+  # dictionary view such as pg_roles (read from pg_catalog) stays readable
+  # although pg_catalog is closed. Views of other sessions' SQL
+  # (pg_stat_activity, V$SQL, sysprocesses, ...), of column statistics and
+  # of stored credentials are refused in every mode, bare names included.
   default_deny_objects: true
+  # System schemas readable in every connection (a connection's allowed_schemas
+  # can name one too). One list for every engine: 'sys' opens SQL Server's
+  # sys, Oracle's SYS dictionary and MySQL's sys schema alike. The default
+  # opens information_schema on PostgreSQL, MySQL, SQL Server and ClickHouse;
+  # note that db_query can then read information_schema about schemas outside
+  # a connection's allowed_schemas (catalog metadata, not table rows): remove
+  # it where that matters. Oracle's DUAL (SYS.DUAL) and Db2's
+  # SYSIBM.SYSDUMMY1-4 are readable in statements without opening sys or
+  # sysibm. Views of other sessions' SQL (processlist, pg_stat_activity,
+  # V$SQL, system.query_log, ...), of column statistics (COLUMN_STATISTICS,
+  # pg_stats, *_HISTOGRAMS, SYSCAT.COLDIST, ...) and of stored credentials
+  # (PostgreSQL's user_mapping_options and foreign_server_options,
+  # pg_authid, mysql.user, sys.sql_logins, database links, ...) stay refused
+  # whatever this lists, and Oracle's *_TAB_COLUMNS and Db2's SYSCAT.COLUMNS
+  # are readable only without their low and high value columns.
+  # Lists: docs/security.md.
   allowed_system_schemas: [information_schema]
   sample_limit: 20
+  # audit_sql_text: true keeps the (redacted) text of each statement that
+  # reached a database; a statement never sent (a refusal, db_validate_query)
+  # keeps only its length and SHA-256. Past each record's first and last
+  # 1024 bytes, at most 1 MiB of text is written per 10 s window.
   audit_sql_text: false
   audit_parameter_values: false
   audit_result_rows: false
+  # db_explain never runs EXPLAIN ANALYZE: false refuses analyze=true as
+  # POLICY_VIOLATION, true as VALIDATION_ERROR (not supported).
   allow_explain_analyze: false
   # mask_columns: EXTRA regex patterns, ADDED to (merged with) the built-in
   # default list — the built-ins cannot be removed here. Built-in defaults
@@ -51,9 +114,22 @@ security:
   # Example extra pattern:
   # mask_columns:
   #   - "(?i)salary"
+  # Masking follows each output value to its source column (aliases, UNIONs,
+  # CTEs, whole-row references); an untraceable statement is masked whole.
+  # It protects projected values only: a WHERE, ORDER BY or GROUP BY on a
+  # masked column can still reveal its values. Column-level grants or views
+  # are the real control for secrets.
   # allowed_schemas (per connection, below): an EMPTY list [] is NOT deny-all.
   # It imposes no schema restriction — every schema the account can see is
-  # listable and queryable. Always name the schemas to expose.
+  # listable and queryable. Always name the schemas to expose. When it is
+  # set (every engine but SQLite), agents must schema-qualify every table in
+  # a statement (database-qualify on MySQL and ClickHouse): ocean.buoys, not
+  # buoys. An entry matches a schema in any case. Where the catalog holds one
+  # name in several spellings (a quoted namesake), an entry is read as an
+  # unquoted name: written in one case it admits the spelling the engine
+  # folds it to (upper case on Oracle and Db2, lower case on PostgreSQL), and
+  # a mixed-case entry admits its exact spelling first; the other spellings
+  # are refused. To admit a namesake as well, list both (['TRAVEL', 'travel']).
   mask_action: mask              # mask | omit
 
 connections:
@@ -63,8 +139,17 @@ connections:
     database: /var/lib/universal-db-mcp/demo/finlink_demo.db
     read_only: true
 
+  # Connection ids: 1-64 ASCII characters of [A-Za-z0-9_-], not starting
+  # with '-'; ids that differ only in case are refused. Give every
+  # connection a SELECT-only login limited to its allowed_schemas (on SQL
+  # Server db_datareader plus GRANT SHOWPLAN, never db_owner; on Db2,
+  # db_explain also needs INSERT, SELECT and DELETE on the explain tables,
+  # and only there: docs/driver-matrix.md).
+
   # IBM Db2 (LUW) example — requires ibm-db wheel from the bundle wheelhouse
-  # and Db2 Connect / client licensing as an administrator prerequisite:
+  # and Db2 Connect / client licensing as an administrator prerequisite.
+  # With tls.enabled the server certificate needs a subjectAltName for host
+  # (docs/db2-tls-setup.md):
   # finance_db2:
   #   type: db2
   #   family: luw
@@ -106,7 +191,11 @@ connections:
   #     tns_alias: PRODDB         # entry in tnsnames.ora (needs tns_admin)
   #     tns_admin: /etc/universal-db-mcp/tns
   #     wallet_location: /etc/universal-db-mcp/oracle-wallet   # with tls.enabled
-  #     wallet_password: ...      # only for a password-protected wallet
+  #                               # (Thick mode: an auto-login cwallet.sso there)
+  #     wallet_password_file: /etc/universal-db-mcp/oracle-wallet.pw   # 0600; Thin
+  #                               # mode, password-protected wallet only (or
+  #                               # wallet_password_env); an inline
+  #                               # wallet_password is refused
   #   mssql:
   #     trusted_connection: true  # Windows/Kerberos identity; no username/password
   #     odbc_driver: ODBC Driver 18 for SQL Server
@@ -124,6 +213,15 @@ connections:
   #     os_authentication: true   # deliberately use the driver's implicit
   #                               # identity (OS user, or 'default' on
   #                               # clickhouse) instead of a configured username
+  #
+  # ClickHouse: the account's settings profile is the only bound on the
+  # server's own memory. Give the MCP login a readonly profile with
+  # max_memory_usage and max_result_bytes set (docs/driver-matrix.md), and
+  # leave dialect, implicit_select, prefer_column_name_to_alias,
+  # enable_global_with_statement and
+  # analyzer_compatibility_join_using_top_level_identifier at their
+  # defaults, and compatibility unset or above 21.x: a readonly=1 profile
+  # that changes them refuses the connection (docs/session-safety.md).
 
   # PostgreSQL example:
   # analytics_pg:

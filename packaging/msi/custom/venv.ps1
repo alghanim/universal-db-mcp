@@ -198,8 +198,11 @@ try {
     Write-Detail "python=$py"
     # Native invocation: EAP is relaxed inside Invoke-Native, so a stray
     # interpreter stderr line cannot escalate; the exit code alone decides.
+    # -I, as for every LocalSystem python run of the MSI (here and in the
+    # venv's pip below): no PYTHON* variables, no user site and no working
+    # directory on sys.path.
     $verExit = Invoke-Native -FilePath $py -ArgumentList @(
-        '-c', 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)')
+        '-I', '-c', 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)')
     if ($verExit -ne 0) {
         Fail "CPython 3.12.x is required (the wheelhouse is built for cp312); found: $py"
     }
@@ -238,7 +241,7 @@ try {
     }
     # Native invocation: EAP is relaxed inside Invoke-Native and the exit code
     # alone decides (fail closed on nonzero, exactly as before).
-    $venvExit = Invoke-Native -FilePath $py -ArgumentList @('-m', 'venv', $VenvDir)
+    $venvExit = Invoke-Native -FilePath $py -ArgumentList @('-I', '-m', 'venv', $VenvDir)
     if ($venvExit -ne 0) {
         Fail "could not create the virtual environment at $VenvDir (python -m venv exited $venvExit)"
     }
@@ -264,7 +267,7 @@ try {
     # the wheelhouse only, --only-binary=:all:, pinned by the signed lock.
     $previousEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & $VenvPython -m pip --isolated --disable-pip-version-check install `
+    & $VenvPython -I -m pip --isolated --disable-pip-version-check install `
         '--no-index' `
         '--no-cache-dir' `
         "--find-links=$Wheelhouse" `

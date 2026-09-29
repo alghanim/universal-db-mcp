@@ -8,8 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
-
+from collections.abc import Mapping
 
 QUERIES = {
     "mock_pg": "SELECT COUNT(*) FROM ocean.readings",
@@ -20,29 +21,71 @@ QUERIES = {
     "mock_db2": "SELECT COUNT(*) FROM MOI.CITIZENS",
 }
 
+# The accounts scripts/fixtures/start_mock_dbs.sh provisions and prints; an
+# exported value wins (see server_env).
 USER_ENV = {
     "UDBMCP_DEMO_PG_USER": "udbmcp_ro",
     "UDBMCP_DEMO_MYSQL_USER": "udbmcp_ro",
     "UDBMCP_DEMO_CH_USER": "default",
     "UDBMCP_DEMO_ORA_USER": "travel",
-    "UDBMCP_DEMO_MSSQL_USER": "sa",
+    "UDBMCP_DEMO_MSSQL_USER": "udbmcp_ro",
     "UDBMCP_DEMO_DB2_USER": "db2inst1",
 }
 
 # Documented staging-host limitations (not product bugs):
-# - mssql: ODBC Driver 18 is an administrator-supplied OS package
-# - db2: pinned clidriver refuses remote plaintext password auth
-BLOCKED_MARKERS = ("TLS", "blocked", "ODBC Driver", "SQL30082N")
+# - mssql: ODBC Driver 18 is an administrator-supplied OS package. The
+#   connector says the driver "is not installed on this machine" and lists the
+#   "SQL Server ODBC drivers" it found (the server redacts the quoted driver
+#   name); the driver manager says IM002 or "Can't open lib". Every other
+#   pyodbc error names "[ODBC Driver 18 for SQL Server]" too, so that alone
+#   marks nothing: permission denied (229), an unknown object (208), a runtime
+#   error or an unreachable host is a failure.
+# - db2: the pinned clidriver refuses remote plaintext password auth with
+#   SQL30082N reason 17 (UNSUPPORTED FUNCTION); any other reason (1 PASSWORD
+#   EXPIRED, 19 USERID DISABLED, 24 USERNAME AND/OR PASSWORD INVALID, ...) is
+#   a failure. The server redacts the quoted reason ('reason <redacted>)'), and
+#   a reason that cannot be read is a failure too: it may be a rejected login.
+#   Only the bare mechanism refusal, which names no reason, stays blocked.
+MISSING_ODBC_DRIVER_MARKERS = (
+    "is not installed on this machine",
+    "SQL Server ODBC drivers",
+    "IM002",
+    "Can't open lib",
+)
+_SQL30082N_REASON = re.compile(r'SQL30082N.*?reason\s*"?(\d+)', re.S)
+_DB2_PLAINTEXT_AUTH_REASON = "17"
+_DB2_MECHANISM_REFUSED = "Security mechanism not supported"
+
+# The report keeps this much of an engine error; the whole error is classified.
+DETAIL_LIMIT = 220
+
+
+# A rejected login is a failure whatever driver reports it: SQL Server's
+# "Login failed" / error 18456 / SQLSTATE 28000 (whose message names the ODBC
+# Driver), Db2's SQL30082N reason 24.
+_LOGIN_FAILURE = re.compile(r"Login failed|\(18456\)|\b28000\b|USERNAME AND/OR PASSWORD INVALID")
 
 
 def is_known_blocked_error(msg: str) -> bool:
     """True when an engine error matches a documented staging-host limitation."""
-    return (
-        "TLS" in msg
-        or "blocked" in msg.lower()
-        or "ODBC Driver" in msg
-        or "SQL30082N" in msg
-    )
+    if _LOGIN_FAILURE.search(msg):
+        return False
+    if "SQL30082N" in msg:
+        reason = _SQL30082N_REASON.search(msg)
+        if reason is not None:
+            return reason.group(1) == _DB2_PLAINTEXT_AUTH_REASON
+        return _DB2_MECHANISM_REFUSED in msg and "reason" not in msg
+    return "TLS" in msg or "blocked" in msg.lower() or any(marker in msg for marker in MISSING_ODBC_DRIVER_MARKERS)
+
+
+def server_env(environ: Mapping[str, str], config_path: str) -> dict[str, str]:
+    """The server's environment: the operator's, with the fixture accounts as
+    defaults for the variables config.mockdbs.yaml reads."""
+    env = dict(environ)
+    for key, value in USER_ENV.items():
+        env.setdefault(key, value)
+    env["UDBMCP_CONFIG"] = config_path
+    return env
 
 
 def query_error_check(msg: str) -> dict[str, object]:
@@ -52,11 +95,12 @@ def query_error_check(msg: str) -> dict[str, object]:
     they must never be counted as passing (a connector bug whose message merely
     contains 'TLS'/'blocked'/... would otherwise be masked), but a documented
     staging limitation must not fail the whole probe either. Anything else is a
-    hard failure: passed=False, status='failed'.
+    hard failure: passed=False, status='failed'. The whole message is
+    classified; the detail keeps its first DETAIL_LIMIT characters.
     """
     if is_known_blocked_error(msg):
-        return {"passed": None, "status": "blocked", "detail": "KNOWN-BLOCKED: " + msg}
-    return {"passed": False, "status": "failed", "detail": "FAILED: " + msg}
+        return {"passed": None, "status": "blocked", "detail": "KNOWN-BLOCKED: " + msg[:DETAIL_LIMIT]}
+    return {"passed": False, "status": "failed", "detail": "FAILED: " + msg[:DETAIL_LIMIT]}
 
 
 async def main() -> int:
@@ -64,14 +108,10 @@ async def main() -> int:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
-    env = dict(os.environ)
-    env.update(USER_ENV)
-    env["UDBMCP_CONFIG"] = config_path
-
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
-        env=env,
+        env=server_env(os.environ, config_path),
     )
     report: dict[str, object] = {"agent": "mcp-stdio-client", "checks": {}}
     ok = True
@@ -105,7 +145,7 @@ async def main() -> int:
                     report["checks"][f"query:{conn_id}"] = {"passed": bool(rows), "detail": json.dumps(rows)}
                     ok = ok and bool(rows)
                 except Exception as exc:  # noqa: BLE001 - probe reports per-engine
-                    check = query_error_check(str(exc)[:220])
+                    check = query_error_check(str(exc))
                     report["checks"][f"query:{conn_id}"] = check
                     if check["status"] == "blocked":
                         blocked_engines.append(conn_id)

@@ -19,36 +19,137 @@ import functools
 import math
 import re
 import secrets
+import socket
+import ssl
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from decimal import Decimal
 from typing import Any
+
+import sqlglot
 
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.connectors.base import (
+    EXPLAIN_ANALYZE_UNSUPPORTED,
     ColumnInfo,
     ConnectorError,
     DatabaseConnector,
     HealthInfo,
     IndexInfo,
     KeyInfo,
+    NameBinding,
     QueryOutcome,
     QuerySpec,
     RoutineInfo,
     SynonymInfo,
+    SynonymTarget,
     TableSummary,
     ViewInfo,
+    own_objects_first,
 )
 from universal_db_mcp.connectors.driver_helpers import (
-    cell_truncated_json,
+    adapt_row,
     cell_truncation_warning,
+    column_names_at,
+    ibm_db_sqlstate,
+    next_fetch_size,
     open_module,
+    statement_body,
+    synonym_chains,
+    synonym_names_refused_view,
     translated_driver_errors,
-    truncated_column_names,
 )
+from universal_db_mcp.discovery.system_schemas import SYSTEM_SCHEMAS, is_session_sql_view
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
+
+# Catalog, internal and package schemas list_tables leaves out (bound as
+# parameters): the discovery set plus Db2's internal schemas.
+_DB2_SYSTEM_SCHEMAS = tuple(
+    sorted({s.upper() for s in SYSTEM_SCHEMAS["db2"]} | {"SYSIBMINTERNAL", "SYSIBMTS", "NULLID", "SQLJ"})
+)
+# Db2 11.1+ reads statements as Netezza does under SQL_COMPAT 'NPS' (a
+# connect procedure can set it for every session): '#' becomes an operator
+# and an expression can name a select-list alias (live, 11.5.9: SELECT 1 AS
+# a, a FROM SYSIBM.SYSDUMMY1 ran). The variable is qualified so that no user
+# variable of that name stands in; PUBLIC may write it. String literals and
+# delimited identifiers read the same in both modes.
+_DB2_PIN_READING = "SET SYSIBM.SQL_COMPAT = 'DB2'"
+# A release before 11.1 has no SQL_COMPAT, and no Netezza mode to leave.
+_DB2_NO_SQL_COMPAT = ("SQL0206N", "SQL0204N")
+
+
+# ibm_db result types whose values can be gigabytes: the driver reads each
+# such value whole, so they are cut on the server.
+_DB2_LOB_TYPES = frozenset({"clob", "dbclob", "blob", "xml"})
+# The first request of every DRDA conversation, the liveness question of the
+# TLS probe: one request DSS (length 10, 0xD0, RQSDSS, correlator 1) carrying
+# EXCSAT (code point 0x1041) with no parameters. A Db2 server answers with its
+# attributes (EXCSATRD) and asks for nothing: no credentials are sent.
+_DRDA_EXCSAT = bytes.fromhex("000ad001000100041041")
+# Database code pages in which Db2 casts graphic strings to character: UTF-8
+# and UTF-16. Elsewhere CAST(<GRAPHIC> AS VARCHAR) is SQL0461N.
+_UNICODE_CODEPAGES = frozenset({1208, 1200})
+
+
+def _db2_read_tail(body: str) -> tuple[str, str]:
+    """``body`` without the clauses at its end that Db2 takes only at the
+    end of the outermost statement (FOR READ ONLY, FOR FETCH ONLY, OPTIMIZE
+    FOR n ROWS, an isolation clause), and those clauses. Read from tokens,
+    so neither a quoted name nor a comment is taken for one."""
+    try:
+        tokens = sqlglot.Dialect.get_or_raise("postgres").tokenize(body)  # the guard's dialect for Db2
+    except Exception:  # noqa: BLE001 - sqlglot's TokenError, and whatever else a tokenizer raises
+        return body, ""
+    words = [body[t.start : t.end + 1].upper() for t in tokens]
+    cut = len(words)
+    while cut:
+        tail = words[:cut]
+        if tail[-3:] in (["FOR", "READ", "ONLY"], ["FOR", "FETCH", "ONLY"]):
+            cut -= 3
+        elif tail[-2:-1] == ["WITH"] and tail[-1] in ("UR", "CS", "RS", "RR"):
+            cut -= 2
+        elif tail[-4:-2] == ["OPTIMIZE", "FOR"] and tail[-2].isdigit() and tail[-1] in ("ROW", "ROWS"):
+            cut -= 4
+        else:
+            break
+    if cut in (0, len(words)):
+        return body, ""
+    start = tokens[cut].start
+    return body[:start].rstrip(), body[start:]
+
+
+def _db2_capped_select(sql: str, described: list[tuple[str, str]], max_cell_bytes: int) -> str | None:
+    """The statement as a nested table expression whose CLOB, DBCLOB, BLOB
+    and XML columns the server cuts to ``max_cell_bytes + 1`` characters or
+    bytes (so a cut is still detected here), or None when it has none.
+
+    Columns are referenced by position and keep the statement's own names,
+    so masking by name still applies. ORDER BY ORDER OF keeps the
+    statement's row order. SUBSTRING (unlike SUBSTR) takes a length past the
+    value's end, and counts CODEUNITS32 so no character is split."""
+    if not any(kind in _DB2_LOB_TYPES for _name, kind in described):
+        return None
+    keep = max_cell_bytes + 1
+    items: list[str] = []
+    for i, (name, kind) in enumerate(described, start=1):
+        ref = f"udbmcp_q.c{i}"
+        if kind == "blob":
+            expr = f"SUBSTRING({ref}, 1, {keep}, OCTETS)"
+        elif kind == "xml":
+            expr = f"SUBSTRING(XMLSERIALIZE({ref} AS CLOB(2G)), 1, {keep}, CODEUNITS32)"
+        elif kind in _DB2_LOB_TYPES:
+            expr = f"SUBSTRING({ref}, 1, {keep}, CODEUNITS32)"
+        else:
+            expr = ref
+        quoted = '"' + name.replace('"', '""') + '"'
+        items.append(f"{expr} AS {quoted}")
+    body, tail = _db2_read_tail(statement_body(sql, "postgres"))
+    positions = ", ".join(f"c{i}" for i in range(1, len(described) + 1))
+    capped = f"SELECT {', '.join(items)} FROM (\n{body}\n) AS udbmcp_q({positions}) ORDER BY ORDER OF udbmcp_q"
+    return f"{capped} {tail}" if tail else capped
 
 
 def _meta_translated(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -95,6 +196,7 @@ class Db2Connector(DatabaseConnector):
         self._module: Any = None
         self._conn: Any = None
         self._exec_lock = threading.Lock()  # serializes queries
+        self._unicode_db: bool | None = None  # the database's code page is Unicode (read at connect)
         if connection.config.family not in (None, "luw"):
             raise ValueError(
                 f"db2 family '{connection.config.family}' is not implemented in this "
@@ -102,6 +204,10 @@ class Db2Connector(DatabaseConnector):
             )
 
     def _connect(self) -> Any:
+        """Connect, bounded by connect_timeout_seconds. A connection opened for
+        one query (``_query_connect``) gets that query's timeout as its CLI
+        statement ceiling, so the server stops the statement when the
+        caller's deadline does (cancel_current has no path to it)."""
         self._module = open_module(
             "ibm_db",
             "ibm_db (manylinux cp312 wheel with bundled clidriver)",
@@ -116,10 +222,14 @@ class Db2Connector(DatabaseConnector):
             ("PROTOCOL", "TCPIP"),
             # What DBAs see in LIST APPLICATIONS / MON_GET_CONNECTION.
             ("CLIENTAPPLNAME", self.session_profile.application_name),
+            # Without it a connect waits for the OS SYN timeout (75 s on
+            # macOS, about 127 s on Linux), or forever on a listener that
+            # accepts and never answers.
+            ("CONNECTTIMEOUT", str(max(1, math.ceil(cfg.connect_timeout_seconds)))),
         ]
-        if self.session_profile.statement_timeout_seconds:
-            # CLI-level statement ceiling, in addition to the client-side cancel.
-            fields.append(("QUERYTIMEOUT", str(int(math.ceil(self.session_profile.statement_timeout_seconds)))))
+        if ceiling := self._statement_ceiling():
+            # CLI-level statement ceiling: SQL0952N (SQLSTATE 57014) at the limit.
+            fields.append(("QUERYTIMEOUT", str(ceiling)))
         if auth := cfg.options.get("authentication"):
             # Servers that demand a specific mechanism (Kerberos, TOKEN, AES)
             # otherwise answer SQL30082N reason 17, which reads exactly like
@@ -129,6 +239,11 @@ class Db2Connector(DatabaseConnector):
             fields.append(("SECURITY", "SSL"))
             if cfg.tls.ca_file:
                 fields.append(("SSLServerCertificate", cfg.tls.ca_file))
+            # The Linux clidriver (11.5.9) does not check the certificate's
+            # host name by default: any certificate the CA issued, for any
+            # host, was accepted. Basic matches HOSTNAME against the SAN (an
+            # IP literal needs an IP SAN) on every platform.
+            fields.append(("SSLClientHostnameValidation", "Basic"))
         # Credentials MUST travel inside the connection string. For a
         # connection-string DSN, ibm_db ignores connect()'s positional
         # user/password arguments, so passing them there sends NO credentials:
@@ -150,9 +265,76 @@ class Db2Connector(DatabaseConnector):
                     "connection string cannot carry in any quoting form; change that value"
                 )
         dsn = "".join(f"{key}={value};" for key, value in fields)
+        if cfg.tls.enabled:
+            self._require_tls_answer()
         conn = self._module.connect(dsn, "", "")
         self._configure_session(conn)
+        if self._unicode_db is None:
+            self._unicode_db = self._database_is_unicode(conn)
         return conn
+
+    def _database_is_unicode(self, conn: Any) -> bool | None:
+        """Whether the database's code page is Unicode, from the CLI's
+        connection information (no statement); None when the driver does not
+        say."""
+        try:
+            codepage = int(self._module.server_info(conn).DB_CODEPAGE)
+        except Exception:  # noqa: BLE001 - optional knowledge; text_expression then compares as declared
+            return None
+        return codepage in _UNICODE_CODEPAGES
+
+    def _require_tls_answer(self) -> None:
+        """Refuse a TLS connect whose listener accepts and never answers.
+
+        CONNECTTIMEOUT bounds a plain connect, but ibm_db's connect over TLS
+        to such a listener never returned: the worker thread and its
+        executor tokens were held for good. So did a peer that completes the
+        handshake and then never answers DRDA (a TLS-terminating proxy in
+        front of a down Db2, a hung instance whose listener still
+        handshakes). A TCP connect, a TLS handshake and an answer to EXCSAT
+        within connect_timeout_seconds show the server answers, and a
+        timeout is reported at the step that did not complete; any other
+        failure (refused, reset, a handshake alert, a peer that hangs up) is
+        left to the Db2 client, which reports it in its own words. Liveness
+        only: the probe sends no credentials, and the certificate is
+        verified by the Db2 client on the real connect (SSLServerCertificate
+        plus host-name validation). A second verifier here could refuse what
+        GSKit accepts."""
+        cfg = self.connection.config
+        host, port = str(cfg.host), int(cfg.port or 50000)
+        budget = max(1.0, float(cfg.connect_timeout_seconds))
+        deadline = time.monotonic() + budget
+        probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        probe.check_hostname = False
+        probe.verify_mode = ssl.CERT_NONE
+        stage = "tcp"  # what the peer has yet to do: accept, handshake, answer
+        try:
+            with socket.create_connection((host, port), timeout=budget) as raw:
+                stage = "tls"
+                raw.settimeout(max(0.05, deadline - time.monotonic()))
+                with probe.wrap_socket(raw, server_hostname=host) as tls:
+                    stage = "drda"
+                    tls.settimeout(max(0.05, deadline - time.monotonic()))
+                    tls.sendall(_DRDA_EXCSAT)
+                    tls.recv(1)  # any answer, or the peer hanging up
+        except TimeoutError:
+            if stage == "tcp":  # a dropped SYN or a wrong address: no TLS was tried
+                raise ConnectorError(
+                    f"db2 connection '{self.connection.name}': {host}:{port} did not accept a TCP connection within "
+                    f"{budget:g} s (connect_timeout_seconds). Check the host and port, and any firewall between "
+                    "this server and it"
+                ) from None
+            what = (
+                "did not answer DRDA after its TLS handshake" if stage == "drda" else "did not complete a TLS handshake"
+            )
+            raise ConnectorError(
+                f"db2 connection '{self.connection.name}': {host}:{port} {what} within {budget:g} s "
+                "(connect_timeout_seconds), so the connect was not handed to the Db2 client, which would wait "
+                "on it without a bound. Check that the port is the server's SSL port (SSL_SVCENAME) and that "
+                "the server, and any TLS proxy in front of it, is responsive"
+            ) from None
+        except OSError:
+            return
 
     def _configure_session(self, conn: Any) -> None:
         """Apply the session safety profile.
@@ -164,9 +346,17 @@ class Db2Connector(DatabaseConnector):
         than running at CS silently). The agent no longer has to remember
         WITH UR - though the clause still works. The lock ceiling is
         best-effort. Db2 has no session-wide read-only; the guard enforces it.
+        SQL_COMPAT 'DB2' (_DB2_PIN_READING) is required where the server has it.
         """
         prof = self.session_profile
         self._session_reset()
+        try:
+            self._module.exec_immediate(conn, _DB2_PIN_READING)
+            self._session_applied("sql_compat=DB2")
+        except Exception as exc:  # noqa: BLE001
+            if not any(code in str(exc) for code in _DB2_NO_SQL_COMPAT):
+                raise self._reading_required("SQL_COMPAT 'DB2'", exc) from exc
+            self._session_skipped("sql_compat (no Netezza mode before Db2 11.1)", exc)
         if prof.isolation:
             try:
                 self._module.exec_immediate(conn, f"SET CURRENT ISOLATION = {prof.isolation.upper()}")
@@ -275,7 +465,15 @@ class Db2Connector(DatabaseConnector):
                 Limitation(scope="families", detail="z/OS and Db2 for i are not implemented in this build."),
                 Limitation(
                     scope="cancel",
-                    detail="No out-of-band cancel in this driver surface; connection is discarded on timeout.",
+                    detail="No out-of-band cancel in this driver surface. Each query's own timeout "
+                    "is its CLI QUERYTIMEOUT, so the server stops the statement at that deadline; the "
+                    "connection is discarded on timeout.",
+                ),
+                Limitation(
+                    scope="query",
+                    detail="CLOB, DBCLOB, BLOB and XML result columns are cut to the cell limit by the "
+                    "server: the statement, described first by a prepare (which runs nothing), runs as a "
+                    "nested table expression. A statement Db2 refuses in that form is refused.",
                 ),
             ],
             required_privileges=[
@@ -354,7 +552,15 @@ class Db2Connector(DatabaseConnector):
                 + ", ".join(["?"] * len(types))
                 + ")"
             )
-            params: list[Any] = list(types)
+            params: list[Any] = [*types]
+            # System schemas are not data unless the administrator allowed
+            # them: returning them would turn them into resolver entries under
+            # the default config. Named one by one, since a 'SYS%' prefix
+            # also matches user schemas.
+            opened = self._opened_schemas()
+            if hidden := [s for s in _DB2_SYSTEM_SCHEMAS if s.lower() not in opened]:
+                sql += " AND TABSCHEMA NOT IN (" + ", ".join(["?"] * len(hidden)) + ")"
+                params.extend(hidden)
             if schema:
                 sql += " AND TABSCHEMA = ?"
                 params.append(schema)
@@ -367,7 +573,7 @@ class Db2Connector(DatabaseConnector):
             out = []
             while row := self._module.fetch_tuple(stmt):
                 kind = "table" if row[2] == "T" else "view"
-                if kind not in kinds:
+                if kind not in kinds or is_session_sql_view(self.engine, _s(row[0]), _s(row[1])):
                     continue
                 out.append(
                     TableSummary(
@@ -380,7 +586,7 @@ class Db2Connector(DatabaseConnector):
                         else None,
                     )
                 )
-            return out
+            return own_objects_first(out, _DB2_SYSTEM_SCHEMAS)
         finally:
             self._module.close(conn)
 
@@ -414,6 +620,22 @@ class Db2Connector(DatabaseConnector):
 
     def length_expression(self, quoted_column: str) -> str:
         return f"CHARACTER_LENGTH({quoted_column}, CODEUNITS32)"  # LENGTH() is bytes on Db2
+
+    def text_expression(self, quoted_column: str, portable_name: str, declared_type: str | None = None) -> str:
+        # ibm_db types a parameter marker from the value it is compared with,
+        # so a value-search needle longer than a CHAR(n)/VARCHAR(n) column
+        # raised CLI0109E and the whole table went unsearched. Compared as the
+        # widest VARCHAR, a longer needle simply does not match. A GRAPHIC or
+        # VARGRAPHIC column is widened as graphic: outside a Unicode database
+        # Db2 refuses to cast graphic to character (SQL0461N). Without the
+        # declared type only a Unicode database takes the VARCHAR cast for
+        # every string column; elsewhere the column is compared as declared.
+        declared = (declared_type or "").strip().upper()
+        if declared.startswith(("GRAPHIC", "VARGRAPHIC", "LONG VARGRAPHIC")):
+            return f"CAST({quoted_column} AS VARGRAPHIC(16336))"
+        if declared or self._unicode_db:
+            return f"CAST({quoted_column} AS VARCHAR(32672))"
+        return quoted_column
 
     def substring_expression(self, quoted_column: str, chars: int) -> str:
         # Db2 raises SQL0138N when SUBSTR asks for more than the value holds
@@ -511,7 +733,11 @@ class Db2Connector(DatabaseConnector):
             rows = []
             while row := self._module.fetch_tuple(stmt):
                 rows.append(row)
-            return [ViewInfo(schema=_s(r[0]), name=_s(r[1]), kind="view", definition_state="unavailable") for r in rows]
+            return [
+                ViewInfo(schema=_s(r[0]), name=_s(r[1]), kind="view", definition_state="unavailable")
+                for r in rows
+                if not is_session_sql_view(self.engine, _s(r[0]), _s(r[1]))
+            ]
         finally:
             self._module.close(conn)
 
@@ -519,22 +745,57 @@ class Db2Connector(DatabaseConnector):
     def list_synonyms(self, schema: str | None) -> list[SynonymInfo]:
         conn = self._connect()
         try:
+            # every alias, of any schema: an alias may name another schema's
+            # alias in turn, which is read to follow the chain, not listed
             sql = "SELECT TABSCHEMA, TABNAME, BASE_TABSCHEMA, BASE_TABNAME FROM SYSCAT.TABLES WHERE TYPE = 'A'"
-            params: list[Any] = []
-            if schema:
-                sql += " AND TABSCHEMA = ?"
-                params.append(schema)
             stmt = self._module.prepare(conn, sql)
-            self._module.execute(stmt, tuple(params))
+            self._module.execute(stmt, ())
             rows = []
             while row := self._module.fetch_tuple(stmt):
-                rows.append(row)
+                rows.append(tuple(_s(v) for v in row[:4]))
+            targets = {(r[0], r[1]): (r[2], r[3]) for r in rows}
+            wanted = schema.rstrip(" ") if schema else None  # Db2 compares names blank-padded
+            # an alias names what its target holds, and may name it through others
             return [
-                SynonymInfo(schema=_s(r[0]), name=_s(r[1]), target_schema=_s(r[2]), target_name=_s(r[3]))
+                SynonymInfo(schema=r[0], name=r[1], target_schema=r[2], target_name=r[3])
                 for r in rows
+                if (wanted is None or r[0] == wanted)
+                and not synonym_names_refused_view(self.engine, (r[0], r[1]), (r[2], r[3]), targets)
             ]
         finally:
             self._module.close(conn)
+
+    @_meta_translated
+    def synonym_chains(
+        self, names: Sequence[tuple[str | None, str]]
+    ) -> dict[tuple[str | None, str], list[SynonymTarget]]:
+        conn = self._connect()
+        try:
+            # every alias, public ones (SYSPUBLIC) included, as the listing reads them
+            stmt = self._module.prepare(
+                conn, "SELECT TABSCHEMA, TABNAME, BASE_TABSCHEMA, BASE_TABNAME FROM SYSCAT.TABLES WHERE TYPE = 'A'"
+            )
+            self._module.execute(stmt, ())
+            targets = {}
+            while row := self._module.fetch_tuple(stmt):
+                targets[(_s(row[0]), _s(row[1]))] = (_s(row[2]), _s(row[3]))
+        finally:
+            self._module.close(conn)
+        # the names as the statement looks them up, exactly (MOI."citizens" is
+        # not MOI.CITIZENS), but for a delimited name's trailing blanks,
+        # which Db2 drops
+        return synonym_chains(names, targets, lambda n: n.rstrip(" "))
+
+    @_meta_translated
+    def name_binding(self) -> NameBinding:
+        # a bare name is CURRENT SCHEMA's object, else a public alias's (SYSPUBLIC)
+        conn = self._connect()
+        try:
+            stmt = self._module.exec_immediate(conn, "SELECT CURRENT SCHEMA FROM SYSIBM.SYSDUMMY1")
+            row = self._module.fetch_tuple(stmt)
+        finally:
+            self._module.close(conn)
+        return NameBinding((_s(row[0]),))
 
     @_meta_translated
     def list_routines(self, schema: str | None) -> list[RoutineInfo]:
@@ -629,40 +890,73 @@ class Db2Connector(DatabaseConnector):
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
         import ibm_db_dbi
 
-        raw = self._connect()
+        with translated_driver_errors(), self._query_connect(spec.timeout_seconds):
+            raw = self._connect()
         start = time.monotonic()
         truncated = False
         cell_truncated_cols: list[str] = []
         rows: list[list[Any]] = []
         approx_bytes = 0
+        cur: Any = None
         import json
 
         try:
-            conn = ibm_db_dbi.Connection(raw)
-            cur = conn.cursor()
-            cur.execute(spec.sql, tuple(spec.parameters) if isinstance(spec.parameters, list) else spec.parameters)
-            cols = [(d[0], "unknown") for d in cur.description or []]
-            col_labels = [
-                getattr(d[1], "__name__", "unknown").lower() if d[1] is not None else "unknown"
-                for d in (cur.description or [])
-            ]
-            while True:
-                batch = cur.fetchmany(200)
-                if not batch:
-                    break
-                for r in batch:
-                    vals, labels, cell_tr = cell_truncated_json(r, spec.max_cell_bytes)
-                    if not col_labels:
-                        col_labels = labels
-                    if cell_tr:
-                        cell_truncated_cols.extend(truncated_column_names(cols, r, spec.max_cell_bytes))
-                    approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
-                    if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
-                        truncated = True
+            # From here on a failure is the statement's (a value that does
+            # not fit a column, SQL0952N at the time limit), not a connection
+            # failure; ibm_db_dbi reports some as a SystemError from fetchmany.
+            with translated_driver_errors(phase="execute"):
+                conn = ibm_db_dbi.Connection(raw)
+                # ibm_db_dbi's per-row type fix-up formats the whole row into
+                # a debug message even with logging off: a 10 MB CLOB cost
+                # 17 MB of memory per row that was never given back. Its one
+                # conversion that matters (DECIMAL text, possibly with a
+                # locale's ',', to Decimal) is done below; BLOB bytes need none.
+                no_fix = getattr(conn, "set_fix_return_type", None)
+                if callable(no_fix):
+                    no_fix(False)
+                cur = conn.cursor()
+                params = tuple(spec.parameters) if isinstance(spec.parameters, list) else spec.parameters
+                described = self._described(raw, spec.sql)
+                capped = _db2_capped_select(spec.sql, described, spec.max_cell_bytes) if described else None
+                if capped is None:
+                    cur.execute(spec.sql, params)
+                else:
+                    self._execute_capped(cur, capped, params, described or [])
+                cols = [(d[0], "unknown") for d in cur.description or []]
+                col_labels = [
+                    getattr(d[1], "__name__", "unknown").lower() if d[1] is not None else "unknown"
+                    for d in (cur.description or [])
+                ]
+                # ibm_db reads every CLOB, DBCLOB, BLOB and XML value of the
+                # rows it fetches whole (cut on the server above, to a few
+                # times the cell limit): such a result is fetched one row at
+                # a time, and a row is let go before the next is read.
+                lob_types = [t for t in (getattr(ibm_db_dbi, n, None) for n in ("TEXT", "BINARY", "XML")) if t]
+                one_by_one = any(any(d[1] is t for t in lob_types) for d in cur.description or [])
+                decimal_type = getattr(ibm_db_dbi, "DECIMAL", None)
+                decimals = [i for i, d in enumerate(cur.description or []) if decimal_type and d[1] is decimal_type]
+                while True:
+                    batch = cur.fetchmany(1 if one_by_one else next_fetch_size(spec.max_rows, len(rows)))
+                    if not batch:
                         break
-                    rows.append(vals)
-                if truncated:
-                    break
+                    for r in batch:
+                        if decimals:
+                            r = [
+                                Decimal(str(v).replace(",", ".")) if i in decimals and v is not None else v
+                                for i, v in enumerate(r)
+                            ]
+                        vals, labels, cut = adapt_row(r, spec.max_cell_bytes)
+                        if not col_labels:
+                            col_labels = labels
+                        cell_truncated_cols.extend(column_names_at(cols, cut))
+                        approx_bytes += len(json.dumps(vals, default=str).encode("utf-8"))
+                        if len(rows) >= spec.max_rows or approx_bytes > spec.max_response_bytes:
+                            truncated = True
+                            break
+                        rows.append(vals)
+                    del batch, r
+                    if truncated:
+                        break
             warnings = ["result truncated by limits"] if truncated else []
             if cell_truncated_cols:
                 truncated = True
@@ -676,10 +970,55 @@ class Db2Connector(DatabaseConnector):
                 warnings=warnings,
             )
         finally:
+            # The statement handle goes before the connection: one freed
+            # later, by the garbage collector after the connection closed,
+            # left an error set that failed the next query's fetch
+            # ('Fetch Failure: ' after any failed statement, live).
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:  # noqa: BLE001, S110
+                    pass
             try:
                 self._module.close(raw)
             except Exception:  # noqa: BLE001, S110
                 pass
+
+    def _described(self, raw: Any, sql: str) -> list[tuple[str, str]] | None:
+        """The statement's result columns as (name, ibm_db type name), from
+        a prepare: Db2 describes the statement and runs nothing. None from a
+        driver module without ibm_db's describe calls."""
+        num_fields = getattr(self._module, "num_fields", None)
+        if not callable(num_fields):
+            return None
+        stmt = self._module.prepare(raw, sql)
+        try:
+            count = num_fields(stmt)
+            return [
+                (str(self._module.field_name(stmt, i)), str(self._module.field_type(stmt, i)).lower())
+                for i in range(count or 0)
+            ]
+        finally:
+            self._module.free_stmt(stmt)
+
+    @staticmethod
+    def _execute_capped(cur: Any, capped: str, params: Any, described: list[tuple[str, str]]) -> None:
+        """Run the value-capped rewrite of the statement. Fails closed: a
+        rewrite Db2 refuses (SQLSTATE class 42: its syntax or its names) is
+        the query's failure, never a reason to run the statement with its
+        values read whole."""
+        try:
+            cur.execute(capped, params)
+        except Exception as exc:
+            if not (ibm_db_sqlstate(exc) or "").startswith("42"):
+                raise
+            lobs = ", ".join(repr(name) for name, kind in described if kind in _DB2_LOB_TYPES)
+            raise ConnectorError(
+                f"the statement returns CLOB, DBCLOB, BLOB or XML column(s) {lobs}, and Db2 refused it with "
+                f"those values cut to the cell limit on the server ({scrub_exception(exc)}); select "
+                "SUBSTRING(<column>, 1, <n>, CODEUNITS32) (XMLSERIALIZE an XML column first) instead",
+                category="QUERY_ERROR",
+            ) from exc
 
     def explain(self, sql: str, analyze: bool) -> dict[str, Any]:
         """EXPLAIN PLAN into the explain tables, read back as operators.
@@ -693,7 +1032,7 @@ class Db2Connector(DatabaseConnector):
         executed.
         """
         if analyze:
-            raise NotImplementedError("EXPLAIN ANALYZE is policy-disabled")
+            raise NotImplementedError(EXPLAIN_ANALYZE_UNSUPPORTED)
         queryno = secrets.randbelow(2_000_000_000) + 1
         cleanup_warning: str | None = None
         with translated_driver_errors():

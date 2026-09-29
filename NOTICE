@@ -1,0 +1,7 @@
+universal-db-mcp
+Copyright 2026 the universal-db-mcp authors
+
+This product includes software developed by third parties, distributed under
+their own licenses. The offline bundle lists those components in
+sbom/cyclonedx.json, and each wheel in its wheelhouse/ carries its license
+files.

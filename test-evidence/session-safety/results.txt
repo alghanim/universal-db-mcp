@@ -1,5 +1,5 @@
 # Session safety profile: live read-back through the connectors' health_check
-date_utc: 2026-09-18T13:43:16Z
+date_utc: 2026-09-29T04:59:16Z
 host: native Darwin arm64; fixtures on loopback; policy hard_query_timeout=60.0s, max_response_bytes=1048576
 
 == mock_clickhouse: healthy=True version="26.3.3.20"
@@ -9,7 +9,7 @@ host: native Darwin arm64; fixtures on loopback; policy hard_query_timeout=60.0s
 
 == mock_db2: healthy=True version="DB2 v11.5.9.0"
    isolation=ur lock_timeout_seconds=5.0 read_only_enforced=False read_only_verified=None app=udbmcp:mock_db2
-   applied=['isolation=ur', 'lock_timeout=5s']
+   applied=['sql_compat=DB2', 'isolation=ur', 'lock_timeout=5s']
    server_reports={'isolation': 'ur', 'lock_timeout_seconds': '5', 'application_name': 'udbmcp:mock_db2'}
 
 == mock_mssql: healthy=False version=null
@@ -20,8 +20,8 @@ host: native Darwin arm64; fixtures on loopback; policy hard_query_timeout=60.0s
 
 == mock_mysql: healthy=True version="9.7.2"
    isolation=None lock_timeout_seconds=5.0 read_only_enforced=True read_only_verified=True app=udbmcp:mock_mysql
-   applied=['read_only', 'statement_timeout=60000ms', 'innodb_lock_wait_timeout=5s', 'lock_wait_timeout=5s']
-   server_reports={'read_only': '1', 'isolation': 'REPEATABLE-READ', 'statement_timeout_ms': '60000', 'innodb_lock_wait_timeout': '5'}
+   applied=['sql_mode without ANSI, ANSI_QUOTES, NO_BACKSLASH_ESCAPES, PIPES_AS_CONCAT, HIGH_NOT_PRECEDENCE, ORACLE, MSSQL, DB2, POSTGRESQL, MAXDB', 'character_set_client=utf8mb4', 'read_only', 'statement_timeout=60000ms', 'innodb_lock_wait_timeout=5s', 'lock_wait_timeout=5s']
+   server_reports={'read_only': '1', 'isolation': 'REPEATABLE-READ', 'statement_timeout_ms': '60000', 'innodb_lock_wait_timeout': '5', 'sql_mode': 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION', 'character_set_client': 'utf8mb4'}
 
 == mock_oracle: healthy=True version="Oracle AI Database 26ai Free Release...
    isolation=None lock_timeout_seconds=None read_only_enforced=False read_only_verified=None app=udbmcp:mock_oracle
@@ -30,16 +30,16 @@ host: native Darwin arm64; fixtures on loopback; policy hard_query_timeout=60.0s
 
 == mock_pg: healthy=True version="PostgreSQL 17.9 (Debian 17.9-1.pgdg1...
    isolation=None lock_timeout_seconds=5.0 read_only_enforced=True read_only_verified=True app=udbmcp:mock_pg
-   applied=['read_only', 'statement_timeout=60000ms', 'lock_timeout=5000ms']
-   server_reports={'read_only': 'on', 'statement_timeout': '1min', 'lock_timeout': '5s', 'application_name': 'udbmcp:mock_pg', 'isolation': 'read committed'}
+   applied=['standard_conforming_strings=on', 'client_encoding=UTF8', 'read_only', 'statement_timeout=60000ms', 'lock_timeout=5000ms']
+   server_reports={'read_only': 'on', 'statement_timeout': '1min', 'lock_timeout': '5s', 'application_name': 'udbmcp:mock_pg', 'isolation': 'read committed', 'standard_conforming_strings': 'on', 'client_encoding': 'UTF8'}
 
 
 == server-side write refusal (SQL guard bypassed on purpose)
-   mock_clickhouse (clickhouse): refused -> ConnectorError: DatabaseError: Received ClickHouse exception, code: 164, server response: Code: 164. DB::Exception: <redacted>: Cannot execute query in readonly mode.
+   mock_clickhouse (clickhouse): refused -> ConnectorError: DatabaseError: Received ClickHouse exception, code: 164, server response: Code: 164. DB::Exception: default: Cannot execute query in readonly mode. (R
    mock_db2 (db2): not applicable, no session-level read-only exists; the SQL guard enforces
    mock_mssql (mssql): not applicable, no session-level read-only exists; the SQL guard enforces
    mock_mysql (mysql): refused -> ConnectorError: OperationalError: (1792, 'Cannot execute statement in a READ ONLY transaction.')
    mock_oracle (oracle): not applicable, no session-level read-only exists; the SQL guard enforces
-   mock_pg (postgres): refused -> ReadOnlySqlTransaction: cannot execute CREATE TABLE in a read-only transaction
+   mock_pg (postgres): refused -> ConnectorError: ReadOnlySqlTransaction: cannot execute CREATE TABLE in a read-only transaction
    mock_db2: connector VALUES (CURRENT ISOLATION, CURRENT LOCK TIMEOUT) -> [['UR', 5]]
    mock_db2: a statement ending in WITH UR is accepted -> [[6]]

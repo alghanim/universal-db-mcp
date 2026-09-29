@@ -311,8 +311,10 @@ fi
 # documented staging-side mode (this host may be macOS/arm64); the ENFORCING
 # verification happens in the container, on the bundle's own platform, both
 # before dpkg -i (preinst prerequisites) and inside postinst (install_offline.sh).
+# Every gate verification passes --no-installed-manifest: a release installed
+# on the machine running the gate never decides it.
 require source_bundle_verified "trusted verifier rejected the source bundle" -- \
-  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" --allow-platform-mismatch
+  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" --allow-platform-mismatch --no-installed-manifest
 
 # Record gate context early so even an early failure yields a complete
 # evidence document.
@@ -386,12 +388,15 @@ NEG_STAGING="$WORK/neg-keymaterial"
 NEG_OUT="$WORK/neg-out"
 mkdir -p "$NEG_STAGING" "$NEG_OUT"
 copy_tree() {
-  # Fast copy for the 100M+ bundle: APFS clone (macOS) -> hardlink (Linux)
-  # -> plain copy. Only ever read afterwards; the poison lands in the
+  # Fast copy for the 100M+ bundle: APFS clone (macOS) -> reflink where the
+  # filesystem has one (GNU cp) -> plain copy. Never hard links: the verifier
+  # refuses a SHA256SUMS or SIGNATURE with a second link (whoever holds the
+  # other name can change it), so a linked copy fails build_deb.sh's source
+  # verification, and the original with it. The poison lands in the
   # trusted-tools copy, never in the bundle copy itself.
   if cp -cR "$1" "$2" 2>/dev/null; then return 0; fi
   rm -rf "$2"
-  if cp -al "$1" "$2" 2>/dev/null; then return 0; fi
+  if cp -R --reflink=auto "$1" "$2" 2>/dev/null; then return 0; fi
   rm -rf "$2"
   cp -R "$1" "$2"
 }
@@ -693,7 +698,7 @@ rec wheel_tampered passed "sqlglot wheel byte-flipped inside a repacked COPY of 
 
 # --- the trusted verifier must reject the tampered payload -------------------
 TAMPERED_BUNDLE=/tmp/tamper/tree/usr/share/universal-db-mcp/bundle
-VOUT="$(python3 /usr/local/lib/udbmcp-trust/verify_bundle.py --bundle "$TAMPERED_BUNDLE" --pubkey /etc/universal-db-mcp/keys/release.pub.pem 2>&1)"
+VOUT="$(python3 /usr/local/lib/udbmcp-trust/verify_bundle.py --bundle "$TAMPERED_BUNDLE" --pubkey /etc/universal-db-mcp/keys/release.pub.pem --no-installed-manifest 2>&1)"
 VRC=$?
 echo "$VOUT" > "$EV/tamper-verify.log"
 if [ "$VRC" -ne 0 ] && echo "$VOUT" | grep -q "signature verification FAILED"; then

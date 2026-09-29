@@ -27,7 +27,7 @@ ENV: dict[str, str] = {
 EXPECTED_ENTRY: dict[str, Any] = {
     "type": "stdio",
     "command": "/opt/universal-db-mcp/venv/bin/python",
-    "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+    "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
     "env": {"UDBMCP_CONFIG": "/etc/universal-db-mcp/config.yaml"},
 }
 

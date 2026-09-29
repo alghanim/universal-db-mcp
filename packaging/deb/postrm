@@ -22,9 +22,11 @@
 #   /etc/systemd/system/universal-db-mcp.service.d/
 #                                        <- postinst's deferred-install guard
 #                                           drop-in lives here
+#   /var/lib/universal-db-mcp-package/   <- postinst's record of the deployed
+#                                           unit's hash (upgrade decisions),
+#                                           in a directory root alone can write
 #   /var/lib/universal-db-mcp/.shipped-unit.sha256
-#                                        <- postinst's record of the deployed
-#                                           unit's hash (upgrade decisions)
+#                                        <- where releases before that kept it
 #
 # That is the entire job of this script: on `purge`, remove the venv tree,
 # the published manifest, the deployed unit with its drop-in directory and
@@ -72,6 +74,7 @@ MANIFEST_FILE="/opt/universal-db-mcp/manifest.json"
 CONFIG_FILE="/etc/universal-db-mcp/config.yaml"
 UNIT_FILE="/etc/systemd/system/universal-db-mcp.service"
 UNIT_DROPIN_DIR="/etc/systemd/system/universal-db-mcp.service.d"
+UNIT_RECORD_DIR="/var/lib/universal-db-mcp-package"
 SHIPPED_UNIT_RECORD="/var/lib/universal-db-mcp/.shipped-unit.sha256"
 
 warn() {
@@ -110,6 +113,10 @@ case "${1:-}" in
             rm -rf "$UNIT_DROPIN_DIR"
             echo "universal-db-mcp postrm: purged $UNIT_DROPIN_DIR."
             unit_removed=1
+        fi
+        if [ -d "$UNIT_RECORD_DIR" ]; then
+            rm -rf "$UNIT_RECORD_DIR"
+            echo "universal-db-mcp postrm: purged $UNIT_RECORD_DIR."
         fi
         if [ -f "$SHIPPED_UNIT_RECORD" ]; then
             rm -f "$SHIPPED_UNIT_RECORD"

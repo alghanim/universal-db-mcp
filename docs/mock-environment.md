@@ -24,19 +24,37 @@ channel, `udbmcp-release.pub.pem`) to the air-gapped target.
 
 ## 2. Air-gapped target: verify and install
 
+Install the trusted tools and the public key first, from the release's
+`trusted-tools/` directory, never from the bundle's own `installers/`
+reference copies (`docs/offline-deployment.md`, "Trust bootstrap"). Then:
+
 ```bash
-python3 installers/verify_bundle.py \
+sudo python3 -I /usr/local/lib/udbmcp-trust/verify_bundle.py \
     --bundle universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312 \
-    --pubkey udbmcp-release.pub.pem          # FAILS CLOSED on any mismatch
-sudo bash installers/install_offline.sh \
+    --pubkey /etc/universal-db-mcp/keys/release.pub.pem   # FAILS CLOSED on any mismatch
+sudo UDBMCP_RELEASE_PUBKEY=/etc/universal-db-mcp/keys/release.pub.pem \
+    bash /usr/local/lib/udbmcp-trust/install_offline.sh \
     universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312 /opt/universal-db-mcp
 ```
 
-The installer runs pip with `--no-index --require-hashes --only-binary=:all:`
-against the bundle wheelhouse only; a hostile inherited pip config cannot
-cause a download (proven in the Gate A-negative evidence).
+On the install target the verifier also compares the bundle with the
+installed release (`/opt/universal-db-mcp/manifest.json`, when present) and
+refuses an older one. The installer verifies the bundle again, refuses an
+older release than the installed one, and runs pip with `--no-index
+--require-hashes --only-binary=:all:` against the bundle wheelhouse only; a
+hostile inherited pip config cannot cause a download (proven in the Gate
+A-negative evidence).
 
 ## 3. Configure connections (secrets never in the config file)
+
+The tarball installer does not create the config; put the bundle's template
+in place, readable by the service account only:
+
+```bash
+sudo install -m 640 -o root -g udbmcp \
+    universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312/config-templates/config.yaml \
+    /etc/universal-db-mcp/config.yaml
+```
 
 `/etc/universal-db-mcp/config.yaml` — connection block pattern (see
 `config.mockdbs.yaml` in the repository for a complete worked example):
@@ -53,8 +71,18 @@ connections:
     database: finance
     username_env: FINANCE_PG_USER          # resolved from the process environment
     password_file: /run/secrets/finance_pg_password   # 0600 file
-    read_only: true
+    allowed_schemas: [reporting]           # agents then write reporting.<table>
 ```
+
+With `allowed_schemas` set, every table in an agent's statement must be
+schema-qualified (`SELECT * FROM reporting.orders`); a bare name is refused
+with the qualified name to use. Without an allowlist, under the default
+`default_deny_objects: true`, a bare name is refused too where the session
+looks bare names up in another schema first (on the loopback fixtures,
+mock_pg's bare `readings`, which lives in `ocean` while the `search_path` is
+`public`, and mock_db2's bare `CITIZENS` in `MOI`), and a name must be
+spelled as the catalog spells it. Give the login SELECT on those schemas
+only.
 
 Validate before serving:
 
@@ -65,8 +93,10 @@ sudo -u udbmcp /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp \
 
 ## 4. Connect the agent
 
-**stdio (agent and server on the same machine):** `~/.mcp.json` or project
-`.mcp.json`:
+**stdio (agent and server on the same machine):** run
+`udbmcp configure-agents` as the user who runs the agent
+(`docs/claude-code-integration.md`). For Claude Code it writes
+`~/.claude.json`:
 
 ```json
 {
@@ -74,24 +104,33 @@ sudo -u udbmcp /opt/universal-db-mcp/venv/bin/python -m universal_db_mcp \
     "universal-db": {
       "type": "stdio",
       "command": "/opt/universal-db-mcp/venv/bin/python",
-      "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
-      "env": {
-        "UDBMCP_CONFIG": "/etc/universal-db-mcp/config.yaml",
-        "FINANCE_PG_USER": "udbmcp_ro"
-      }
+      "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+      "env": { "UDBMCP_CONFIG": "/home/<you>/.universal-db-mcp/config.yaml" }
     }
   }
 }
 ```
 
-The agent process launches the server as a child; stdout is protocol-only.
+The server runs as your user, so it reads your per-user config, not the
+service's `/etc/universal-db-mcp/config.yaml`, whose audit log only the
+service account can write. The `.pkg`, and the tarball steps here and in
+`docs/offline-deployment.md`, leave that file unreadable to other users; the
+`.deb` ships it `root:root` 0644, so on a `.deb` host run
+`sudo chown root:udbmcp /etc/universal-db-mcp/config.yaml &&
+sudo chmod 640 /etc/universal-db-mcp/config.yaml` before `configure-agents`,
+or it registers the service's file. `-I` keeps the open project's files off
+the server's import path. A connection whose credentials come from `username_env` or
+`password_env` needs those variables in the harness's own environment;
+`configure-agents` names such connections. The agent process launches the
+server as a child; stdout is protocol-only.
 Every tool call is guard-checked (dialect-aware SQL validation, read-only
 enforcement), row/byte/time bounded, and audited.
 
 **HTTP (agent and server on different machines, credentials hidden from the
-agent):** run the server as a service (`operations/universal-db-mcp.service`)
-with `transport: http`, a `http_bearer_token_file`, and an internal reverse
-proxy in front; the agent registers:
+agent):** run the server as a service (the bundle's
+`operations/universal-db-mcp.service`) with `transport: http`, a
+`http_bearer_token_file`, and an internal reverse proxy in front; the agent
+registers:
 
 ```json
 {
@@ -128,7 +167,18 @@ The probe is an MCP client over the pinned SDK: it initializes the server,
 lists the 29 tools, and runs one themed query per configured engine. On a
 healthy deployment it reports `status: passed`; per-engine `KNOWN-BLOCKED`
 entries name the specific missing administrator prerequisite (e.g. the SQL
-Server ODBC driver package).
+Server ODBC driver package). A login failure (`Login failed`, 18456, SQLSTATE
+28000, Db2 `USERNAME AND/OR PASSWORD INVALID`) counts as `FAILED`.
+
+For the local fixtures, `scripts/fixtures/start_mock_dbs.sh` starts the
+containers, writes their passwords to `out/mockdb-secrets/*.pw` (0600) and
+prints the `UDBMCP_DEMO_*_USER` exports to use; `config.mockdbs.yaml` takes
+each user name from those variables, and its paths are relative to the file
+itself (the repository root), so it works from any checkout and any working
+directory. The SQL Server fixture's reader login is `udbmcp_ro`
+(`db_datareader` plus `SHOWPLAN`, so `db_explain` works); `sa` only seeds.
+The probe defaults to those users and honours exported values. Fixtures
+created before the reader login existed must be recreated with the script.
 
 > **SQL Server driver note:** the `KNOWN-BLOCKED` SQL Server entry means the
 > ODBC Driver 18 package is absent on the machine running the probe. On the
@@ -162,14 +212,21 @@ row to the home-level patch layer `$DSH_HOME/cordis.patch.yml` (default
         serverName: udb
         transport: stdio
         command: /opt/universal-db-mcp/venv/bin/python
-        args: ['-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']
+        args: ['-I', '-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']
         env:
-          UDBMCP_CONFIG: /etc/universal-db-mcp/config.yaml
+          UDBMCP_CONFIG: /home/<you>/.universal-db-mcp/config.yaml
           # username_env values for each connection (the bridge scrubs
           # ambient secret-looking env names; pass them explicitly):
           FINANCE_PG_USER: udbmcp_ro
         failOnStartupError: true
 ```
+
+`udbmcp configure-agents --agent dsh` writes this row for you. A row with
+this id that starts the server without `-I` (also through a wrapper or a
+shell command line), or several rows with this id, are refused (fail closed):
+keep one row whose args start with `-I`. Only the exact row an earlier
+release of this tool wrote is upgraded in place. The patch file's line
+endings (LF or CRLF) are kept.
 
 Verify the row composes without booting the agent:
 

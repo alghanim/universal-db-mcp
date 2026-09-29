@@ -230,6 +230,7 @@ def test_postgres_list_tables_escapes_literal_percent(app_ctx, demo_policy) -> N
 
     conn = PostgresConnector.__new__(PostgresConnector)
     conn.connection = app_ctx.resolved["demo_sqlite"]  # never dialled; meta conn is faked
+    conn.policy = demo_policy  # the catalog filter keeps the schemas the policy opened
     conn._meta_conn = None
     captured: dict = {}
 
@@ -318,7 +319,13 @@ def test_p0_unqualified_name_reauthorizes_schema() -> None:
     g = SqlGuard("postgres", _pg_policy_with_schema(["reporting"]), _Resolver())
     with pytest.raises(ToolFailure, match="not permitted"):
         g.validate_select("SELECT * FROM salaries")  # resolves to hr.salaries -> denied
-    g.validate_select("SELECT * FROM demo")  # resolves to reporting.demo -> allowed
+    # under an allowlist a bare name is refused even where it resolves to an
+    # allowed schema (owner decision 2026-09-27): the engine binds it, not the policy
+    with pytest.raises(ToolFailure, match="write reporting.demo"):
+        g.validate_select("SELECT * FROM demo")
+    g.validate_select("SELECT * FROM reporting.demo")
+    with pytest.raises(ToolFailure, match="not permitted"):
+        g.validate_select("SELECT * FROM hr.salaries")
 
 
 def test_p0_tables_for_filters_by_allowed_schemas() -> None:
@@ -330,22 +337,36 @@ def test_p0_tables_for_filters_by_allowed_schemas() -> None:
     policy = _pg_policy_with_schema(["public"])
 
     class FakeCache:
-        def get_tables(self, *a: object) -> None:
+        def get_tables(self, *a: object, **kw: object) -> None:
             return None
 
-        def put_tables(self, *a: object) -> None:
+        def put_tables(self, *a: object, **kw: object) -> None:
             return None
 
     class FakeApp:
         cache = FakeCache()
+        schema_names = srv.AppContext.schema_names
+
+        def __init__(self) -> None:
+            self._schema_names: dict[str, object] = {}
+
+        def _target(self, _connection_id: str) -> str:
+            return "target"
 
     tables = [
         TableSummary(schema="public", name="orders", kind="table", row_estimate=None),
         TableSummary(schema="hr", name="salaries", kind="table", row_estimate=None),
     ]
 
+    class Catalog:
+        def list_tables(self, *_a: object) -> list[TableSummary]:
+            return tables
+
+        def list_schemas(self, *_a: object) -> list[str]:
+            return ["hr", "public"]
+
     async def fake_run_meta(app, cid, fn):  # type: ignore[no-untyped-def]
-        return tables
+        return fn(Catalog())
 
     orig = srv.run_meta
     srv.run_meta = fake_run_meta  # type: ignore[assignment]
@@ -786,6 +807,17 @@ def test_mysql_shared_metadata_connection_discarded_on_error() -> None:
     assert len(connects) == 2 and not connects[1].closed
 
 
+class _PyMySQLEscapingConn:
+    """The connection side of PyMySQL's client-side formatter. 1.2.0 escapes
+    values through literal(), later 1.x releases through escape() (read even
+    for an empty tuple), so the fake offers both."""
+
+    def literal(self, obj: object) -> str:
+        return repr(obj)
+
+    escape = literal
+
+
 def test_mysql_unparameterised_query_is_sent_verbatim() -> None:
     """PyMySQL runs ``query % args`` whenever args is not None — an empty
     tuple included — so ``parameters or ()`` made every unparameterised
@@ -812,9 +844,9 @@ def test_mysql_unparameterised_query_is_sent_verbatim() -> None:
 
     # Prove the contract against the real driver's client-side formatter.
     cur = pymysql.cursors.Cursor.__new__(pymysql.cursors.Cursor)
-    cur.connection = object()  # _get_db() only checks truthiness
+    cur.connection = _PyMySQLEscapingConn()
     assert cur.mogrify(sql, None) == sql
-    with pytest.raises((TypeError, ValueError)):
+    with pytest.raises((TypeError, ValueError, pymysql.err.ProgrammingError)):
         cur.mogrify(sql, ())
 
 
@@ -915,6 +947,10 @@ class _PgFakeConn:
     def cancel(self) -> None:
         self.cancel_count += 1
 
+    def cancel_safe(self, timeout: float | None = None) -> None:
+        # psycopg's non-blocking cancel (libpq's PQcancel holds the GIL)
+        self.cancel_count += 1
+
     def close(self) -> None:
         self.closed = True
 
@@ -988,8 +1024,11 @@ def test_postgres_meta_conn_discarded_on_error() -> None:
     state = _PgFakeState(fail_executes=1)
     _pg_fake_connect(conn, state)
 
-    with pytest.raises(RuntimeError, match="simulated"):
+    # The driver error reaches the caller translated at the connector
+    # boundary (driver_helpers.translated_driver_errors), cause attached.
+    with pytest.raises(ConnectorError, match="simulated") as info:
         conn.list_views(None)
+    assert isinstance(info.value.__cause__, RuntimeError)
     assert conn._meta_conn is None
     assert state.connects[0].closed
     assert not conn._pool_lock.locked()  # the lock is released on the error path
@@ -4424,9 +4463,29 @@ class _CHFakeResult:
         self.column_names = names
 
 
+class _CHFakeStream:
+    """``query_column_block_stream`` stand-in: a context manager whose
+    ``source`` carries the column names and which yields column-oriented
+    blocks (here one, built from the given rows)."""
+
+    def __init__(self, rows: list, names: list) -> None:
+        self.source = _CHFakeResult([], names)
+        self._blocks = [[list(col) for col in zip(*rows, strict=True)]] if rows else []
+
+    def __enter__(self) -> _CHFakeStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(self._blocks)
+
+
 class _CHFakeClient:
     """Mimics the clickhouse-connect client surface the connector uses:
-    a shared-by-reference ``params`` dict, ``query``, ``command``, ``close``."""
+    a shared-by-reference ``params`` dict, ``query_column_block_stream``,
+    ``query``, ``command``, ``close``."""
 
     def __init__(self, state: dict) -> None:
         self.params: dict = {}
@@ -4434,6 +4493,11 @@ class _CHFakeClient:
 
     def set_client_setting(self, name: str, value: object) -> None:
         self.params[name] = value
+
+    def query_column_block_stream(self, sql: str, parameters: object = None, settings: object = None) -> _CHFakeStream:
+        self._state["queries"].append((sql, parameters))
+        self._state["query_id_seen"] = self.params.get("query_id")
+        return _CHFakeStream([("1",)], ["v"])
 
     def query(self, sql: str, parameters: object = None) -> _CHFakeResult:
         self._state["queries"].append((sql, parameters))
@@ -4500,14 +4564,17 @@ def test_clickhouse_cancel_kills_the_pinned_query_id(monkeypatch) -> None:
     monkeypatch.setattr(ch_module, "open_module", lambda name, hint: fake_module)
 
     # Simulate the executor's deadline hook firing mid-flight.
-    original_query = _CHFakeClient.query
+    original_stream = _CHFakeClient.query_column_block_stream
 
-    def query_with_hook(self, sql, parameters=None):  # type: ignore[no-untyped-def]
+    def stream_with_hook(self, sql, parameters=None, settings=None):  # type: ignore[no-untyped-def]
         state["cancel_during_flight"] = conn.cancel_current()
-        return original_query(self, sql, parameters)
+        return original_stream(self, sql, parameters, settings)
 
-    monkeypatch.setattr(_CHFakeClient, "query", query_with_hook)
-    conn._execute(QuerySpec(sql="SELECT 1"))
+    monkeypatch.setattr(_CHFakeClient, "query_column_block_stream", stream_with_hook)
+    # The hook also flags the fetch loop (hardening 2026-09-27, F07): the
+    # abandoned worker stops at its next row instead of reading on.
+    with pytest.raises(ConnectorError, match="cancel"):
+        conn._execute(QuerySpec(sql="SELECT 1"))
     qid = state["query_id_seen"]
     assert qid, "the executing client must pin a query_id for cancellation"
     assert state["cancel_during_flight"] is True
@@ -4580,9 +4647,10 @@ def test_mysql_driver_errors_become_connector_error() -> None:
 
 
 def test_mysql_catalog_queries_exclude_system_schemas() -> None:
-    """mysql.*, performance_schema.*, sys.* and information_schema must never
-    be listed: tables_for turns catalog rows into permitted resolver entries
-    under the default (empty allowed_schemas) policy."""
+    """mysql.*, performance_schema.* and sys.* must never be listed: tables_for
+    turns catalog rows into permitted resolver entries under the default
+    (empty allowed_schemas) policy. information_schema is listed only when
+    security.allowed_system_schemas opens it (it does by default)."""
     conn = _mysql_connector()
     state: dict = {"calls": []}
 
@@ -4613,13 +4681,19 @@ def test_mysql_catalog_queries_exclude_system_schemas() -> None:
 
     conn._connect = lambda: _Conn()  # type: ignore[method-assign]
 
+    def assert_excluded(call: tuple[str, object]) -> None:
+        # spelled inline or bound; information_schema is left to the policy,
+        # whose security.allowed_system_schemas opens it by default
+        sql, args = call
+        assert "table_schema NOT IN (" in sql, sql
+        for name in ("mysql", "performance_schema", "sys"):
+            assert f"'{name}'" in sql or name in list(args or ()), (name, sql, args)
+
     conn.list_tables(None, {"table", "view"}, None)
-    tables_sql = state["calls"][-1][0]
-    assert "table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" in tables_sql
+    assert_excluded(state["calls"][-1])
 
     conn.list_views(None)
-    views_sql = state["calls"][-1][0]
-    assert "table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" in views_sql
+    assert_excluded(state["calls"][-1])
 
 
 def test_mssql_dict_parameters_fail_as_connector_error(monkeypatch) -> None:
@@ -4842,11 +4916,14 @@ def test_install_offline_never_chowns_install_tree_to_caller() -> None:
     """The installer used to `chown $(id -u):$(id -g)` the target when it was
     not writable, handing the interactive operator ownership of the code the
     udbmcp service and root-run tools execute."""
+    import re
+
     text = _offline_script("install_offline.sh").read_text(encoding="utf-8")
     assert 'chown "$(id -u):$(id -g)"' not in text, "install tree must never be chowned to the caller"
     assert 'install -d -m 755 -o root -g root "$TARGET"' in text, "target must be created root-owned"
-    # the venv and the pip install run in the privileged context
-    assert "$sudo_ok \"$PY\" -m venv" in text
+    # the venv and the pip install run in the privileged context (whatever
+    # interpreter flags the venv build passes, such as -I)
+    assert re.search(r'\$sudo_ok "\$PY"(?: -[A-Za-z]+)* -m venv\b', text), "venv must be built privileged"
     assert "$sudo_ok env" in text and "-r \"$BUNDLE/requirements/runtime.lock\"" in text
 
 
@@ -5142,7 +5219,7 @@ def test_upgrade_offline_closes_verify_then_use_and_switch_windows() -> None:
     kill window between the two switch renames that used to leave NO venv; the
     script must stage+re-verify and restore venv.previous on interruption."""
     text = _offline_script("upgrade_offline.sh").read_text(encoding="utf-8")
-    assert "udbmcp-upgrade." in text and "cp -a" in text, "must stage a private copy"
+    assert "udbmcp-upgrade." in text and 'STAGING="$(private_copy "$NEW_BUNDLE"' in text, "must stage a private copy"
     assert text.index("mktemp -d") < text.index('mv "$NEWVENV" "$TARGET/venv"')
     assert "restore_previous_venv_on_interrupt" in text
     assert "[ ! -d \"$TARGET/venv\" ]" in text, "restore must fire only when no venv exists"
@@ -5331,17 +5408,31 @@ async def test_tables_for_survives_metadata_cache_errors(anyio_backend: str) -> 
     tables = [TableSummary(schema="public", name="orders", kind="table", row_estimate=None)]
 
     class ExplodingCache:
-        def get_tables(self, *a: object) -> None:
+        def get_tables(self, *a: object, **kw: object) -> None:
             raise sqlite3.OperationalError("database is locked")
 
-        def put_tables(self, *a: object) -> None:
+        def put_tables(self, *a: object, **kw: object) -> None:
             raise sqlite3.OperationalError("database is locked")
 
     class FakeApp:
         cache = ExplodingCache()
+        schema_names = srv.AppContext.schema_names
+
+        def __init__(self) -> None:
+            self._schema_names: dict[str, object] = {}
+
+        def _target(self, _connection_id: str) -> str:
+            return "target"
+
+    class Catalog:
+        def list_tables(self, *_a: object) -> list[TableSummary]:
+            return tables
+
+        def list_schemas(self, *_a: object) -> list[str]:
+            return ["public"]
 
     async def fake_run_meta(app, cid, fn):  # type: ignore[no-untyped-def]
-        return tables
+        return fn(Catalog())
 
     policy = _pg_policy_with_schema(["public"])
     orig = srv.run_meta
@@ -5874,8 +5965,10 @@ def test_systemd_unit_sets_restrictive_umask() -> None:
 
 # ---------------------------------------------------------------------------
 # Postgres EXPLAIN with parenthesized options (final residual-fix wave)
-# EXPLAIN (FORMAT JSON) / (VERBOSE) / (ANALYZE, ...) must be accepted instead
-# of being rejected as unparseable, while ANALYZE/WAL stay policy-gated.
+# EXPLAIN (FORMAT YAML) / (VERBOSE) must be accepted instead of being rejected
+# as unparseable, while ANALYZE/WAL stay policy-gated. Since the 2026-09-27
+# review (F89) options reach the engine or are refused, never dropped: FORMAT
+# JSON and the executing options are refused even when policy allows ANALYZE.
 
 
 def _explain_guard(allow_explain_analyze: bool):  # type: ignore[no-untyped-def]
@@ -5891,13 +5984,17 @@ def _explain_guard(allow_explain_analyze: bool):  # type: ignore[no-untyped-def]
 
 def test_p0_explain_parenthesized_options_allowed_without_analyze_flag() -> None:
     g = _explain_guard(allow_explain_analyze=False)
-    for sql in (
-        "EXPLAIN (FORMAT JSON) SELECT * FROM reporting.demo",
-        "EXPLAIN (VERBOSE) SELECT * FROM reporting.demo",
-        "EXPLAIN (COSTS TRUE) SELECT * FROM reporting.demo",
+    for sql, options in (
+        ("EXPLAIN (FORMAT YAML) SELECT * FROM reporting.demo", "(FORMAT YAML) "),
+        ("EXPLAIN (VERBOSE) SELECT * FROM reporting.demo", "(VERBOSE) "),
+        ("EXPLAIN (COSTS TRUE) SELECT * FROM reporting.demo", "(COSTS TRUE) "),
     ):
         result = g.validate_explain(sql)
         assert result.kind == "explain"
+        assert result.text is not None and result.text.startswith(options)
+    # the connector renders text plans, so a JSON plan is refused, not dropped
+    with pytest.raises(ToolFailure, match="VALIDATION_ERROR"):
+        g.validate_explain("EXPLAIN (FORMAT JSON) SELECT * FROM reporting.demo")
 
 
 def test_p0_explain_parenthesized_analyze_policy_gated() -> None:
@@ -5910,15 +6007,19 @@ def test_p0_explain_parenthesized_analyze_policy_gated() -> None:
     ):
         with pytest.raises(ToolFailure, match="disabled by policy"):
             g_off.validate_explain(sql)
-        assert g_on.validate_explain(sql).kind == "explain"
+        # allowing ANALYZE by policy does not smuggle it through the option list
+        with pytest.raises(ToolFailure, match="VALIDATION_ERROR"):
+            g_on.validate_explain(sql)
 
 
-def test_p0_explain_legacy_bare_analyze_unchanged() -> None:
+def test_p0_explain_legacy_bare_analyze_is_refused() -> None:
     g_off = _explain_guard(allow_explain_analyze=False)
     g_on = _explain_guard(allow_explain_analyze=True)
     with pytest.raises(ToolFailure, match="disabled by policy"):
         g_off.validate_explain("EXPLAIN ANALYZE SELECT * FROM reporting.demo")
-    assert g_on.validate_explain("EXPLAIN ANALYZE SELECT * FROM reporting.demo").kind == "explain"
+    # refused like (ANALYZE), never dropped from the text sent to the engine
+    with pytest.raises(ToolFailure, match="VALIDATION_ERROR"):
+        g_on.validate_explain("EXPLAIN ANALYZE SELECT * FROM reporting.demo")
     # the plain form is unchanged and needs no flag
     assert g_off.validate_explain("EXPLAIN SELECT * FROM reporting.demo").kind == "explain"
 
@@ -6646,8 +6747,10 @@ def test_clickhouse_cell_truncation_sets_flag_and_names_column(monkeypatch) -> N
         def set_client_setting(self, name: str, value: object) -> None:
             self.params[name] = value
 
-        def query(self, sql: str, parameters: object = None) -> _Res:
-            return _Res([["x" * 20000]], ["big_text"])
+        def query_column_block_stream(
+            self, sql: str, parameters: object = None, settings: object = None
+        ) -> _CHFakeStream:
+            return _CHFakeStream([("x" * 20000,)], ["big_text"])
 
         def close(self) -> None:
             pass
@@ -6689,6 +6792,11 @@ async def test_db_query_envelope_reports_cell_truncation(tmp_path, monkeypatch) 
             if sql == "SELECT 1":
                 return _Res([["1"]], ["v"])
             return _Res([["x" * 20000]], ["big_text"])
+
+        def query_column_block_stream(
+            self, sql: str, parameters: object = None, settings: object = None
+        ) -> _CHFakeStream:
+            return _CHFakeStream([("x" * 20000,)], ["big_text"])
 
         def close(self) -> None:
             pass
@@ -6746,7 +6854,9 @@ def _param_guard(engine: str):  # type: ignore[no-untyped-def]
 
     from universal_db_mcp.security.sql_guard import SqlGuard, StaticResolver
 
-    policy = FakePolicy(engine=engine)
+    # no schema allowlist: under one a bare name is refused, and bare names
+    # keep these statements about the placeholders
+    policy = FakePolicy(engine=engine, allowed_schemas=frozenset())
     resolver = StaticResolver({(None, "t"), ("main", "t")})
     return SqlGuard(engine, policy, resolver)  # type: ignore[arg-type]
 
@@ -6813,15 +6923,12 @@ def test_mysql_connector_translates_paramstyle_before_driver() -> None:
     # Prove the contract against the real driver's client-side formatter: the
     # translated statement + values mogrify without error (the pre-fix qmark
     # form raised TypeError, the :name form produced server-side 1064).
-    class _LiteralConn:
-        def literal(self, obj: object) -> str:
-            return repr(obj)
-
+    # PyMySQL after 1.2.0 re-raises the formatter's TypeError as ProgrammingError.
     cur = pymysql.cursors.Cursor.__new__(pymysql.cursors.Cursor)
-    cur.connection = _LiteralConn()
+    cur.connection = _PyMySQLEscapingConn()
     assert cur.mogrify("SELECT * FROM t WHERE a = %s AND b > %s", [1, 2])
     assert cur.mogrify("SELECT * FROM t WHERE a = %(x)s", {"x": 1})
-    with pytest.raises((TypeError, ValueError)):
+    with pytest.raises((TypeError, ValueError, pymysql.err.ProgrammingError)):
         cur.mogrify("SELECT * FROM t WHERE a = ? AND b > ?", [1, 2])
 
     for sql, params in [
@@ -6849,7 +6956,7 @@ async def test_parameterized_query_reaches_driver_through_execution_service(anyi
     state = _mysql_fake_state(conn)
     conn._connect = lambda: _MySQLFakeConn(state)  # type: ignore[method-assign]
 
-    policy = FakePolicy(engine="mysql")
+    policy = FakePolicy(engine="mysql", allowed_schemas=frozenset())  # no allowlist: the bare name resolves
     guard = SqlGuard("mysql", policy, StaticResolver({(None, "t")}))  # type: ignore[arg-type]
     sql = "SELECT * FROM t WHERE a = ? AND b > ?"
     validated = guard.validate_select(sql)  # qmark parses natively

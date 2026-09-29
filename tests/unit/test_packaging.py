@@ -240,19 +240,19 @@ def _platform_flags(cmd: list[str]) -> list[str]:
 
 
 def test_pip_command_linux_uses_single_manylinux_platform() -> None:
-    cmd = pob.pip_download_command(PROFILES[LINUX], ["pyodbc"], Path("wh"), Path("c.txt"))
+    cmd = pob.pip_download_command(PROFILES[LINUX], Path("wh"), Path("closure.txt"))
     assert _platform_flags(cmd) == ["manylinux2014_x86_64"]
     assert cmd[cmd.index("--python-version") + 1] == "3.12"
     assert cmd[cmd.index("--abi") + 1] == "cp312"
 
 
 def test_pip_command_windows_uses_win_amd64() -> None:
-    cmd = pob.pip_download_command(PROFILES[WINDOWS], ["pyodbc"], Path("wh"), Path("c.txt"))
+    cmd = pob.pip_download_command(PROFILES[WINDOWS], Path("wh"), Path("closure.txt"))
     assert _platform_flags(cmd) == ["win_amd64"]
 
 
 def test_pip_command_macos_passes_repeated_platform_flags() -> None:
-    cmd = pob.pip_download_command(PROFILES[MACOS], ["ibm-db"], Path("wh"), Path("c.txt"))
+    cmd = pob.pip_download_command(PROFILES[MACOS], Path("wh"), Path("closure.txt"))
     assert _platform_flags(cmd) == ["macosx_11_0_arm64", "macosx_14_0_arm64"]
 
 

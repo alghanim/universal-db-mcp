@@ -37,7 +37,7 @@ ROW_SHAPE = {
                 "serverName": "udb",
                 "transport": "stdio",
                 "command": FAKE_PYTHON,
-                "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+                "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
                 "env": {"UDBMCP_CONFIG": FAKE_CONFIG},
                 "failOnStartupError": True,
             },
@@ -90,7 +90,7 @@ def test_detect_recognizes_live_style_registration_as_configured(tmp_path: Path,
         serverName: udb
         transport: stdio
         command: /old/venv/bin/python
-        args: ['-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']
+        args: ['-I', '-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']
         env:
           UDBMCP_CONFIG: /old/config.mockdbs.yaml
           UDBMCP_DEMO_PG_USER: udbmcp_ro
@@ -102,6 +102,10 @@ def test_detect_recognizes_live_style_registration_as_configured(tmp_path: Path,
 """
     home = make_dsh_home(tmp_path, with_patch=existing)
     assert detect(home) == CONFIGURED
+    # The same row as written before -I (another interpreter and config, so
+    # not upgradeable) still starts the server unisolated: never "configured".
+    (home / "cordis.patch.yml").write_text(existing.replace("['-I', '-m',", "['-m',"), encoding="utf-8")
+    assert detect(home) == UNKNOWN
 
 
 def test_detect_installed_unconfigured_when_patch_lacks_registration(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -171,7 +175,7 @@ def test_plan_describes_exact_bytes_for_fresh_file(tmp_path: Path, monkeypatch) 
     assert f"    - id: {REGISTRATION_ID}" in p.config_block
     assert f"        command: {FAKE_PYTHON}" in p.config_block
     assert f"          UDBMCP_CONFIG: {FAKE_CONFIG}" in p.config_block
-    assert "args: ['-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']" in p.config_block
+    assert "args: ['-I', '-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']" in p.config_block
     assert p.config_block == dsh._registration_block()
     # logical entry matches the block and carries no secrets
     assert p.entry["id"] == REGISTRATION_ID

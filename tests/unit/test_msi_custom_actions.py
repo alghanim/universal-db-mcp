@@ -158,7 +158,9 @@ def test_service_create_shape(sources: dict[str, str]) -> None:
     assert has_sc_subcommand(text, "create")
     assert "binPath= " in text
     assert "start= auto" in text
-    assert '" -m universal_db_mcp serve --transport http' in text
+    # -I: the LocalSystem service reads no PYTHON* variables, user site or
+    # working directory
+    assert '" -I -m universal_db_mcp serve --transport http' in text
     assert "obj= " in text, "service account property must be passed to obj="
 
 
