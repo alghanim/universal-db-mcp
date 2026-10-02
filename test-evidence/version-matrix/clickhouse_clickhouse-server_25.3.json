@@ -1,31 +1,31 @@
 {
   "label": "clickhouse/clickhouse-server:25.3",
   "engine": "clickhouse",
-  "probe_rev": "c820896",
-  "started_utc": "2026-09-16T20:37:15Z",
+  "probe_rev": "ec47573",
+  "started_utc": "2026-10-02T22:04:22Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 129,
+      "ms": 155,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 9,
+      "ms": 12,
       "detail": "25.3.14.14"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 6,
+      "ms": 5,
       "detail": "vm"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 4,
+      "ms": 3,
       "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(system.tables.total_rows)', comment=None), TableSummary(schema='vm', name='orders', k"
     },
     {
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 2,
+      "ms": 5,
       "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
     },
     {
@@ -67,7 +67,7 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 2,
+      "ms": 3,
       "detail": "(sorting key)"
     },
     {
@@ -103,37 +103,37 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 7,
+      "ms": 20,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 10,
+      "ms": 18,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 5,
+      "ms": 9,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 5,
+      "ms": 6,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 4,
+      "ms": 10,
       "detail": "['raw']"
     }
   ],
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:37:15Z",
+  "finished_utc": "2026-10-02T22:04:22Z",
   "summary": {
     "passed": 19,
     "failed": []

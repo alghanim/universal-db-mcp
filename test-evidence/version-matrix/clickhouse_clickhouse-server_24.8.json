@@ -1,31 +1,31 @@
 {
   "label": "clickhouse/clickhouse-server:24.8",
   "engine": "clickhouse",
-  "probe_rev": "c820896",
-  "started_utc": "2026-09-16T20:36:55Z",
+  "probe_rev": "ec47573",
+  "started_utc": "2026-10-02T22:04:01Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 121,
+      "ms": 142,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 6,
+      "ms": 7,
       "detail": "24.8.14.39"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 4,
+      "ms": 6,
       "detail": "vm"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 4,
+      "ms": 2,
       "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(system.tables.total_rows)', comment=None), TableSummary(schema='vm', name='orders', k"
     },
     {
@@ -85,7 +85,7 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "v_orders"
     },
     {
@@ -97,7 +97,7 @@
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "catalog_estimate(system.tables)"
     },
     {
@@ -109,25 +109,25 @@
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 7,
+      "ms": 15,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 5,
+      "ms": 7,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 4,
+      "ms": 5,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:36:55Z",
+  "finished_utc": "2026-10-02T22:04:01Z",
   "summary": {
     "passed": 19,
     "failed": []

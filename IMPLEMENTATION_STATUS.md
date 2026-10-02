@@ -1302,7 +1302,15 @@ the residuals).
   rollback and the post-rollback probe included, and
   `scripts/http_client_evidence.py` passed (29 tools over TLS through nginx;
   wrong or missing token refused with 401; `test-evidence/http-transport/`
-  refreshed). Still to re-run before a release: the version matrix.
+  refreshed). The version matrix was re-run the same day: 26 of 26 rows
+  pass (PostgreSQL 12-17, MySQL 5.7/8.0/8.4, MariaDB 10.6/11.4, ClickHouse
+  23.8-25.3, Oracle 18.4/21.3/23 thin and 11.2/18.4/23 thick, SQL Server
+  2017/2019/2022, Db2 11.5.8/11.5.9; `test-evidence/version-matrix/`). Two
+  harness fixes were needed: the Oracle probe seeded into `SYSTEM`, which the
+  connector now leaves out of its listings as Oracle-maintained, so it seeds
+  an ordinary `VM` schema; and the SQL Server and Oracle-thick runners no
+  longer go on when `docker network create` fails (a host whose address pools
+  are exhausted pre-creates the network with an explicit `--subnet`).
 
 **Owner actions:**
 

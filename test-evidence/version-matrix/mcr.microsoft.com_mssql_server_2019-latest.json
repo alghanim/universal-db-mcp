@@ -1,31 +1,31 @@
 {
   "label": "mcr.microsoft.com/mssql/server:2019-latest",
   "engine": "mssql",
-  "probe_rev": "1a66c3c",
-  "started_utc": "2026-09-18T12:33:28Z",
+  "probe_rev": "ec47573",
+  "started_utc": "2026-10-02T22:19:18Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 887,
+      "ms": 1168,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 24,
+      "ms": 61,
       "detail": "Microsoft SQL Server 2019 (RTM-CU32-GDR) (KB5122772) - 15.0."
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 4,
+      "ms": 8,
       "detail": "dbo"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 29,
+      "ms": 48,
       "detail": "[TableSummary(schema='dbo', name='customers', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='dbo', name='orders', kind='table', row_estimate=None, row_e"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 30,
+      "ms": 42,
       "detail": "[ColumnInfo(schema='dbo', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='dbo', table='customers', name='email', data_type='nv"
     },
     {
@@ -49,14 +49,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 17,
+      "ms": 24,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 55,
-      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83FA15"
+      "ms": 63,
+      "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition=None, primary=False, kind='nonclustered', schema='dbo', table='orders'), IndexInfo(name='PK__orders__3213E83F090"
     },
     {
       "check": "index_on_fk_visible",
@@ -67,8 +67,8 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 0,
-      "detail": "PK__customer__3213E83FDB43B1C1"
+      "ms": 3,
+      "detail": "PK__customer__3213E83F20FF8E7C"
     },
     {
       "check": "composite_unique_index",
@@ -79,61 +79,61 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 21,
+      "ms": 42,
       "detail": "customers"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 5,
+      "ms": 8,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 9,
+      "ms": 11,
       "detail": "f_one"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 36,
+      "ms": 53,
       "detail": "catalog_estimate(sys.partitions)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 2,
+      "ms": 13,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 5,
+      "ms": 11,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 26,
+      "ms": 42,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 2,
+      "ms": 9,
       "detail": "[['north', 100]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 3,
+      "ms": 13,
       "detail": "[122, 'user122@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 3,
+      "ms": 5,
       "detail": "['raw', 'rows', 'method']"
     }
   ],
@@ -148,6 +148,7 @@
     "server_read_only_available": false,
     "applied": [
       "statement_timeout=60s",
+      "quoted_identifier=on",
       "isolation=read_uncommitted",
       "lock_timeout=5000ms"
     ],
@@ -161,7 +162,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-18T12:33:29Z",
+  "finished_utc": "2026-10-02T22:19:19Z",
   "summary": {
     "passed": 22,
     "failed": []

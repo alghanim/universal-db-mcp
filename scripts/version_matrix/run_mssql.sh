@@ -13,7 +13,10 @@ NET="udbmcp-vm-mssql"
 PW="VmProbe_2026x"
 PWDIR="$(mktemp -d)"; printf '%s\n' "$PW" > "$PWDIR/pw"; chmod 600 "$PWDIR/pw"
 trap 'rm -rf "$PWDIR"; docker network rm "$NET" >/dev/null 2>&1 || true' EXIT
-docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
+docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null || {
+  echo "FAIL: cannot create docker network $NET (see the docker error above; a host whose address pools are exhausted can pre-create it with an explicit --subnet)" >&2
+  exit 1
+}
 
 if ! docker image inspect "$CLIENT_IMG" >/dev/null 2>&1; then
   echo "client image $CLIENT_IMG missing; build it with scripts/test_isolated_integrations.sh first" >&2

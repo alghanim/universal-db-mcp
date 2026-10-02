@@ -1,32 +1,32 @@
 {
   "label": "gvenzl/oracle-xe:11.2.0.2-slim (thick)",
   "engine": "oracle",
-  "probe_rev": "1a66c3c",
-  "started_utc": "2026-09-18T12:34:05Z",
+  "probe_rev": "ec47573",
+  "started_utc": "2026-10-02T22:20:09Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 621,
+      "ms": 845,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 215,
+      "ms": 234,
       "detail": "Oracle Database 11g Express Edition Release 11.2.0.2.0 - 64b"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 246,
-      "detail": "SYSTEM"
+      "ms": 285,
+      "detail": "VM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 350,
-      "detail": "[TableSummary(schema='SYSTEM', name='AQ$DEF$_AQCALL', kind='view', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='SYSTEM', name='AQ$DEF$_AQERROR', kind='view', row_es"
+      "ms": 459,
+      "detail": "[TableSummary(schema='VM', name='VM_CUSTOMERS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='VM', name='VM_ORDERS', kind='table', row_estimate=None, r"
     },
     {
       "check": "list_tables_has_seed",
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 31,
-      "detail": "[ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='SYSTEM', table='VM_CUSTOMERS', name='EM"
+      "ms": 29,
+      "detail": "[ColumnInfo(schema='VM', table='VM_CUSTOMERS', name='ID', data_type='NUMBER(10)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='VM', table='VM_CUSTOMERS', name='EMAIL', da"
     },
     {
       "check": "list_columns_count",
@@ -49,14 +49,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 344,
+      "ms": 382,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 271,
-      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='SYSTEM', table='VM_ORDERS'), IndexInfo(name='SYS_C006988', columns=["
+      "ms": 427,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='normal', schema='VM', table='VM_ORDERS'), IndexInfo(name='SYS_C006988', columns=['ID'"
     },
     {
       "check": "index_on_fk_visible",
@@ -67,7 +67,7 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 262,
+      "ms": 336,
       "detail": "SYS_C006987"
     },
     {
@@ -79,61 +79,61 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 1787,
+      "ms": 1975,
       "detail": "VM_CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 74,
+      "ms": 77,
       "detail": "VM_V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 68,
+      "ms": 72,
       "detail": "VM_F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 7,
+      "ms": 8,
       "detail": "catalog_estimate(all_tables.num_rows)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 231,
+      "ms": 227,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 235,
+      "ms": 233,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 210,
-      "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
+      "ms": 218,
+      "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 245,
-      "detail": "[['south', 67], ['north', 66]]"
+      "ms": 358,
+      "detail": "[['south', 68], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 219,
+      "ms": 230,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 466,
+      "ms": 647,
       "detail": "['raw', 'rows', 'method']"
     }
   ],
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-18T12:34:11Z",
+  "finished_utc": "2026-10-02T22:20:17Z",
   "summary": {
     "passed": 22,
     "failed": []

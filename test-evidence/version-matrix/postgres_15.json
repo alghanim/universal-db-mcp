@@ -1,25 +1,25 @@
 {
   "label": "postgres:15",
   "engine": "postgres",
-  "probe_rev": "5d8ec4e",
-  "started_utc": "2026-09-16T20:33:31Z",
+  "probe_rev": "ec47573",
+  "started_utc": "2026-10-02T22:00:24Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 79,
+      "ms": 97,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 5,
+      "ms": 19,
       "detail": "PostgreSQL 15.19 (Debian 15.19-1.pgdg13+"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 5,
+      "ms": 11,
       "detail": "vm"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 3,
+      "ms": 5,
       "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
     },
     {
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 3,
+      "ms": 4,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition='CREATE INDEX ix_orders_customer ON vm.orders USING btree (customer_id)', primary=False, kind='btree', schema='v"
     },
     {
@@ -67,7 +67,7 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "customers_pkey"
     },
     {
@@ -79,61 +79,61 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 2,
+      "ms": 4,
       "detail": "customers"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 0,
+      "ms": 1,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 6,
+      "ms": 11,
       "detail": "f_one"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 1,
+      "ms": 5,
       "detail": "catalog_estimate(pg_class.reltuples / pg_stat_user_tables)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 5,
+      "ms": 14,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 7,
+      "ms": 44,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 6,
+      "ms": 45,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 5,
+      "ms": 38,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 5,
+      "ms": 14,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 4,
+      "ms": 11,
       "detail": "['raw']"
     }
   ],
@@ -147,6 +147,8 @@
     "read_only_requested": true,
     "server_read_only_available": true,
     "applied": [
+      "standard_conforming_strings=on",
+      "client_encoding=UTF8",
       "read_only",
       "statement_timeout=60000ms",
       "lock_timeout=5000ms"
@@ -159,11 +161,13 @@
       "statement_timeout": "1min",
       "lock_timeout": "5s",
       "application_name": "udbmcp:vm",
-      "isolation": "read committed"
+      "isolation": "read committed",
+      "standard_conforming_strings": "on",
+      "client_encoding": "UTF8"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:33:31Z",
+  "finished_utc": "2026-10-02T22:00:25Z",
   "summary": {
     "passed": 22,
     "failed": []
