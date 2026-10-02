@@ -451,13 +451,13 @@ fi
 # --- demo fixture + config at the documented path -----------------------------
 mkdir -p /tmp/demo /etc/universal-db-mcp
 cp "$V1/config-templates/create_demo.py" "$V1/config-templates/config.template.yaml" /tmp/demo/
-( cd /tmp/demo && "$VENV/python" /tmp/demo/create_demo.py --path /tmp/finlink_demo.db > /tmp/demo.log 2>&1 ) \
+( cd /tmp/demo && "$VENV/python" /tmp/demo/create_demo.py --path /tmp/demo/finlink_demo.db > /tmp/demo.log 2>&1 ) \
   || { rec demo_fixture failed "create_demo.py failed: $(tail -c 300 /tmp/demo.log | tr '\n' ' ')"; exit 1; }
 cp /tmp/demo/config.yaml /etc/universal-db-mcp/config.yaml
 rec demo_fixture passed "synthetic SQLite demo fixture + config at /etc/universal-db-mcp/config.yaml"
 
 # --- protocol probe against the v1 venv ---------------------------------------
-if "$VENV/python" "$V1/tests/protocol_probe.py" "$VENV/python" /tmp/finlink_demo.db \
+if "$VENV/python" "$V1/tests/protocol_probe.py" "$VENV/python" /tmp/demo/finlink_demo.db \
     > "$EV/protocol-probe-v1.json" 2> "$EV/protocol-probe-v1.stderr.txt"; then
   rec protocol_probe_v1 passed "stdio MCP protocol lifecycle probe passed on the installed v1 venv"
 else
@@ -503,7 +503,7 @@ else
 fi
 
 # --- protocol probe against the UPGRADED venv ---------------------------------
-if "$VENV/python" "$V2/tests/protocol_probe.py" "$VENV/python" /tmp/finlink_demo.db \
+if "$VENV/python" "$V2/tests/protocol_probe.py" "$VENV/python" /tmp/demo/finlink_demo.db \
     > "$EV/protocol-probe-v2.json" 2> "$EV/protocol-probe-v2.stderr.txt"; then
   rec protocol_probe_v2 passed "stdio MCP protocol lifecycle probe passed on the UPGRADED venv"
 else
@@ -545,7 +545,7 @@ if [ ! -d "$TARGET/venv.previous" ] && [ -d "$TARGET/venv" ]; then
 else
   rec rollback_state failed "unexpected rollback end state: venv.previous=$([ -d "$TARGET/venv.previous" ] && echo present || echo absent)"
 fi
-if "$VENV/python" "$V1/tests/protocol_probe.py" "$VENV/python" /tmp/finlink_demo.db \
+if "$VENV/python" "$V1/tests/protocol_probe.py" "$VENV/python" /tmp/demo/finlink_demo.db \
     > "$EV/protocol-probe-rollback.json" 2> "$EV/protocol-probe-rollback.stderr.txt"; then
   rec protocol_probe_after_rollback passed "protocol probe passed on the ROLLED BACK venv"
 else

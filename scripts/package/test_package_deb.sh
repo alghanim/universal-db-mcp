@@ -640,8 +640,8 @@ fi
 mkdir -p /tmp/demo
 cp "$BUNDLE_INSTALLED/config-templates/create_demo.py" \
    "$BUNDLE_INSTALLED/config-templates/config.template.yaml" /tmp/demo/
-if "$VENV/python" /tmp/demo/create_demo.py --path /tmp/finlink_demo.db > /tmp/demo.log 2>&1; then
-  rec demo_fixture passed "synthetic SQLite demo fixture created at /tmp/finlink_demo.db"
+if "$VENV/python" /tmp/demo/create_demo.py --path /tmp/demo/finlink_demo.db > /tmp/demo.log 2>&1; then
+  rec demo_fixture passed "synthetic SQLite demo fixture created at /tmp/demo/finlink_demo.db"
 else
   rec demo_fixture failed "create_demo.py failed: $(tail -c 300 /tmp/demo.log | tr '\n' ' ')"
   exit 1
@@ -651,11 +651,13 @@ if "$VENV/python" -m universal_db_mcp doctor --config /tmp/demo/config.yaml \
     > "$EV/doctor.json" 2> "$EV/doctor.stderr.txt"; then
   rec doctor passed "doctor passed against the deb-installed venv (config: /tmp/demo/config.yaml)"
 else
-  rec doctor failed "doctor reported fatal checks: $(tail -c 300 "$EV/doctor.stderr.txt" | tr '\n' ' ')"
+  # doctor reports its checks as JSON on stdout; name the fatal ones
+  fatal="$(python3 -c 'import json,sys; print("; ".join(c["check"] + ": " + c.get("detail", "") for c in json.load(open(sys.argv[1])).get("checks", []) if c.get("status") == "fatal"))' "$EV/doctor.json" 2>/dev/null || true)"
+  rec doctor failed "doctor reported fatal checks: ${fatal:-$(tail -c 300 "$EV/doctor.stderr.txt" | tr '\n' ' ')}"
 fi
 
 # --- protocol probe over stdio (no network) ----------------------------------
-if "$VENV/python" "$BUNDLE_INSTALLED/tests/protocol_probe.py" "$VENV/python" /tmp/finlink_demo.db \
+if "$VENV/python" "$BUNDLE_INSTALLED/tests/protocol_probe.py" "$VENV/python" /tmp/demo/finlink_demo.db \
     > "$EV/protocol-probe.json" 2> "$EV/protocol-probe.stderr.txt"; then
   rec protocol_probe passed "stdio MCP protocol lifecycle probe passed"
 else
