@@ -1293,10 +1293,16 @@ the residuals).
   Oracle and Db2 give the recorded catalog, profile, review, federated and
   inference results, and PostgreSQL, MySQL and ClickHouse refuse a write
   with the guard bypassed (SQL Server skipped: no ODBC driver on this Mac).
-  Re-run the version matrix, `scripts/http_client_evidence.py` and the package gates
-  (`scripts/package/release_usb.sh` runs the deb and pkg gates;
-  `scripts/package/test_upgrade_offline.sh` has a new `downgrade_refused`
-  check) before a release.
+  On 2026-10-03, at commit 5627468 (the code-review fixes plus a gate fix
+  that keeps the gates' demo database out of world-writable `/tmp`, which the
+  hardened metadata cache rightly refuses), `scripts/package/release_usb.sh
+  --demo` ran clean: deb gate 50 passed + 1 recorded, pkg gate 23 passed,
+  stick signature verified (demo key; not for a site).
+  `scripts/package/test_upgrade_offline.sh` passed, `downgrade_refused`,
+  rollback and the post-rollback probe included, and
+  `scripts/http_client_evidence.py` passed (29 tools over TLS through nginx;
+  wrong or missing token refused with 401; `test-evidence/http-transport/`
+  refreshed). Still to re-run before a release: the version matrix.
 
 **Owner actions:**
 
