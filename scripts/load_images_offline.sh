@@ -332,6 +332,16 @@ echo "==> staging a private copy of the verified bundle (closes the verify-then-
 STAGING="$(private_copy "$BUNDLE" "$STAGING_DIR" "No image was loaded.")" || exit 1
 verify_with_proof "$STAGING"
 
+# Which docker daemon gets the images: the one the operator's own docker
+# command reaches when there is one (a rootless daemon, DOCKER_HOST or a docker
+# context: the one `docker compose up` uses afterwards, and which sudo, whose
+# env_reset drops DOCKER_HOST, never reaches), else root's through sudo. The
+# private copy is root's alone either way: root reads it and the operator's
+# docker reads the stream, so what is loaded is still the verified copy.
+DOCKER_AS=""
+if [ -n "$sudo_ok" ] && ! docker info >/dev/null 2>&1; then
+  DOCKER_AS="$sudo_ok"
+fi
 load_one() {
   local tar="$1" expect="$2"
   if ! $sudo_ok test -f "$tar"; then
@@ -339,9 +349,13 @@ load_one() {
     exit 1
   fi
   echo "==> loading $(basename "$tar")"
-  $sudo_ok docker load -i "$tar"
+  if [ -n "$sudo_ok" ] && [ -z "$DOCKER_AS" ]; then
+    $sudo_ok cat -- "$tar" | docker load
+  else
+    $DOCKER_AS docker load -i "$tar"
+  fi
   if [ -n "$expect" ]; then
-    $sudo_ok docker image inspect "$expect" > /dev/null 2>&1 || {
+    $DOCKER_AS docker image inspect "$expect" > /dev/null 2>&1 || {
       echo "FAIL: image '$expect' not present after load (identity mismatch)" >&2
       exit 1
     }

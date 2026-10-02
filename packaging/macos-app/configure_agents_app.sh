@@ -26,18 +26,22 @@
 #   * `chosen as text` joins with the CURRENT delimiters (empty by default!):
 #     without setting them first, a multi-selection becomes ONE concatenated
 #     bogus name (verified on Darwin 25).
+#   * `display dialog` takes `with title "..." with icon note`: the shorthand
+#     `with icon note title "..."` does not compile (-2740), and osascript
+#     then exits non-zero with no dialog, so the app ended silently and
+#     registered nothing. Every snippet is compiled by a unit test.
 set -u
 
 VENV_PY="/usr/local/universal-db-mcp/venv/bin/python"
 TITLE="Configure UniversalDB MCP"
 
 fail_dialog() {
-  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with icon stop title \"$TITLE\"" >/dev/null 2>&1
+  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with title \"$TITLE\" with icon stop" >/dev/null 2>&1
   exit 1
 }
 
 info_dialog() {
-  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with icon note title \"$TITLE\"" >/dev/null 2>&1
+  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with title \"$TITLE\" with icon note" >/dev/null 2>&1
 }
 
 [ -x "$VENV_PY" ] || fail_dialog "UniversalDB MCP is not installed at /usr/local/universal-db-mcp. Install the package first."
@@ -108,7 +112,7 @@ APPLESCRIPT
 pretty="${selected//|/, }"
 osascript -e "display dialog \"Register UniversalDB MCP with: $pretty?
 
-Each config file gets a timestamped .bak backup before anything is written; re-running never duplicates entries.\" buttons {\"Cancel\", \"Configure\"} default button \"Configure\" with icon note title \"$TITLE\"" >/dev/null || exit 0
+Each config file gets a timestamped .bak backup before anything is written; re-running never duplicates entries.\" buttons {\"Cancel\", \"Configure\"} default button \"Configure\" with title \"$TITLE\" with icon note" >/dev/null || exit 0
 
 # --- step 4: apply per selected harness (--yes is the recorded consent) ------
 # stderr is NOT merged into the JSON payload: the success path parses stdout

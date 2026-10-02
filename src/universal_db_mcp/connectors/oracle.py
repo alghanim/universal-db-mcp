@@ -450,6 +450,11 @@ class OracleConnector(DatabaseConnector):
         super().__init__(connection, policy)
         self._module: Any = None
         self._cancel_target: Any = None
+        # Set by cancel_current while a query is in progress: a break
+        # reaches only a call in progress, so the statement, which starts
+        # after a round trip of its own, looks here first.
+        self._cancelled = threading.Event()
+        self._executing = False
         self._exec_lock = threading.Lock()  # serializes queries: cancel slot correctness
         self._pool_lock = threading.Lock()
         self._meta_conn: Any = None  # reused metadata connection (probe on checkout)
@@ -684,6 +689,8 @@ class OracleConnector(DatabaseConnector):
             )
 
     def cancel_current(self) -> bool:
+        if self._executing:
+            self._cancelled.set()
         target = self._cancel_target
         if target is not None:
             try:
@@ -691,7 +698,7 @@ class OracleConnector(DatabaseConnector):
                 return True
             except Exception:  # noqa: BLE001, S110
                 return False
-        return False
+        return self._executing  # still connecting: the statement will not start
 
     def capabilities(self) -> CapabilityMatrix:
         return CapabilityMatrix(
@@ -1121,7 +1128,12 @@ class OracleConnector(DatabaseConnector):
 
     def execute_query(self, spec: QuerySpec) -> QueryOutcome:
         with self._exec_lock:
-            return self._execute(spec)
+            self._cancelled.clear()
+            self._executing = True
+            try:
+                return self._execute(spec)
+            finally:
+                self._executing = False
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
         self._refuse_db_link(spec.sql)
@@ -1147,6 +1159,11 @@ class OracleConnector(DatabaseConnector):
                 # end of the result take one round trip.
                 cur.prefetchrows = 2
                 cur.arraysize = next_fetch_size(spec.max_rows, 0)
+                if self._cancelled.is_set():
+                    # the deadline fired during the connect or the check above
+                    raise ConnectorError(
+                        "the statement was cancelled before it started", category=ErrorCategory.TIMEOUT
+                    )
                 cur.execute(spec.sql, spec.parameters or None)
                 decoded_whole = _DECODED_WHOLE if getattr(conn, "thin", True) else _DECODED_WHOLE_THICK
                 whole = {i for i, d in enumerate(cur.description or []) if getattr(d[1], "name", None) in decoded_whole}

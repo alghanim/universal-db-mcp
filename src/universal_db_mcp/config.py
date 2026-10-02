@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
@@ -294,6 +295,16 @@ class ConnectionConfig(StrictModel):
     options: dict[str, Any] = Field(default_factory=dict)
     session: SessionConfig = Field(default_factory=SessionConfig)
 
+    def secret_env_variables(self) -> list[str]:
+        """The environment variables this connection reads its credentials
+        from (names only; values are never read here): username_env,
+        password_env and the Oracle options.wallet_password_env. A server a
+        GUI harness spawns does not inherit them from any shell."""
+        wallet = self.options.get("wallet_password_env")
+        return [
+            v for v in (self.username_env, self.password_env, wallet if isinstance(wallet, str) else None) if v
+        ]
+
     @field_validator("read_only")
     @classmethod
     def _read_only_required(cls, v: bool) -> bool:
@@ -534,8 +545,8 @@ class AppConfig(StrictModel):
         """Writable state must each be a separate file, and none of it may be
         a file the server reads: a secret, a TLS file, the HTTP bearer token
         or a queried SQLite data source (spec §5). State is every file the
-        server writes: the audit log, its .lock sidecar and its rotated
-        backups <audit_path>.1..N, and the metadata cache with the -wal,
+        server writes: the audit log, its .lock sidecar, its rotated
+        backups <audit_path>.1..N and <audit_path>.rotating, and the metadata cache with the -wal,
         -shm and -journal files SQLite keeps beside it. Read-only inputs of
         one kind may be shared, e.g. two connections using one password file
         or one CA bundle; the bearer token, which every HTTP client holds,
@@ -566,6 +577,12 @@ class AppConfig(StrictModel):
             ("state", "application.audit_path", app.audit_path),
             # the cross-process rotation lock AuditLog keeps next to the log
             ("state", "application.audit_path lock file", f"{app.audit_path}.lock" if app.audit_path else None),
+            # where rotation moves the log before it shifts the backups
+            (
+                "state",
+                "application.audit_path rotation file",
+                f"{app.audit_path}.rotating" if app.audit_path else None,
+            ),
             ("state", "application.metadata_cache_path", app.metadata_cache_path),
             ("token", "application.http_bearer_token_file", app.http_bearer_token_file),
         ]
@@ -591,7 +608,12 @@ class AppConfig(StrictModel):
                 ("tls", f"connections.{name}.tls.ca_file", conn.tls.ca_file),
                 ("tls", f"connections.{name}.tls.client_cert_file", conn.tls.client_cert_file),
                 ("tls", f"connections.{name}.tls.client_key_file", conn.tls.client_key_file),
-                ("data", f"connections.{name}.database", conn.database if conn.type == "sqlite" else None),
+                # the connector opens Path(database).expanduser().resolve()
+                (
+                    "data",
+                    f"connections.{name}.database",
+                    os.path.expanduser(conn.database) if conn.type == "sqlite" and conn.database else None,
+                ),
             ]
 
         def state_clash(rp: str, first: str, second: str) -> ValueError:
@@ -881,6 +903,106 @@ def _check_secret_file_permissions(path: Path) -> None:
         raise ConfigError(
             f"secret file '{path}' has unsafe permissions ({stat.filemode(mode)}): remove group/other access bits"
         )
+    try:
+        problems = darwin_secret_file_acl_problems(path)
+    except OSError as exc:
+        raise ConfigError(f"secret file '{path}': its access control list cannot be read ({exc.strerror})") from exc
+    if problems:
+        raise ConfigError(
+            f"secret file '{path}' has unsafe permissions: {'; '.join(problems)}. Remove the access control "
+            "list (chmod -N <file>)"
+        )
+
+
+# macOS <sys/acl.h>: ACL_TYPE_EXTENDED (the only ACL type macOS has), the
+# ACL_EXTENDED_ALLOW tag, acl_get_entry's ACL_FIRST_ENTRY/ACL_NEXT_ENTRY and
+# the rights that expose or replace a secret; <membership.h> ID_TYPE_UID.
+_DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+_DARWIN_ACL_EXTENDED_ALLOW = 1
+_DARWIN_ACL_FIRST_ENTRY = 0
+_DARWIN_ACL_NEXT_ENTRY = -1
+_DARWIN_ID_TYPE_UID = 0
+_DARWIN_ACL_RIGHTS = (
+    (1 << 1, "read"),
+    (1 << 2, "write"),
+    (1 << 5, "append"),
+    (1 << 12, "writesecurity"),
+    (1 << 13, "chown"),
+)
+
+
+def darwin_secret_file_acl_problems(path: Path) -> list[str]:
+    """What the macOS extended ACL of *path* grants beyond its mode bits: each
+    allow entry giving anyone but the file's owner read or write access, or
+    the right to rewrite the ACL or take ownership (either leads to read
+    access). A 0600 file with 'everyone allow read' lists as -rw-------+ and
+    every local user can read it. Deny entries only take access away. Empty
+    on other platforms and on a filesystem without ACLs; OSError when the
+    ACL cannot be read."""
+    if sys.platform != "darwin":
+        return []
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_get_file.restype = ctypes.c_void_p
+    libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    libc.acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    libc.acl_get_permset.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_perm_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    libc.acl_get_qualifier.restype = ctypes.c_void_p
+    libc.acl_get_qualifier.argtypes = [ctypes.c_void_p]
+    libc.mbr_uuid_to_id.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_int)]
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    ctypes.set_errno(0)
+    acl = libc.acl_get_file(os.fsencode(path), _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        err = ctypes.get_errno()
+        if err in (errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP):  # no ACL, or none possible here
+            return []
+        raise OSError(err, os.strerror(err), str(path))
+    problems: list[str] = []
+    try:
+        owner = os.stat(path).st_uid
+        entry = ctypes.c_void_p()
+        which = _DARWIN_ACL_FIRST_ENTRY
+        while libc.acl_get_entry(acl, which, ctypes.byref(entry)) == 0:
+            which = _DARWIN_ACL_NEXT_ENTRY
+            tag, permset = ctypes.c_int(), ctypes.c_void_p()
+            if libc.acl_get_tag_type(entry, ctypes.byref(tag)) or libc.acl_get_permset(entry, ctypes.byref(permset)):
+                problems.append("an access control list entry cannot be read")
+                continue
+            if tag.value != _DARWIN_ACL_EXTENDED_ALLOW:
+                continue
+            rights = ",".join(name for bit, name in _DARWIN_ACL_RIGHTS if libc.acl_get_perm_np(permset, bit) == 1)
+            if not rights:
+                continue
+            ident, id_type = ctypes.c_uint32(), ctypes.c_int()
+            qualifier = libc.acl_get_qualifier(entry)
+            unresolved = 1
+            if qualifier:
+                try:
+                    unresolved = libc.mbr_uuid_to_id(qualifier, ctypes.byref(ident), ctypes.byref(id_type))
+                finally:
+                    libc.acl_free(qualifier)
+            if unresolved:
+                problems.append(f"an access control list entry grants {rights} to a trustee that cannot be checked")
+            elif id_type.value != _DARWIN_ID_TYPE_UID or ident.value != owner:  # the owner's own entry adds nothing
+                who = _darwin_trustee_name(ident.value, user=id_type.value == _DARWIN_ID_TYPE_UID)
+                problems.append(f"an access control list entry grants {rights} to {who}")
+    finally:
+        libc.acl_free(acl)
+    return problems
+
+
+def _darwin_trustee_name(ident: int, *, user: bool) -> str:
+    import grp
+    import pwd
+
+    try:
+        return f"user {pwd.getpwuid(ident).pw_name}" if user else f"group {grp.getgrgid(ident).gr_name}"
+    except KeyError:
+        return f"uid {ident}" if user else f"gid {ident}"
 
 
 def resolve_env_name(name: str, *, kind: str) -> str:
@@ -904,7 +1026,11 @@ def _identity_mark(value: str) -> SecretMark:
 
 def _read_secret_file(p: Path, what: str) -> str:
     _check_secret_file_permissions(p)
-    val = p.read_text(encoding="utf-8").strip("\r\n")
+    try:
+        val = p.read_text(encoding="utf-8").strip("\r\n")
+    except UnicodeDecodeError:
+        # the codec's message quotes a byte of the secret and its offset
+        raise ConfigError(f"{what} '{p}' is not valid UTF-8 text") from None
     if not val:
         raise ConfigError(f"{what} '{p}' is empty")
     return val
@@ -1190,6 +1316,9 @@ def load_config(path: str | Path) -> AppConfig:
         raw_text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"cannot read config file '{p}': {exc}") from exc
+    except UnicodeDecodeError:
+        # the codec's message would quote a byte of the file
+        raise ConfigError(f"config file '{p}' is not valid UTF-8 text") from None
     raw = load_yaml_strict(raw_text, str(p))
     if not isinstance(raw, dict):
         raise ConfigError(f"config '{p}' must be a mapping at the top level")

@@ -5,6 +5,7 @@ findings and masking, cross-table value search, relationship inference."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -212,7 +213,7 @@ def test_foreign_key_targets_outside_the_allowlist_are_redacted(monkeypatch: pyt
     monkeypatch.setenv("U", "app_ro")
     from universal_db_mcp.connectors.base import KeyInfo
     from universal_db_mcp.security.policy import EffectivePolicy
-    from universal_db_mcp.server import _redact_foreign_target
+    from universal_db_mcp.server import _SchemaView
 
     cfg = ConnectionConfig.model_validate(
         {"type": "postgres", "host": "h", "database": "d", "username_env": "U", "allowed_schemas": ["app"]}
@@ -222,9 +223,10 @@ def test_foreign_key_targets_outside_the_allowlist_are_redacted(monkeypatch: pyt
                      ref_table="customers", ref_columns=["id"])
     visible = KeyInfo(kind="foreign_key", name="fk2", columns=["order_id"], ref_schema="app",
                       ref_table="orders", ref_columns=["id"])
-    assert _redact_foreign_target(policy, hidden)["ref_table"] == "<not permitted>"
-    assert _redact_foreign_target(policy, hidden)["columns"] == ["customer_id"]
-    assert _redact_foreign_target(policy, visible)["ref_table"] == "orders"
+    view = _SchemaView(policy)
+    assert view.foreign_key(dataclasses.asdict(hidden))["ref_table"] == "<not permitted>"
+    assert view.foreign_key(dataclasses.asdict(hidden))["columns"] == ["customer_id"]
+    assert view.foreign_key(dataclasses.asdict(visible))["ref_table"] == "orders"
 
 
 def test_catalog_and_index_listing_hide_system_catalogs_unless_asked(server: Any, monkeypatch: Any) -> None:

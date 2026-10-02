@@ -394,6 +394,12 @@ docker network create --internal udbmcp-internal   # admin-managed
 docker compose -f <bundle>/operations/compose.offline.yaml up -d
 ```
 
+The loader hands the images to the docker daemon the operator's own `docker`
+command reaches when there is one (a rootless daemon, `DOCKER_HOST` or a
+docker context: the one `docker compose up` uses afterwards, which `sudo`
+would not reach), streaming the root-only verified copy to it; otherwise it
+loads through root's daemon.
+
 `pull_policy: never` — an absent image fails locally; no registry contact.
 The compose file sets `ulimits: nofile: 65536` and a bounded `json-file` log
 (10 MB x 5).
@@ -446,8 +452,10 @@ pubkey on the native-mode path above). The enforcement mechanism here is a
 chain of **deferred, `Impersonate="no"`, `Return="check"` custom actions**
 authored in `packaging/msi/udbmcp.wxs` and implemented by the
 `packaging/msi/custom/*.ps1` scripts that `scripts/package/build_msi.sh`
-stages into the package. After `InstallFiles`, and in this strict order,
-`msiexec` runs: (1) `VerifyBundleCA` — verify the installed bundle with the
+stages into the package. Before `CreateFolders`, on install and repair,
+`CheckFoldersCA` checks the two folders the install writes into (its script,
+`folders.ps1`, is embedded in the MSI, since nothing is installed yet; see
+below). After `InstallFiles`, and in this strict order, `msiexec` runs: (1) `VerifyBundleCA` — verify the installed bundle with the
 ADMIN-installed trusted verifier and public key, and refuse an older release
 than the installed one, (2) `BuildVenvCA` — build the venv from the verified
 wheelhouse with `pip --no-index --require-hashes` and `PIP_CONFIG_FILE`
@@ -456,8 +464,9 @@ execution of payload code, strictly after verification passed, and (4)
 `RegisterServiceCA` — `sc.exe` service registration and the installed-release
 record. Any nonzero exit rolls the whole install back, so a failed
 verification can never leave a half-trusted install behind: the rollback twin
-`RollbackRemoveServiceCA` removes the service and puts back the record this
-install replaced. After a successful install, repair or upgrade, the commit
+`RollbackRemoveServiceCA` removes the service a first install or an upgrade
+registered (a failed repair keeps the service that was registered before it
+began) and puts back the record this install replaced. After a successful install, repair or upgrade, the commit
 action `CommitReleaseRecordCA` removes the record's rollback copy (it never
 touches the service). Every Python run these actions make as LocalSystem is
 isolated (`-I`), `venv.ps1`'s and the service included.
@@ -585,7 +594,9 @@ address or URL. Layout after a successful install:
   because a process held it open is harmless: delete it once nothing holds
   it, and never copy it over `manifest.json`,
 - `C:\ProgramData\UniversalDB MCP\` — `config.yaml` (installed once, never
-  overwritten on upgrade/repair), `http-token`, `smoke\` and `logs\`. The
+  overwritten on upgrade or repair, and retained on uninstall: the component
+  is `Permanent`, so neither `msiexec /x` nor the old product's removal a
+  major upgrade runs deletes it), `http-token`, `smoke\` and `logs\`. The
   folder has a protected DACL: SYSTEM and Administrators only, plus read for a
   dedicated service account; reading it needs an elevated prompt,
 - `C:\ProgramData\UniversalDB MCP\logs\` — the one place a dedicated service
@@ -596,7 +607,19 @@ address or URL. Layout after a successful install:
 - `C:\ProgramData\universal-db-mcp\install-verify.log` — the verifier
   output written by `VerifyBundleCA`.
 
-An install or repair fails closed when anything under
+Before anything is created or installed, `CheckFoldersCA` refuses (and rolls
+the install back): an `INSTALLFOLDER` that anyone but SYSTEM,
+Administrators, TrustedInstaller or an administrator may write (inherit-only
+grants included; everything installed there runs as LocalSystem, and a
+custom folder such as `D:\Apps\...` usually inherits Authenticated Users
+Modify), a config folder that is a junction or symbolic link or is not owned
+by SYSTEM, Administrators or an administrator, and any folder above either
+one that is a junction or that a non-administrator could delete,
+re-permission or empty (and so swap for a junction). A missing
+`INSTALLFOLDER` or config folder is created with its protected DACL
+(`INSTALLFOLDER`: SYSTEM and Administrators Full Control, Users read and
+execute). A launch condition refuses an `INSTALLFOLDER` holding a single
+quote. An install or repair also fails closed when anything under
 `C:\ProgramData\UniversalDB MCP` is a junction or symlink, or is owned by
 anyone but SYSTEM or an administrator (entries the configured service
 account wrote below `logs\`, such as its audit log, are accepted). The
@@ -717,8 +740,14 @@ Features; the release string stays in the file name):
 - **Upgrade** (newer over older): the old version is removed first (its
   `RemoveServiceCA` stops and deletes the service) and the full verify →
   venv → doctor → service sequence re-runs against the fresh payload.
-  `config.yaml` is left untouched (`NeverOverwrite`). A rebuild of the same
-  bundle may replace itself.
+  `config.yaml` is left untouched (`NeverOverwrite` and `Permanent`: the old
+  product's removal no longer deletes it, which before this release put the
+  template in place of the admin's config). A rebuild of the same bundle may
+  replace itself. A repair or upgrade run without `UDBMCP_SERVICE_ACCOUNT`
+  keeps the account the service is registered under only when `logs\`
+  grants it write access, as the install that registered it did; otherwise
+  (an account other than LocalSystem with no such grant, which could only
+  come from the command line) it fails, naming the remedy.
 - **Anti-rollback.** `VerifyBundleCA` refuses a bundle older than the
   installed-release record `C:\Program Files\UniversalDB MCP\manifest.json`
   (a fixed path whatever `INSTALLFOLDER` is). The MSI also refuses to install
@@ -746,16 +775,30 @@ Features; the release string stays in the file name):
 - **Uninstall** removes the install tree but keeps the release record
   `C:\Program Files\UniversalDB MCP\manifest.json`; `RemoveServiceCA` stops
   and deletes the `udbmcp` service first. `config.yaml` under
-  `C:\ProgramData\UniversalDB MCP\` is NOT retained (unlike the .deb conffile
-  behavior) — back it up before uninstalling if you want to keep your edits.
+  `C:\ProgramData\UniversalDB MCP\` is retained, as the .deb keeps its
+  conffile; a later install finds it and keeps it.
+- **A failed repair** keeps the service registered before it (the rollback
+  twin deletes only a service a first install or an upgrade registered).
+  Residual: a repair that fails inside `service.ps1`, between its removal of
+  the existing service and `sc.exe create`, still leaves no service; run a
+  repair again.
 
 ### Status (honest)
 
-**The MSI has never been compiled, and no Windows runtime step has run.** WiX
+**No MSI has been built on Windows, and no Windows runtime step has run.** WiX
 (v4.0.5, 5.0.2 and 6.0.2 all tested) rejects every `Directory/@Name` on a
 Unix host with error **WIX0389** ("... is not a relative path"), a toolchain
-limitation, not an authoring defect: every first-party build step before the
-compile (trusted verification of the signed `windows-x86_64-cp312` bundle,
+limitation, not an authoring defect. With only the Unix-host artefacts
+transformed (directory names, cabinets) and a stubbed `msi.dll`, WiX 4.0.6
+on the macOS staging host compiles and links this release's `.wxs` and
+writes its tables, apart from those artefacts (2026-10-02). The earlier
+authoring did not: a private search property for the registered service
+account failed with **WIX0012**, so no MSI could have been built from it,
+and an uninstall's `RemoveServiceCA` ran before the interpreter property was
+set, which would have failed (1721) and rolled back every uninstall and
+upgrade. Both are fixed (`UDBMCPREGISTEREDACCOUNT`, public and `Secure`;
+`SetPowerShellExe` before `InstallInitialize`). Every first-party build step
+before the compile (trusted verification of the signed `windows-x86_64-cp312` bundle,
 payload staging with a no-key-material scan, deterministic harvest,
 `xmllint`, a real `wix` invocation) ran and passed on the macOS staging host
 (`out/package-evidence/msi/`). MSI compilation requires a **Windows** staging
@@ -782,7 +825,9 @@ protocol probe, tamper negative, and the checks `programdata_acl`,
 `folder_squat_cleanup_reinstalled`, `installed_manifest_recorded`, which also
 fails when a rollback copy or marker is left beside the record,
 `rollback_refused`, `launch_conditions` and `repair_keeps_account`); none has
-been run. In CI these unit tests run under the ubuntu-24.04 runner's
+been run. A failing `service_running` check (error 1053 is the known
+blocker) is recorded and the checks after it still run; the gate then exits
+nonzero. In CI these unit tests run under the ubuntu-24.04 runner's
 PowerShell 7 and the suite fails, rather than skips them, when `pwsh` is
 missing; on a host without `pwsh` they still skip. Until both the Windows
 build and that gate have passed, no "passed" or "verified" wording may be
@@ -877,11 +922,20 @@ root-only directory yourself and install it from there;
 `sudo apt-get install ./<file>.deb` in that directory works as well.)
 
 The package refuses a payload whose signed `release_seq` is older than the
-installed release (`FAIL: rollback refused ...`); an intended downgrade is
+installed release, or another release with the installed release's
+`release_seq` (a different `source_rev`: `release_seq` is a commit timestamp,
+which a rebase can give two commits alike). `preinst` makes both checks from
+the values `build_deb.sh` wrote into it, before dpkg unpacks anything
+(`FAIL: rollback refused: ... nothing was unpacked`); `postinst`'s verifier
+remains the authority for what that cannot order. An intended downgrade is
 `sudo UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <older .deb>`. It also refuses trusted
-tools that predate this release: an installer without
-`udbmcp-installer-format: 3` or `--force-reinstall`, or a verifier without
+tools that predate this release, in `preinst`, before the old service is
+stopped and the payload unpacked: an installer without
+`udbmcp-installer-format: 4` or `--force-reinstall`, or a verifier without
 `--installed-manifest` (each an `OUTDATED copy`); refresh them from the stick.
+When dpkg undoes a failed upgrade (`abort-upgrade`, `abort-remove`,
+`abort-deconfigure`), `postinst` starts the service the old `prerm` stopped
+again (when it is enabled) and changes nothing else.
 On upgrade, root-owned `audit.jsonl*` files in `/var/log/universal-db-mcp`
 (the log, its `.lock`, rotated backups; regular files with one link) are
 handed back to `udbmcp` with mode 0600, and each is printed.
@@ -1024,12 +1078,20 @@ profile bundle — not the Linux one). It follows the same verify-before-execute
 model as the `.deb`: **no payload byte is ever executed before a trusted
 `verify_bundle.py --pubkey` run has passed.** Because the macOS Installer
 unpacks the payload only *after* the `preinstall` script runs, the package
-splits the work honestly:
+splits the work honestly. The package's Distribution declares the arm64 host
+(`hostArchitectures="arm64"`), so the Installer refuses an Intel Mac and runs
+the scripts natively; should it still run them under Rosetta 2, each script
+starts over as a native arm64 process, and the verifier judges the hardware
+architecture, not the translated process's (a universal2 python started
+under Rosetta reported x86_64 and the arm64 bundle was refused). How the
+real Installer treats the declaration is confirmed only by a real install:
 
 - **`preinstall`** checks the trust *prerequisites* only (trusted verifier,
   release public key, CPython 3.12 per-machine install) and **fails closed
   (exit 1, the Installer aborts)** with bootstrap instructions if any is
-  missing;
+  missing, if the verifier predates `--installed-manifest`, or if the
+  payload is an older release than the installed one (or another release
+  with its `release_seq`);
 - **`postinstall`** re-verifies the unpacked payload with the trusted
   verifier against the admin-held public key, and only then builds the venv,
   creates the service account, and bootstraps the launchd daemon.

@@ -23,16 +23,19 @@ and non-secret env only)::
       }
     }
 
-Scope policy: the user config is always written (created when absent); a
-project ``.mcp.json`` is only updated when it already exists — this adapter
-never drops a new file into a working tree unprompted.
+Scope policy: the user config is always written (created when absent). A
+project ``.mcp.json`` is shared through the repository, so this adapter never
+adds this machine's paths (interpreter, config) to it, nor creates one: it is
+written only to upgrade this tool's own pre-``-I`` entry already in it (the
+same paths, only the args change). The user-scope registration covers every
+project.
 
 Fail-closed rules implemented here:
 
 - An existing config that is unreadable, malformed, not a JSON object, or
   whose ``mcpServers`` is not an object yields
   ``AgentStatus.UNKNOWN_STATE_FAIL_CLOSED`` and the adapter refuses to write,
-  printing the offending file's current contents.
+  printing why (and this tool's own entry in it, never its other servers).
 - A differing registration already sitting under the ``universal-db`` key is
   operator-managed state and is never silently rewritten (fail closed). The
   one exception is this tool's own pre-``-I`` registration (identical except
@@ -69,9 +72,11 @@ from .core import (
     backup_path,
     ensure_directory,
     ensure_replaceable,
+    fail_closed_block,
     holds_legacy_entry,
     is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
     require_isolated_import,
     resolve_harness_config_path,
     unisolated_entry_note,
@@ -210,6 +215,18 @@ def _scope_problems(
     return None, None
 
 
+def _writes(scope: str, path: Path, create: bool, entry: Mapping[str, Any]) -> bool:
+    """Whether ``apply`` writes the ``scope`` config ``path``: an absent one
+    only when it is created (the user scope), an existing user scope unless it
+    already holds ``entry``, and a project file only to upgrade this tool's
+    pre-``-I`` entry in it (see the scope policy above)."""
+    if not path.exists():
+        return create
+    if scope == "project":
+        return holds_legacy_entry(path, MCP_SERVERS_KEY, SERVER_KEY, entry)
+    return not _holds_entry(path, entry)
+
+
 def _unreplaceable_scope(
     entry: Mapping[str, Any], home: Path, project_dir: Path
 ) -> tuple[Path, str] | None:
@@ -217,9 +234,8 @@ def _unreplaceable_scope(
     one it would rewrite (read-only, another user's, hard-linked, with an ACL
     the replace would change, in a read-only directory), or the user-scope
     one it would create (``core.ensure_replaceable``)."""
-    for _scope, path, create in _targets(home, project_dir):
-        written = not _holds_entry(path, entry) if path.exists() else create
-        if written:
+    for scope, path, create in _targets(home, project_dir):
+        if _writes(scope, path, create, entry):
             reason = unreplaceable_reason(path)
             if reason is not None:
                 return path, reason
@@ -295,13 +311,10 @@ def detect(
     return AgentStatus.INSTALLED_UNCONFIGURED
 
 
-def _fail_closed_block(target: Path) -> str:
-    """Render the offending file's current bytes for operator inspection."""
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"# {target} could not be read: {exc}"
-    return f"# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: Mapping[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, MCP_SERVERS_KEY, SERVER_KEY, entry)
 
 
 def plan(
@@ -337,9 +350,10 @@ def plan(
                 bad_path = target
             summary = (
                 f"{AGENT_NAME}: {bad_path} is unreadable, malformed, or holds a differing "
-                f'"{SERVER_KEY}" entry; refusing to write (fix or inspect the file, then re-run)'
+                f'"{SERVER_KEY}" entry{load_problem_note(bad_path)}; refusing to write (fix or inspect the '
+                "file, then re-run)"
             ) + unisolated_entry_note(bad_path, MCP_SERVERS_KEY, SERVER_KEY)
-        block = _fail_closed_block(bad_path)
+        block = _fail_closed_block(bad_path, entry)
     elif status is AgentStatus.CONFIGURED:
         summary = (
             f"{AGENT_NAME}: already configured under "
@@ -356,6 +370,12 @@ def plan(
                     f"{scope} scope {path}: would back up to a timestamped .bak, then replace this "
                     f'tool\'s earlier "{SERVER_KEY}" registration with one that starts the server '
                     "in isolated mode (-I) (other entries preserved)"
+                )
+            elif path.exists() and scope == "project":
+                parts.append(
+                    f"{scope} scope {path}: left as it is (a project file is shared through the repository, "
+                    "and this tool never adds this machine's paths to it; the user-scope registration "
+                    "covers this project)"
                 )
             elif path.exists():
                 parts.append(
@@ -413,7 +433,7 @@ def apply(
     # so a malformed project file blocks the user-scope write too).
     entry = registration_entry(env, home)
     staged: list[tuple[Path, dict[str, Any], Path | None]] = []
-    for _scope, path, create in _targets(home, proj):
+    for scope, path, create in _targets(home, proj):
         if path.exists():
             data, _error = load_json_or_fail_closed(path)
             if data is None or (
@@ -421,7 +441,7 @@ def apply(
             ):
                 # Re-check at write time: fail closed rather than overwrite.
                 # plan() re-runs detect(), which reports the fail-closed
-                # state (with the offending file's contents) for these cases.
+                # state (with the reason, never the file's other entries) for these cases.
                 return plan(env, home, project_dir=proj)
             # Absent key and present-but-null both normalize to an empty
             # registry (mirrors the write loop below).
@@ -434,6 +454,8 @@ def apply(
             if SERVER_KEY in servers and not is_legacy_entry(servers[SERVER_KEY], entry):
                 # A differing entry appeared since detect(): never overwrite.
                 return plan(env, home, project_dir=proj)
+            if scope == "project" and SERVER_KEY not in servers:
+                continue  # never adds this machine's paths to a shared project file
             staged.append((path, data, backup_path(path)))
         elif create:
             staged.append((path, {MCP_SERVERS_KEY: {}}, None))
@@ -456,7 +478,7 @@ def apply(
                 f"{AGENT_NAME}: {step} failed ({exc}); {failed_path} was left as it was; "
                 f"backed up: {', '.join(backed_up) or 'nothing'}; written: {', '.join(written) or 'nothing'}"
             ),
-            config_block=_fail_closed_block(failed_path),
+            config_block=_fail_closed_block(failed_path, entry),
             entry=entry,
         )
 

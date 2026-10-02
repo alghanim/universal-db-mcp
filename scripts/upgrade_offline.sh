@@ -67,7 +67,11 @@ if [ ! -f "$VERIFIER" ] || [ ! -s "$VERIFIER" ]; then
   echo "      A zero-length verifier would 'verify' vacuously: python3 on an empty script exits 0." >&2
   exit 1
 fi
-case "$(cd "$(dirname "$VERIFIER")" && pwd -P)" in
+# The RESOLVED FILE PATH is compared, as for the key below: a verifier sitting
+# directly in the bundle root has dirname == $bundle_real, which a
+# "$bundle_real"/* match on the directory alone let through (and ran as root).
+verifier_real="$(cd "$(dirname "$VERIFIER")" && pwd -P)/$(basename "$VERIFIER")"
+case "$verifier_real" in
   "$bundle_real"/*)
     echo "FAIL: UDBMCP_VERIFIER points inside the bundle; the verifier must come from the trusted channel." >&2
     exit 1 ;;
@@ -425,6 +429,7 @@ fi
 if [ -d "$TARGET/venv" ]; then
   $sudo_ok rm -rf "$TARGET/venv.previous"   # rollback depth is one release
   $sudo_ok rm -f "$TARGET/venv.previous.sha256"   # manifest of the discarded release
+  $sudo_ok rm -f "$TARGET/venv.previous.manifest.json"   # and its release record
   # rollback_offline.sh executes the demoted venv only after it matches this
   # manifest, so record it BEFORE the rename: an upgrade killed between these
   # two operations still leaves a verifiable venv.previous behind. Relative
@@ -433,6 +438,14 @@ if [ -d "$TARGET/venv" ]; then
   $sudo_ok sh -c 'cd "$1/venv" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$1/venv.previous.sha256"' sh "$TARGET" \
     || { $sudo_ok rm -f "$TARGET/venv.previous.sha256"; \
          echo "FAIL: could not record the rollback integrity manifest; aborting without switching" >&2; exit 1; }
+  # The running release's record goes with its venv: after rolling back to it,
+  # rollback_offline.sh raises $TARGET/manifest.json to it when it names an
+  # older release (after an intended downgrade), so anti-rollback never
+  # compares with a release below the one that runs.
+  if $sudo_ok test -f "$TARGET/manifest.json"; then
+    $sudo_ok install -m 644 -o root -g root "$TARGET/manifest.json" "$TARGET/venv.previous.manifest.json" \
+      || echo "WARNING: could not keep the running release's record for rollback_offline.sh" >&2
+  fi
   $sudo_ok mv "$TARGET/venv" "$TARGET/venv.previous"
 fi
 $sudo_ok mv "$NEWVENV" "$TARGET/venv"
@@ -452,6 +465,7 @@ if [ -n "${UDBMCP_CONFIG:-}" ] || [ -f /etc/universal-db-mcp/config.yaml ]; then
     echo "FAIL: doctor failed after switch; rolling back automatically" >&2
     $sudo_ok rm -rf "$TARGET/venv.failed"; $sudo_ok mv "$TARGET/venv" "$TARGET/venv.failed"
     if [ -d "$TARGET/venv.previous" ]; then $sudo_ok mv "$TARGET/venv.previous" "$TARGET/venv"; fi
+    $sudo_ok rm -f "$TARGET/venv.previous.manifest.json"  # its release is the running one again
     # The unit was stopped for the switch: leave the rolled-back installation
     # running again instead of exiting with the service down and no hint.
     if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl start universal-db-mcp || true; fi
@@ -468,12 +482,22 @@ fi
 # written only AFTER validation succeeds and the switch is final: on the
 # auto-rollback path the existing manifest keeps describing the restored venv.
 # $NEW_BUNDLE is the re-verified private staging copy here, so what is
-# published is exactly what was verified.
-if [ -f "$NEW_BUNDLE/manifest.json" ]; then
-  $sudo_ok install -m 644 -o root -g root "$NEW_BUNDLE/manifest.json" "$TARGET/manifest.json"
+# published is exactly what was verified. That copy is root's alone (mode 700):
+# through sudo it is tested through sudo too (an unprivileged test never found
+# it, and the release record anti-rollback compares with was never written).
+# A record that cannot be published fails the upgrade, once the service is
+# started again.
+PUBLISHED=1
+if $sudo_ok test -f "$NEW_BUNDLE/manifest.json"; then
+  $sudo_ok install -m 644 -o root -g root "$NEW_BUNDLE/manifest.json" "$TARGET/manifest.json" || PUBLISHED=0
 fi
 
 if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl start universal-db-mcp || true; fi
+if [ "$PUBLISHED" -eq 0 ]; then
+  echo "FAIL: could not publish $TARGET/manifest.json, the installed release's record anti-rollback" >&2
+  echo "      compares the next bundle with; the new release is installed and running. Re-run this upgrade." >&2
+  exit 1
+fi
 
 echo "==> upgraded from $ORIG_BUNDLE. Rollback if needed:"
 echo "    rollback_offline.sh $TARGET"

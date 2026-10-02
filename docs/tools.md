@@ -71,7 +71,11 @@ version strings. PostgreSQL XML errors lose their DETAIL. Names you supplied
 an error's text is capped at 2000 characters. A connector's own refusal that
 is not built from a driver error (for example ClickHouse's "more than 8 MiB
 ... even on 1-row blocks") is shown as written, numbers and quoted names
-included. When a connector cannot be built at all, absolute file paths in the
+included, and so is a connector's own diagnostic wrapped like a driver error
+(SQL Server: the ODBC driver it needs is not installed, naming the installed
+ones). Auth failures: ClickHouse's login is hidden (`DB::Exception:
+<redacted>: Authentication failed`); a MySQL 1045 keeps its errno and its
+`(using password: YES)` hint. When a connector cannot be built at all, absolute file paths in the
 `CONNECTION_ERROR` text (POSIX, Windows drive-letter and UNC) read `<path>`.
 
 ## Tools
@@ -83,17 +87,17 @@ included. When a connector cannot be built at all, absolute file paths in the
 | `db_get_capabilities` | implemented vs verified vs permission-dependent |
 | `db_list_catalogs` / `db_list_databases` | engine-appropriate; explains otherwise. On MySQL and ClickHouse `db_list_databases` is filtered by `allowed_schemas`, like `db_list_schemas` |
 | `db_list_schemas` | policy-filtered, paginated |
-| `db_list_tables` | kinds filter, search, catalog row estimates marked as estimates. On every engine the database's own objects come first, then those of the system schemas or dictionary owners the policy opens: under the default `security.allowed_system_schemas: [information_schema]` that is `information_schema` on PostgreSQL and MySQL (kind `view` on MySQL), SQL Server's `INFORMATION_SCHEMA` views when views are requested, and ClickHouse's `INFORMATION_SCHEMA` and `information_schema`. Oracle decides a dictionary owner as the policy does (`PDBADMIN` is user data, `APEX_nnnnnn` a dictionary); Db2 lists `SYSCAT` and `SYSIBM` last. Oracle `SYS.DUAL` and Db2 `SYSIBM.SYSDUMMY1` are listed only when `SYS` or `SYSIBM` is opened. SQLite's own `sqlite_*` tables, the views of other sessions' SQL, of column statistics and of stored credentials (`docs/security.md`), and a SQL Server `dbo` table named like a compatibility view are never listed, even with `include_system` or with their schema opened |
+| `db_list_tables` | kinds filter, search, catalog row estimates marked as estimates. On every engine the database's own objects come first, then those of the system schemas or dictionary owners the policy opens: under the default `security.allowed_system_schemas: [information_schema]` that is `information_schema` on PostgreSQL and MySQL (kind `view` on MySQL), SQL Server's `INFORMATION_SCHEMA` views when views are requested, and ClickHouse's `INFORMATION_SCHEMA` and `information_schema`. Oracle decides a dictionary owner as the policy does (`PDBADMIN` is user data, `APEX_nnnnnn` a dictionary); Db2 lists `SYSCAT` and `SYSIBM` last. Oracle `SYS.DUAL` and Db2 `SYSIBM.SYSDUMMY1` are listed only when `SYS` or `SYSIBM` is opened. SQLite's own `sqlite_*` tables and the internal tables of its FTS and R*Tree indexes, the views of other sessions' SQL, of column statistics, of stored credentials and of other objects' definitions (`information_schema.VIEWS`, `ROUTINES`, `COLUMNS`, ...; `docs/security.md`), and a SQL Server `dbo` table named like a compatibility view are never listed, even with `include_system` or with their schema opened |
 | `db_get_table` | columns/keys/indexes/definition/estimate. Each column carries `sensitive`; a sensitive column's DEFAULT reads `<masked>`. A definition is withheld (null, with a warning) when a sensitive column has a DEFAULT or the definition names a sensitive column beside a string literal, and is otherwise cut to `security.max_cell_bytes`. A foreign key into a schema the policy hides reads `<not permitted>`. On SQL Server a bare name resolves where SQL Server resolves it (the login's default schema, then `dbo`) and `schema` names the one found. For schema arguments under an allowlist, see Schema arguments below |
 | `db_list_columns` | paginated; sensitive DEFAULTs masked; the SQL Server bare-name rule above |
-| `db_list_views` | definitions only where the engine reports them, cut to `max_cell_bytes`, and withheld when they name a sensitive column beside a string literal. It lists the engine's view catalog within the allowlist, without the system-schema filter of `db_list_tables`: without an allowlist, PostgreSQL, Oracle and Db2 list their dictionary views too, by name only (live on the fixtures: PostgreSQL's `pg_tables` and `pg_roles`, Db2's `SYSCAT.TABLES`). It never lists a view of other sessions' SQL, of column statistics or of stored credentials (`pg_stat_activity`, `pg_stats`, `SYSIBMADM.MON_CURRENT_SQL`, `SYSCAT.COLDIST`), with or without an allowlist |
+| `db_list_views` | definitions only where the engine reports them, cut to `max_cell_bytes`, and withheld when they name a sensitive column beside a string literal (DDL text is read with a tokenizer under every reading the engine may use, backslash escapes and nested comments or not; a comment counts as a literal, and text no reading can finish is withheld wherever it names a sensitive word). It lists the engine's view catalog within the allowlist, without the system-schema filter of `db_list_tables`: without an allowlist, PostgreSQL, Oracle and Db2 list their dictionary views too, by name only (live on the fixtures: PostgreSQL's `pg_tables` and `pg_roles`, Db2's `SYSCAT.TABLES`). Called without a schema it leaves out the views of a namesake schema (one differing only in case from an allowed one), as `db_list_synonyms` and `db_list_routines` do. It never lists a view of other sessions' SQL, of column statistics, of stored credentials or of other objects' definitions (`pg_stat_activity`, `pg_stats`, `SYSIBMADM.MON_CURRENT_SQL`, `SYSCAT.COLDIST`), with or without an allowlist |
 | `db_list_synonyms` | targets listed, remote links never traversed; paged (`next_cursor`). Scoped like `db_list_views`, by the allowlist only: without one, Oracle lists the synonyms `ALL_SYNONYMS` holds, the PUBLIC synonyms for its dictionary views (`ALL_USERS`) included, by name only. On Oracle and Db2 a synonym or alias is left out when its own name, its target, or any synonym or alias further along its chain is a view no statement may read (Oracle's PUBLIC `V$SQL` and `ALL_TAB_HISTOGRAMS`); for a schema, Oracle reads that owner's synonyms and each local synonym they name in turn (`CONNECT BY NOCYCLE`) and lists only the owner's, and Db2 reads every alias and filters by schema |
 | `db_list_routines` | metadata only; never executed; paged. Scoped like `db_list_views`, by the allowlist only (without one, Db2 lists the routines of `SYSIBM`, `SYSIBMADM`, `SYSPROC`, `SYSFUN` and its other system schemas too) |
 | `db_search_metadata` | deterministic lexical ranking + match reasons |
 | `db_get_relationships` | declared FKs; `include_inferred` adds labeled heuristics (no value sampling). A key into a hidden schema reads `to_table: <not permitted>` with no columns |
 | `db_get_statistics` | catalog estimates with freshness; no COUNT(*) by default |
 | `db_validate_query` | validation without execution + stated limitations; the same refusals the guard gives `db_query` (it runs no statement, so the Oracle bare-`DUAL` session check below is not made). `referenced_objects` names every table the statement reads, as written (a bare `DUAL` is `{schema: null, name: "DUAL"}`; on ClickHouse an `a.b` column that ClickHouse reads as the table `a.b` too). On MySQL and ClickHouse, `SHOW`/`DESCRIBE` verdicts apply the allowlist, qualification, schema-spelling and default-deny rules to the named object, `SHOW TABLES FROM <db>` included (`db_query` still never runs them). The limitations always include `db_explain captures plans without executing the statement: EXPLAIN ANALYZE is not supported`, plus `EXPLAIN ANALYZE is disabled by policy` while `security.allow_explain_analyze` is false, and on MySQL `db_explain returns a TREE or JSON plan only for a statement naming no masked column (MySQL prints the values it reads from const tables into those formats); FORMAT=TRADITIONAL plans are returned for any` |
-| `db_query` | validated, bounded read; masking applied (see Masking). `parameters` values must be JSON scalars (string, number, boolean or null) and their names identifiers; anything else is `VALIDATION_ERROR` before anything runs. A result cut by the row or byte limit carries `truncated: true` and the warning `result truncated: limits are rows<=N, bytes<=M`. A cell cut to `max_cell_bytes` adds a warning of its own (`... exceeded the N byte cell limit and were truncated`), and on every engine but SQLite it also sets `truncated: true` (with the warning above); on SQLite only the row and byte limits set it |
+| `db_query` | validated, bounded read; masking applied (see Masking). `parameters` values must be JSON scalars (string, number, boolean or null) and their names identifiers; anything else is `VALIDATION_ERROR` before anything runs. On MySQL, ClickHouse and PostgreSQL the text the driver formats is exactly the validated statement: only a placeholder outside string literals, quoted names and comments takes a value, a placeholder inside one is plain text, and every other `%` arrives as written; a placeholder count or name that does not match the values, or a named value no placeholder uses, is `VALIDATION_ERROR` (`docs/security.md`, Query safety). `parameters: []` binds nothing (a `LIKE 'a%'` runs as written). A result cut by the row or byte limit carries `truncated: true` and the warning `result truncated: limits are rows<=N, bytes<=M`. A cell cut to `max_cell_bytes` adds a warning of its own (`... exceeded the N byte cell limit and were truncated`), and on every engine but SQLite it also sets `truncated: true` (with the warning above); on SQLite only the row and byte limits set it |
 | `db_sample_table` | default 20 rows; masking/omission policy applied; an object whose name holds a control character is refused (`VALIDATION_ERROR`), and such columns are skipped with a warning |
 | `db_explain` | non-executing plans only, spelled `EXPLAIN <select>` on every engine: native EXPLAIN on PostgreSQL, MySQL, ClickHouse and SQLite; Oracle through `EXPLAIN PLAN` into the session-private `PLAN_TABLE` (DBMS_XPLAN text plus rows); SQL Server through `SET SHOWPLAN_ALL` on a private connection (needs the SHOWPLAN permission, named when missing); Db2 through `EXPLAIN PLAN` into DBA-provisioned explain tables (session schema or SYSTOOLS; refused with the `SYSINSTALLOBJECTS` instruction when absent; the rows written are read back and deleted again; the account needs INSERT, SELECT and DELETE on the explain tables, and a DELETE that fails is reported as a warning, never hidden). The statement reaches the engine exactly as written (the guard validated that text; Db2 `WITH UR` and `OPTIMIZE FOR n ROWS` survive). `parameters` are refused: a plan is captured for the text as written, so inline the literal values. The plan names every object the engine touches, including the base tables behind a permitted view. On MySQL a TREE or JSON plan of a statement naming a masked column is withheld (see below). Options and ANALYZE: see below |
 | `db_get_query_history` | "Redacted operational history of this server process (fingerprints, not raw SQL); under HTTP it holds every client's calls. Not a substitute for the audit log." The result's note reads `operational history of this server process (under HTTP, every client's calls); raw SQL text is not included` (see the identity note below). It lists every call, the refusals the audit log coalesces included |
@@ -104,7 +108,7 @@ included. When a connector cannot be built at all, absolute file paths in the
 | `db_infer_relationships` | declared foreign keys + inferred join candidates (name/type match, `<table>_id` convention) within and across connections, metadata only (details below) |
 | `db_review_schema` | optimization review of a schema or whole connection: every permitted table profiled on a bounded sample under one time budget (biggest tables first, paged), findings prioritized by severity with evidence and a suggestion; `sensitive` columns counted only; `recommendations` count against `max_response_bytes` |
 | `db_federated_query` | one validated read statement on several connections (or one statement per connection): per-connection results, each guarded, bounded and masked under its own policy, plus a merged view with a leading `connection` column when the column names agree; one failing connection is a warning (a refused statement is reported in that connection's `results[].error` and not run); one time budget; the strictest `max_response_bytes` among the connections binds the whole response, `merged` included (cut with a warning), and each statement runs with what is left of it, so a statement that ran is always reported; every statement leaves its own audit record (`db_federated_query:statement`, same request id, its connection and fingerprint) |
-| `db_federated_join` | a client-side hash join of two bounded read results from two connections (or the same one) on key columns: inner or left, row-capped, keys compared as normalised text so `5`, `5.0` and `'5'` from different engines match; masked values never match; the joined output is bounded by the stricter of the two policies' `max_response_bytes` (a partial join is `truncated` with a warning); either side refused fails the call; each side leaves its own audit record; nothing is written |
+| `db_federated_join` | a client-side hash join of two bounded read results from two connections (or the same one) on key columns: inner or left, row-capped, keys compared as normalised text so `5`, `5.0` and `'5'` from different engines match; `on` lists 1 to 16 `[left, right]` pairs (more is `VALIDATION_ERROR`, a repeated pair counts once); masked values never match; the joined output is bounded by the stricter of the two policies' `max_response_bytes` (a partial join is `truncated` with a warning); either side refused fails the call; each side leaves its own audit record; nothing is written |
 | `db_document_schema` | Markdown data dictionary of a schema or whole connection (paged): columns with declared and portable types, nullability, defaults, keys, indexes, comments, declared relationships; metadata only; comments and definitions cut to `max_cell_bytes`; a page can end early on the discovery time budget |
 
 Every tool that takes a list of connections (`db_search_metadata`,
@@ -436,7 +440,11 @@ across system catalogs unless asked (`include_system` on `db_search_values`
 and `db_infer_relationships`; profiling takes one named object), or run
 outside the policy's row, byte and time ceilings
 (`security.profile_max_sample_rows`, `security.discovery_time_budget_seconds`
-and the query timeout). Evidence status: the findings rules are unit-tested
+and the query timeout). They walk only the listed tables a named
+`db_sample_table` would read: a listed table the policy's object check
+refuses (Db2 `SYSIBM.SYSCOLUMNS`, whose `HIGH2KEY`/`LOW2KEY` hold other
+columns' values, once `SYSIBM` is opened) is skipped by `db_search_values`,
+`db_review_schema`, `db_get_catalog` and `db_document_schema`. Evidence status: the findings rules are unit-tested
 on a seeded SQLite database; in the live fixture run
 (`test-evidence/discovery-tools/`) only ClickHouse held enough rows for the
 data-driven rules to fire, and the cross-connection inference produced
@@ -485,7 +493,9 @@ cross-connection path is unit-tested).
   left out.
 - A key shared by more than 3 tables, or a column that is the source table's
   own key, is treated as a convention (a surrogate key) and is not a
-  candidate, unless the target table's name derives the column.
+  candidate, unless the column is named for the target table (it starts
+  with the table's name or its singular and `_`: `customer_id`,
+  `customer_no`, `customers_code`).
 - It honours `security.discovery_time_budget_seconds` (the smallest across
   the connections read) over its catalog reads and reads at most 50 schemas
   per call; tables whose catalog was not read are left out with a warning,
@@ -539,7 +549,32 @@ first branch names its own CTE), every column the
 statement does not prove clean is masked, with the warning `the result's
 columns could not all be traced to their source columns; every column the
 statement does not prove clean was masked (fail closed)`. A masked result is
-cut again to `max_response_bytes` after masking.
+cut again to `max_response_bytes` after masking. In particular:
+
+- PostgreSQL `(expr).*` and ClickHouse `untuple(t)` are traced as a run of
+  columns of unknown width, never as one column.
+- A statement with Oracle `MATCH_RECOGNIZE` or PostgreSQL `SEARCH`/`CYCLE`
+  (whose `ord`/`path` columns carry the BY columns' values) is untraceable:
+  every column it does not prove clean is masked.
+- A column qualifier the analysis binds to no source (other than on
+  ClickHouse), or one two FROM items share in different case (`"A"` and
+  `a`) where the engine may bind either, is not proven clean. A PIVOT or
+  UNPIVOT alias binds to its FROM item and is traced through it.
+- SQLite names an unaliased expression by its text (`upper(x)`) and a second
+  column of one name `x:1`: such names, and a name no source outputs, are
+  masked when the source may carry a sensitive value.
+- Where a star expands to a run of unknown width, each alias the statement
+  wrote must be reported by the driver at the position the trace gives it;
+  otherwise every column not proven clean is masked (a PostgreSQL alias over
+  63 bytes, which the server truncates, included).
+- Engines that fold names are traced as they fold (Oracle by Unicode's
+  rules), so a CTE decoy in another case does not hide a table.
+
+Definitions (`db_get_table`, `db_list_views`, index definitions) are read
+with a tokenizer, so an apostrophe in a quoted name, a comment or a MySQL
+`\'` escape cannot shift where a literal begins: a definition is withheld
+when any reading the engine may use finds a literal (a comment counts) next
+to a sensitive name.
 
 PostgreSQL attribute notation (`b.fn` meaning `fn(b)`): a qualified name is
 checked against the base table's catalog columns (one `information_schema`

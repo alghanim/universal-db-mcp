@@ -8,6 +8,9 @@
 # flag. When it runs, the live configuration is displaced to
 # <backup-root>/pre-rollback-<ts>/ and preserved — never deleted — and the
 # backup is validated through the restored venv before anything is moved.
+# The release public key (keys/), the HTTP bearer token (http-token) and the
+# external rollback anchor are not restored from the backup: the live ones
+# are kept.
 #
 # Verify-then-use: the restored venv is executed (doctor below) exactly in the
 # failure scenarios where on-disk state is least trustworthy, so nothing under
@@ -272,6 +275,47 @@ udbmcp_anchor_verified_manifest() {
   echo "    verified manifest anchored at $ROLLBACK_ANCHOR for the next rollback"
 }
 
+# Prints how the installed-release record $1 relates to the record $2 of the
+# release a rollback restored: raise ($1 is missing, unreadable or an older
+# release), same (the same release_seq), or keep (a later release, or no
+# release_seq to order them by).
+udbmcp_record_order() {
+  [ -f "$2" ] || { echo keep; return 0; }
+  python3 -I -S - "$1" "$2" <<'PYEOF' 2>/dev/null || echo keep
+import json
+import sys
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def seq(manifest):
+    value = manifest.get("release_seq")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+record, running = load(sys.argv[1]), load(sys.argv[2])
+if running is None or seq(running) is None:
+    print("keep")
+elif record is None or seq(record) is None or seq(record) < seq(running):
+    print("raise")
+elif seq(record) == seq(running):
+    print("same")
+else:
+    print("keep")
+PYEOF
+}
+
+# The record of the release in venv.previous, kept beside it by the installer
+# that demoted it (install_offline.sh, upgrade_offline.sh).
+RESTORED_RECORD="$TARGET/venv.previous.manifest.json"
+
 if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl stop universal-db-mcp || true; fi
 if [ -d "$TARGET/venv.previous" ]; then
   # Integrity gate BEFORE any rename and before the doctor call below executes
@@ -301,11 +345,34 @@ if [ -d "$TARGET/venv.previous" ]; then
   else
     echo "==> rollback complete"
   fi
-  # Anti-rollback: $TARGET/manifest.json still names the release rolled back
-  # FROM, so installing the older bundle again is refused as a downgrade
-  # unless the operator says so explicitly.
-  echo "    NOTE: re-installing the older bundle is a downgrade: pass --allow-downgrade to"
-  echo "          install_offline.sh/upgrade_offline.sh (or UDBMCP_ALLOW_DOWNGRADE=1 for dpkg -i)"
+  # Anti-rollback: $TARGET/manifest.json is the installed-release record the
+  # verifier compares the next bundle with. It still names the release rolled
+  # back FROM and stays so (installing the older bundle again is a downgrade
+  # the operator must name), unless that release is OLDER than the one now
+  # running: a rollback after an intended downgrade. A record below the
+  # running release would accept every bundle in between without a word, so
+  # the record of the release now running (kept beside its venv by the
+  # installer that demoted it) replaces it then.
+  case "$(udbmcp_record_order "$TARGET/manifest.json" "$RESTORED_RECORD")" in
+    raise)
+      if cp "$RESTORED_RECORD" "$TARGET/manifest.json.new.$$" && chmod 0644 "$TARGET/manifest.json.new.$$" \
+        && mv -f "$TARGET/manifest.json.new.$$" "$TARGET/manifest.json"; then
+        echo "    the installed-release record $TARGET/manifest.json named an older release than the"
+        echo "    one now running; it now names the running release (an older bundle is refused)"
+      else
+        rm -f "$TARGET/manifest.json.new.$$" 2>/dev/null || true
+        echo "WARN: $TARGET/manifest.json names an older release than the one now running and could" >&2
+        echo "      not be replaced: until a release is installed again, bundles older than the" >&2
+        echo "      running release are not refused" >&2
+      fi
+      ;;
+    same) ;;
+    *)
+      echo "    NOTE: re-installing the older bundle is a downgrade: pass --allow-downgrade to"
+      echo "          install_offline.sh/upgrade_offline.sh (or UDBMCP_ALLOW_DOWNGRADE=1 for dpkg -i)"
+      ;;
+  esac
+  rm -f "$RESTORED_RECORD"
 else
   echo "no $TARGET/venv.previous found"
 fi
@@ -330,6 +397,23 @@ if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP/universal-db-mcp/config.yaml"
     # staged NEXT TO $ETC_DIR (not inside it) so the displacement below
     # cannot carry it away; the final move is a rename within the same
     # directory, hence atomic, and never aborts the restore.
+    # Trust material and credentials are not configuration either: the
+    # release public key (keys/, rotated with bootstrap.sh --rotate-key) and
+    # the HTTP bearer token (http-token, rotated by the operator) are the live
+    # ones, never the backup's. Restoring the backup's would put back the key
+    # a rotation retired, or a token that was rotated because it leaked. The
+    # live copies are carried into the restored directory (a name absent from
+    # the live directory stays absent).
+    for _live in keys http-token; do
+      rm -rf "$ETC_DIR.new/$_live"
+      if [ -e "$ETC_DIR/$_live" ] || [ -L "$ETC_DIR/$_live" ]; then
+        cp -a "$ETC_DIR/$_live" "$ETC_DIR.new/$_live" || {
+          echo "FAIL: could not carry the live $ETC_DIR/$_live into the restored configuration; live configuration left untouched" >&2
+          rm -rf "$ETC_DIR.new"
+          exit 1
+        }
+      fi
+    done
     _anchor_in_etc=0
     _anchor_restore=""
     case "$ROLLBACK_ANCHOR" in

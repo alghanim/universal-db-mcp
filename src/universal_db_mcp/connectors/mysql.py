@@ -54,7 +54,7 @@ from universal_db_mcp.discovery.system_schemas import is_session_sql_view
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
-from universal_db_mcp.security.sql_guard import mask_pyformat_placeholders, translate_paramstyle
+from universal_db_mcp.security.sql_guard import bind_text, mask_pyformat_placeholders, translate_paramstyle
 
 # PyMySQL FIELD_TYPE codes -> stable column labels (driver-derived, not
 # data-derived).
@@ -94,8 +94,11 @@ _MYSQL_STRING_TYPES = frozenset({15, 253, 254})
 # derived table's column it names differently or twice.
 _REWRITE_REFUSED = frozenset({1054, 1059, 1060, 1064, 1166, 1234})
 # The prepared-statement protocol does not take the statement (some SHOW
-# forms): it is not described.
-_PREPARE_UNSUPPORTED = 1295
+# forms, 1295), the server holds no more prepared statements
+# (max_prepared_stmt_count, 1461), or a proxy does not know the command
+# (1047): the statement is not described, and runs as written (review E5:
+# SELECT 1, COUNT(*), UNION and CTEs failed with 1461).
+_PREPARE_UNAVAILABLE = frozenset({1295, 1461, 1047})
 # Longest name MySQL takes as an identifier.
 _MYSQL_NAME_MAX = 64
 # The server's own schemas, which list_tables leaves out unless allowed.
@@ -249,15 +252,14 @@ def _mysql_cut_columns(description: Sequence[Any], max_cell_bytes: int) -> set[i
     return cut
 
 
-def _mysql_quote(name: str, *, bound: bool) -> str:
-    """A backtick-quoted name; '%' doubled when parameters are bound
-    (PyMySQL formats the text then)."""
-    quoted = "`" + name.replace("`", "``") + "`"
-    return quoted.replace("%", "%%") if bound else quoted
+def _mysql_quote(name: str) -> str:
+    """A backtick-quoted name. A '%' in it is doubled with the rest of the
+    text when parameters are bound (bind_text)."""
+    return "`" + name.replace("`", "``") + "`"
 
 
 def _mysql_capped_select(
-    select: SelectList, description: Sequence[Any], cut: set[int], max_cell_bytes: int, *, bound: bool
+    select: SelectList, description: Sequence[Any], cut: set[int], max_cell_bytes: int
 ) -> str | None:
     """The statement with the output columns at ``cut`` cut by the server
     to ``max_cell_bytes + 1`` (so a cut is still detected here) and kept
@@ -271,12 +273,49 @@ def _mysql_capped_select(
         return None
     keep = max_cell_bytes + 1
     return select.rewrite(
-        names, cut, lambda text: f"LEFT({text}, {keep})", lambda name: _mysql_quote(name, bound=bound)
+        names, cut, lambda text: f"LEFT({text}, {keep})", _mysql_quote
     )
 
 
+def _mysql_spelled_star(
+    select: SelectList, description: Sequence[Any], tables: Sequence[str] | None, cut: set[int], max_cell_bytes: int
+) -> str | None:
+    """A ``SELECT *`` over a join with the star spelled out, each column as
+    ``table.name`` (the table or alias the server described it under) and the
+    ones at ``cut`` cut to ``max_cell_bytes + 1``; None where that is not
+    exactly the star. The other rewrites cannot take such a statement when
+    two of its columns share a name: a derived table refuses duplicate names
+    (1060), and only MySQL 8.0 takes the derived column list that renames
+    them (5.7 and MariaDB: 1064; review E4). A star does not rename what it
+    expands, so ``table.name`` is that column, except where a USING or
+    NATURAL join merges a pair of columns into one."""
+    tree = select.tree
+    entries = select.entries
+    joins = tree.args.get("joins") or []
+    names = [str(d[0]) for d in description]
+    if (
+        tables is None
+        or entries is None
+        or len(entries) != 1
+        or not isinstance(entries[0].node, exp.Star)
+        or not joins
+        or any(j.args.get("using") or str(j.args.get("method") or "").upper() == "NATURAL" for j in joins)
+        or tree.args.get("distinct")
+        or cut & _mysql_compared_outputs(tree, names)
+        or len({(t.lower(), n.lower()) for t, n in zip(tables, names, strict=True)}) != len(names)
+    ):
+        return None
+    keep = max_cell_bytes + 1
+    parts = []
+    for i, (table, name) in enumerate(zip(tables, names, strict=True)):
+        ref = f"{_mysql_quote(table)}.{_mysql_quote(name)}"
+        parts.append(f"{f'LEFT({ref}, {keep})' if i in cut else ref} AS {_mysql_quote(name)}")
+    entry = entries[0]
+    return select.sql[: entry.start] + ", ".join(parts) + select.sql[entry.end :]
+
+
 def _mysql_derived_selects(
-    sql: str, description: Sequence[Any], cut: set[int], max_cell_bytes: int, *, bound: bool
+    sql: str, description: Sequence[Any], cut: set[int], max_cell_bytes: int
 ) -> list[str]:
     """The statement as a derived table whose columns at ``cut`` the server
     cuts to ``max_cell_bytes + 1``, each output under its own name: first
@@ -292,17 +331,22 @@ def _mysql_derived_selects(
     body = statement_body(sql, "mysql")
     forms: list[tuple[list[str], str]] = []
     if all(0 < len(n) <= _MYSQL_NAME_MAX for n in names) and len({n.lower() for n in names}) == len(names):
-        forms.append(([f"udbmcp_q.{_mysql_quote(n, bound=bound)}" for n in names], ""))
+        forms.append(([f"udbmcp_q.{_mysql_quote(n)}" for n in names], ""))
     positions = [f"c{i}" for i in range(1, len(names) + 1)]
     forms.append(([f"udbmcp_q.{p}" for p in positions], f"({', '.join(positions)})"))
     out: list[str] = []
     for refs, column_list in forms:
         items = [
-            f"{f'LEFT({ref}, {keep})' if i in cut else ref} AS {_mysql_quote(name, bound=bound)}"
+            f"{f'LEFT({ref}, {keep})' if i in cut else ref} AS {_mysql_quote(name)}"
             for i, (ref, name) in enumerate(zip(refs, names, strict=True))
         ]
         out.append(f"SELECT {', '.join(items)} FROM (\n{body}\n) AS udbmcp_q{column_list}")
     return out
+
+
+def _bound(text: str, args: Any) -> str:
+    """``text`` as PyMySQL must receive it with ``args`` bound (bind_text)."""
+    return bind_text(text, args, engine="mysql")
 
 
 def _mysql_parse(sql: str) -> exp.Expr | None:
@@ -352,6 +396,8 @@ class MySQLConnector(DatabaseConnector):
         self._running_thread: int | None = None  # server thread id of the executing query
         self._pool_lock = threading.Lock()
         self._meta_conn: Any = None  # reused metadata connection (ping on checkout)
+        # the table (or alias) of each column the last LIMIT 0 describe returned, when PyMySQL gave them
+        self._described_tables: list[str] | None = None
 
     @contextmanager
     def _shared_meta_conn(self) -> Iterator[Any]:
@@ -875,12 +921,18 @@ class MySQLConnector(DatabaseConnector):
         # them onto the driver's spelling after validation. Raised outside
         # translated_driver_errors() so a parameter-style mismatch keeps its
         # VALIDATION category instead of becoming a CONNECTION error.
-        sql, parameters = translate_paramstyle(spec.sql, spec.parameters, backslash_escapes=True)
+        sql, parameters = translate_paramstyle(spec.sql, spec.parameters, engine="mysql")
         # PyMySQL runs ``query % args`` whenever args is not None — an empty
         # tuple included — so an unparameterised statement with a literal '%'
         # (LIKE 'a%') would fail client-side. Pass None when nothing is bound
         # so the SQL is sent verbatim.
         args = parameters or None
+        # With values bound, PyMySQL fills every %s of the text, one in a
+        # string literal or a comment too, after the guard validated it: each
+        # text below goes through bind_text first (a '%' that is not a
+        # placeholder in code is doubled), and a placeholder/value mismatch is
+        # refused here, still a VALIDATION error.
+        bind_text(sql, args, engine="mysql")
         with translated_driver_errors():
             conn = self._connect()
         try:
@@ -907,7 +959,7 @@ class MySQLConnector(DatabaseConnector):
                 # close is easier to make idempotent.
                 cur = conn.cursor()
                 if plan is None:
-                    cur.execute(sql, args)
+                    cur.execute(_bound(sql, args), args)
                 else:
                     self._execute_capped(cur, plan, args)
                 cols = [(d[0], "unknown") for d in cur.description or []]
@@ -995,6 +1047,7 @@ class MySQLConnector(DatabaseConnector):
         no LIMIT, so there a statement that orders its rows is refused
         rather than returned in another order.
         """
+        self._described_tables = None
         tree = _mysql_parse(sql)
         if tree is not None and not isinstance(tree, exp.Query):
             return None  # SHOW, DESCRIBE: the server's own catalog text
@@ -1008,15 +1061,15 @@ class MySQLConnector(DatabaseConnector):
         cut = _mysql_cut_columns(description, spec.max_cell_bytes)
         if not cut:
             return None
-        bound = args is not None
         columns = [str(description[i][0]) for i in sorted(cut)]
         rewrites: list[str] = []
         if select is not None and (
-            in_place := _mysql_capped_select(select, description, cut, spec.max_cell_bytes, bound=bound)
+            in_place := _mysql_capped_select(select, description, cut, spec.max_cell_bytes)
+            or _mysql_spelled_star(select, description, self._described_tables, cut, spec.max_cell_bytes)
         ):
             rewrites.append(in_place)
         if "mariadb" not in str(getattr(conn, "server_version", "")).lower() or not _mysql_orders_rows(tree):
-            rewrites.extend(_mysql_derived_selects(sql, description, cut, spec.max_cell_bytes, bound=bound))
+            rewrites.extend(_mysql_derived_selects(sql, description, cut, spec.max_cell_bytes))
         elif not rewrites:
             raise _uncut_refusal(
                 columns, "MariaDB does not keep the ORDER BY of the derived table that would cut them"
@@ -1029,8 +1082,13 @@ class MySQLConnector(DatabaseConnector):
         statement's own error, a KILL) is the statement's."""
         probe = conn.cursor()
         try:
-            probe.execute(probe_sql, args)
-            return list(probe.description or [])
+            probe.execute(_bound(probe_sql, args), args)
+            fields = getattr(getattr(probe, "_result", None), "fields", None) or []
+            tables = [getattr(f, "table_name", None) for f in fields]
+            description = list(probe.description or [])
+            if len(tables) == len(description) and all(isinstance(t, str) and t for t in tables):
+                self._described_tables = [str(t) for t in tables]
+            return description
         except getattr(self._module, "MySQLError", ()) as exc:
             if exc.args and exc.args[0] in _REWRITE_REFUSED:
                 return None
@@ -1052,12 +1110,12 @@ class MySQLConnector(DatabaseConnector):
         connection_type = getattr(getattr(pymysql, "connections", None), "Connection", None)
         if connection_type is None or not isinstance(conn, connection_type):
             return None
-        text = conn.cursor().mogrify(sql, args)
+        text = conn.cursor().mogrify(_bound(sql, args), args)
         conn._execute_command(pymysql.constants.COMMAND.COM_STMT_PREPARE, text)
         try:
             head = conn._read_packet()  # an error packet raises here
         except pymysql.MySQLError as exc:
-            if exc.args and exc.args[0] == _PREPARE_UNSUPPORTED:
+            if exc.args and exc.args[0] in _PREPARE_UNAVAILABLE:
                 return None
             raise
         head.read_uint8()  # OK
@@ -1077,7 +1135,7 @@ class MySQLConnector(DatabaseConnector):
         them all, the statement never runs with its values uncut."""
         for i, text in enumerate(plan.rewrites):
             try:
-                cur.execute(text, args)
+                cur.execute(_bound(text, args), args)
                 return
             except getattr(self._module, "MySQLError", ()) as exc:
                 if not (exc.args and exc.args[0] in _REWRITE_REFUSED):

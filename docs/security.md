@@ -44,7 +44,13 @@ reporting only).
   `options.wallet_password_env`). An inline `options.wallet_password` is a
   `CONFIG_ERROR`.
 - `*_env` names must be ASCII identifiers (`[A-Za-z_][A-Za-z0-9_]*`).
-- POSIX: secret files with group/other read bits are rejected.
+- POSIX: secret files with group/other read bits are rejected. On macOS an
+  extended ACL entry that grants anyone but the file's owner read, write,
+  append, writesecurity or chown on a secret file or the HTTP token
+  (`-rw-------+` with `everyone allow read`) is rejected too, when `serve`
+  reads it and by `doctor` (remedy: `chmod -N <file>`); an ACL that cannot be read is
+  rejected. A secret or config file that is not UTF-8 text is a
+  `CONFIG_ERROR` that names the file but no byte of it.
 - Windows: `serve` and `doctor` check the secret files' and the HTTP token's
   ACLs. The owner must be SYSTEM, Administrators or the service account, and
   no ACE may grant read or write (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`,
@@ -59,10 +65,15 @@ reporting only).
 - Never present in results, errors, logs, DSNs, process args, or the bundle
   manifest. Passwords, tokens and wallet passwords are scrubbed wherever they
   appear; auth-failure message shapes are redacted. Usernames are treated as
-  identifiers and are not scrubbed from arbitrary text.
+  identifiers and are not scrubbed from arbitrary text, except in the
+  auth-failure shapes: ClickHouse's `DB::Exception: <login>: Authentication
+  failed` hides the login. MySQL's `(using password: YES)` is kept, so a 1045
+  error keeps its errno and message.
 - `add-connection` writes secrets as private files in `<config dir>/secrets/`
   (on Windows with a protected DACL; a pre-created, junctioned or broadly
-  readable secrets folder is refused), keeps backups of replaced secret files
+  readable secrets folder is refused; on macOS an extended ACL the folder
+  inherited as it was created is removed, and one an existing folder carries
+  is refused: `chmod -N <dir>`), keeps backups of replaced secret files
   (`<name>.username.bak.<stamp>`, `<name>.password.bak.<stamp>`; they hold old
   credentials, so remove them once checked), and as root writes secrets only
   when every directory from `/` to the config's directory is root-owned and
@@ -87,8 +98,10 @@ reporting only).
   not the working directory: `audit_path`, `metadata_cache_path`,
   `http_bearer_token_file`, `username_file`, `password_file`, the `tls`
   files, `options.wallet_password_file` and PostgreSQL `options.passfile`. A
-  SQLite `database` and the directory-valued Oracle options are used as
-  written. A relative `UDBMCP_HTTP_BEARER_TOKEN_FILE` is relative to the
+  SQLite `database` (a leading `~` is expanded) and the directory-valued
+  Oracle options (`wallet_location`, `tns_admin`, `lib_dir`) are used as
+  written, so a relative one follows the server's working directory (`/`
+  under the systemd unit): write them absolute. A relative `UDBMCP_HTTP_BEARER_TOKEN_FILE` is relative to the
   service manager's working directory.
 
 ## Query safety (details in docs/tools.md)
@@ -113,7 +126,13 @@ reporting only).
 - Sequence access denied (`NEXT VALUE FOR`, Oracle `NEXTVAL`/`CURRVAL`, Db2
   `NEXTVAL FOR`): a read that advances a sequence is a write. T-SQL table
   hints other than NOLOCK, READUNCOMMITTED, READPAST and NOWAIT denied (they
-  take or escalate locks).
+  take or escalate locks), in the legacy form without `WITH` after a table's
+  alias too (`FROM t b (TABLOCKX)` is refused: `table hint '<name>' is not
+  permitted on a read-only connection ...`). An optimizer hint comment
+  (`/*+ ... */`) is inert: its body names no object and calls no function
+  (Oracle `INDEX`, `LEADING`, `USE_NL`, MySQL `BKA` are accepted), except the
+  MySQL hints that change how the statement runs, `MAX_EXECUTION_TIME`,
+  `SET_VAR` and `RESOURCE_GROUP`, which are refused.
 - EXPLAIN/SHOW/DESCRIBE via dedicated per-dialect policies only; the
   validated statement text is what reaches the engine. `db_explain` never runs
   a statement: ANALYZE asked for with `analyze=true`, or written in a
@@ -123,7 +142,19 @@ reporting only).
   and SQL Server have no ANALYZE form and SQLite cannot parse one, so ANALYZE
   written in their statements is `POLICY_VIOLATION` either way.
 - Bound parameters via driver facilities (JSON scalars only); identifiers
-  validated and quoted by the adapter.
+  validated and quoted by the adapter. On MySQL, ClickHouse (client-side
+  binding) and PostgreSQL the driver formats the values into the text with
+  Python's `%` operator, which also fills a `%s` inside a string literal or
+  a comment, after the guard validated the text. The connectors therefore
+  hand the driver exactly the validated statement: only a placeholder in
+  code (outside literals, quoted names and comments, as that engine bounds
+  them, PostgreSQL `$tag$` quotes and `E'...'` strings and ClickHouse
+  heredocs included) takes a value, and every other `%` reaches the engine
+  as written (`sql_guard.bind_text`, at the driver boundary; the statement
+  the guard and the audit see is plain SQL). A placeholder inside a literal
+  or comment is text. A placeholder count that does not match the values,
+  a `%(name)s` with no value, a named value no placeholder uses, or both
+  styles at once is `VALIDATION_ERROR` before anything runs.
 - A name after `IN` without parentheses is refused, since ClickHouse and
   SQLite read it as a table (`x IN t`, `x IN db.t`, and any expression there
   holding a name, such as `x IN tuple(t)`); on ClickHouse `IN (<single name>)`
@@ -207,7 +238,16 @@ reporting only).
   escapes ClickHouse decodes (`` `on\x65` `` reads `one`; double a backquote
   inside backquotes). A SQL Server table or column whose catalog name is not
   ASCII therefore cannot be named in a statement; `SELECT *` and the
-  metadata, sample and profile tools still reach it.
+  metadata, sample and profile tools still reach it. An empty quoted name
+  (`""`, `[]`, ``` `` ```) as a schema, table or column is refused
+  (`"".ALL_USERS`, `[].syslogins` read as a bare name the bare-name rules did
+  not see), in statements and in the `object_name` of the metadata tools
+  (`VALIDATION_ERROR`, each part must be a non-empty name).
+- A bare FROM item is taken for a CTE only when the engine binds it to that
+  CTE under every case folding it may apply: Oracle upper-cases an unquoted
+  name by Unicode's rules, character by character (`WITH "é" ... FROM é`
+  reads the table `É` and is authorized as one); on PostgreSQL and Db2 the
+  ASCII and the Unicode folding must agree.
 
 ### SQL Server (T-SQL) specifics
 
@@ -317,7 +357,10 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
   admitted spelling) in statements and in the schema arguments of the
   listing, metadata, sample and profile tools (`docs/tools.md`, Schema
   arguments). Called without a schema, `db_list_views`, `db_list_synonyms`
-  and `db_list_routines` still list a namesake's objects, by name only. The
+  and `db_list_routines` leave a namesake's objects out; a declared foreign
+  key into a namesake (`db_get_table`, `db_get_relationships`, the catalog
+  tools) names its target `<not permitted>`, as one into a schema outside the
+  allowlist, and `db_infer_relationships` leaves such a target out. The
   spellings are compared over the whole schema list (`list_schemas`, as
   `db_list_schemas` reads it) as well as the listing, so a namesake that holds
   nothing listed (empty, only foreign tables or partitioned parents) is still
@@ -463,13 +506,16 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
     `session`, `innodb_lock_waits` and `schema_table_lock_waits` (and their
     `x$` twins); `mysql.general_log` and `mysql.slow_log`.
   - PostgreSQL: `pg_stat_activity`, bare or in `pg_catalog`;
-    `pg_stat_statements`, `pg_stat_monitor` and `pg_qualstats*` in any
-    schema.
+    `pg_stat_statements`, `pg_stat_monitor`, `pg_qualstats*`,
+    `pg_show_plans` (every running statement's plan with its literals) and
+    `pg_store_plans*` in any schema.
   - ClickHouse: `system.processes`, `query_cache`, `asynchronous_inserts`,
-    `mutations`, `distributed_ddl_queue` and `errors`, and the logs
-    `query_log`, `query_thread_log`, `query_views_log`, `text_log`,
-    `error_log`, `opentelemetry_span_log`, `asynchronous_insert_log` and
-    `crash_log`, with or without the `_N` suffix an upgrade leaves.
+    `mutations`, `distributed_ddl_queue`, `errors` and `zookeeper` (a
+    replicated table's queue entries hold block ids and mutation SQL), and
+    the logs `query_log`, `query_thread_log`, `query_views_log`, `text_log`,
+    `error_log`, `opentelemetry_span_log`, `asynchronous_insert_log`,
+    `crash_log` and `zookeeper_log`, with or without the `_N` suffix an
+    upgrade leaves.
   - Oracle, in any schema or bare: the `V$`, `GV$`, `V_$` and `GV_$`
     spellings of `SESSION`, `SQL`, `SQLAREA`, `SQLAREA_PLAN_HASH`, `SQLTEXT`,
     `SQLTEXT_WITH_NEWLINES`, `SQLSTATS`, `SQLSTATS_PLAN_HASH`, `OPEN_CURSOR`,
@@ -478,7 +524,9 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
     `ALL_SQL_BIND_CAPTURE`, `SQL_PLAN`, `SQL_PLAN_STATISTICS_ALL`,
     `SQL_HISTORY`, `ADVISOR_CURRENT_SQLPLAN`, `DB_OBJECT_CACHE`,
     `SQL_SHARED_MEMORY`, `UNIFIED_AUDIT_TRAIL`, `XML_AUDIT_TRAIL`,
-    `LOGMNR_CONTENTS`, `DIAG_TRACE_FILE_CONTENTS`, `DIAG_SQL_TRACE_RECORDS`
+    `LOGMNR_CONTENTS`, `DIAG_TRACE_FILE_CONTENTS`, `DIAG_ALERT_EXT` (the
+    alert log; ORA- messages quote the failing statement),
+    `RESULT_CACHE_OBJECTS` (the cached statements), `DIAG_SQL_TRACE_RECORDS`
     and `DIAG_OPT_TRACE_RECORDS`; `FLASHBACK_TRANSACTION_QUERY`;
     `DBA_HIST_`/`CDB_HIST_` `SQLTEXT`, `SQLBIND`, `SQL_PLAN`, `SQLSTAT`,
     `REPORTS` and `REPORTS_DETAILS`; `AWR_ROOT_`/`AWR_PDB_`/`AWR_CDB_`
@@ -619,12 +667,33 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
   earlier as credentials. `information_schema.foreign_tables` stays
   readable; residual: `pg_attribute.attfdwoptions` is readable once
   `pg_catalog` is opened.
+- **Object definitions.** The `information_schema` views that carry other
+  objects' SQL and literals (view and routine bodies, trigger statements,
+  event bodies, check clauses, the DEFAULT expressions of columns,
+  parameters, attributes and domains, a masked column's default literal
+  among them) hand back the definitions of every schema the account sees,
+  allowlisted or not. They are refused to every tool and left out of the
+  same listings as the views above: `POLICY_VIOLATION: '<name>' carries the
+  definitions of every schema's objects (...), which would hand back values
+  column masking hides: it is not readable on any connection;
+  db_list_columns and db_list_views describe the objects this connection may
+  read`. MySQL `information_schema` `VIEWS`, `ROUTINES`, `COLUMNS`,
+  `TRIGGERS`, `EVENTS`, `CHECK_CONSTRAINTS` and `INNODB_COLUMNS`;
+  PostgreSQL `VIEWS`, `ROUTINES`, `COLUMNS`, `TRIGGERS`,
+  `CHECK_CONSTRAINTS`, `PARAMETERS`, `ATTRIBUTES` and `DOMAINS`; ClickHouse
+  `VIEWS` and `COLUMNS` (either spelling of `information_schema`); SQL
+  Server `VIEWS`, `ROUTINES`, `COLUMNS`, `CHECK_CONSTRAINTS` and `DOMAINS`.
+  The views that hold names only (`TABLES`, `SCHEMATA`,
+  `KEY_COLUMN_USAGE`, ...) stay readable.
 - **Known gap (pending an owner decision).** Under the default
-  `[information_schema]`, `db_query` can read `information_schema` views about
-  schemas outside a connection's `allowed_schemas` (names of tables and
-  columns, not their data), although the metadata tools refuse those schemas.
-  The credential views above stay refused there. Remove `information_schema`
-  from `allowed_system_schemas` where that matters.
+  `[information_schema]`, `db_query` can read the names-only
+  `information_schema` views (`TABLES`, `SCHEMATA`, `KEY_COLUMN_USAGE`, ...)
+  about schemas outside a connection's `allowed_schemas` (names of tables and
+  columns, not their data or definitions), although the metadata tools
+  refuse those schemas, and `information_schema.PARTITIONS` (a partition's
+  bounds). The credential and definition views above stay refused there.
+  Remove `information_schema` from `allowed_system_schemas` where that
+  matters.
 - **SQLite.** Statements and the metadata tools reach only the tables and views
   `db_list_tables` lists. SQLite's own catalog (`sqlite_schema` and every other
   `sqlite_*` table), which holds the full DDL including sensitive DEFAULT
@@ -632,7 +701,14 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
   statements, `AUTHORIZATION_DENIED` for the metadata and sample tools),
   whatever `default_deny_objects` says; so are SQLite's eponymous virtual
   tables (`pragma_*`, `dbstat`, `json_each`), which expose DEFAULT literals and
-  the database file path.
+  the database file path. The internal (shadow) tables of FTS3/4/5 and
+  R*Tree indexes hold the indexed values under generic column names (`c0`,
+  `c1ssn`), where masking by name cannot apply: they are not listed, have no
+  columns or detail, and a statement naming one (as a name, a quoted string
+  or a quoted identifier) is refused (`QUERY_ERROR: '<name>' is an internal
+  table of a full-text or R*Tree index ...`); query the index's own table.
+  Residual: a view the database owner creates over a shadow table is an
+  ordinary view and readable.
 - `SHOW`/`DESCRIBE` are validated by `db_validate_query` on MySQL and
   ClickHouse under the same allowlist, qualification, schema-spelling and
   default-deny rules (`SHOW TABLES FROM <db>` included), and never executed
@@ -674,7 +750,14 @@ sent and the server's `statement_timeout` ends the query), Oracle
 `connection.cancel()`, ClickHouse `KILL QUERY`. MySQL (`KILL QUERY` from a
 second connection) and SQL Server (`Cursor.cancel()`, SQLCancel) are
 `unverified`. Db2 has no cancel; a query's own timeout is its CLI
-`QUERYTIMEOUT`, so the server stops it at that deadline. On a timeout the
+`QUERYTIMEOUT`, so the server stops it at that deadline. SQLite's cancel
+also sets a flag that a progress handler (every 1000 virtual-machine steps)
+and every step of the query check, because `interrupt()` reaches only a
+statement already running: a deadline that fires while the statement is
+being described or rewritten stops it before it starts, and a connector once
+cancelled refuses its later calls (the executor discards it). On SQL Server
+and Oracle a deadline that fires before the statement starts (while it
+connects or is described) stops it before it is sent. On a timeout the
 connection is discarded and the tool output says whether the query may
 continue server-side. The executor never reuses a poisoned connection.
 
@@ -795,7 +878,9 @@ by default).
   `arguments_sha256` and `invalid_arguments`, and coalesced like every other
   refusal; argument values are never recorded.
 - **Stopping a stdio server.** On SIGTERM, in-flight calls are cancelled and
-  audited as `cancelled`, and the process exits 0 about 2 s later even when
+  audited as `cancelled`, and the process exits 0 about 3 s later (the
+  executor's 2 s cancel-hook budget plus 1 s to write the `cancelled`
+  records, so a blocked hook no longer loses them) even when
   stdin stays open; once the handler has run, a second SIGTERM ends it at
   once. The SIGTERM handler also arms a 5 s kernel alarm (`SIGALRM`), which
   ends the process when a cancel hook this SIGTERM fired blocks while
@@ -835,7 +920,15 @@ by default).
   dropped when fail-open. A root run (for example `sudo site-check`) against
   the service's audit directory hands the files it creates to the directory's
   owner; prefer `sudo -u <service account> udbmcp site-check`.
-- Rotation by size (`audit_max_bytes`, `audit_max_backups`).
+- Rotation by size (`audit_max_bytes`, `audit_max_backups`). Rotation first
+  moves the log to `<audit_path>.rotating`, then shifts the backups below the
+  first free slot down by one (a missing backup takes the shift) and moves
+  the staged log to `<audit_path>.1`; the oldest generation is replaced only
+  once the log itself has moved. A rotation that fails part-way (a reader
+  holding the log open on Windows, `EACCES`, `ENOSPC`) loses no generation
+  and is finished by the next record. A log loosened while the server keeps
+  it open (`chmod 644`) is set back to 0600 before the next record is
+  appended.
 
 ## Local state files
 
@@ -858,7 +951,8 @@ by default).
   differ, reads a separate entry; entries in the older key form are never
   read again and age out with the TTL.
 - **Isolation.** The audit log, its `.lock`, its rotated backups
-  `<audit_path>.1..N`, and the metadata cache with its `-wal`, `-shm` and
+  `<audit_path>.1..N`, the rotation staging name `<audit_path>.rotating`
+  (reserved: no other file may use it), and the metadata cache with its `-wal`, `-shm` and
   `-journal` files must each be separate from every file the server reads:
   secrets, TLS files, the bearer token, SQLite data sources, a PostgreSQL
   `options.passfile`. Paths are compared by realpath (case-folded on macOS and

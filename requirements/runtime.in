@@ -8,6 +8,9 @@ sqlglot==30.18.0
 # (http_protocol.py): pinned here, not left to whatever mcp allows.
 uvicorn==0.53.0
 h11==0.16.0
+# Security floor for a transitive dependency of mcp: PYSEC-2026-4141 is
+# fixed in 2.15.0 (the server itself does not use JWT).
+pyjwt>=2.15.0
 
 # Connector wheels (lazy-imported; missing wheels must be declared in the
 # bundle manifest rather than skipped silently):

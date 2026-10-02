@@ -718,9 +718,10 @@ def test_the_ledger_keeps_the_instant_client_zip_residual_current() -> None:
 
 
 def test_the_site_and_the_ledger_give_one_test_count() -> None:
-    status = re.search(r"\*\*Test status after this review:\*\* `(\d+) passed, (\d+) skipped", _read(LEDGER))
-    assert status is not None
-    passed = int(status.group(1))
+    # the site follows the ledger's latest whole-suite count
+    counts = re.findall(r"\*\*Test status after [^*]+:\*\* `(\d+) passed, (\d+) skipped", _read(LEDGER))
+    assert counts
+    passed = int(counts[-1][0])
     page = _read(PAGE)
     assert f'data-count="{passed}" data-sep="1">{passed:,}</b>' in page
     faq = re.search(r"<summary>Is it production-ready\?</summary><p>(.*?)</p>", page)

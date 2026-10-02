@@ -822,7 +822,8 @@ _REFUSED_VIEWS = {
     "clickhouse": [("system", "processes"), ("system", "query_log")],
 }
 _KEPT = {
-    "mysql": ("information_schema", "COLUMNS"),
+    # names only: COLUMNS carries DEFAULT expressions and is refused (DEFINITION_VIEWS, review T1)
+    "mysql": ("information_schema", "TABLES"),
     "postgres": ("pg_catalog", "pg_class"),
     "oracle": ("SYS", "ALL_TAB_COLUMNS"),  # its low and high values are refused by column, not listed away
     "db2": ("SYSCAT", "COLUMNS"),

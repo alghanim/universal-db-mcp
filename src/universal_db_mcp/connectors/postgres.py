@@ -48,7 +48,7 @@ from universal_db_mcp.discovery.system_schemas import is_session_sql_view
 from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, CapabilityState, Limitation
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
-from universal_db_mcp.security.sql_guard import translate_paramstyle
+from universal_db_mcp.security.sql_guard import bind_text, translate_paramstyle
 
 # Result types whose text form has a small bound (booleans, numbers, dates
 # and times, network addresses, uuid, geometric points and boxes, reg* and
@@ -107,9 +107,7 @@ def _pg_is_array(conn: Any, oid: int) -> bool:
     return info is not None and getattr(info, "array_oid", None) == oid
 
 
-def _pg_capped_select(
-    conn: Any, sql: str, description: Sequence[Any], max_cell_bytes: int, *, bound: bool
-) -> str | None:
+def _pg_capped_select(conn: Any, sql: str, description: Sequence[Any], max_cell_bytes: int) -> str | None:
     """The statement as a derived table whose unbounded columns the server
     cuts to ``max_cell_bytes + 1`` (so a cut is still detected here), or
     None when no column needs it.
@@ -117,8 +115,8 @@ def _pg_capped_select(
     Columns are referenced by position (duplicate or odd names cannot
     collide) and keep the statement's own names, so masking by name still
     applies. PostgreSQL never pulls a subquery with ORDER BY into the outer
-    query, so the rows keep their order. A '%' in a name is doubled when
-    parameters are bound (psycopg formats the text then). json, jsonb and
+    query, so the rows keep their order. A '%' in a name is doubled with
+    the rest of the text when parameters are bound (bind_text). json, jsonb and
     record values within the limit keep their type, so psycopg still loads
     them (a JSON number stays a number); only a longer one arrives as its
     cut text. An array has no such form and is cut as its JSON text. Such a
@@ -152,7 +150,7 @@ def _pg_capped_select(
             expr = f"left({ref}::text, {keep})"
         capped = capped or expr != ref
         name = '"' + str(d[0]).replace('"', '""') + '"'
-        items.append(f"{expr} AS {name.replace('%', '%%') if bound else name}")
+        items.append(f"{expr} AS {name}")
     if not capped:
         return None
     # The statement ends at its last token: ';' (or several), whitespace and
@@ -777,7 +775,13 @@ class PostgresConnector(DatabaseConnector):
         with translated_driver_errors(), self._connect() as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
-            except Exception:  # noqa: BLE001 - pre-11 servers lack prokind
+            except Exception:  # noqa: BLE001 - pre-11 servers lack prokind; any other failure recurs below
+                # The connection is not in autocommit: the failed query
+                # aborted its transaction, and the fallback failed with
+                # 25P02 until it was rolled back (A4).
+                rollback = getattr(conn, "rollback", None)
+                if callable(rollback):
+                    rollback()
                 rows = conn.execute(legacy_sql, params).fetchall()
         return [RoutineInfo(schema=r[0], name=r[1], kind=r[2]) for r in rows]
 
@@ -956,8 +960,15 @@ class PostgresConnector(DatabaseConnector):
         # mismatch keeps its VALIDATION category.
         sql, parameters = spec.sql, spec.parameters
         if isinstance(parameters, dict):
-            sql, parameters = translate_paramstyle(sql, parameters, backslash_escapes=False)
-        args: Any = tuple(parameters) if isinstance(parameters, (list, tuple)) else parameters
+            sql, parameters = translate_paramstyle(sql, parameters, engine="postgres")
+        # psycopg reads every '%' of the text as a placeholder whenever args
+        # is not None, an empty list included (a LIKE 'a%' failed client-side
+        # with parameters=[]): nothing bound is None. With values bound, a %s
+        # in a string literal, a $tag$ quote or a comment would take one of
+        # them: every text goes through bind_text first, and a
+        # placeholder/value mismatch is refused here as a VALIDATION error.
+        args: Any = (tuple(parameters) if isinstance(parameters, (list, tuple)) else parameters) or None
+        bind_text(sql, args, engine="postgres")
         with translated_driver_errors():
             conn = self._connect()
         self._cancel_target = conn
@@ -969,10 +980,10 @@ class PostgresConnector(DatabaseConnector):
                 # the first FETCH, so the description decides whether the
                 # values must be cut server-side first.
                 with conn.cursor(name="udbmcp_query") as cur:
-                    cur.execute(sql, args)
+                    cur.execute(bind_text(sql, args, engine="postgres"), args)
                     description = list(cur.description or [])
                     cols = [(d[0], self._PG_OID_TYPES.get(d.type_code, "unknown")) for d in description]
-                    capped = _pg_capped_select(conn, sql, description, spec.max_cell_bytes, bound=args is not None)
+                    capped = _pg_capped_select(conn, sql, description, spec.max_cell_bytes)
                     if capped is None:
                         rows, cell_truncated_cols, truncated = self._stream(cur, cols, spec)
                 if capped is not None:
@@ -1010,7 +1021,7 @@ class PostgresConnector(DatabaseConnector):
         uncut."""
         with conn.cursor(name="udbmcp_query") as cur:
             try:
-                cur.execute(capped, args)
+                cur.execute(bind_text(capped, args, engine="postgres"), args)
             except Exception as exc:
                 if getattr(exc, "sqlstate", None) == "42601":
                     raise ConnectorError(

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# udbmcp-installer-format: 3
+# udbmcp-installer-format: 4
 # (the marker above is checked by the package's preinst/postinst: a trusted
 # copy of this installer that lacks the current format number predates a
 # change the package relies on and is refused; refresh it from the stick)
@@ -489,12 +489,21 @@ if [ "$VENV_BUILD" != "$TARGET/venv" ]; then
   echo "==> switching (the running release is kept as $TARGET/venv.previous for rollback_offline.sh; depth 1)"
   $sudo_ok rm -rf "$TARGET/venv.previous"          # rollback depth is one release
   $sudo_ok rm -f "$TARGET/venv.previous.sha256"     # manifest of the discarded release
+  $sudo_ok rm -f "$TARGET/venv.previous.manifest.json"  # and its release record
   # rollback_offline.sh executes the demoted venv only after it matches this
   # manifest, so record it BEFORE the rename (same recipe as upgrade_offline.sh:
   # relative paths, regular files only, sorted, sha256sum).
   $sudo_ok sh -c 'cd "$1/venv" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$1/venv.previous.sha256"' sh "$TARGET" \
     || { $sudo_ok rm -f "$TARGET/venv.previous.sha256"; $sudo_ok rm -rf "$VENV_BUILD"
          echo "FAIL: could not record the rollback integrity manifest; the running venv was left untouched" >&2; exit 1; }
+  # The running release's record goes with its venv: after rolling back to it,
+  # rollback_offline.sh raises $TARGET/manifest.json to it when it names an
+  # older release (after an intended downgrade), so anti-rollback never
+  # compares with a release below the one that runs.
+  if $sudo_ok test -f "$TARGET/manifest.json"; then
+    $sudo_ok install -m 644 -o root -g root "$TARGET/manifest.json" "$TARGET/venv.previous.manifest.json" \
+      || echo "WARNING: could not keep the running release's record for rollback_offline.sh" >&2
+  fi
   $sudo_ok mv "$TARGET/venv" "$TARGET/venv.previous"
   $sudo_ok mv "$VENV_BUILD" "$TARGET/venv"
   echo "==> switched: $TARGET/venv is the new release, $TARGET/venv.previous the one before"
@@ -576,9 +585,16 @@ fi
 # guessing from the running platform. Guarded: a bundle without a manifest must
 # not fail the install — doctor falls back to an honest platform description.
 # $BUNDLE is the re-verified private staging copy here, so what is published is
-# exactly what was verified.
-if [ -f "$BUNDLE/manifest.json" ]; then
-  $sudo_ok install -m 644 -o root -g root "$BUNDLE/manifest.json" "$TARGET/manifest.json"
+# exactly what was verified. That copy is root's alone (mode 700), so a run
+# through sudo can only see it through sudo too: an unprivileged test there
+# never found it, and the release record anti-rollback compares with was never
+# written. A bundle that has one and cannot be published fails the install.
+if $sudo_ok test -f "$BUNDLE/manifest.json"; then
+  $sudo_ok install -m 644 -o root -g root "$BUNDLE/manifest.json" "$TARGET/manifest.json" || {
+    echo "FAIL: could not publish $TARGET/manifest.json, the installed release's record anti-rollback" >&2
+    echo "      compares the next bundle with; the new release is installed. Re-run this installer." >&2
+    exit 1
+  }
 fi
 
 echo "==> installed. Next steps:"

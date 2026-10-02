@@ -28,6 +28,10 @@ Doctor never stops on a path the current user may not inspect:
 | Windows, machine-wide config: `audit-path` / `metadata-cache-path` warning ending `unverified: the service account needs write access to '<dir>' ...` | doctor cannot evaluate NTFS ACLs for another account; expected, not an error. |
 | Windows: `'<path>' absent and its directory '<logs>' does not exist: ... repair or reinstall the MSI` | the default audit folder `%ProgramData%\UniversalDB MCP\logs` is missing; a dedicated service account cannot create it. |
 | `session-<id>` warning with `enforce_read_only=false` | on PostgreSQL, MySQL, ClickHouse or SQLite only the SQL guard refuses writes for that connection. |
+| `audit-path` / `metadata-cache-path` fatal: `'<path>' is writable but its directory '<dir>' is not: ...` | the file exists and is writable, but the server also writes beside it: rotation renames the log at `audit_max_bytes`, SQLite creates its `-wal`/`-journal` files. Make the directory writable by the server's account. |
+| `connection-<id>-secret-perms` or `http-bearer-token` fatal: `... is exposed to other local users: an access control list entry grants read to ...` | macOS: an extended ACL (`ls -le` shows `+`) opens the file beyond its 0600 mode; `serve` refuses it too. Remove it with `chmod -N <file>`. |
+| `config` or `connection-<id>-secrets` fatal: `... is not valid UTF-8 text` | the config or a secret file is not UTF-8; the report names the file, never a byte of it. |
+| `connection-<id>-reachable` fatal: `cannot reach <host>:<port>: ...` for a host such as `db..example.com` | a host name with an empty or over-long label; doctor reports it instead of stopping. |
 | `audit-path` reports `'<path>.lock' cannot be opened (...)` (or the log's path) | the lock or the log became a symlink or another non-regular file after doctor's first check: the probe opens it without following a link (`O_NOFOLLOW`, `O_NONBLOCK`). Replace it with the regular file the server creates. |
 
 ## Authentication failures by engine
@@ -79,6 +83,9 @@ are quoted as the driver reports them.
 | `POLICY_VIOLATION: ... not permitted` | guard denied the statement (DML, unknown function, multi-statement, reserved keyword alias on SQL Server, a name after `IN` without parentheses, ...) | use a read statement with permitted objects and bound parameters; the message names the construct and, where there is one, the fix. A placeholder or constant after `IN` (ClickHouse `IN {ids:Array(UInt64)}`) is accepted |
 | `POLICY_VIOLATION: '<name>' shows other sessions' SQL or the values it carries (statement text, literals, bind values, error text, locked keys) ...` | a view of other sessions' statements or their values (`pg_stat_activity`, MySQL `PROCESSLIST`, Oracle `V$SQL`, ClickHouse `system.query_log`, SQL Server `sys.dm_exec_requests`, ...) is refused on every connection and left out of `db_list_tables`, the catalog tools, and the view and synonym listings of PostgreSQL, Oracle and Db2; `allowed_system_schemas` cannot open it | none: it would hand back values masking hides. The full list is in `docs/security.md` |
 | `POLICY_VIOLATION: '<name>' holds column statistics (histogram buckets, most common values, low and high values) ...` or `... holds stored credentials (password hashes, or the passwords and connection details the database keeps for other servers) ...` | a column-statistics view (MySQL `COLUMN_STATISTICS`, `pg_stats`, Oracle `*_HISTOGRAMS`, Db2 `SYSCAT.COLDIST`, ...) or a credential view (`information_schema.user_mapping_options`, `mysql.user`, `sys.sql_logins`, Oracle `*_DB_LINKS`, ...), refused on every connection whatever is opened. Some of them were `AUTHORIZATION_DENIED` as a closed system schema before | none; the lists are in `docs/security.md` |
+| `POLICY_VIOLATION: '<name>' carries the definitions of every schema's objects (view and routine bodies, trigger statements, check clauses, DEFAULT expressions with their literals) ...` | an `information_schema` definition view (`VIEWS`, `ROUTINES`, `COLUMNS`, `TRIGGERS`, `CHECK_CONSTRAINTS`, ...; per engine in `docs/security.md`), which covers schemas outside the allowlist too | `db_list_columns` and `db_list_views` describe the objects the connection may read; `information_schema.TABLES` and the other names-only views stay readable |
+| `VALIDATION_ERROR: the statement has N placeholder(s) outside string literals, quoted names and comments but M positional value(s) were supplied ...` or `... parameter(s) [...] were supplied but no %(name)s placeholder ... uses them ...` | MySQL, ClickHouse or PostgreSQL: a placeholder inside a literal or comment is text, so the values do not match the placeholders in code | put each placeholder outside quotes (`WHERE name = %s`, not `'%s'`), one value per placeholder |
+| `QUERY_ERROR: '<name>' is an internal table of a full-text or R*Tree index ...` | SQLite: a shadow table of an FTS or R*Tree index, which holds the indexed values under generic column names | query the index's own (virtual) table |
 | `POLICY_VIOLATION: '<name>' carries each column's low and high values (...): name the columns you need, without those, without * and without a column list after its alias ...` | Oracle `*_TAB_COLUMNS`/`COLS` or Db2 `SYSCAT.COLUMNS` read with `LOW_VALUE`, `HIGH_VALUE`, `HIGH2KEY` or `LOW2KEY`, with `*` (outside `COUNT`) or with a column list after the alias; the sample, profile and metadata tools refuse these views whole. Ending `; a CTE of the name '<name>' does not change this ...`: a CTE named like one of these views | name the columns you need; rename such a CTE |
 | `POLICY_VIOLATION: table <t> is not spelled as the catalog lists it on connection '<id>' (<spelling>): ...` | default-deny on PostgreSQL, Oracle, Db2 or ClickHouse: a quoted name in another case than the catalog's, or an unquoted one the engine folds to another (on SQL Server, a case variant under a case-sensitive collation) | write the spelling the message gives |
 | `POLICY_VIOLATION: the bare name <t> is the listed <s>.<t> only where the session looks bare names up in <s> first; ... a bare name is looked up in <schema> first ...` or `the bare name <t> is read from pg_catalog first ...` | default-deny on PostgreSQL, Oracle, SQL Server or Db2: the engine would read another object of that name (a dictionary view, a synonym) before the listed table | write `<s>.<t>` as the message says |
@@ -157,8 +164,18 @@ are quoted as the driver reports them.
   them).
 - The config is replaced atomically. A symlinked config is edited through
   the link (the target is replaced, the link kept); the file keeps its mode
-  and group, and its owner when run as root. A change that turns TLS off
-  prints a warning.
+  and group, and its owner when run as root. A config in a group this user
+  is not in, whose mode gives that group access of its own (0640), is refused
+  rather than rewritten into another group (the service would lose read
+  access at its next start): run as a member of that group or as root. A
+  change that turns TLS off prints a warning. A relative `tls.ca_file`
+  already in the config is offered resolved against the config's directory,
+  as the server reads it.
+- On macOS the secrets directory must carry no extended ACL (one inherited
+  as the wizard creates it is removed; one an existing directory carries is
+  refused: `chmod -N <dir>`), since every secret file created in it would
+  inherit it. A `UDBMCP_CONFIG` starting with a `~user` that names no
+  account is a `CONFIG_ERROR`.
 - Backups: `<config>.bak.<stamp>` beside the config, created with the
   config's permission bits only (setuid, setgid and sticky are never copied;
   run as root, the backup is root-owned and loses group and other write
@@ -193,8 +210,9 @@ the replacement would change its group (`... belongs to group <gid>, which
 this user is not in ...`: `chgrp` it to a group you are in, or add the
 printed block by hand); a config with a different `universal-db` entry; a
 harness whose config appeared while it ran. Nothing is backed up or written
-then. A config whose ACL is exactly the inherited one is written and keeps
-it. The fixes and exit codes are in `docs/claude-code-integration.md`. A
+then, and the output shows the reason and this tool's own entry in the file,
+never its other servers' entries. A config whose ACL is exactly the inherited
+one is written and keeps it. The fixes and exit codes are in `docs/claude-code-integration.md`. A
 registered interpreter that cannot `import universal_db_mcp.server` in
 isolated mode is refused with
 `CONFIG_ERROR: <python> -I cannot import universal_db_mcp.server (...)`:

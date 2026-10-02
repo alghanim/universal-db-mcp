@@ -1396,6 +1396,9 @@ def test_f08_sqlite_fetches_within_the_row_budget(tmp_path: Path, monkeypatch: p
             sizes.append(1)
             return self._cur.fetchone()
 
+        def fetchall(self) -> list[Any]:  # the catalog read (PRAGMA table_list), not the result
+            return self._cur.fetchall()
+
     class _Conn:
         def __init__(self, real: sqlite3.Connection) -> None:
             self._real = real
@@ -1701,8 +1704,9 @@ def test_f08_mysql_describes_under_its_own_limit_replaced_and_escapes_percent_wi
     head = "SELECT j AS `100%` FROM t WHERE id = %s ORDER BY id"
     state = _Rows([("{}",)], [_Col("100%", 245, 4294967295)])
     _my_described(monkeypatch, state)._execute(QuerySpec(sql=head + limit, parameters=[1], max_cell_bytes=100))
+    # every text PyMySQL formats has its non-placeholder '%' doubled once (bind_text)
     assert state.statements == [
-        (head + probe_limit, [1]),
+        (head.replace("100%", "100%%") + probe_limit, [1]),
         ("SELECT LEFT(j, 101) AS `100%%` FROM t WHERE id = %s ORDER BY id" + limit, [1]),
     ]
 
@@ -1891,13 +1895,13 @@ def test_f08_mysql_a_statement_sqlglot_cannot_read_is_still_described_and_cut(
 
 
 def test_f08_mysql_a_derived_table_quotes_names_and_percent_signs(monkeypatch: pytest.MonkeyPatch) -> None:
-    sql = "SELECT j AS `100%%`, x AS `w``x` FROM t WHERE id IN (SELECT id FROM u WHERE v = %s)"
+    sql = "SELECT j AS `100%`, x AS `w``x` FROM t WHERE id IN (SELECT id FROM u WHERE v = %s)"
     state = _Rows([("{}", "y")], [_Col("100%", 245, 4294967295), _Col("w`x", 253, 80)])
     conn, _asked = _my_prepared(monkeypatch, state)
     out = conn._execute(QuerySpec(sql=sql, parameters=[1], max_cell_bytes=100))
     assert state.statements[-1] == (
         "SELECT LEFT(udbmcp_q.`100%%`, 101) AS `100%%`, udbmcp_q.`w``x` AS `w``x` FROM (\n"
-        + sql + "\n) AS udbmcp_q",
+        + sql.replace("100%", "100%%") + "\n) AS udbmcp_q",
         [1],
     )
     assert [c for c, _t in out.columns] == ["100%", "w`x"]
@@ -3822,7 +3826,7 @@ def test_f08_postgres_cap_keeps_json_jsonb_and_records_typed_unless_too_long() -
     desc = [_Col("j", 114), _Col("jb", 3802), _Col("r", 2249), _Col("a", 1007), _Col("t", 25)]
     psycopg = pytest.importorskip("psycopg")
     capped = pg_module._pg_capped_select(
-        types.SimpleNamespace(adapters=psycopg.adapters), "SELECT j, jb, r, a, t FROM x", desc, 50, bound=False
+        types.SimpleNamespace(adapters=psycopg.adapters), "SELECT j, jb, r, a, t FROM x", desc, 50
     )
     assert capped is not None
     head = capped.split(" FROM (", 1)[0]
@@ -3847,7 +3851,7 @@ def test_f08_postgres_typed_cut_keeps_null_and_computes_each_value_once() -> Non
     so a computed document (to_jsonb(t), jsonb_build_object(...)) was built
     two or three times per row; the body is fenced now."""
     desc = [_Col("r", 2249), _Col("jb", 3802), _Col("t", 25)]
-    capped = pg_module._pg_capped_select(None, "SELECT r, jb, t FROM x", desc, 50, bound=False)
+    capped = pg_module._pg_capped_select(None, "SELECT r, jb, t FROM x", desc, 50)
     assert capped is not None
     assert (
         "CASE WHEN COALESCE(octet_length(udbmcp_q.c1::text), 0) <= 50 THEN udbmcp_q.c1 "
@@ -3858,7 +3862,7 @@ def test_f08_postgres_typed_cut_keeps_null_and_computes_each_value_once() -> Non
         "FROM (SELECT * FROM (\nSELECT r, jb, t FROM x\n) AS udbmcp_s OFFSET 0) AS udbmcp_q(c1, c2, c3)"
     )
     # no typed cut: every column is read once already, and the body is not fenced
-    plain = pg_module._pg_capped_select(None, "SELECT t FROM x", [_Col("t", 25)], 50, bound=False)
+    plain = pg_module._pg_capped_select(None, "SELECT t FROM x", [_Col("t", 25)], 50)
     assert plain is not None and plain.endswith("FROM (\nSELECT t FROM x\n) AS udbmcp_q(c1)")
 
 

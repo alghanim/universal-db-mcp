@@ -9,7 +9,7 @@
 #       -ConfigPath "[ProgramDataUdbmcpDir]config.yaml"
 #       -BundleManifest "[INSTALLFOLDER]bundle\manifest.json"
 #       -ServiceAccount "[UDBMCP_SERVICE_ACCOUNT]"
-#       -RegisteredAccount "[UdbmcpRegisteredAccount]"
+#       -RegisteredAccount "[UDBMCPREGISTEREDACCOUNT]"
 #   Exit code 0 = continue; any nonzero exit fails the action and WiX rolls
 #   back the entire install. There is deliberately no "warn and continue"
 #   path: an install whose doctor is unhealthy must not complete.
@@ -348,10 +348,11 @@ function Test-PasswordAccount {
 function Get-EarlierAccountSid {
     # An account other than $ServiceSid that the service ran as, as the
     # write access the registration action granted it on $LogsDir (logs\)
-    # shows, or $null. Only a logs\ an install made counts: a directory, not
-    # a junction or symbolic link, owned by SYSTEM, Administrators or an
-    # administrator (the walk refuses any other).
-    param([string]$LogsDir, [string]$ServiceSid)
+    # shows, or $null; with $GrantedSid, that account if logs\ grants it
+    # write access, or $null. Only a logs\ an install made counts: a
+    # directory, not a junction or symbolic link, owned by SYSTEM,
+    # Administrators or an administrator (the walk refuses any other).
+    param([string]$LogsDir, [string]$ServiceSid, [string]$GrantedSid = '')
     $attributes = Get-EntryAttributes -Path $LogsDir
     if ($null -eq $attributes -or ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
         -not ($attributes -band [System.IO.FileAttributes]::Directory)) { return $null }
@@ -360,7 +361,8 @@ function Get-EarlierAccountSid {
     foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
         $sid = $rule.IdentityReference.Value
         if ($rule.IsInherited -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-            $sid -eq $ServiceSid -or (Test-TrustedOwner -Sid $sid) -or -not (Test-AccountSid -Sid $sid)) { continue }
+            $sid -eq $ServiceSid -or ($GrantedSid -and $sid -ne $GrantedSid) -or (Test-TrustedOwner -Sid $sid) -or
+            -not (Test-AccountSid -Sid $sid)) { continue }
         if ([int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights) -band $script:WriteRights) {
             return $sid
         }
@@ -375,9 +377,15 @@ function Get-ImplicitAccountProblem {
     # service is registered under, or LocalSystem when there is none. Such
     # an account is refused when it signs in with a password and none was
     # given ($Password): the service is registered again, and its password
-    # cannot be read back. It is refused too when logs\ in $ConfigDir grants
-    # another account write access: the service ran as that account, and
-    # would lose its token and logs\ although nobody named another one.
+    # cannot be read back. An account other than LocalSystem is refused
+    # unless logs\ in $ConfigDir grants it write access, as the registration
+    # action did when it registered the service under it: the MSI reads the
+    # account into a public property, which msiexec lets anybody set when
+    # the service key is absent, so only that grant tells the account the
+    # service ran as from one named on a command line. It is refused too
+    # when logs\ grants another account write access: the service ran as
+    # that account, and would lose its token and logs\ although nobody named
+    # another one.
     param([string]$Account, [string]$ServiceSid, [string]$ConfigDir, [switch]$Password)
     $remedy = ('pass UDBMCP_SERVICE_ACCOUNT to msiexec (from an elevated prompt), naming the account to keep' +
                ' or another one, and rerun the install')
@@ -387,6 +395,10 @@ function Get-ImplicitAccountProblem {
                 ', then set that password again (services.msc or sc.exe config)')
     }
     $logsDir = Join-Path $ConfigDir 'logs'
+    if ($ServiceSid -and -not (Get-EarlierAccountSid -LogsDir $logsDir -GrantedSid $ServiceSid)) {
+        return ("this install was told the service is registered under '" + $Account + "', but '" + $logsDir +
+                "' does not grant that account write access, as the install that registered it does; " + $remedy)
+    }
     $earlier = Get-EarlierAccountSid -LogsDir $logsDir -ServiceSid $ServiceSid
     if ($earlier) {
         return ("'" + $logsDir + "' grants " + $earlier + ' write access: the service ran as that account, and' +

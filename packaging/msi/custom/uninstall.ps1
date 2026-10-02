@@ -12,7 +12,10 @@
 #   (RollbackRemoveServiceCA, Execute="rollback"), which also passes
 #       -InstalledManifest "[ProgramFiles64Folder]UniversalDB MCP\manifest.json"
 #   so that a failed install puts back the installed-release record
-#   RegisterServiceCA replaced (see "Rollback" below), and the commit action
+#   RegisterServiceCA replaced (see "Rollback" below), and
+#       -Repair "[Installed]"
+#   (non-empty when the product was installed before this run: a repair),
+#   and the commit action
 #   CommitReleaseRecordCA (Execute="commit", Return="ignore"), which passes
 #   that and -Commit, and only removes the record's rollback copy once the
 #   install succeeded. The uninstall itself never passes -InstalledManifest:
@@ -38,11 +41,10 @@
 #     reboot); failing the uninstall for that would strand the files.
 #   * Any other sc.exe/reg.exe failure exits nonzero (fail closed).
 #   * The machine-wide config at ProgramData\UniversalDB MCP\config.yaml is
-#     NOT retained at uninstall: the config component's NeverOverwrite
-#     protects it at install/repair time only, and the MSI RemoveFiles
-#     standard action (which runs immediately after this one) deletes it in
-#     the same transaction. Back it up before uninstalling. This differs
-#     from the .deb, whose postrm keeps the config on remove.
+#     retained at uninstall: the config component is Permanent (and
+#     NeverOverwrite), so neither an uninstall nor the uninstall of the old
+#     product a major upgrade runs first removes it, as the .deb's postrm
+#     keeps the config on remove. This script never touches it.
 #
 # Rollback: RegisterServiceCA copies the installed-release record it replaces
 # to <record>.previous (an empty copy: there was none) just before it writes
@@ -54,6 +56,13 @@
 # before it removes such a copy, and a copy this script cannot remove (a
 # local user may hold it open: anyone can read under Program Files) keeps
 # the marker. A failure there is reported and the service is still removed.
+# The service: a first install or an upgrade that fails has no service to
+# keep (an upgrade removed the old product, and its service, first), so the
+# twin stops and deletes the one this install registered. A repair (-Repair
+# non-empty) keeps it: the product, and a registered service, were there
+# before the repair began, and the rollback restores the files the service
+# runs. Deleting it there took a working service away whenever the repair
+# failed, even before RegisterServiceCA had touched the service.
 # Commit (-Commit): the install succeeded, so the copy and the marker go and
 # nothing else is done.
 #
@@ -67,7 +76,11 @@ param(
     # record to restore, or whose rollback copy to remove.
     [string]$InstalledManifest = '',
     # The commit action: remove the record's rollback copy, and nothing else.
-    [switch]$Commit
+    [switch]$Commit,
+    # The rollback twin only: Windows Installer's Installed property, set
+    # when this run maintains an installed product (a repair). The twin then
+    # keeps the service (see "Rollback" above).
+    [string]$Repair = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -202,6 +215,11 @@ try {
         }
     }
 
+    if ($InstalledManifest -and $Repair) {
+        Write-Output ("==> a failed repair: the service '" + $ServiceName + "' registered before it is kept")
+        exit 0
+    }
+
     if (-not (Test-ServiceExists -Name $ServiceName)) {
         Write-Output ("==> service '" + $ServiceName + "' not present: nothing to stop or delete")
     }
@@ -271,7 +289,7 @@ try {
         Write-Output ("==> no UDBMCP_CONFIG value under " + $envKey + " (nothing to clean)")
     }
 
-    Write-Output ("==> uninstall custom action complete (machine-wide config.yaml under ProgramData is NOT retained: RemoveFiles deletes it in this transaction; back it up before uninstalling)")
+    Write-Output ("==> uninstall custom action complete (the machine-wide config.yaml under ProgramData is retained)")
     exit 0
 }
 catch {

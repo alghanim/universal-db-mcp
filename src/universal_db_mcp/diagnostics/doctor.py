@@ -20,6 +20,7 @@ from universal_db_mcp.config import (
     AppConfig,
     ConnectionConfig,
     ResolvedConnection,
+    darwin_secret_file_acl_problems,
     default_audit_path,
     is_system_config,
     load_config,
@@ -164,6 +165,22 @@ def _mssql_odbc_remediation() -> str:
 
 def _check(name: str, ok: bool, detail: str, *, fatal: bool = False) -> dict[str, Any]:
     return {"check": name, "status": "ok" if ok else ("fatal" if fatal else "warning"), "detail": detail}
+
+
+def _failure_detail(exc: BaseException) -> str:
+    """str(exc) for the report, except a decode error's: the codec's message
+    quotes the offending byte and its offset, and the file may be a secret."""
+    if isinstance(exc, UnicodeError):
+        return "a file it reads is not valid UTF-8 text"
+    return str(exc)
+
+
+def _acl_problems(path: Path) -> list[str]:
+    """darwin_secret_file_acl_problems, with an ACL that cannot be read as one."""
+    try:
+        return darwin_secret_file_acl_problems(path)
+    except OSError as exc:
+        return [f"its access control list cannot be read ({exc.strerror or exc})"]
 
 
 def _uninspectable(exc: OSError, path: object = None) -> str:
@@ -402,7 +419,7 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                 cfg = load_config(p)
                 results.append(_check("config", True, f"loaded '{p}': {len(cfg.connections)} connection(s)"))
             except Exception as exc:  # noqa: BLE001
-                results.append(_check("config", False, str(exc), fatal=True))
+                results.append(_check("config", False, _failure_detail(exc), fatal=True))
 
     # --- per-connection local prerequisites (no credentials needed) ----------
     if cfg:
@@ -412,7 +429,7 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                 ResolvedConnection(name, conn)
                 results.append(_check(f"connection-{name}-secrets", True, "secret references resolvable"))
             except Exception as exc:  # noqa: BLE001
-                results.append(_check(f"connection-{name}-secrets", False, str(exc), fatal=True))
+                results.append(_check(f"connection-{name}-secrets", False, _failure_detail(exc), fatal=True))
 
             # local files this connection names: one this user may not look
             # into ends this connection's file checks, not the report
@@ -437,7 +454,7 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                             )
                         )
                     else:
-                        dbp = Path(conn.database)
+                        dbp = Path(conn.database).expanduser()  # as the connector opens it
                         if not dbp.exists():
                             results.append(
                                 _check(f"connection-{name}-file", False, f"data file '{dbp}' not found", fatal=True)
@@ -717,6 +734,25 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                             _check(label, False, f"{lock_problem}; no audit record can be written", fatal=fatal)
                         )
                         continue
+                    # the server also writes beside the file: rotation renames
+                    # the log, SQLite creates its -wal/-journal files
+                    if not os.access(fp.parent, os.W_OK):
+                        needs = (
+                            "rotation renames the log once it reaches audit_max_bytes, and from then on no "
+                            "audit record can be written"
+                            if label == "audit-path"
+                            else "SQLite creates its -wal and -journal files beside the cache, so the server "
+                            "cannot open it"
+                        )
+                        results.append(
+                            _check(
+                                label,
+                                False,
+                                f"'{path}' is writable but its directory '{fp.parent}' is not: {needs}",
+                                fatal=fatal,
+                            )
+                        )
+                        continue
                     if label == "metadata-cache-path":
                         # The cache opens the file as SQLite; a corrupted
                         # (non-SQLite) file is fatal at startup.
@@ -931,6 +967,15 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                             fatal=True,
                         )
                     )
+                elif acl_problems := _acl_problems(tp):
+                    results.append(
+                        _check(
+                            "http-bearer-token",
+                            False,
+                            f"bearer token file '{tp}' is exposed to other local users: {'; '.join(acl_problems)}",
+                            fatal=True,
+                        )
+                    )
                 else:
                     results.append(
                         _check(
@@ -975,6 +1020,15 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                             fatal=True,
                         )
                     )
+                elif acl_problems := _acl_problems(pf):
+                    results.append(
+                        _check(
+                            f"connection-{name}-secret-perms",
+                            False,
+                            f"'{pf}' is exposed to other local users: {'; '.join(acl_problems)}",
+                            fatal=True,
+                        )
+                    )
 
     # --- optional connectivity probes ---------------------------------------
     if connectivity and cfg:
@@ -1002,7 +1056,9 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                             f"TCP connect to {conn.host}:{port} succeeded (no credentials sent)",
                         )
                     )
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
+                # ValueError: a UnicodeError for a name IDNA cannot encode
+                # (an empty or over-long label: db..example.com)
                 results.append(
                     _check(f"connection-{name}-reachable", False, f"cannot reach {conn.host}:{port}: {exc}", fatal=True)
                 )

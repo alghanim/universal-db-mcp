@@ -68,9 +68,11 @@ from .core import (
     atomic_write_text,
     backup_path,
     ensure_replaceable,
+    fail_closed_block,
     holds_legacy_entry,
     is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
     other_unisolated_note,
     require_isolated_import,
     resolve_harness_config_path,
@@ -226,14 +228,10 @@ def _config_status(env: Mapping[str, str], home: Path) -> AgentStatus:
     return AgentStatus.INSTALLED_UNCONFIGURED
 
 
-def _fail_closed_block(target: Path, intended_block: str) -> str:
-    """Render the intended registration plus the offending file's bytes."""
-    header = f"# intended registration for {target}:\n{intended_block}\n"
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"{header}\n# {target} could not be read: {exc}"
-    return f"{header}\n# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: Mapping[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, MCP_SERVERS_KEY, SERVER_KEY, entry)
 
 
 def _write_failed(step: str, target: Path, entry: dict[str, Any], exc: OSError, backup: Path | None) -> Plan:
@@ -246,7 +244,7 @@ def _write_failed(step: str, target: Path, entry: dict[str, Any], exc: OSError, 
         status=AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
         backup_paths=(backup,) if backup is not None else (),
         summary=f"{AGENT_NAME}: {step} failed ({exc}); {target} was left as it was{note}",
-        config_block=_fail_closed_block(target, json.dumps({MCP_SERVERS_KEY: {SERVER_KEY: entry}}, indent=2)),
+        config_block=_fail_closed_block(target, entry),
         entry=entry,
     )
 
@@ -280,9 +278,10 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
         else:
             summary = (
                 f"{AGENT_NAME}: {target} is unreadable, malformed, or holds a differing "
-                f'"{SERVER_KEY}" entry; refusing to write (fix or inspect the file, then re-run)'
+                f'"{SERVER_KEY}" entry{load_problem_note(target)}; refusing to write (fix or inspect the file, '
+                "then re-run)"
             ) + unisolated_entry_note(target, MCP_SERVERS_KEY, SERVER_KEY)
-        block = _fail_closed_block(target, block)
+        block = _fail_closed_block(target, entry)
     elif holds_legacy_entry(target, MCP_SERVERS_KEY, SERVER_KEY, entry):
         summary = (
             f"{AGENT_NAME}: would back up {target} to a timestamped .bak, then replace this tool's "

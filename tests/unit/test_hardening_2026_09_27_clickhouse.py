@@ -933,7 +933,9 @@ def test_f10_percent_in_a_catalog_name_survives_client_side_binding(tmp_path: An
     expr = f"LOWER({conn.text_expression(conn.quote_identifier(name), 'text')})"
     where = conn.like_predicate(expr, conn.placeholder(1))
     sql = conn.build_search_query("telecom", name, ["id", name], where, 5)
-    final, server_params = bind_query(sql, conn.pack_parameters(["%zürich%"]))
+    params = conn.pack_parameters(["%zürich%"])
+    # the statement is plain SQL; the connector doubles its '%' for the driver (_driver_sql)
+    final, server_params = bind_query(ch_module._driver_sql(sql, params), params)
     assert server_params == {}
     assert _shape(str(final)) == ({("telecom", name)}, ["id", name])
     like = sqlglot.parse_one(str(final), read="clickhouse").find(exp.Like)

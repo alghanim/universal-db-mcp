@@ -494,12 +494,48 @@ else
   rec payload_layout failed "payload incomplete; missing:$MISSING"
 fi
 
+# Files under $1 that hold key material: a PEM block, its armour line
+# (-----BEGIN ... KEY-----, or ... KEY BLOCK-----) followed by a base64 body,
+# also inside a string literal where the line breaks are written \n. Not the
+# armour text alone: the shipped verify_bundle.py names 'BEGIN PUBLIC KEY' in
+# its PEM parser, and a package without any key must still pass. Every file is
+# read, text or not; a failure to read one is reported as a hit (fail closed).
+pem_key_files() {
+  python3 -I -S - "$1" <<'PYEOF'
+import os
+import re
+import sys
+
+ARMOUR = re.compile(
+    rb"-----BEGIN [A-Z0-9 ]*KEY(?: BLOCK)?-----"
+    rb"(?:\\[rn]|[ \t\r\n])+"  # the line break, or a written \n
+    rb"(?:[A-Za-z-]+: [^\r\n\\]*(?:\\[rn]|[\r\n])+)*"  # RFC 1421 headers (Proc-Type: ...)
+    rb"(?:\\[rn]|[ \t\r\n])*"
+    rb"[A-Za-z0-9+/]{16}"
+)
+for top, dirs, files in os.walk(sys.argv[1]):
+    dirs.sort()
+    for name in sorted(files):
+        path = os.path.join(top, name)
+        if os.path.islink(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            print(f"{path} (unreadable: {exc.strerror})")
+            continue
+        if ARMOUR.search(data):
+            print(path)
+PYEOF
+}
+
 # Trust invariant (2): the release pubkey is NEVER shipped inside the package.
 # Name patterns mirror build_deb.sh's find_pubkey_material (plus *.key) so the
 # scan stays equally strict on the UDBMCP_DEB pre-built-package path, which
 # bypasses the builder's staged-root scan.
 LEAKS="$(find /tmp/inspect -type f \( -name '*.pem' -o -name '*.pub' -o -name '*.key' -o -name 'release.pub*' -o -name '*pubkey*' \) 2>/dev/null | tr '\n' ' ')"
-TEXT_LEAKS="$(grep -rIl -- 'BEGIN PUBLIC KEY\|BEGIN PRIVATE KEY' /tmp/inspect 2>/dev/null | head -3 | tr '\n' ' ')"
+TEXT_LEAKS="$(pem_key_files /tmp/inspect | head -3 | tr '\n' ' ')"
 if [ -z "$LEAKS" ] && [ -z "$TEXT_LEAKS" ]; then
   rec no_keys_in_package passed "no .pem/.pub/.key/*pubkey*/release.pub* files and no PEM blocks anywhere in the package payload"
 else

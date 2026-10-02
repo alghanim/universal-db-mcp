@@ -93,6 +93,10 @@ ROLLBACK_ACTION = ("RollbackRemoveServiceCA", "uninstall.ps1")
 # The commit action that removes the rollback copy of the installed-release
 # record once the install has succeeded.
 COMMIT_ACTION = ("CommitReleaseRecordCA", "uninstall.ps1")
+# The folder check before CreateFolders: its script (folders.ps1) is not an
+# installed file (nothing is installed yet), but the embedded property
+# UdbmcpFolderCheck, run as a script block.
+FOLDER_CHECK_ACTION = "CheckFoldersCA"
 
 BUILD_MSI_SH = REPO_ROOT / "scripts" / "package" / "build_msi.sh"
 
@@ -362,6 +366,12 @@ def test_wxs_wires_the_deferred_custom_actions_as_authored_xml() -> None:
     expected[DEFERRED_UNINSTALL_ACTION[0]] = DEFERRED_UNINSTALL_ACTION[1]
     expected[ROLLBACK_ACTION[0]] = ROLLBACK_ACTION[1]
     expected[COMMIT_ACTION[0]] = COMMIT_ACTION[1]
+    check = deferred.pop(FOLDER_CHECK_ACTION, None)
+    assert check is not None, f"{FOLDER_CHECK_ACTION} must be authored (it runs before CreateFolders)"
+    assert (check.get("Execute"), check.get("Impersonate"), check.get("Return"), check.get("Property")) == (
+        "deferred", "no", "check", "POWERSHELLEXE"
+    )
+    assert "-File" not in (check.get("ExeCommand") or "") and "[UdbmcpFolderCheck]" in (check.get("ExeCommand") or "")
     assert set(deferred) == set(expected), (
         f"the deferred/rollback custom action set changed: got {sorted(deferred)}, expected {sorted(expected)} — "
         "review the change and update this gate; an unreviewed action must not ship silently"

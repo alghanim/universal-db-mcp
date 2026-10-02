@@ -32,9 +32,10 @@ Security posture (hard rules):
   it as it was).
 - ``apply(confirmed=False)`` never writes; the CLI layer owns the interactive
   y/n prompt and passes explicit confirmation through.
-- Malformed or unrecognized harness state fails closed: the existing config
-  block is reported (via :func:`plan` / :class:`ApplyResult`) and nothing is
-  written.
+- Malformed or unrecognized harness state fails closed: the reason and the
+  rows for our id are reported (via :func:`plan` / :class:`ApplyResult`),
+  never the other rows (they may hold other servers' secrets), and nothing
+  is written.
 - Re-runs are idempotent: an existing registration (matched by id, regardless
   of its env keys) is reported as already-configured, never duplicated. The
   exception is a registration whose launch still runs ``-m universal_db_mcp``
@@ -68,6 +69,7 @@ from universal_db_mcp.agents.core import (
     backup_path,
     ensure_replaceable,
     isolation_advice,
+    refuse_foreign_read,
     require_isolated_import,
     resolve_harness_config_path,
     starts_without_isolation,
@@ -261,6 +263,7 @@ def _holds_legacy_row(patch: Path) -> bool:
     file that mixes them, is not upgraded).
     """
     try:
+        refuse_foreign_read(patch)
         text = patch.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return False
@@ -277,9 +280,11 @@ def _load_patch(patch: Path) -> tuple[Any, str | None]:
     """Parse ``cordis.patch.yml``; return ``(data, None)`` or ``(None, reason)``.
 
     Never raises: any read/parse/shape problem becomes a reason string so the
-    caller can fail closed.
+    caller can fail closed. As root, a file a user's link leads to is not read
+    (``core.refuse_foreign_read``).
     """
     try:
+        refuse_foreign_read(patch)
         text = patch.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         return None, f"unreadable (not valid UTF-8): {exc}"
@@ -355,6 +360,32 @@ def _starts_without_isolation(entry: dict[str, Any]) -> bool:
     if not isinstance(config, dict):
         return False
     return starts_without_isolation(config.get("args"), config.get("command"))
+
+
+def _own_rows(patch: Path) -> str:
+    """What a fail-closed plan shows of ``patch``: its rows for our id, as
+    YAML, and never the other rows (they may hold other servers' secrets);
+    only the reason when it cannot be read or parsed."""
+    data, reason = _load_patch(patch)
+    if reason is not None or not isinstance(data, list):
+        return f"(its contents are not shown: {reason or 'not a YAML sequence'})"
+    import yaml
+
+    rows: list[Any] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        entries = row.get("insert")
+        if isinstance(entries, list):
+            ours = [e for e in entries if isinstance(e, dict) and e.get("id") == REGISTRATION_ID]
+            rows += [{"insert": ours}] if ours else []
+        elif row.get("id") == REGISTRATION_ID or ("insert" in row and _names_our_id(entries)):
+            rows.append(row)
+    if not rows:
+        return f"(no row for id {REGISTRATION_ID!r}; the other rows are not shown)"
+    return f"its rows for id {REGISTRATION_ID!r} (the other rows are not shown):\n" + yaml.safe_dump(
+        rows, sort_keys=False, default_flow_style=False
+    )
 
 
 def _registrations(data: Any) -> list[dict[str, Any]]:
@@ -462,8 +493,17 @@ def _unknown_reason(patch: Path) -> str:
 
 
 def detect(env_home: Path) -> Any:
-    """Classify the dsh installation under ``env_home`` (typically ``~/.dsh``)."""
+    """Classify the dsh installation under ``env_home`` (typically ``~/.dsh``).
+
+    Once dsh is there, the registration is resolved first, as every adapter
+    does: an override that cannot be registered (a relative ``UDBMCP_CONFIG``
+    naming no file) is refused here (``CONFIG_ERROR``), before a write is
+    offered.
+    """
     patch = env_home / PATCH_FILENAME
+    if not patch.exists() and _home_status(env_home) is AgentStatus.NOT_INSTALLED:
+        return AgentStatus.NOT_INSTALLED
+    _registration_entry()
     if patch.exists():
         data, reason = _load_patch(patch)
         if reason is not None:
@@ -513,16 +553,9 @@ def plan(env_home: Path) -> Plan:
         refused = None if patch.exists() else _create_refusal(env_home, patch)
         if patch.exists():
             reason = _unknown_reason(patch)
-            try:
-                existing = patch.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                # The fail-closed report itself must never raise (e.g. the
-                # patch path is a directory); report the reason without the
-                # config-block dump instead.
-                existing = "<existing config could not be read for display>"
             summary = (
                 f"action=none (FAIL CLOSED): not modifying {patch} ({reason}). "
-                "Manual review required; existing config block:\n" + existing
+                "Manual review required; " + _own_rows(patch)
             )
         elif refused is not None:
             summary = f"action=none (FAIL CLOSED): not creating {patch} ({refused})."
@@ -622,6 +655,7 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
     backup: Path | None = None
     if patch.exists():
         try:
+            refuse_foreign_read(patch)
             # Not read_text: universal newlines would write every CRLF back as LF.
             original = patch.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:

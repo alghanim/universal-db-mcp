@@ -28,6 +28,7 @@ from decimal import Decimal
 from typing import Any
 
 import sqlglot
+from sqlglot import TokenType
 
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.connectors.base import (
@@ -121,6 +122,31 @@ def _db2_read_tail(body: str) -> tuple[str, str]:
     return body[:start].rstrip(), body[start:]
 
 
+def _db2_ordered(body: str) -> bool:
+    """Whether the statement has an ORDER BY of its own (outside every
+    parenthesis: not a subquery's, a common table expression's or a window's).
+    Read from tokens, so a quoted name or a string is never taken for one;
+    True for a statement the tokenizer refuses, as before this check."""
+    try:
+        tokens = sqlglot.Dialect.get_or_raise("postgres").tokenize(body)  # the guard's dialect for Db2
+    except Exception:  # noqa: BLE001 - sqlglot's TokenError, and whatever else a tokenizer raises
+        return True
+    depth = 0
+    for i, t in enumerate(tokens):
+        if t.token_type == TokenType.L_PAREN:
+            depth += 1
+        elif t.token_type == TokenType.R_PAREN:
+            depth -= 1
+        elif depth == 0 and (
+            t.token_type == TokenType.ORDER_BY
+            # ORDER /* comment */ BY: two words to the tokenizer
+            or (t.token_type == TokenType.VAR and t.text.upper() == "ORDER" and i + 1 < len(tokens)
+                and tokens[i + 1].token_type == TokenType.VAR and tokens[i + 1].text.upper() == "BY")
+        ):
+            return True
+    return False
+
+
 def _db2_capped_select(sql: str, described: list[tuple[str, str]], max_cell_bytes: int) -> str | None:
     """The statement as a nested table expression whose CLOB, DBCLOB, BLOB
     and XML columns the server cuts to ``max_cell_bytes + 1`` characters or
@@ -128,7 +154,9 @@ def _db2_capped_select(sql: str, described: list[tuple[str, str]], max_cell_byte
 
     Columns are referenced by position and keep the statement's own names,
     so masking by name still applies. ORDER BY ORDER OF keeps the
-    statement's row order. SUBSTRING (unlike SUBSTR) takes a length past the
+    statement's row order; it is added only to a statement with an ORDER BY
+    of its own, as Db2 refuses ORDER OF a nested table expression without
+    one (SQLSTATE 428FI) and such a statement promises no order. SUBSTRING (unlike SUBSTR) takes a length past the
     value's end, and counts CODEUNITS32 so no character is split."""
     if not any(kind in _DB2_LOB_TYPES for _name, kind in described):
         return None
@@ -148,7 +176,8 @@ def _db2_capped_select(sql: str, described: list[tuple[str, str]], max_cell_byte
         items.append(f"{expr} AS {quoted}")
     body, tail = _db2_read_tail(statement_body(sql, "postgres"))
     positions = ", ".join(f"c{i}" for i in range(1, len(described) + 1))
-    capped = f"SELECT {', '.join(items)} FROM (\n{body}\n) AS udbmcp_q({positions}) ORDER BY ORDER OF udbmcp_q"
+    order = " ORDER BY ORDER OF udbmcp_q" if _db2_ordered(body) else ""
+    capped = f"SELECT {', '.join(items)} FROM (\n{body}\n) AS udbmcp_q({positions}){order}"
     return f"{capped} {tail}" if tail else capped
 
 

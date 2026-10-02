@@ -171,9 +171,11 @@ def test_malformed_config_fails_closed(tmp_path: Path) -> None:
 
     planned = cline.plan(env, home)
     assert planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-    # The intended config block is printed for the operator (never written).
+    # The intended config block is printed for the operator (never written);
+    # the file is described, never printed (other servers' secrets).
     assert "universal-db" in planned.config_block
-    assert "{ this is not json }}}" in planned.config_block
+    assert "is not valid JSON" in planned.config_block
+    assert "{ this is not json }}}" not in planned.config_block
 
     applied = cline.apply(env, home, confirmed=True)
     assert applied.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED

@@ -2049,9 +2049,9 @@ def test_schemaless_catalog_listings_are_policy_scoped() -> None:
     The shared scope helper must drop them exactly like tables_for does."""
     from types import SimpleNamespace
 
-    from universal_db_mcp.server import _scope_listing
+    from universal_db_mcp.server import _SchemaView, _scope_listing
 
-    policy = _pg_policy_with_schema(["public"])
+    policy = _SchemaView(_pg_policy_with_schema(["public"]))  # the connection's schema rule
 
     def item(schema: str | None) -> SimpleNamespace:
         return SimpleNamespace(schema=schema)
@@ -2064,7 +2064,7 @@ def test_schemaless_catalog_listings_are_policy_scoped() -> None:
     # an explicit schema was already authorized via check_object: not re-filtered
     assert _scope_listing(policy, "public", items) is items
     # no schema allowlist configured: nothing is dropped
-    assert _scope_listing(_pg_policy_with_schema([]), None, items) == items
+    assert _scope_listing(_SchemaView(_pg_policy_with_schema([])), None, items) == items
 
 
 def test_capability_gate_accepts_unverified_remote_connectors(tmp_path) -> None:  # type: ignore[no-untyped-def]

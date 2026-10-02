@@ -56,9 +56,11 @@ from .core import (
     backup_path,
     ensure_directory,
     ensure_replaceable,
+    fail_closed_block,
     holds_legacy_entry,
     is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
     other_unisolated_note,
     require_isolated_import,
     resolve_harness_config_path,
@@ -248,10 +250,10 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
             summary = f"{AGENT_NAME}: refusing to write: {refused}"
         else:
             summary = (
-                f"{AGENT_NAME}: {target} is missing, unreadable, or malformed; "
+                f"{AGENT_NAME}: {target} is missing, unreadable, or malformed{load_problem_note(target)}; "
                 "refusing to write (fix or remove the file, then re-run)"
             )
-        block = _fail_closed_block(target)
+        block = _fail_closed_block(target, entry)
     else:
         if holds_legacy_entry(target, MCP_SERVERS_KEY, SERVER_KEY, entry):
             summary = (
@@ -283,13 +285,10 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
     )
 
 
-def _fail_closed_block(target: Path) -> str:
-    """Render the offending file's current bytes for operator inspection."""
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"# {target} could not be read: {exc}"
-    return f"# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: dict[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, MCP_SERVERS_KEY, SERVER_KEY, entry)
 
 
 def _write_failed(step: str, target: Path, entry: dict[str, Any], exc: OSError, backup: Path | None) -> Plan:
@@ -302,7 +301,7 @@ def _write_failed(step: str, target: Path, entry: dict[str, Any], exc: OSError, 
         status=AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
         backup_paths=(backup,) if backup is not None else (),
         summary=f"{AGENT_NAME}: {step} failed ({exc}); {target} was left as it was{note}",
-        config_block=_fail_closed_block(target),
+        config_block=_fail_closed_block(target, entry),
         entry=entry,
     )
 

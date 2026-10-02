@@ -263,6 +263,7 @@ def test_wxs_uses_launch_not_launchcondition() -> None:
         'NOT UDBMCP_ALLOW_DOWNGRADE OR UDBMCP_ALLOW_DOWNGRADE="1"',
         "AdminUser OR NOT (UDBMCP_SERVICE_ACCOUNT OR UDBMCP_ALLOW_DOWNGRADE)",
         'NOT (UDBMCP_SERVICE_ACCOUNT >< UdbmcpQuoteChar OR UDBMCP_SERVICE_ACCOUNT >> "\\")',
+        "NOT (INSTALLFOLDER >< \"'\")",
     ], others
     for el in _iter_local(root, "Launch"):
         assert el.get("Message"), "a Launch refusal must carry a remediation message"

@@ -506,7 +506,9 @@ class AuditLog:
             finally:
                 self._lock.release()
         except OSError as exc:
-            self._coalescer.restore(closed)
+            if not isinstance(exc, _UnsyncedWrite):
+                # nothing reached the file: the counts wait for the next record
+                self._coalescer.restore(closed)
             if summaries_only:
                 return False
             if self._fail_closed:
@@ -585,14 +587,19 @@ class AuditLog:
                 st = None
             # only a regular file is rotated: renaming a directory away would
             # turn a fail-closed EISDIR into a silently fresh log
-            if st is not None and stat.S_ISREG(st.st_mode) and self._max_backups > 0 and st.st_size >= self._max_bytes:
+            due = st is not None and stat.S_ISREG(st.st_mode) and st.st_size >= self._max_bytes
+            if self._max_backups > 0 and (due or os.path.lexists(self._staging_path())):
                 self._close_fd()
-                self._rotate()
+                self._rotate(live=due)
                 st = None
             if self._fd is not None and (st is None or not os.path.samestat(os.fstat(self._fd), st)):
                 self._close_fd()
             if self._fd is None:
                 self._fd = self._open_log()
+            elif sys.platform != "win32" and st is not None and st.st_mode & 0o077:
+                # loosened (chmod 644) while this process kept it open: the
+                # record about to be appended may carry SQL text
+                os.fchmod(self._fd, 0o600)
             _write_record(self._fd, line)
         except OSError:
             self._close_fd()
@@ -611,20 +618,53 @@ class AuditLog:
             with contextlib.suppress(OSError):
                 os.close(fd)
 
-    def _rotate(self) -> None:
-        # Tolerant of missing generations (a hole left by an administrator,
-        # or a live file already moved): ENOENT here is never an audit
-        # failure. Any other error (EACCES, ENOSPC, ...) still fails closed.
+    def _backup_path(self, suffix: str) -> Path:
         assert self._path is not None
-        for i in range(self._max_backups - 1, 0, -1):
-            src = self._path.with_suffix(self._path.suffix + f".{i}")
-            dst = self._path.with_suffix(self._path.suffix + f".{i + 1}")
+        return self._path.with_suffix(self._path.suffix + f".{suffix}")
+
+    def _staging_path(self) -> Path:
+        return self._backup_path("rotating")
+
+    def _rotate(self, *, live: bool) -> None:
+        """Move the log to <audit_path>.1 (when *live*), first finishing a
+        rotation that stopped part-way. No failure loses a generation: the log
+        is moved to <audit_path>.rotating before any backup moves, so a log
+        that cannot be moved (a Windows reader holding it open, EBUSY) leaves
+        everything as it was; and each backup only ever moves into a free
+        slot, so a retry resumes where the failed attempt stopped instead of
+        shifting the chain again. The oldest generation is replaced only
+        once the log itself has moved."""
+        staging = self._staging_path()
+        if os.path.lexists(staging):
+            # an earlier rotation moved the log there and then failed
+            self._settle(staging)
+        if not live:
+            return
+        try:
+            assert self._path is not None
+            self._path.replace(staging)
+        except FileNotFoundError:
+            return  # already moved away by an administrator: nothing to rotate
+        self._settle(staging)
+
+    def _settle(self, staging: Path) -> None:
+        """Shift the backups below the first free slot (the oldest slot when
+        there is none) down by one and move *staging* to .1. Tolerant of
+        missing generations (a hole left by an administrator takes the
+        shift): ENOENT here is never an audit failure. Any other error
+        (EACCES, ENOSPC, ...) still fails closed, with every generation
+        still under some name."""
+        free = next(
+            (n for n in range(1, self._max_backups + 1) if not os.path.lexists(self._backup_path(str(n)))),
+            self._max_backups,
+        )
+        for i in range(free - 1, 0, -1):
             try:
-                src.replace(dst)
+                self._backup_path(str(i)).replace(self._backup_path(str(i + 1)))
             except FileNotFoundError:
                 continue
         with contextlib.suppress(FileNotFoundError):
-            self._path.replace(self._path.with_suffix(self._path.suffix + ".1"))
+            staging.replace(self._backup_path("1"))
 
 
 def _open_state_file(path: Path, flags: int) -> int:
@@ -694,6 +734,12 @@ def _give_to_directory_owner(fd: int, directory: Path) -> None:
             os.fchown(fd, dst.st_uid, dst.st_gid)
 
 
+class _UnsyncedWrite(OSError):
+    """The record is in the file (written in full) but fsync failed, so it may
+    not be on disk: still a failed write, but what it carried is not written
+    again with the next record."""
+
+
 def _write_record(fd: int, line: bytes) -> None:
     """Append *line* with a single write on the O_APPEND descriptor. A short
     write (disk full, file-size limit) is truncated away so the fragment can
@@ -709,7 +755,10 @@ def _write_record(fd: int, line: bytes) -> None:
         with contextlib.suppress(OSError):
             os.ftruncate(fd, start)
         raise OSError(errno.EIO, f"short write: {written} of {len(line)} bytes (disk full or file-size limit)")
-    os.fsync(fd)
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise _UnsyncedWrite(*exc.args) from exc
 
 
 def _serialize(event: dict[str, Any]) -> bytes:

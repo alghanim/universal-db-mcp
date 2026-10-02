@@ -130,7 +130,7 @@ else
   sudo bash "$STICK/trust-bootstrap-linux/bootstrap.sh"
 fi
 grep -c -- --force-reinstall /usr/local/lib/udbmcp-trust/install_offline.sh    # must print 2
-grep -c 'udbmcp-installer-format: 3' /usr/local/lib/udbmcp-trust/install_offline.sh   # must print 1
+grep -c 'udbmcp-installer-format: 4' /usr/local/lib/udbmcp-trust/install_offline.sh   # must print 1
 grep -c -- --installed-manifest /usr/local/lib/udbmcp-trust/verify_bundle.py   # must print more than 0
 sudo ls -l "$DEB"                                                              # the checked copy step 0 named
 cat "$STICK/trust-bootstrap-linux/RELEASE"                                     # this stick's release
@@ -209,7 +209,7 @@ does, in order, and what it refuses:
   to use on the next upgrade.
 
 The package refuses to install over a trusted installer that lacks the
-`udbmcp-installer-format: 3` marker or `--force-reinstall`, and over a
+`udbmcp-installer-format: 4` marker or `--force-reinstall`, and over a
 verifier that cannot check the release order (`--installed-manifest`); each
 diagnostic says `OUTDATED copy`, and this step is the fix.
 
@@ -461,7 +461,11 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   line breaks, and copies the packages into `/var/cache/udbmcp-trust/`,
   where it checks them again: `dpkg -i` those copies, never the stick's
   files. The package refuses trusted tools that predate this release
-  (`OUTDATED copy`): step 1 is mandatory. Sticks are ordered: each carries
+  (`OUTDATED copy`; the installer's marker is now
+  `udbmcp-installer-format: 4`): step 1 is mandatory. The `.deb` makes that
+  check, and the older-release check below, in `preinst`, before dpkg stops
+  the service and unpacks anything; if dpkg undoes a failed upgrade,
+  `postinst` starts the service again. Sticks are ordered: each carries
   `trust-bootstrap-linux/RELEASE` on its signed list, and the installed
   `bootstrap.sh` records it in `/usr/local/lib/udbmcp-trust/RELEASE` and
   refuses an older stick (`--allow-downgrade` to mean it); on the first
@@ -483,7 +487,9 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   purge removes.
 - **Anti-rollback.** Every bundle carries a signed `release_seq`. The
   installers refuse a bundle older than the installed release (`FAIL: rollback
-  refused ...`). An intended downgrade is explicit: `sudo
+  refused ...`), and another release with the installed release's
+  `release_seq` (a different `source_rev`; `release_seq` is a commit
+  timestamp). An intended downgrade is explicit: `sudo
   UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <older .deb>`, or `--allow-downgrade` for
   `install_offline.sh` / `upgrade_offline.sh`. On macOS it is a one-shot flag
   file, on Windows `UDBMCP_ALLOW_DOWNGRADE=1` for one `msiexec` run of one of
@@ -495,7 +501,13 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   release is refused as a downgrade once the trust dir holds this release's
   verifier. Container hosts: `load_images_offline.sh` keeps a root-owned
   release record (`/var/lib/universal-db-mcp/release.json`) and refuses an
-  older bundle (`docs/offline-deployment.md`, "Container mode").
+  older bundle (`docs/offline-deployment.md`, "Container mode"). An install
+  or upgrade that cannot publish `/opt/universal-db-mcp/manifest.json` (the
+  record those checks compare with) now fails instead of finishing without
+  it (under `sudo` it was skipped silently). On macOS the `.pkg` declares an
+  arm64 host (an Intel Mac is refused) and its scripts start over natively
+  when the Installer runs them under Rosetta; the verifier judges the
+  hardware architecture.
 - **Config that no longer loads.** These stop `serve` at start; run `doctor`
   before restarting:
   - a connection-level `read_only: false` (v1 is read-only);
@@ -526,7 +538,9 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   `options.passfile` now resolves against the config file's directory, not
   the directory the server was started in (`/` under the systemd unit). Write
   them absolute, or relative to `/etc/universal-db-mcp`, and check with
-  `doctor`.
+  `doctor`. A SQLite `database` and the Oracle `wallet_location`,
+  `tns_admin` and `lib_dir` are used as written, so a relative one follows
+  the working directory: write those absolute.
 - **Audit is never off.** When `application.audit_path` is unset, the service
   config audits to `/var/log/universal-db-mcp/audit.jsonl` and a per-user
   config to `~/.universal-db-mcp/audit.jsonl`. The audit path must be on a
@@ -568,9 +582,10 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   `ocean` and `"Ocean"` on PostgreSQL), an `allowed_schemas` entry admits the
   spelling the engine folds it to; an entry mixing upper- and lower-case
   letters admits its exact spelling first. The other spellings are left out
-  of `db_list_schemas` and `db_list_tables` and refused (`... differ only in
-  case ...`); `db_list_views`, `db_list_synonyms` and `db_list_routines`
-  called without a schema can still name their objects. To admit a quoted
+  of `db_list_schemas`, `db_list_tables`, and `db_list_views`,
+  `db_list_synonyms` and `db_list_routines` called without a schema, and
+  refused (`... differ only in case ...`); a foreign key into one names its
+  target `<not permitted>`. To admit a quoted
   namesake as well, list both spellings (`['TRAVEL', 'travel']`).
 - **Masking follows the value, not the column name.** UNIONs, CTE column
   lists, aliases and whole-row references no longer unmask a sensitive
@@ -579,6 +594,12 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   Unicode-normalised form (`ＭＲＮ`, `'MRN '`). A `WHERE`/`ORDER BY`/`GROUP BY`
   on a masked column is still not masked (a documented limitation): use
   column grants or views for secrets.
+- **Bound parameters.** On MySQL, ClickHouse and PostgreSQL a placeholder
+  inside a string literal or comment is text, not a parameter, and every
+  `%` other than a placeholder in code arrives as written. A placeholder
+  count or name that does not match the values, or a named value no
+  placeholder uses, is `VALIDATION_ERROR`; queries that relied on a `%s`
+  inside quotes being filled need the placeholder outside them.
 - **Errors.** A statement the engine rejects is now `QUERY_ERROR` (was often
   `CONNECTION_ERROR`); a statement stopped by the engine's time limit is
   `TIMEOUT`. Driver error text has values, quoted fragments and numbers
@@ -604,7 +625,12 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   `a.1`); `@@` server variables on every engine and MySQL user variables;
   PostgreSQL and Db2 `U&"..."` identifiers and the prefix `@` operator
   (`abs(x)`); every Oracle database link (`@` outside literals, quoted names
-  and hints); a `WITH` after `UNION`,
+  and hints); SQL Server lock hints in the legacy form without `WITH`
+  (`FROM t b (TABLOCKX)`; `NOLOCK`, `READUNCOMMITTED`, `READPAST`, `NOWAIT`
+  stay allowed); MySQL `MAX_EXECUTION_TIME`, `SET_VAR` and `RESOURCE_GROUP`
+  optimizer hints (other hint comments, Oracle's `INDEX` or `LEADING`
+  included, are accepted and not checked as functions); an empty quoted name
+  (`"".ALL_USERS`, `[].syslogins`); a `WITH` after `UNION`,
   `INTERSECT` or `EXCEPT` with more branches after its query (write
   `(WITH ... SELECT ...)`); PostgreSQL `EXPLAIN (FORMAT JSON)` (use YAML or
   XML). On SQL Server and MySQL, a CTE referenced in a different letter case
@@ -636,7 +662,11 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   without their `LOW_VALUE`/`HIGH_VALUE` or `HIGH2KEY`/`LOW2KEY` columns,
   without `*` and without a column list after the alias; a CTE named like
   one of them (`WITH cols AS (...) SELECT * FROM cols` on Oracle) is refused
-  the same way. The full lists are in `docs/security.md`.
+  the same way. The `information_schema` views that carry other objects'
+  definitions (`VIEWS`, `ROUTINES`, `COLUMNS`, `TRIGGERS`,
+  `CHECK_CONSTRAINTS`, ...) are refused and unlisted too: describe objects
+  with `db_list_columns` and `db_list_views`. The full lists are in
+  `docs/security.md`.
 - **No EXPLAIN ANALYZE, whatever the policy.** With `allow_explain_analyze:
   true`, `EXPLAIN ANALYZE ...` used to pass the guard; it is now
   `VALIDATION_ERROR: EXPLAIN option 'ANALYZE' is not supported by db_explain:
@@ -652,9 +682,11 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   `security.allowed_system_schemas: [information_schema]` now lists and opens
   `information_schema` on PostgreSQL, MySQL, SQL Server and ClickHouse (it
   appears after the database's own objects in `db_list_tables`). Under
-  `allowed_schemas` those views still describe every schema the login can
-  see, which the metadata tools refuse; set `allowed_system_schemas: []`
-  where object names outside the allowlist must stay hidden. Oracle
+  `allowed_schemas` its names-only views (`TABLES`, `SCHEMATA`, ...) still
+  name the objects of every schema the login can see, which the metadata
+  tools refuse (its definition views are refused, above); set
+  `allowed_system_schemas: []` where object names outside the allowlist
+  must stay hidden. Oracle
   `DUAL` (bare or `SYS.DUAL`) and Db2 `SYSIBM.SYSDUMMY1`..`4` are readable in
   statements on every connection without opening `SYS` or `SYSIBM`, which
   stay closed otherwise; a bare Db2 `SYSDUMMY1` under an allowlist is refused
@@ -693,8 +725,8 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   `ALL_USERS` is then refused unless `SYS` is opened. SQL Server's
   compatibility views (`syslogins`, `sysobjects`, ...) under `dbo` or bare
   are authorized as `sys.<name>` in every mode.
-- **SQLite.** `sqlite_*` catalog tables and SQLite's virtual tables are never
-  readable; statements read only the tables and views `db_list_tables` lists.
+- **SQLite.** `sqlite_*` catalog tables, SQLite's virtual tables and the
+  internal tables of FTS and R*Tree indexes are never readable; statements read only the tables and views `db_list_tables` lists.
   A value longer than the handle's length limit (16 MiB by default) is
   `QUERY_ERROR: string or blob too big: the statement builds or reads a value
   longer than this server lets SQLite handle ...`, where it was a bare
@@ -787,7 +819,11 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   registrations; `chmod 600` old `~/.claude.json` backups. A harness config it
   may not replace (read-only, another owner, hard-linked, an access control
   list other than the one its directory gives new files, a group the user is
-  not in that its mode gives access of its own) is refused, not overwritten.
+  not in that its mode gives access of its own) is refused, not overwritten;
+  the refusal shows only this tool's own entry, never the other servers' in
+  the file. A project `.mcp.json` is no longer given this machine's paths
+  (only this tool's own pre-`-I` entry there is upgraded); the user-scope
+  registration covers every project.
   On a `.deb` host, give the system config to the service account before
   anyone runs `configure-agents`: the conffile ships `root:root` 0644, and
   `configure-agents` registers a system config its user can read, whose
@@ -851,7 +887,11 @@ That restores the venv installed BEFORE this upgrade (depth one). The
 installed-release record (`/opt/universal-db-mcp/manifest.json`) still names
 the newer release afterwards, so installing the older bundle again is a
 downgrade and needs the explicit override below; the next upgrade to a newer
-release needs nothing special.
+release needs nothing special. After an intended downgrade the record names
+the older release; a rollback from there raises it to the release now
+running, so bundles between the two are not accepted silently.
+`rollback_offline.sh --restore-config` keeps the live `keys/` and
+`http-token` (a rotated key or token is never put back).
 
 To go back to an older package instead, or when the site was installed
 before `venv.previous` existed, install the previous stick's package. Four

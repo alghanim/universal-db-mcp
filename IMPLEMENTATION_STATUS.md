@@ -244,7 +244,7 @@ closed.
 
 | Package | Status | What was and was not verified |
 | --- | --- | --- |
-| Ubuntu `.deb` (linux-x86_64-ubuntu24.04-cp312) | full no-network gate **PASSED** 2026-09-12 (re-run green after the same-day positive-path failure; latest recorded run 2026-09-12T12:28:29Z) | `scripts/package/test_package_deb.sh` mirrors Gates A/B: sign → `dpkg-deb` build inside the baseline container → install under `docker --network none` → doctor with demo config → stdio protocol probe, plus a negative case (a tampered wheel repacked into the deb must fail closed at postinst verification with the canonical diagnostic). Evidence (`out/package-evidence/deb/results.json`, 2026-09-12T12:28:29Z, status `passed`, 29/29 checks): **positive path** — `dpkg -i` succeeded (preinst checked trust prerequisites only; postinst re-verified the unpacked payload through the existing `install_offline.sh` — no installer fork — at configure time: 91 artifacts, 42 pinned wheels, 11/11 bundle OS packages hash-checked, `signature: verified`); the dpkg-dependent install (venv, wheelhouse, bundle OS packages, service enable) then completed in a background worker after dpkg released its locks (20 s wait, `deferred-install.log`); doctor passed (12/12 checks, 0 fatal) against the deb-installed venv and the stdio MCP protocol probe passed inside the same no-network container. The minimal baseline image carries no `python3`/`python3-venv` .debs (its CPython 3.12 is installed outside dpkg), so the gate configures the package with forced dependencies — real ubuntu-24.04 targets satisfy the declared `Depends` normally. **Negative path** — a byte-flipped sqlglot wheel inside a repacked deb (its SHA256SUMS line refreshed so the rejection must come from the SIGNATURE, not the integrity hash) is rejected by the trusted verifier with the canonical `signature verification FAILED` diagnostic, and `dpkg -i` of the tampered package fails closed at postinst verification. Two further fail-closed negatives recorded in the same run: the builder refuses to build when public-key material is staged into the package root (`build_rejects_key_material`), and with no admin trust dir provisioned the postinst refuses to self-bootstrap a verifier from the package's own `trusted-tools/` copy — a stub verifier planted in the package is never executed and `dpkg -i` of that package fails closed (`no_admin_bootstrap`, `deb_verifier_stubbed`, `postinst_refuses_self_bootstrap`, `stub_verifier_never_ran`, `tampered2_dpkg_install_fails`). **Upgrade path (added 2026-09-18; latest run at 1617401: 50/51 gate checks passed, the rest `recorded`)** — in its own container the gate installs, plants a marker in a wheel-tracked file of the installed venv (the previous release's code) and an admin edit in `/etc/universal-db-mcp/config.yaml`, installs the same package again and proves the marker is gone (`upgrade_replaces_venv_code`: the trusted installer's `--force-reinstall` replaced the code; the 2026-09-15 site incident would fail this check) while the admin edit survives (`upgrade_keeps_admin_config`); then a trusted installer WITHOUT `--force-reinstall` is refused at preinst with the OUTDATED diagnostic and no worker starts (`upgrade_refuses_outdated_installer`), and after refreshing the trusted installer the upgrade succeeds again (`upgrade_after_refresh`); doctor's `installed-release` line is present. Added later the same day: the upgrade keeps `venv.previous` with its integrity manifest and `rollback_offline.sh` restores it (marker back: `upgrade_keeps_previous_venv`, `rollback_restores_previous_release`); a trusted installer without the `udbmcp-installer-format: 3` marker is refused at preinst too (`upgrade_refuses_unmarked_installer`, `upgrade_after_marker_refresh`); and `dpkg --compare-versions` proves the `<release>+<build stamp>.g<sha7>` version upgrades a legacy `0.1.0~<hash>` install and any older build stamp (`upgrade_version_ordering`). Still simulated: both installs use the same package. **`systemctl enable --now` under a real systemd PID 1: `not_run`** — the gate container runs without systemd; the unit is installed and the enable is guarded so container installs still succeed, but no host with PID 1 = systemd was exercised. Version provenance: the package version embeds the signed manifest's build stamp and source revision — `0.1.0+<YYYYMMDDHHMM>.g<sha7>` — so the artifact is tied to the exact source state that was signed and every build sorts after the previous one. |
+| Ubuntu `.deb` (linux-x86_64-ubuntu24.04-cp312) | full no-network gate **PASSED** 2026-09-12 (re-run green after the same-day positive-path failure; latest recorded run 2026-09-12T12:28:29Z) | `scripts/package/test_package_deb.sh` mirrors Gates A/B: sign → `dpkg-deb` build inside the baseline container → install under `docker --network none` → doctor with demo config → stdio protocol probe, plus a negative case (a tampered wheel repacked into the deb must fail closed at postinst verification with the canonical diagnostic). Evidence (`out/package-evidence/deb/results.json`, 2026-09-12T12:28:29Z, status `passed`, 29/29 checks): **positive path** — `dpkg -i` succeeded (preinst checked trust prerequisites only; postinst re-verified the unpacked payload through the existing `install_offline.sh` — no installer fork — at configure time: 91 artifacts, 42 pinned wheels, 11/11 bundle OS packages hash-checked, `signature: verified`); the dpkg-dependent install (venv, wheelhouse, bundle OS packages, service enable) then completed in a background worker after dpkg released its locks (20 s wait, `deferred-install.log`); doctor passed (12/12 checks, 0 fatal) against the deb-installed venv and the stdio MCP protocol probe passed inside the same no-network container. The minimal baseline image carries no `python3`/`python3-venv` .debs (its CPython 3.12 is installed outside dpkg), so the gate configures the package with forced dependencies — real ubuntu-24.04 targets satisfy the declared `Depends` normally. **Negative path** — a byte-flipped sqlglot wheel inside a repacked deb (its SHA256SUMS line refreshed so the rejection must come from the SIGNATURE, not the integrity hash) is rejected by the trusted verifier with the canonical `signature verification FAILED` diagnostic, and `dpkg -i` of the tampered package fails closed at postinst verification. Two further fail-closed negatives recorded in the same run: the builder refuses to build when public-key material is staged into the package root (`build_rejects_key_material`), and with no admin trust dir provisioned the postinst refuses to self-bootstrap a verifier from the package's own `trusted-tools/` copy — a stub verifier planted in the package is never executed and `dpkg -i` of that package fails closed (`no_admin_bootstrap`, `deb_verifier_stubbed`, `postinst_refuses_self_bootstrap`, `stub_verifier_never_ran`, `tampered2_dpkg_install_fails`). **Upgrade path (added 2026-09-18; latest run at 1617401: 50/51 gate checks passed, the rest `recorded`)** — in its own container the gate installs, plants a marker in a wheel-tracked file of the installed venv (the previous release's code) and an admin edit in `/etc/universal-db-mcp/config.yaml`, installs the same package again and proves the marker is gone (`upgrade_replaces_venv_code`: the trusted installer's `--force-reinstall` replaced the code; the 2026-09-15 site incident would fail this check) while the admin edit survives (`upgrade_keeps_admin_config`); then a trusted installer WITHOUT `--force-reinstall` is refused at preinst with the OUTDATED diagnostic and no worker starts (`upgrade_refuses_outdated_installer`), and after refreshing the trusted installer the upgrade succeeds again (`upgrade_after_refresh`); doctor's `installed-release` line is present. Added later the same day: the upgrade keeps `venv.previous` with its integrity manifest and `rollback_offline.sh` restores it (marker back: `upgrade_keeps_previous_venv`, `rollback_restores_previous_release`); a trusted installer without the `udbmcp-installer-format: 3` marker (4 since the 2026-10-02 review fixes) is refused at preinst too (`upgrade_refuses_unmarked_installer`, `upgrade_after_marker_refresh`); and `dpkg --compare-versions` proves the `<release>+<build stamp>.g<sha7>` version upgrades a legacy `0.1.0~<hash>` install and any older build stamp (`upgrade_version_ordering`). Still simulated: both installs use the same package. **`systemctl enable --now` under a real systemd PID 1: `not_run`** — the gate container runs without systemd; the unit is installed and the enable is guarded so container installs still succeed, but no host with PID 1 = systemd was exercised. Version provenance: the package version embeds the signed manifest's build stamp and source revision — `0.1.0+<YYYYMMDDHHMM>.g<sha7>` — so the artifact is tied to the exact source state that was signed and every build sorts after the previous one. |
 | macOS `.pkg` (macos-arm64-cp312) | built + payload verified natively on this arm64 staging host; **the current package (built from 6edc579) was installed on this host by the user on 2026-09-18 with `sudo installer -pkg ... -target /` over the 2026-09-14 install (94069c3)**: `installer: The upgrade was successful`; per `/var/log/install.log` the preinstall found the trust prerequisites, the postinstall re-verified the unpacked payload with the trusted verifier (`integrity: 83 artifacts checked, full coverage verified`, `signature: verified against provided public key`), force-reinstalled the application wheel into the existing venv (site-packages dated 19:39, the new code present), left `/etc/universal-db-mcp/config.yaml` and the token untouched, and re-bootstrapped the LaunchDaemon; after `launchctl kickstart -k` the service runs as `_udbmcp` (new PID) on 127.0.0.1:8765 (HTTP 401 without a token) and its doctor reports `installed-release ... source_rev 6edc5795...` and `venv-interpreter` ok. Not observed: Gatekeeper prompting, since the command-line installer was used; **package is UNSIGNED** (no developer signing identity); the full 23-check gate was re-run and recorded **green** (latest recorded run 2026-09-12T12:38:10Z, status `passed`, 23/23 checks — closing the earlier 11:17:20Z 22/23 run whose single failed check was `unit_suite`, a transient race with concurrent edits, both affected tests passing on re-run); full `installer` run `not_run` | `scripts/package/test_package_pkg.sh`: the signed macos-arm64-cp312 bundle is built and re-verified by the trusted verifier before packaging; the wheelhouse is fully resolved **including the `ibm-db` `macosx_14_0_arm64` wheel**; the package payload is proven to be the signed bundle (`pkgutil --expand-full`, then the trusted verifier run against the expanded payload); and an executed tamper negative: a byte-flipped wheel inside a repacked COPY of the `.pkg` is rejected by the trusted verifier with the canonical FAIL diagnostic (`tamper_copy`, `wheel_tampered`, `tampered_payload_rejected` all passed). Evidence (`out/package-evidence/pkg/results.json`): the latest recorded run (2026-09-12T12:38:10Z) recorded status `passed` with 23/23 checks — `pkg_built`, `payload_signature_verified` (trusted verifier accepted the expanded payload), `no_keys_in_payload`, install-script hardening, all plist checks (incl. `launchd_label_consistency`), the executed tamper negative, and the native unit suite green for the on-disk package (`dist/universal-db-mcp-0.1.0-macos-arm64.pkg`, 12:35Z rebuild, `out/package-evidence/pkg/build-20260912T123541Z.log`, sha256 `16fa8266…`). History: an earlier same-day run (10:47:30Z) recorded 20/20 green before the tamper checks were added; the 11:17:20Z run added the first executed tamper negative (all three tamper checks passed) but failed `unit_suite` alone — two `tests/unit/test_hardening_gates.py` rollback tests raced with concurrent edits to `scripts/rollback_offline.sh` at gate time and both pass on re-run (verified after the rollback integrity-manifest behavior landed) — and the owed full re-run has since been recorded green as described above. An earlier same-day run (09:56Z) also passed all of its checks. preinstall validates trust prerequisites only (trusted verifier + admin pubkey, else exit with bootstrap instructions); postinstall re-verifies the payload, builds the venv with the same hostile-pip neutralization, and bootstraps the LaunchDaemon. **Honesty caveat recorded per the build log's explicit WARNING:** the `.pkg` is **UNSIGNED** — no Apple Developer ID signing identity is configured on this host, so Gatekeeper/`installer` will not attribute the package to a developer; product signing is an organizational key-ceremony step, not performed here. **The full `installer` run and the launchd daemon start: done on this host by the user on 2026-09-18 (see the status column); the gate itself still does not run them** (opt-in behind `UDBMCP_PKG_INSTALL=1`, off by default). Documented delta: macOS has no ProtectSystem-equivalent; the plist otherwise mirrors the systemd unit line-for-line. |
 | Windows `.msi` (win_amd64) | **NOT built on this host, and cannot be**: the signed `windows-x86_64-cp312` bundle IS built (`out/bundle-windows`, source_rev at HEAD) but the WiX Toolset refuses to compile on macOS (v4.0.6 and v6.0.2: `WIX0389 Directory/@Name is not a relative path` for every directory, with `warning WIX0000: The WiX Toolset only supports Windows`; v7.0.0 additionally requires accepting the OSMF EULA, which is not mine to accept). The MSI needs a Windows build host; install gate `not_run` | The plan-Phase-0 prerequisites **ARE installed** on this staging host (user-local .NET 8 SDK `8.0.425` + the `wix` global dotnet tool, `6.0.2`; `wix` 7.0.0 was refused fail-closed at the OSMF-EULA gate, and `wix` 4.0.5/5.0.2/6.0.2 all behave identically below), and `scripts/package/build_msi.sh` was executed end-to-end against a freshly built, SIGNED `windows-x86_64-cp312` bundle (release 0.1.0, 42 wheels, no missing connectors; `out/bundle-windows/universal-db-mcp-0.1.0-windows-x86_64-cp312` with `SIGNATURE` + `SHA256SUMS`). Every first-party build step ran and passed: trusted-channel `verify_bundle.py --pubkey` verification (79 artifacts, signature verified, 42 pinned requirements), payload staging with a no-key-material scan, deterministic harvest, `xmllint` validation, and a real `wix build` that reached full authoring validation. The compile itself fails closed with 15× **WIX0389** (WiX-on-Unix rejects every `Directory/@Name` — a toolchain limitation, not an authoring defect: these are the ONLY remaining errors), so **no MSI was produced**, and MSI compilation therefore requires a **Windows** staging host. Evidence: `out/package-evidence/msi/results.json` + `out/package-evidence/msi/build-msi-build-only.log`. The stray 12-byte `universal-db-mcp-1.2.3-win-x86_64.msi` placeholder (literal `FAKE` after the OLE magic; its 1.2.3 version matched nothing in the signed manifest release 0.1.0, and it was not produced by `build_msi.sh`) was deleted from `dist/`; no `*.msi` exists there now. Delivered authoring, exercised as far as a Unix host allows: `scripts/package/build_msi.sh` + `packaging/msi/udbmcp.wxs` with the deferred, `Impersonate="no"` custom actions — trusted `verify_bundle.py` against the installed bundle with the admin pubkey, venv build `--no-index --require-hashes` with hostile pip env neutralized, doctor smoke, `sc.exe` service registration — implemented by `packaging/msi/custom/{verify,venv,doctor,service,uninstall}.ps1`, staged and wired by `build_msi.sh` via `-define CustomActionScriptsDir=…`. No Windows machine was available, so once built the install gate must be exercised on the target OS before anything is claimed: service behavior, the admin-supplied msodbcsql MSI, and NTFS ACL behavior remain unexercised — the ledger records **no pass for any Windows runtime step**. The gate script **`scripts/test_package_msi.ps1` is delivered** for a real Windows machine (msiexec with `/l*v`, `sc.exe query`, doctor, stdio protocol probe, tamper negative case, evidence JSON). |
 
@@ -630,7 +630,7 @@ Requested after the honest 7/10 assessment. What was done, with evidence:
   documented); `release_usb.sh` defaulted to the demo key (a key
   pair or `--demo` is now explicit, the fingerprint is printed and shipped
   as `RELEASE-KEY-FINGERPRINT.txt`); the trusted installer carries a
-  format marker (`udbmcp-installer-format: 3`) that preinst/postinst
+  format marker (`udbmcp-installer-format: 3`, now 4) that preinst/postinst
   require of any pip-running copy (deb gate case added); `live_evidence.py`
   implied DDL consent from a config file name (flag always required);
   `http_client_evidence.py` could leak its server and proxy on a failure
@@ -1018,9 +1018,16 @@ the residuals).
   values. Column grants or views are the control.
 - **`information_schema` beyond the allowlist** (pending an owner decision):
   under the default `allowed_system_schemas: [information_schema]`, `db_query`
-  can read catalog names of schemas outside a connection's `allowed_schemas`,
-  so `allowed_schemas` does not scope catalog SQL (the credential views there
-  are refused since the convergence wave).
+  can read the names-only views (`TABLES`, `SCHEMATA`, `KEY_COLUMN_USAGE`,
+  ...) about schemas outside a connection's `allowed_schemas`, and
+  `information_schema.PARTITIONS` (a partition's bounds), so
+  `allowed_schemas` does not scope catalog names. The credential views are
+  refused since the convergence wave, and since the code review the
+  definition views (`VIEWS`, `ROUTINES`, `COLUMNS`, `TRIGGERS`, `EVENTS`,
+  `CHECK_CONSTRAINTS`, `PARAMETERS`, `ATTRIBUTES`, `DOMAINS`, MySQL
+  `INNODB_COLUMNS`, per engine: `docs/security.md`, Object definitions),
+  which handed back other schemas' view SQL and a masked column's DEFAULT
+  literal.
 - **Bare dictionary names without an allowlist:** with
   `default_deny_objects: false` and no `allowed_schemas`, PostgreSQL's bare
   `pg_roles` binds to `pg_catalog` and stays readable although `pg_catalog`
@@ -1120,8 +1127,8 @@ the residuals).
   an allowlist (`_scope_listing` in `server.py`), by schema and ignoring
   case. Without `allowed_schemas` they return the connector's catalog,
   dictionaries included; under it they also keep the system schemas
-  `allowed_system_schemas` opens and the case namesakes of an allowed
-  schema. Since the convergence wave the connectors leave out every view
+  `allowed_system_schemas` opens (since the code review no longer the case
+  namesakes of an allowed schema). Since the convergence wave the connectors leave out every view
   `is_session_sql_view` matches (other sessions' SQL, column statistics,
   stored credentials), and a synonym or alias whose chain reaches one, from
   PostgreSQL's, Oracle's and Db2's view listings and Oracle's and Db2's
@@ -1233,8 +1240,9 @@ the residuals).
 
 **Not verified on this Mac** (all `not_run`):
 
-- **Windows:** the MSI has never been compiled (WiX on Unix, §1d) and no
-  Windows runtime step has run; the custom actions ran only under
+- **Windows:** no MSI has been built on Windows (WiX on Unix, §1d; since
+  the code review the `.wxs` compiles and links with WiX 4.0.6 on this Mac
+  apart from the Unix-host artefacts) and no Windows runtime step has run; the custom actions ran only under
   PowerShell 7 on POSIX with Windows APIs stubbed. Not seen on Windows:
   Windows Installer running the commit action `CommitReleaseRecordCA` after
   a successful install, real sharing violations on the release record's
@@ -1324,6 +1332,101 @@ skipped) and the final checks (a Thick-mode TLS alias keyed on its own
 skips are the pwsh-driven MSI custom-action tests (no pwsh on this Mac; they
 ran in the Linux replay above), the integration tests that need
 `UDBMCP_TEST_*_HOST`, and single Windows- or Linux-only cases.
+
+**Code review (2026-09-29 to 2026-10-02).** A `/code-review` at maximum
+effort over this branch confirmed 73 findings and rated 6 more plausible;
+all 79 are fixed, with regression tests in `tests/unit/test_cr_fix_*.py`.
+By area (operator-visible behaviour in `docs/security.md`, `docs/tools.md`,
+`docs/architecture.md`, `docs/claude-code-integration.md`,
+`docs/offline-deployment.md`):
+
+- **Bound parameters (two critical).** PyMySQL, clickhouse-connect's
+  client-side binding and psycopg filled a `%s` inside a string literal or
+  comment after validation, so a value could close the literal and become
+  SQL (a `UNION` over a denied table, live). The driver now gets exactly the
+  validated text (`sql_guard.bind_text`, each engine's own literal and
+  comment rules, PostgreSQL `$tag$` quotes included); placeholder/value
+  mismatches are `VALIDATION_ERROR`; PostgreSQL `parameters: []` binds
+  nothing.
+- **Guard and catalog views.** `information_schema` definition views
+  refused and unlisted (other schemas' view SQL and DEFAULT literals, live);
+  new session-SQL views (Oracle `V$DIAG_ALERT_EXT`, `V$RESULT_CACHE_OBJECTS`,
+  ClickHouse `system.zookeeper(_log)`, PostgreSQL `pg_show_plans`,
+  `pg_store_plans`); SQL Server legacy table hints without `WITH` held to
+  the allowlist; optimizer hints inert except MySQL `MAX_EXECUTION_TIME`,
+  `SET_VAR`, `RESOURCE_GROUP`; empty quoted names refused; Oracle CTE names
+  folded by Unicode, PostgreSQL/Db2 under both foldings.
+- **Masking.** `(expr).*`/`untuple`, case-variant and unbindable
+  qualifiers, PIVOT/UNPIVOT aliases, SQLite engine-made names,
+  `MATCH_RECOGNIZE`, `SEARCH`/`CYCLE`, aliases the driver reports
+  elsewhere, decoy CTEs over a row function; DDL read with a tokenizer;
+  namesake schemas left out of the listings and FK targets; discovery tools
+  read only what `check_object` permits (Db2 `SYSIBM.SYSCOLUMNS`);
+  `db_federated_join` `on` capped at 16 pairs; SQLite FTS/R*Tree shadow
+  tables hidden and refused.
+- **Connectors.** ClickHouse `LIMIT 0` statements stream under the budgets;
+  Db2 `ORDER OF` only with an own `ORDER BY` (Db2 refuses it otherwise,
+  428FI, which refused every LOB statement without one); MySQL 5.7/MariaDB star-over-join cut and prepare
+  1461/1047; SQL Server half surrogate pairs; SQLite constant `GROUP BY`
+  terms, `data_version`, a cancel that cannot be lost; SQL Server and Oracle
+  deadlines before the statement starts; PostgreSQL 10 routine fallback
+  (25P02); ClickHouse login and MySQL 1045 error text; a lone surrogate no
+  longer drops the audit record; `customer_no`-style inferred links.
+- **Config, audit, doctor.** Audit rotation never loses a generation
+  (`<audit_path>.rotating`), no double-counted coalescer restore, a loosened
+  log re-tightened to 0600; macOS ACLs on secrets and the token refused;
+  non-UTF-8 files give a byte-free `CONFIG_ERROR`; `doctor` checks state
+  directories, survives bad host names, expands `~` SQLite paths;
+  `wallet_password_env` warned; stdio SIGTERM grace 3 s.
+- **CLI, agents, wizard.** Fail-closed output shows only this tool's entry;
+  as root a user's symlink or foreign hard link is not read; no machine
+  paths added to a project `.mcp.json`; seeding failure is exit 1; `dsh`
+  and `~user` overrides fail closed cleanly; the wizard refuses a group
+  change it cannot keep and strips or refuses secrets-directory ACLs; the
+  macOS Configure app's dialogs compile (it did nothing before).
+- **MSI.** The `.wxs` compiles with WiX 4.0.6 (WIX0012 fixed);
+  `SetPowerShellExe` before `InstallInitialize` (every uninstall and upgrade
+  failed with 1721); `config.yaml` `Permanent`; `CheckFoldersCA` refuses
+  writable or movable install/config folders and junctions; a failed repair
+  keeps the service; an account claimed without a `logs\` grant is refused;
+  the gate runs every check past `service_running`.
+- **Packaging.** Installer format marker 4; `.deb` downgrade and
+  outdated-verifier refusals in `preinst` (nothing unpacked), `abort-*`
+  restarts the service; equal `release_seq` with another `source_rev`
+  refused everywhere; `.pkg` declares the arm64 host and its scripts re-run
+  natively, the verifier judges the hardware architecture; a failed
+  manifest publish fails install/upgrade (it was skipped silently under
+  sudo); rollback raises the anti-rollback record after an intended
+  downgrade; `--restore-config` keeps the live `keys/` and `http-token`; the
+  image loader uses the operator's docker daemon; the bootstrap test hook is
+  refused as root; the deb gate's `no_keys_in_package` matches key material,
+  not the verifier's PEM parser (it failed every run, so `release_usb.sh`
+  aborted).
+
+Still open after the review: a repair that fails inside `service.ps1`
+between `Remove-ExistingService` and `sc.exe create` loses the service; an
+Oracle Thin connect to a listener that never answers (F37); ClickHouse
+server memory is bounded only by the account profile; the `.pkg`
+`hostArchitectures` and native re-run need a real `sudo installer` on Apple
+silicon and an Intel Mac to confirm; masking of predicate-only columns
+(owner decision, unchanged); a view the database owner creates over an
+SQLite shadow table is an ordinary, readable view.
+
+**Test status after the code-review fixes:** `11804 passed, 267 skipped, 1 xfailed`
+(0 failed) for the whole suite on this Mac on 2026-10-02; `mypy --strict src` and
+`ruff check src tests scripts` clean. The CI job replayed on `linux/amd64`
+(Debian 12, pwsh 7.4.6, non-root): 12009 passed, 37 skipped, 1 xfailed and 2
+failed. Both were FTS tests that assumed SQLite 3.40 can build FTS tables under
+the connector's read-only authorizer; they now probe it
+(`tests/unit/helpers_sqlite.py::connector_reads_fts`) and the affected files
+pass there (492 passed, 3 skipped); the no-leak assertions hold on both builds.
+The same replay's pip-audit flagged `pyjwt 2.14.0` (PYSEC-2026-4141, a
+transitive dependency of mcp the server does not use): `requirements/runtime.in`
+now carries the floor `pyjwt>=2.15.0`, and `uv.lock` and the three profile locks
+pin 2.15.1; `--check-locks` and pip-audit over every lock are clean.
+`scripts/live_evidence.py` re-run on 2026-10-02 gives the recorded results
+(the SQL Server driver diagnostic now names the driver instead of
+`<redacted>`).
 
 ## 4. Gates not (fully) run (recorded truthfully)
 

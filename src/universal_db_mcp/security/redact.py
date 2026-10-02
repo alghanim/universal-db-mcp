@@ -51,7 +51,15 @@ def redact_text(text: str) -> str:
     if not text:
         return text
     patterns = [
-        (re.compile(r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[=:]\s*\S+"), r"\1=<redacted>"),
+        # MySQL's own "(using password: YES)" is a hint, not a value: cut, it
+        # took the closing quote and parenthesis of PyMySQL's (errno, "...")
+        # wrapper with it, and the error then lost its errno and message.
+        (
+            re.compile(
+                r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[=:]\s*(?!(?<=using password: )(?:YES|NO)\))\S+"
+            ),
+            r"\1=<redacted>",
+        ),
         (re.compile(r"(?i)(postgres(?:ql)?|mysql|db2|oracle|mssql|clickhouse)://[^\s]+"), r"\1://<redacted-url>"),
         # Backstop: usernames embedded by driver auth-failure messages.
         # keyword=value / keyword: value / keyword "value" forms.
@@ -60,6 +68,9 @@ def redact_text(text: str) -> str:
         (re.compile(r"(?i)\b((?:for\s+)?user(?:name)?|uid|login)\s+(['\"])[^'\"\s;@]+\2"), r"\1 <redacted>"),
         # keyword + bare value after the specific "for user" phrasing.
         (re.compile(r"(?i)\b(for user)\s+[^'\"\s;@]+"), r"\1 <redacted>"),
+        # ClickHouse names the login first: DB::Exception: svc_ro: Authentication
+        # failed (the name may hold spaces and colons, live 26.3).
+        (re.compile(r"(DB::Exception: )[^\n]*?(?=: Authentication failed)"), r"\1<redacted>"),
     ]
     out = text
     for pat, repl in patterns:
@@ -120,7 +131,10 @@ def sql_fingerprint(sql: str) -> str:
     s = re.sub(r"\s+", " ", s).strip().lower()
     if len(sql) > _FINGERPRINT_MAX_CHARS:
         s += f" [{len(sql)} chars]"
-    return "sha256:" + hashlib.sha256(s.encode()).hexdigest()
+    # surrogatepass: a lone surrogate (a JSON \\udcff escape) must not raise
+    # here, in the audit path, after the statement ran (R2); the audit
+    # digests encode the same way.
+    return "sha256:" + hashlib.sha256(s.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def new_request_id() -> str:

@@ -426,6 +426,22 @@ def _created(manifest: object) -> datetime.datetime | None:
     return created if created.tzinfo else created.replace(tzinfo=datetime.UTC)
 
 
+def _source_rev(manifest: object) -> str | None:
+    value = manifest.get("source_rev") if isinstance(manifest, dict) else None
+    if isinstance(value, str) and value.strip() and value.strip().lower() != "unknown":
+        return value.strip()
+    return None
+
+
+def _same_release(manifest: dict[str, object], installed: dict[str, object]) -> bool:
+    """Whether a bundle with the installed release's release_seq can be that release: not when
+    both name a source revision and the two differ (a rebuild of one commit is the same release).
+    Without a revision on both sides nothing tells them apart, as before release_seq had a
+    default: such a release_seq was given explicitly (--release-seq), by whoever built both."""
+    new_rev, old_rev = _source_rev(manifest), _source_rev(installed)
+    return new_rev is None or old_rev is None or new_rev == old_rev
+
+
 def platform_installed_manifest() -> Path | None:
     """Where this platform's installer records the installed release's manifest.json.
 
@@ -444,6 +460,49 @@ def platform_installed_manifest() -> Path | None:
         program_files = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles")
         return Path(program_files) / "UniversalDB MCP" / "manifest.json" if program_files else None
     return None
+
+
+def _rosetta_translated() -> bool:
+    """Whether this process is an x86_64 process that Rosetta 2 translates on arm64 hardware."""
+    try:
+        import ctypes  # noqa: PLC0415 - macOS only, and only when platform.machine() says x86_64
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        value = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        rc = libc.sysctlbyname(b"sysctl.proc_translated", ctypes.byref(value), ctypes.byref(size), None,
+                               ctypes.c_size_t(0))
+    except (OSError, AttributeError, ImportError):
+        return False
+    return bool(rc == 0 and value.value == 1)
+
+
+def host_machine() -> str:
+    """This machine's architecture, as the hardware has it.
+
+    platform.machine() describes the running process. Under Rosetta 2 that is x86_64 on an arm64
+    Mac: the macOS Installer runs a package's scripts translated unless its Distribution declares
+    the arm64 host, and a universal2 python started by a translated parent runs as x86_64, which
+    would refuse the macos-arm64 bundle of the very Mac it is on.
+    """
+    machine = platform.machine()
+    if platform.system() == "Darwin" and machine == "x86_64" and _rosetta_translated():
+        return "arm64"
+    return machine
+
+
+def host_profile_mismatches(profiles: ModuleType, prof: object) -> list[str]:
+    """How this machine differs from the profile *prof*: the registry's check of the running
+    interpreter, with the architecture judged by the hardware (host_machine) under Rosetta 2."""
+    mismatches = list(profiles.profile_host_mismatches(prof))
+    machine = host_machine()
+    if machine != platform.machine():
+        translated = f"machine architecture {platform.machine()} ("
+        mismatches = [m for m in mismatches if not m.startswith(translated)]
+        if machine not in getattr(prof, "host_machines", ()):
+            target = getattr(prof, "manifest_target", {}).get("arch")
+            mismatches.append(f"machine architecture {machine} (target {target})")
+    return mismatches
 
 
 def _target_os_arch(manifest: object) -> tuple[str, str] | None:
@@ -475,7 +534,7 @@ def unknown_profile_on_target(manifest: dict[str, object], installed_path: Path,
         return False
     if target == _target_os_arch(installed):
         return True
-    system, machine = platform.system(), platform.machine()
+    system, machine = platform.system(), host_machine()
     return any(
         system in p.host_systems and machine in p.host_machines
         and (p.manifest_target.get("os"), p.manifest_target.get("arch")) == target
@@ -490,9 +549,12 @@ def check_release_order(
 
     Releases are ordered by the signed manifest's integer release_seq. When
     neither manifest has one (both builds predate it), the signed 'created'
-    timestamp orders them. A missing value counts as older, and an equal one
-    (a reinstall) is allowed. *by_default*: the caller named no installed
-    manifest and *installed_path* is this platform's (platform_installed_manifest).
+    timestamp orders them. A missing value counts as older. An equal one is
+    allowed for the same release only (a reinstall, or a rebuild of the same
+    source revision, see _same_release): release_seq defaults to a commit
+    timestamp, which a rebase can give two releases alike, so it cannot order
+    them. *by_default*: the caller named no installed manifest and
+    *installed_path* is this platform's (platform_installed_manifest).
     """
     if by_default:
         print(f"release order: no --installed-manifest given; checking this machine's installed release "
@@ -513,10 +575,15 @@ def check_release_order(
                  f"({exc}). If you mean to install this bundle anyway, re-run with --allow-downgrade")
         return
     new_seq, old_seq = _release_seq(manifest), _release_seq(installed)
+    other = False
     if old_seq is not None:
         older = new_seq is None or new_seq < old_seq
         what = (f"bundle release_seq {'missing' if new_seq is None else new_seq}, "
                 f"installed release_seq {old_seq}")
+        if new_seq == old_seq and not _same_release(manifest, installed):
+            older = other = True
+            what += (f", but another release (source_rev {_source_rev(manifest) or 'missing'}, installed "
+                     f"source_rev {_source_rev(installed) or 'missing'}), which release_seq cannot order")
     elif new_seq is not None:
         older = False
         what = f"bundle release_seq {new_seq}, the installed release predates release_seq"
@@ -539,7 +606,9 @@ def check_release_order(
             stuck += ("; such a .pkg is refused only after the Installer has written its payload (the bundle "
                       "folder, the share scripts and the LaunchDaemon plist), which it does not put back: "
                       "re-install the current release's .pkg to restore them")
-        fail(f"rollback refused: this bundle is an OLDER release than the one installed ({what}; "
+        which = ("another release with the installed release's release_seq, which may be the older one"
+                 if other else "an OLDER release than the one installed")
+        fail(f"rollback refused: this bundle is {which} ({what}; "
              f"installed manifest {installed_path}). It would bring back code that later releases "
              "fixed. If the downgrade is intended, re-run with --allow-downgrade (the install "
              f"scripts and the .deb take UDBMCP_ALLOW_DOWNGRADE=1){stuck}")
@@ -632,19 +701,19 @@ def main() -> int:
             on_target = (not args.allow_platform_mismatch and default is not None
                          and unknown_profile_on_target(manifest, default, profiles))
         else:
-            mismatches = profiles.profile_host_mismatches(prof)
+            mismatches = host_profile_mismatches(profiles, prof)
             on_target = not mismatches and not args.allow_platform_mismatch
             if mismatches:
                 if args.allow_platform_mismatch:
                     print(
                         f"WARNING: verifying a {profile} bundle on "
-                        f"{platform.system()}/{platform.machine()}. This is a STAGING-side "
+                        f"{platform.system()}/{host_machine()}. This is a STAGING-side "
                         f"integrity/authenticity check only. The bundle must still be verified "
                         f"WITHOUT this flag on the actual install target."
                     )
                 else:
                     fail(f"bundle profile '{profile}' does not match this machine "
-                         f"({platform.system()}/{platform.machine()}/"
+                         f"({platform.system()}/{host_machine()}/"
                          f"{platform.python_version()}): {'; '.join(mismatches)}; pass "
                          f"--allow-platform-mismatch only when verifying on a staging machine")
     except Exception as exc:  # pragma: no cover - fail closed on any registry problem

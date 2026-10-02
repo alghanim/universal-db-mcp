@@ -72,9 +72,11 @@ from .core import (
     backup_path,
     ensure_directory,
     ensure_replaceable,
+    fail_closed_block,
     holds_legacy_entry,
     is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
     other_unisolated_note,
     require_isolated_import,
     resolve_harness_config_path,
@@ -252,13 +254,10 @@ def detect(env: Mapping[str, str], home: Path, platform: str | None = None) -> A
     return _registration_status(config_path(home, platform, env=env), entry)
 
 
-def _fail_closed_block(target: Path) -> str:
-    """Render the offending file's current bytes for operator inspection."""
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"# {target} could not be read: {exc}"
-    return f"# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: Mapping[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, SERVERS_KEY, SERVER_KEY, entry)
 
 
 def _desired_block(entry: Mapping[str, Any]) -> str:
@@ -292,7 +291,7 @@ def _describe(status: AgentStatus, target: Path, scope: str, entry: Mapping[str,
                 "overwrite user-managed state (edit or remove that entry manually, then re-run)"
             ) + unisolated_entry_note(target, SERVERS_KEY, SERVER_KEY)
         return (
-            f"{prefix}: {target} is unreadable or malformed; refusing to "
+            f"{prefix}: {target} is unreadable or malformed{load_problem_note(target)}; refusing to "
             "write (fix or remove the file, then re-run)"
         )
     if holds_legacy_entry(target, SERVERS_KEY, SERVER_KEY, entry):
@@ -317,7 +316,7 @@ def _unisolated_notes(paths: list[Path]) -> str:
 def _plan_block(status: AgentStatus, target: Path, entry: Mapping[str, Any]) -> str:
     """The config block a plan prints for one target."""
     if status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
-        return _fail_closed_block(target)
+        return _fail_closed_block(target, entry)
     if status is AgentStatus.CONFIGURED:
         return ""
     return _desired_block(entry)
@@ -392,7 +391,7 @@ def plan(
 
 
 def _write_failed(
-    label: str, step: str, target: Path, exc: OSError, backup: Path | None
+    label: str, step: str, target: Path, entry: Mapping[str, Any], exc: OSError, backup: Path | None
 ) -> tuple[AgentStatus, str, str, Path | None]:
     """Fail-closed :func:`_apply_target` result for a backup or write
     (``step``) that raised (``target`` unchanged; ``backup`` is reported when
@@ -401,7 +400,7 @@ def _write_failed(
     return (
         AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
         f"{AGENT_NAME} [{label}]: {step} failed ({exc}); {target} was left as it was{note}",
-        _fail_closed_block(target),
+        _fail_closed_block(target, entry),
         backup,
     )
 
@@ -423,7 +422,7 @@ def _apply_target(
         return (
             status,
             _describe(status, target, label, entry),
-            _fail_closed_block(target),
+            _fail_closed_block(target, entry),
             None,
         )
     if status is AgentStatus.CONFIGURED:
@@ -448,7 +447,7 @@ def _apply_target(
             return (
                 AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
                 f"{AGENT_NAME} [{label}]: {target} changed state; refusing to write",
-                _fail_closed_block(target),
+                _fail_closed_block(target, entry),
                 None,
             )
         # An mcp.json without a "servers" key is INSTALLED_UNCONFIGURED, not an
@@ -459,19 +458,19 @@ def _apply_target(
         try:
             ensure_replaceable(target)  # refused before the backup, so none is left behind
         except OSError as exc:
-            return _write_failed(label, f"writing {target}", target, exc, None)
+            return _write_failed(label, f"writing {target}", target, entry, exc, None)
         backup = backup_path(target)
         try:
             write_private_backup(target, backup)
         except OSError as exc:
-            return _write_failed(label, f"backing up {target} to {backup}", target, exc, None)
+            return _write_failed(label, f"backing up {target} to {backup}", target, entry, exc, None)
         merged_servers = dict(servers)
         merged_servers[SERVER_KEY] = dict(entry)
         data[SERVERS_KEY] = merged_servers
         try:
             atomic_write_text(target, json.dumps(data, indent=2, sort_keys=True) + "\n")
         except OSError as exc:
-            return _write_failed(label, f"writing {target}", target, exc, backup)
+            return _write_failed(label, f"writing {target}", target, entry, exc, backup)
         return (
             AgentStatus.CONFIGURED,
             f'{AGENT_NAME} [{label}]: added "{SERVER_KEY}" to {target} (backup: {backup})',
@@ -484,7 +483,7 @@ def _apply_target(
         # Found absent: only ever created, so one that appeared meanwhile fails closed.
         atomic_write_text(target, _desired_block(entry) + "\n", create=True)
     except OSError as exc:
-        return _write_failed(label, f"writing {target}", target, exc, None)
+        return _write_failed(label, f"writing {target}", target, entry, exc, None)
     return (
         AgentStatus.CONFIGURED,
         f'{AGENT_NAME} [{label}]: created {target} with "{SERVER_KEY}"',

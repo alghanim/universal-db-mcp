@@ -123,10 +123,10 @@ def infer_relationships(tables: list[TableFacts], *, cross_connection: bool = Tr
             ctype = portable_type(t.engine, col.data_type)
             for kt, kcol in candidates(t, ctype, by_name.get(cname, [])):
                 target = kt.ref.table.lower()
-                named_for_target = cname in {f"{target}_id", f"{_singular(target)}_id"}
-                if not named_for_target and (t.ref, cname) in own_keys:
-                    continue  # sibling surrogate keys (uuid, rowguid), not a reference
+                # named for the target table: customer_id, customer_no, customers_code
                 derived = cname.startswith((f"{target}_", f"{_singular(target)}_"))
+                if not derived and (t.ref, cname) in own_keys:
+                    continue  # sibling surrogate keys (uuid, rowguid), not a reference
                 if key_tables[cname] > _SHARED_KEY_TABLES and not derived:
                     # a key every table carries is a convention; one shared by 1:1
                     # extension tables still points at the table it is named for

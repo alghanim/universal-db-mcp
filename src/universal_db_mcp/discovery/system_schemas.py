@@ -179,18 +179,24 @@ SESSION_SQL_VIEWS: dict[str, re.Pattern[str]] = {
         r"|mysql\.(?:general_log|slow_log)"
     ),
     "postgres": re.compile(
-        r"(?:pg_catalog\.)?pg_stat_activity|(?:[^.]+\.)?(?:pg_stat_statements|pg_stat_monitor|pg_qualstats\w*)"
+        # pg_show_plans: every running statement's plan with its literals; pg_store_plans: the stored ones
+        r"(?:pg_catalog\.)?pg_stat_activity"
+        r"|(?:[^.]+\.)?(?:pg_stat_statements|pg_stat_monitor|pg_qualstats\w*|pg_show_plans|pg_store_plans\w*)"
     ),
     # a log table an upgrade changed is kept renamed with a numeric suffix (query_log_0)
     "clickhouse": re.compile(
         r"system\.(?:processes|query_cache|asynchronous_inserts|mutations|distributed_ddl_queue|errors"
+        # zookeeper: a replicated table's queue entries hold the inserted rows' block ids and mutation SQL
+        r"|zookeeper"
         r"|(?:query_log|query_thread_log|query_views_log|text_log|error_log|opentelemetry_span_log"
-        r"|asynchronous_insert_log|crash_log)(?:_\d+)?)"
+        r"|asynchronous_insert_log|crash_log|zookeeper_log)(?:_\d+)?)"
     ),
     "oracle": re.compile(
         r"(?:[^.]+\.)?(?:"
         r"g?v_?\$(?:session|sql|sqlarea|sqlarea_plan_hash|sqltext|sqltext_with_newlines|sqlstats|open_cursor"
         r"|sql_monitor|sql_bind_capture|sql_plan|sql_plan_statistics_all|logmnr_contents|diag_trace_file_contents"
+        # the alert log (ORA- messages quote the failing statement) and the result cache's cached statements
+        r"|diag_alert_ext|result_cache_objects"
         # 23ai: readable by an unprivileged account (live, 2026-09-28); other_xml holds the peeked binds
         r"|all_sql_bind_capture|all_sql_monitor|recent_sql_monitor|(?:all_)?sql_plan_monitor|sql_history"
         r"|advisor_current_sqlplan"
@@ -373,6 +379,31 @@ CREDENTIAL_VIEWS: dict[str, re.Pattern[str]] = {
     "clickhouse": re.compile(r"system\.named_collections"),
 }
 
+# information_schema views that carry other objects' SQL and literals: view
+# and routine bodies, trigger statements, event bodies, check clauses, and
+# columns', parameters', attributes' and domains' DEFAULT expressions (a
+# masked column's default literal among them). information_schema is open by
+# default (security.allowed_system_schemas), and these hand back the
+# definitions of every schema the account sees, allowlisted or not (review
+# T1, live: hr's view SQL and a masked column's DEFAULT '999-90-1111' under
+# allowed_schemas [shop]). Refused and left out of listings like
+# SESSION_SQL_VIEWS, as before information_schema was listed; the views that
+# hold names only (TABLES, SCHEMATA, KEY_COLUMN_USAGE, ...) stay readable,
+# and db_list_columns and db_list_views describe the allowlisted objects.
+# Not listed: information_schema.PARTITIONS (a partition's bounds, the
+# documented residual beside COLUMN_VALUE_COLUMNS).
+DEFINITION_VIEWS: dict[str, re.Pattern[str]] = {
+    # INNODB_COLUMNS.DEFAULT_VALUE: the default of a column added instantly
+    "mysql": re.compile(
+        r"information_schema\.(?:views|routines|columns|triggers|events|check_constraints|innodb_columns)"
+    ),
+    "postgres": re.compile(
+        r"information_schema\.(?:views|routines|columns|triggers|check_constraints|parameters|attributes|domains)"
+    ),
+    "clickhouse": re.compile(r"information_schema\.(?:views|columns)"),
+    "mssql": re.compile(r"information_schema\.(?:views|routines|columns|check_constraints|domains)"),
+}
+
 # Catalog views that describe every column and carry its lowest and highest
 # values beside the description: Oracle's *_TAB_COLUMNS (LOW_VALUE,
 # HIGH_VALUE, raw bytes of the value) and COLS, the PUBLIC synonym of
@@ -434,15 +465,27 @@ def is_credential_view(engine: str, schema: str | None, name: str) -> bool:
     return pattern is not None and pattern.fullmatch(_shown(schema, name)) is not None
 
 
+def is_definition_view(engine: str, schema: str | None, name: str) -> bool:
+    """``schema.name`` is one of the engine's DEFINITION_VIEWS, in any
+    spelling loose_name folds to one."""
+    pattern = DEFINITION_VIEWS.get(engine)
+    return pattern is not None and pattern.fullmatch(_shown(schema, name)) is not None
+
+
 def is_session_sql_view(engine: str, schema: str | None, name: str) -> bool:
     """``schema.name`` (or a bare ``name``) is one of the engine's
-    SESSION_SQL_VIEWS, COLUMN_STATISTICS_VIEWS or CREDENTIAL_VIEWS, in any
-    spelling loose_name folds to one: a view that hands back values masking
-    hides, or credentials, refused to every tool and left out of every
-    listing."""
+    SESSION_SQL_VIEWS, COLUMN_STATISTICS_VIEWS, CREDENTIAL_VIEWS or
+    DEFINITION_VIEWS, in any spelling loose_name folds to one: a view that
+    hands back values masking hides, or credentials, refused to every tool
+    and left out of every listing."""
     pattern = SESSION_SQL_VIEWS.get(engine)
     matched = pattern is not None and pattern.fullmatch(_shown(schema, name)) is not None
-    return matched or is_column_statistics_view(engine, schema, name) or is_credential_view(engine, schema, name)
+    return (
+        matched
+        or is_column_statistics_view(engine, schema, name)
+        or is_credential_view(engine, schema, name)
+        or is_definition_view(engine, schema, name)
+    )
 
 
 def is_system_object(engine: str, schema: str | None, table: str) -> bool:

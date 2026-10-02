@@ -26,9 +26,12 @@ it, use the venv's interpreter with `-m universal_db_mcp`:
 
 It detects Claude Code, Claude Desktop, Cursor, VS Code, Cline and the
 DeepSeek harness (`dsh`). For Claude Code it writes the user scope,
-`~/.claude.json` (top-level `mcpServers`), and updates the `.mcp.json` of the
-directory it runs in only when that file already exists; it never creates a
-`.mcp.json` in a working tree. The entry it writes:
+`~/.claude.json` (top-level `mcpServers`), which covers every project. A
+project `.mcp.json` is shared through the repository, so it never creates
+one and never adds this machine's paths to one: it rewrites the `.mcp.json`
+of the directory it runs in only to upgrade this tool's own entry from a
+release before `-I` (same paths, only the args change), and otherwise
+reports it `left as it is`. The entry it writes:
 
 ```json
 {
@@ -179,9 +182,19 @@ harness is reported `unknown_state_fail_closed`, with `refusing to write:
   may come back in your own group (Linux) or its directory's (macOS), which
   changes no access;
 - under `sudo`, a symlink on the path that a user owns and that points to
-  something that user does not own;
+  something that user does not own, or a file with several hard links that
+  the owner of its directory does not own: as root such a file is not even
+  read (a dry run printed a root-only file a user had linked in);
 - a config another program created after `configure-agents` found it absent
   (re-run to add the registration to it).
+
+A failed-closed harness prints the reason (a parse error names the line and
+column) and, under `details:`, the registration it would add and the
+`universal-db` entry the file holds now, never the file's other entries:
+those hold other MCP servers' env values (API tokens), and the output ends
+up in terminals and logs. For `dsh`, only the rows for this server's id are
+shown. A `UDBMCP_CONFIG` the `dsh` registration cannot use (a relative path
+naming no file) fails closed at detection, before a write is offered.
 
 In these cases no backup is made and the file is left as it is. Make the file
 writable by, and owned by, the user who runs `configure-agents` (a hard link
@@ -208,7 +221,9 @@ only) or `~/.config` on Linux, `~/Library/Application Support` on macOS. Under `
 create are given to the owner of their nearest existing parent; running it as
 the logged-in user is still the recommended way.
 
-The macOS "Configure UniversalDB MCP" app runs the same command. When no
+The macOS "Configure UniversalDB MCP" app runs the same command (before
+this release its dialogs did not compile and the app exited without
+registering anything or showing a dialog; it now works). When no
 harness can be configured and one failed (detection error, or a config that
 needs a manual fix), it shows a stop dialog with the Terminal command for the
 diagnostic and exits 1; otherwise it lists the failed harnesses as not
@@ -222,8 +237,11 @@ Nothing is ever written to a harness that failed closed.
 
 Exit status: `0` on success, for plain detection and for `--yes --dry-run`
 (a failed-closed harness is reported, not fatal); `1` when a confirmed write
-did not happen (the adapter refused, raised or crashed) or a write needs
-`--yes` and stdin is not a terminal; `2` for an unknown `--agent`, or when a
+did not happen (the adapter refused, raised or crashed), the registration
+was written but the per-user config it names could not be seeded (`FAIL
+CLOSED: the per-user harness config the registration names could not be
+seeded ...`; with `--json` the harness carries `seed_error`), or a write
+needs `--yes` and stdin is not a terminal; `2` for an unknown `--agent`, or when a
 harness failed closed and either `--agent` names it (also with `--dry-run`
 and for plain detection) or `--yes` was given without `--dry-run`. Under
 `--yes` the other writable harnesses are still applied first, and exit `2`

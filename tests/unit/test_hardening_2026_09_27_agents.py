@@ -1220,7 +1220,8 @@ def test_f48_claude_code_failure_separates_backups_from_writes(
 ) -> None:
     h = _with_existing("claude-code", tmp_path, monkeypatch)
     project = claude_code.project_config_path(tmp_path / "proj")
-    project.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    # The project file is written only to upgrade this tool's own entry (G5).
+    project.write_text(json.dumps({"mcpServers": {"universal-db": _legacy_entry(h)}}), encoding="utf-8")
     project_before = project.read_bytes()
     real_replace = os.replace
     replaced: list[str] = []
@@ -2144,7 +2145,8 @@ def test_f48_claude_code_refuses_every_scope_before_any_backup(
     # A read-only project file must not leave a backup of the user scope either.
     h = _with_existing("claude-code", tmp_path, monkeypatch)
     project = claude_code.project_config_path(tmp_path / "proj")
-    project.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    # The project file is written only to upgrade this tool's own entry (G5).
+    project.write_text(json.dumps({"mcpServers": {"universal-db": _legacy_entry(h)}}), encoding="utf-8")
     project.chmod(0o444)
     user_before = h.target.read_bytes()
     # Detection saw both scopes writable (the project file turned read-only
@@ -2519,7 +2521,13 @@ def test_i51_claude_code_read_only_project_file_is_reported_at_detection(
 ) -> None:
     h = _with_existing("claude-code", tmp_path, monkeypatch)
     project = claude_code.project_config_path(tmp_path / "proj")
+    # Written only to upgrade this tool's own entry in it (G5); one without
+    # it is never written, so its mode does not matter.
     project.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    project.chmod(0o444)
+    assert h.detect() is AgentStatus.INSTALLED_UNCONFIGURED
+    project.chmod(0o644)
+    project.write_text(json.dumps({"mcpServers": {"universal-db": _legacy_entry(h)}}), encoding="utf-8")
     project.chmod(0o444)
 
     assert h.detect() is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED

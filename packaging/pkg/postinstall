@@ -26,6 +26,19 @@
 # deliberately ignored.
 set -euo pipefail
 
+# >>> run natively on Apple silicon: identical in preinstall and postinstall
+# The Installer runs a package's scripts under Rosetta 2 unless its
+# Distribution declares the arm64 host (build_pkg.sh declares it: this block
+# is the second line of defence). Everything below would then run as x86_64,
+# and so would a universal2 python started from it: the verifier would see an
+# x86_64 machine and refuse the macos-arm64 bundle, and pip the bundle's arm64
+# wheels. On arm64 hardware the script starts over as a native process (once:
+# the guard stops a loop if the kernel still reports translation).
+if [ "$(/usr/sbin/sysctl -n sysctl.proc_translated 2>/dev/null || true)" = 1 ] && [ -z "${UDBMCP_PKG_NATIVE:-}" ]; then
+  UDBMCP_PKG_NATIVE=1 exec /usr/bin/arch -arm64 /bin/bash "$0" "$@"
+fi
+# <<< run natively on Apple silicon
+
 PREFIX="/usr/local/universal-db-mcp"
 BUNDLE="$PREFIX/bundle"
 VENV="$PREFIX/venv"

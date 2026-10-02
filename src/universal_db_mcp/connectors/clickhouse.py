@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import array
 import functools
+import importlib
 import math
 import re
 import sys
@@ -22,7 +23,11 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any, NoReturn
+
+import sqlglot
+from sqlglot import exp
 
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.connectors.base import (
@@ -53,6 +58,7 @@ from universal_db_mcp.models.capabilities import Cap, CapabilityMatrix, Capabili
 from universal_db_mcp.models.responses import ErrorCategory
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.redact import scrub_exception
+from universal_db_mcp.security.sql_guard import bind_text, code_view, mask_pyformat_placeholders
 
 # What one db_query may pull off the wire, in decoded bytes. The driver decodes
 # a whole server block before the first of its rows reaches the row/byte
@@ -119,9 +125,18 @@ _CH_READING_SETTINGS = {
 }
 # The server's own databases (names are case-sensitive: both spellings exist).
 _CH_SYSTEM_DATABASES = ("system", "INFORMATION_SCHEMA", "information_schema")
-# A client-side %-format placeholder, and the backtick-quoted identifiers that
-# may contain a '%' of their own (backslash escapes included).
-_BIND_TOKENS = re.compile(r"`(?:[^`\\]|\\.)*`|%\(\w+\)s|%", re.DOTALL)
+# clickhouse-connect sends a statement whose text ends in LIMIT 0 (its own
+# comment regex applied, which keeps '#' comments) as a columns-only FORMAT
+# JSON request, read whole into memory outside the stream budget, the
+# row/byte ceilings and KILL: a UNION whose last branch ends in LIMIT 0, or a
+# '# LIMIT 0' comment, downloaded everything before it (p03L-2). A bound
+# value at the end can be that 0.
+_COLUMNS_ONLY = re.compile(r"LIMIT\s+(?:0|%s|%\(\w+\)s)\s*(?:;\s*)*$", re.IGNORECASE)
+_OWN_LIMIT_0 = re.compile(r"\bLIMIT\s+0[\s;]*$", re.IGNORECASE)
+# A '#!' comment that ends in a quoted string: the server skips it to the end
+# of the text, while the driver's comment regex keeps the string, so the text
+# no longer ends in LIMIT 0 for the driver and streams like any other.
+_NO_COLUMNS_PROBE = "\n#!''"
 
 
 def _server_setting(client: Any, name: str) -> tuple[str, bool]:
@@ -184,18 +199,58 @@ def _statement_errors() -> Iterator[None]:
         raise ConnectorError(text, category=ErrorCategory.QUERY) from exc
 
 
-def _percent_escaped(sql: str) -> str:
-    """Double every '%' that is not a ``%(name)s`` placeholder: the driver
-    binds dict parameters client-side with Python %-formatting over the whole
-    statement, quoted identifiers included."""
+def _driver_module(name: str) -> Any:
+    """A clickhouse-connect module; None without the driver."""
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
 
-    def escape(match: re.Match[str]) -> str:
-        text = match.group(0)
-        if text.startswith("`"):
-            return text.replace("%", "%%")
-        return "%%" if text == "%" else text
 
-    return _BIND_TOKENS.sub(escape, sql)
+def _server_bound(sql: str, params: Any) -> bool:
+    """Whether the driver sends ``params`` as server-side parameters (a
+    mapping, and a {name:Type} placeholder in the text, as its own regex
+    finds one): it formats nothing into the text then."""
+    binding = _driver_module("clickhouse_connect.driver.binding")
+    pattern = getattr(binding, "external_bind_re", None)
+    return isinstance(params, dict) and pattern is not None and pattern.search(sql) is not None
+
+
+def _returns_no_rows(sql: str) -> bool:
+    """Whether the statement is one SELECT whose own top-level LIMIT 0 ends
+    its code: the driver's columns-only request then reads a header."""
+    if not _OWN_LIMIT_0.search(code_view(sql, "clickhouse").rstrip()):
+        return False
+    try:
+        tree = sqlglot.parse_one(mask_pyformat_placeholders(sql), read="clickhouse")
+    except Exception:  # noqa: BLE001 - sqlglot's errors, and whatever else a parser raises
+        return False
+    limit = tree.args.get("limit") if isinstance(tree, exp.Select) else None
+    value = limit.args.get("expression") if isinstance(limit, exp.Limit) else None
+    return isinstance(value, exp.Literal) and value.this == "0" and not tree.args.get("offset")
+
+
+def _streamed(sql: str, *, probe_ok: bool) -> str:
+    """``sql`` as the driver must receive it to stream it (_COLUMNS_ONLY):
+    unchanged unless the driver would send a columns-only request for it,
+    and ``probe_ok`` and the statement really returns no rows."""
+    query = _driver_module("clickhouse_connect.driver.query")
+    remove_comments = getattr(query, "remove_sql_comments", None)
+    uncommented = str(remove_comments(sql)) if callable(remove_comments) else sql
+    if not _COLUMNS_ONLY.search(uncommented) or (probe_ok and _returns_no_rows(sql)):
+        return sql
+    return re.sub(r"[\s;]*\Z", "", sql) + _NO_COLUMNS_PROBE
+
+
+def _driver_sql(sql: str, params: Any) -> str:
+    """The text the driver gets for ``sql`` with ``params``. Bound
+    client-side, the driver %-formats the values into the whole text, string
+    literals and comments included, after the guard validated it: bind_text
+    doubles every '%' that is not a placeholder in code and refuses
+    placeholders that do not match the values (p03L-1)."""
+    if params and not _server_bound(sql, params):
+        sql = bind_text(sql, params, engine="clickhouse")
+    return _streamed(sql, probe_ok=True)
 
 
 class _StreamBudgetExceeded(Exception):
@@ -941,17 +996,9 @@ class ClickHouseConnector(DatabaseConnector):
         text = quoted_column if portable_name == "text" else f"toString({quoted_column})"
         return f"lowerUTF8({text})"
 
-    def build_search_query(
-        self, schema: str | None, table: str, select_columns: list[str], where_sql: str, limit: int
-    ) -> str:
-        sql = super().build_search_query(schema, table, select_columns, where_sql, limit)
-        # The value search binds its placeholders client-side, with Python
-        # %-formatting over the whole text: a catalog name such as 'pct_%'
-        # failed its table's statement ('unsupported format character').
-        binds = any(m.group(0).startswith("%(") for m in _BIND_TOKENS.finditer(where_sql))
-        return _percent_escaped(sql) if binds else sql
-
     def placeholder(self, index: int) -> str:
+        # A '%' in a catalog name ('pct_%') is doubled with the rest of the
+        # text when the statement runs with its values bound (_driver_sql).
         return f"%(p{index})s"
 
     def pack_parameters(self, values: list[Any]) -> Any:
@@ -1121,6 +1168,9 @@ class ClickHouseConnector(DatabaseConnector):
                 self._session_skipped("per-query result ceilings", RuntimeError(self._ceilings_refused))
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
+        # outside translated_driver_errors: a placeholder/value mismatch stays a VALIDATION error
+        params = spec.parameters or None
+        spec = replace(spec, sql=_driver_sql(spec.sql, params), parameters=params)
         cancel = threading.Event()
         self._cancel_event = cancel
         start = time.monotonic()
@@ -1339,7 +1389,8 @@ class ClickHouseConnector(DatabaseConnector):
         row estimate, not a read. A profile constraint that refuses one of the
         settings (not visible in system.settings) plans without them and
         empties ``sent``."""
-        explain = "EXPLAIN " + sql  # noqa: S608 - validated upstream
+        # a plan is never a columns-only request (it came back empty)
+        explain = _streamed("EXPLAIN " + sql, probe_ok=False)  # noqa: S608 - validated upstream
         try:
             return client.query(explain).result_rows
         except Exception as exc:

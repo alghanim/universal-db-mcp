@@ -7,8 +7,13 @@
 #
 # Schema rules: unknown fields and mapping keys given twice are rejected;
 # secrets are referenced, never inlined (username_env / password_env /
-# username_file / password_file). Relative paths resolve against this file's
-# directory. There is no write mode: security.read_only: false,
+# username_file / password_file). A relative audit_path, metadata_cache_path,
+# http_bearer_token_file, username_file, password_file, tls file,
+# options.wallet_password_file or options.passfile resolves against this
+# file's directory. A sqlite database and the Oracle directory options
+# (wallet_location, tns_admin, lib_dir) are used as written, so a relative one
+# follows the server's working directory (/ under the systemd unit): write
+# those absolute. There is no write mode: security.read_only: false,
 # allow_write_operations: true and a connection's read_only: false are
 # rejected at load.
 
@@ -81,15 +86,18 @@ security:
   # can name one too). One list for every engine: 'sys' opens SQL Server's
   # sys, Oracle's SYS dictionary and MySQL's sys schema alike. The default
   # opens information_schema on PostgreSQL, MySQL, SQL Server and ClickHouse;
-  # note that db_query can then read information_schema about schemas outside
-  # a connection's allowed_schemas (catalog metadata, not table rows): remove
-  # it where that matters. Oracle's DUAL (SYS.DUAL) and Db2's
+  # note that db_query can then read information_schema's names-only views
+  # (TABLES, SCHEMATA, ...) about schemas outside a connection's
+  # allowed_schemas (object names, not table rows): remove it where that
+  # matters. Oracle's DUAL (SYS.DUAL) and Db2's
   # SYSIBM.SYSDUMMY1-4 are readable in statements without opening sys or
   # sysibm. Views of other sessions' SQL (processlist, pg_stat_activity,
   # V$SQL, system.query_log, ...), of column statistics (COLUMN_STATISTICS,
   # pg_stats, *_HISTOGRAMS, SYSCAT.COLDIST, ...) and of stored credentials
   # (PostgreSQL's user_mapping_options and foreign_server_options,
-  # pg_authid, mysql.user, sys.sql_logins, database links, ...) stay refused
+  # pg_authid, mysql.user, sys.sql_logins, database links, ...) and
+  # information_schema's views of other objects' definitions (VIEWS,
+  # ROUTINES, COLUMNS, TRIGGERS, CHECK_CONSTRAINTS, ...) stay refused
   # whatever this lists, and Oracle's *_TAB_COLUMNS and Db2's SYSCAT.COLUMNS
   # are readable only without their low and high value columns.
   # Lists: docs/security.md.

@@ -19,6 +19,7 @@ from universal_db_mcp.discovery.system_schemas import (
     is_column_statistics_view,
     is_credential_view,
     is_data_free_table,
+    is_definition_view,
     is_listed_system_schema,
     is_session_sql_view,
     value_columns,
@@ -74,6 +75,14 @@ def check_not_session_sql(engine: str, schema: str | None, name: str, *, columns
             f"'{shown}' carries each column's low and high values beside its description, which would hand back "
             f"values column masking hides: read it with db_query naming the columns you need (not "
             f"{', '.join(sorted(c.upper() for c in carried))})",
+        )
+    if is_definition_view(engine, schema, name):
+        raise ToolFailure(
+            ErrorCategory.POLICY,
+            f"'{shown}' carries the definitions of every schema's objects (view and routine bodies, trigger "
+            f"statements, check clauses, DEFAULT expressions with their literals), allowlisted or not, which "
+            f"would hand back values column masking hides: it is not readable on any connection; "
+            f"db_list_columns and db_list_views describe the objects this connection may read",
         )
     if is_session_sql_view(engine, schema, name):
         raise ToolFailure(

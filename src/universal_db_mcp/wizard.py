@@ -47,7 +47,13 @@ from typing import Any
 
 import yaml
 
-from universal_db_mcp.config import AppConfig, ConnectionConfig, ResolvedConnection, load_config
+from universal_db_mcp.config import (
+    AppConfig,
+    ConnectionConfig,
+    ResolvedConnection,
+    darwin_secret_file_acl_problems,
+    load_config,
+)
 from universal_db_mcp.connectors.registry import build_connector
 from universal_db_mcp.errors import ConfigError
 from universal_db_mcp.security.policy import EffectivePolicy
@@ -407,11 +413,18 @@ def _prepare_secrets_dir(sdir: Path, owner: tuple[int, int] | None, parent_fd: i
             raise WizardError(linked)
         _win32_make_private(sdir, directory=True)
         return None
+    created = True
     if parent_fd is None:
-        sdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        sdir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            sdir.mkdir(mode=0o700)
+        except FileExistsError:
+            created = False
     else:
-        with contextlib.suppress(FileExistsError):
+        try:
             os.mkdir(sdir.name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            created = False
     try:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         fd = os.open(sdir.name, flags, dir_fd=parent_fd) if parent_fd is not None else os.open(sdir, flags)
@@ -421,10 +434,41 @@ def _prepare_secrets_dir(sdir: Path, owner: tuple[int, int] | None, parent_fd: i
         os.fchmod(fd, 0o700)
         if owner is not None:
             os.fchown(fd, *owner)
+        _refuse_extended_acl(fd, sdir, created=created)
     except BaseException:
         os.close(fd)
         raise
     return fd
+
+
+def _refuse_extended_acl(fd: int, sdir: Path, *, created: bool) -> None:
+    """Keep the macOS secrets directory *fd* free of an extended ACL, which
+    the 0700 mode does not show and which every secret file created in it
+    inherits ('everyone allow read,file_inherit' made each one readable by
+    all). One the directory inherited from the config directory as it was
+    created is removed; one an existing directory carries is refused
+    (WizardError), the operator's to remove. On Linux a POSIX ACL's mask is
+    the group bits, which the 0700 mode clears."""
+    if not _has_extended_acl(fd):
+        return
+    if created:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.acl_init.restype = ctypes.c_void_p
+        libc.acl_init.argtypes = [ctypes.c_int]
+        libc.acl_set_fd_np.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        libc.acl_free.argtypes = [ctypes.c_void_p]
+        empty = libc.acl_init(0)
+        if empty:
+            libc.acl_set_fd_np(fd, empty, _ACL_TYPE_EXTENDED)
+            libc.acl_free(empty)
+        if not _has_extended_acl(fd):
+            return
+    raise WizardError(
+        f"{sdir} carries an access control list (ls -led shows it) that can let other accounts read the "
+        f"secret files created in it; no secret was written there: remove it (chmod -N {sdir}) and re-run"
+    )
 
 
 def _open_secrets_dir(config_path: Path, name: str, sdir: Path) -> tuple[tuple[int, int] | None, int | None]:
@@ -478,7 +522,9 @@ def _create_private(path: Path, data: bytes, owner: tuple[int, int] | None, dir_
     owner can read it: on Windows a protected DACL, as root *owner* on the
     descriptor. The exclusive, no-follow create refuses an existing file or
     a planted symlink (O_NOFOLLOW does not exist on Windows, where it used
-    to escape as a raw AttributeError). A failed write removes the file.
+    to escape as a raw AttributeError). On macOS a file whose extended ACL
+    opens it to others (inherited from the directory) is refused before
+    anything is written into it. A failed write removes the file.
     With *dir_fd* the file is created in that directory."""
     name = _at(path, dir_fd)
     fd = os.open(name, _new_file_flags(), 0o600, dir_fd=dir_fd)
@@ -487,6 +533,12 @@ def _create_private(path: Path, data: bytes, owner: tuple[int, int] | None, dir_
             _win32_make_private(path, directory=False)
         elif owner is not None:
             os.fchown(fd, *owner)
+        problems = darwin_secret_file_acl_problems(path)
+        if problems:
+            raise WizardError(
+                f"{path} would not be private ({'; '.join(problems)}); remove the access control list of "
+                f"{path.parent} (chmod -N), then re-run"
+            )
         _write_all(fd, data)
     except BaseException:
         os.close(fd)
@@ -1126,11 +1178,21 @@ def commit_merge(plan: MergePlan, credentials: StagedCredentials | None = None) 
         with os.fdopen(fd, "wb") as fh:
             if _is_root():
                 os.fchown(fh.fileno(), st.st_uid, st.st_gid)
-            elif sys.platform != "win32" and os.fstat(fh.fileno()).st_gid != st.st_gid:
+            elif sys.platform != "win32" and (created_gid := os.fstat(fh.fileno()).st_gid) != st.st_gid:
                 # keep the group a service account may read it through (a
                 # member of that group may give the file to it)
-                with contextlib.suppress(PermissionError):
+                try:
                     os.fchown(fh.fileno(), -1, st.st_gid)
+                except PermissionError as exc:
+                    mode = stat.S_IMODE(st.st_mode)
+                    if (mode >> 3) & 0o7 != mode & 0o7:
+                        # the group decides who may read it (0640): the
+                        # service would lose it at its next start
+                        raise PermissionError(
+                            f"{target} belongs to group {st.st_gid}, which this user is not in, and the "
+                            f"rewritten file would get group {created_gid} ({exc}), changing who may read it; "
+                            "run add-connection as a member of that group (or as root), or edit it by hand"
+                        ) from exc
             if sys.platform != "win32":
                 os.fchmod(fh.fileno(), stat.S_IMODE(st.st_mode))
             fh.write(payload)
@@ -1232,6 +1294,17 @@ def _default(value: Any) -> str | None:
     return None if value is None or value == "" else str(value)
 
 
+def _config_relative(cfg_path: Path, value: Any) -> str | None:
+    """A path value of the config as a prompt default: a relative one as the
+    server resolves it, against the config file's directory (config.py's
+    _resolve_relative_paths), never the wizard's working directory, which
+    _absolute would anchor it at."""
+    default = _default(value)
+    if default is None or os.path.isabs(os.path.expanduser(default)):
+        return default
+    return str(Path(os.path.abspath(cfg_path)).parent / default)
+
+
 def _existing_block(cfg_path: Path, name: str, engine: str) -> dict[str, Any]:
     """Connection *name* as the config has it now, when it is an *engine*
     connection, for the prompt defaults; {} otherwise. Nothing is validated
@@ -1325,7 +1398,8 @@ def collect_answers_interactive(
         # every tool call whenever security.require_remote_tls is on.
         tls_enabled = _ask_bool("Use TLS for this connection?", bool(existing_tls.get("enabled", True)))
         while tls_enabled:
-            tls_ca_file = _ask("CA certificate file (absolute path)", _default(existing_tls.get("ca_file")))
+            ca_default = _config_relative(cfg_path, existing_tls.get("ca_file"))
+            tls_ca_file = _ask("CA certificate file (absolute path)", ca_default)
             if tls_ca_file and Path(tls_ca_file).is_file():
                 break
             print("  that file does not exist; TLS verification needs the CA certificate")

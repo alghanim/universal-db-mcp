@@ -112,6 +112,18 @@ def _extra_statement_error(reason: str | None) -> ConnectorError:
 
 
 _MSSQL_XML = 241  # sys.types.system_type_id of xml
+# ODBC SQL_WCHAR, SQL_WVARCHAR and SQL_WLONGVARCHAR: nchar, nvarchar (an
+# xml column cast to nvarchar(max) included) and ntext, fetched as UTF-16.
+_WIDE_TEXT_TYPES = (-8, -9, -10)
+
+
+def _utf16_cut_tolerant(raw: bytes | None) -> str | None:
+    """A wide text value as text. SET TEXTSIZE cuts a (max) value at a byte
+    count, which can fall inside a UTF-16 surrogate pair; pyodbc's own
+    strict decode then failed the whole query. The half pair (or an
+    unpaired surrogate the value holds) reads as U+FFFD; a cut value's
+    last character is past the cell limit anyway, so it is never shown."""
+    return None if raw is None else raw.decode("utf-16-le", "replace")
 # Schemas of the server's catalog views, which information_schema.tables
 # never lists (their canonical spelling: a binary collation compares exactly).
 # The connector's own statements spell each view and column as the catalog
@@ -169,6 +181,11 @@ class MssqlConnector(DatabaseConnector):
         self._module: Any = None
         self._exec_lock = threading.Lock()  # serializes queries
         self._cursor_lock = threading.Lock()  # guards _running_cursor against close during cancel
+        # Set by cancel_current while a query is in progress: Cursor.cancel()
+        # reaches only a statement running, so the statement, which starts
+        # after its description, looks here first.
+        self._cancelled = threading.Event()
+        self._executing = False  # under _cursor_lock
         self._running_cursor: Any = None  # the executing query's cursor, for cancel_current
 
     @staticmethod
@@ -407,11 +424,14 @@ class MssqlConnector(DatabaseConnector):
     def cancel_current(self) -> bool:
         """Cancel the executing statement with pyodbc's Cursor.cancel() (ODBC
         SQLCancel, made to be called from another thread). The slot lock
-        keeps the query from closing that cursor under the call."""
+        keeps the query from closing that cursor under the call. A query
+        whose statement has not started yet is stopped before it does."""
         with self._cursor_lock:
+            if self._executing:
+                self._cancelled.set()
             cur = self._running_cursor
             if cur is None:
-                return False
+                return self._executing
             try:
                 cur.cancel()
                 return True
@@ -914,7 +934,14 @@ class MssqlConnector(DatabaseConnector):
 
     def execute_query(self, spec: QuerySpec) -> QueryOutcome:
         with self._exec_lock:
-            return self._execute(spec)
+            with self._cursor_lock:
+                self._cancelled.clear()
+                self._executing = True
+            try:
+                return self._execute(spec)
+            finally:
+                with self._cursor_lock:
+                    self._executing = False
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
         with translated_driver_errors(), self._query_connect(spec.timeout_seconds):
@@ -928,6 +955,10 @@ class MssqlConnector(DatabaseConnector):
 
         try:
             with translated_driver_errors(phase="execute"):
+                add_converter = getattr(conn, "add_output_converter", None)  # pyodbc's; absent from a stand-in
+                if callable(add_converter):
+                    for sqltype in _WIDE_TEXT_TYPES:
+                        add_converter(sqltype, _utf16_cut_tolerant)
                 cur = conn.cursor()
                 with self._cursor_lock:
                     self._running_cursor = cur
@@ -939,6 +970,11 @@ class MssqlConnector(DatabaseConnector):
                 cur.execute(f"SET TEXTSIZE {2 * (spec.max_cell_bytes + 1)}")
                 params = tuple(spec.parameters) if isinstance(spec.parameters, list) else spec.parameters
                 sql = self._xml_cast(cur, spec.sql, params)
+                if self._cancelled.is_set():
+                    # the deadline fired while the statement was described
+                    raise ConnectorError(
+                        "the statement was cancelled before it started", category=ErrorCategory.TIMEOUT
+                    )
                 if params:
                     cur.execute(sql, params)
                 else:

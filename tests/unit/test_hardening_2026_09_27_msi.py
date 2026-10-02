@@ -317,7 +317,7 @@ def test_f15_gate_asserts_the_post_install_acl() -> None:
     assert "Get-SecretAclProblem -Path $entry.FullName -AllowedSids $SecretSids -DaclOnly" in code[walk : walk + 300]
     assert "'programdata_acl'" in code
     # evaluated before the service check, which cannot pass yet on Windows
-    assert code.index("'programdata_acl'") < code.index("Stop-Gate 'service_running'")
+    assert code.index("'programdata_acl'") < code.index("'service_running'")
 
 
 def test_f15_gate_has_a_squatted_token_negative() -> None:
@@ -849,7 +849,13 @@ exit $LASTEXITCODE
 """
 
 _ICACLS_STUB = '#!/bin/sh\nexec "$H_PY" "$H_HELPER" icacls "$@"\n'
-_SC_STUB = '#!/bin/sh\necho "sc $*" >> "$H_CALLS"\n[ "$1" = query ] && exit 36\nexit 0\n'
+# H_SC_SERVICE=1: the service exists (and reads as stopped); else sc.exe
+# query answers 1060, as on a host without it.
+_SC_STUB = (
+    '#!/bin/sh\necho "sc $*" >> "$H_CALLS"\n'
+    'if [ "$1" = query ]; then [ -n "$H_SC_SERVICE" ] || exit 36; echo "        STATE              : 1  STOPPED"; fi\n'
+    "exit 0\n"
+)
 _REG_STUB = '#!/bin/sh\necho "reg $*" >> "$H_CALLS"\n[ -n "$H_REG_FAIL" ] && exit 1\nexit 0\n'
 _PYTHON_STUB = f"""#!/bin/sh
 echo "python $*" >> "$H_CALLS"
@@ -3187,7 +3193,9 @@ def test_exec_w2_i62_uninstall_leaves_the_record(host: _Host) -> None:
 
 def test_w2_i62_only_the_rollback_twin_restores_the_record() -> None:
     cmds = _custom_action_commands()
-    assert cmds["RollbackRemoveServiceCA"].endswith(f'-ServiceName "udbmcp" -InstalledManifest "{RECORD}"')
+    assert cmds["RollbackRemoveServiceCA"].endswith(
+        f'-ServiceName "udbmcp" -InstalledManifest "{RECORD}" -Repair "[Installed]"'
+    )
     assert "-InstalledManifest" not in cmds["RemoveServiceCA"]
     body = _main_body(_code(SERVICE_PS1))
     # the stale copy goes first, before anything in the action can fail
@@ -3211,7 +3219,7 @@ def test_w2_i62_only_the_rollback_twin_restores_the_record() -> None:
 #   low:    doctor.ps1's walk after the logs\ DACL was pinned statically only;
 #           venv.ps1 ran python as LocalSystem without -I.
 
-REGISTERED = "UdbmcpRegisteredAccount"
+REGISTERED = "UDBMCPREGISTEREDACCOUNT"
 SERVICE_KEY = "SYSTEM\\CurrentControlSet\\Services\\udbmcp"
 GMSA = "CORP\\udbmcp-gmsa$"
 GMSA_SID = "S-1-5-21-1111-2222-3333-1106"
@@ -3242,8 +3250,12 @@ def test_fu2_wxs_reads_the_registered_account_before_anything_runs() -> None:
     root = _wxs_root()
     props = {el.get("Id"): el for el in root.iter() if _local(el) == "Property"}
     prop = props[REGISTERED]
-    assert REGISTERED != REGISTERED.upper(), "a private property: msiexec cannot set it"
-    assert prop.get("Secure") is None and prop.get("Value") is None
+    # A search property must be public (WiX refuses a lower-case one with
+    # WIX0012, so no MSI could be built) and Secure (with a user interface
+    # AppSearch runs in the client only). Being public, the actions keep it
+    # only when logs\ corroborates it (test_cr_fix_msi.py).
+    assert REGISTERED == REGISTERED.upper(), "a search property must be public"
+    assert prop.get("Secure") == "yes" and prop.get("Value") is None
     searches = [el for el in prop.iter() if _local(el) == "RegistrySearch"]
     assert len(searches) == 1
     search = searches[0]
@@ -3429,7 +3441,11 @@ def test_exec_fu2_a_password_account_is_not_kept_without_its_password(host: _Hos
 @executed
 def test_exec_fu2_doctor_keeps_a_password_account_whose_password_is_given(host: _Host) -> None:
     lsa = {"H_ACCOUNTS": "HOST\\svc=" + DEDICATED_SID, "UDBMCP_SERVICE_PASSWORD": "pw-4f1e"}
-    code, out, calls = host.doctor({host.cfgdir: SAFE, host.config: SAFE}, registered=".\\svc", **lsa)
+    logs = host.cfgdir / "logs"
+    logs.mkdir()
+    # the grant the install that registered the service under it made
+    acl = {host.cfgdir: SAFE, host.config: SAFE, logs: _entry(SID_ADMINS, [DEDICATED_SID, "Allow", "(OI)(CI)M", False])}
+    code, out, calls = host.doctor(acl, registered=".\\svc", **lsa)
     assert code == 0, out
     assert "keeping '.\\svc'" in out and "pw-4f1e" not in out + calls, out
 

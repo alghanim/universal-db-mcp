@@ -310,8 +310,8 @@ def test_malformed_config_fails_closed_without_write(tmp_path: Path, bad_content
 
     planned = claude_desktop.plan(ENV, home)
     assert planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-    # The plan prints the offending file's contents for the operator.
-    assert bad_content in planned.config_block
+    # The plan describes the offending file, never prints it (other servers' secrets).
+    assert "its contents are not shown" in planned.config_block
     assert "refusing to write" in planned.summary
 
     applied = claude_desktop.apply(ENV, home, confirmed=True)
@@ -347,7 +347,7 @@ def test_null_mcp_servers_fails_closed(tmp_path: Path) -> None:
 
     planned = claude_desktop.plan(ENV, home)
     assert planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-    assert bad in planned.config_block
+    assert "is not an object" in planned.config_block and "Ctrl+Space" not in planned.config_block
     assert "refusing to write" in planned.summary
 
     applied = claude_desktop.apply(ENV, home, confirmed=True)

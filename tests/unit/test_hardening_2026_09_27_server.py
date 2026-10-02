@@ -111,6 +111,7 @@ from universal_db_mcp.connectors.sqlite import SQLiteConnector
 from universal_db_mcp.discovery.inference import TableFacts, TableRef, infer_relationships
 from universal_db_mcp.errors import ToolFailure
 from universal_db_mcp.models.capabilities import CapabilityState
+from universal_db_mcp.security.sql_guard import bind_text
 from universal_db_mcp.server import AppContext, build_server
 from universal_db_mcp.services.audit import AuditWriteFailure
 
@@ -2216,7 +2217,10 @@ def _percent_fake(cls: Any) -> Any:
 
         def execute_query(self, spec: Any) -> QueryOutcome:
             params = spec.parameters
-            sent = spec.sql % (tuple(params) if isinstance(params, list) else params)
+            # what the connector hands the driver: every '%' that is not a
+            # placeholder doubled (bind_text), then the driver's formatting
+            text = bind_text(spec.sql, params, engine=cls.engine)
+            sent = text % (tuple(params) if isinstance(params, list) else params)
             self.statements.append((spec.sql, sent))
             return QueryOutcome(columns=[("id", "integer"), ("pct%", "text")], rows=[[1, "zqxneedle"]],
                                 truncated=False, rows_seen=1, elapsed_ms=0)
@@ -2233,7 +2237,9 @@ def test_a_percent_in_a_catalog_name_survives_the_drivers_formatting(
     env = _call(server, "db_search_values", {"query": "zqxneedle"})
     assert [(h["table"], h["matched_columns"]) for h in env["data"]["hits"]] == [("t%x", ["pct%"])], env["warnings"]
     ((built, sent),) = fake.statements
-    assert fake.quote_identifier("pct%%") in built and fake.quote_identifier("t%%x") in built
+    # the server writes the names as the catalog spells them; the connector
+    # escapes them for the driver's formatting (bind_text)
+    assert fake.quote_identifier("pct%") in built and fake.quote_identifier("t%x") in built and "%%" not in built
     assert fake.quote_identifier("pct%") in sent and fake.quote_identifier("t%x") in sent and "%%" not in sent
 
 
@@ -2481,6 +2487,7 @@ def test_attribute_notation_function_names_are_columns_on_other_engines(demo_pol
     ],
 )
 def test_clickhouse_tuple_access_through_an_alias_is_traced(demo_policy: Any, sql: str, expected: set[int]) -> None:
+    demo_policy = dataclasses.replace(demo_policy, engine="clickhouse")  # tuple access is ClickHouse's
     ast = sqlglot.parse_one(sql, read="clickhouse")
     assert srv._query_mask_positions(demo_policy, ast, [("c0", "t")]) == expected
 

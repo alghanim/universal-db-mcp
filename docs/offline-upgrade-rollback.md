@@ -61,8 +61,9 @@ Properties:
 - `upgrade_offline.sh` REQUIRES `UDBMCP_RELEASE_PUBKEY` and verifies the new
   bundle's signature before touching anything. It also refuses a bundle whose
   signed `release_seq` is lower than the installed release's
-  (`/opt/universal-db-mcp/manifest.json`): `FAIL: rollback refused ...`. An
-  intended downgrade passes `--allow-downgrade` (or
+  (`/opt/universal-db-mcp/manifest.json`), or equal to it from another
+  `source_rev` (a commit timestamp cannot order two such releases): `FAIL:
+  rollback refused ...`. An intended downgrade passes `--allow-downgrade` (or
   `UDBMCP_ALLOW_DOWNGRADE=1`); the `.deb` takes
   `sudo UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <older .deb>`. Refresh the trusted
   tools from the new release first: a verifier from before `release_seq`
@@ -220,7 +221,13 @@ sudo systemctl restart universal-db-mcp
 After a rollback, `/opt/universal-db-mcp/manifest.json` still names the
 release rolled back FROM, so installing the older bundle again is a downgrade
 and needs `--allow-downgrade` (or `UDBMCP_ALLOW_DOWNGRADE=1` for `dpkg -i`);
-the next upgrade to a newer release needs nothing special.
+the next upgrade to a newer release needs nothing special. The one exception
+is a rollback after an intended downgrade, where that record names an older
+release than the one the rollback brings back: the installers keep the
+running release's record beside its venv (`venv.previous.manifest.json`),
+and the rollback raises `manifest.json` to it, so bundles between the two
+are refused again. The installers fail when they cannot publish
+`manifest.json` at all (it used to be skipped silently under `sudo`).
 
 Restores the previous venv (both venvs are created with `python -m venv
 --copies`, so each carries its own copy of the interpreter and the rollback
@@ -233,7 +240,10 @@ latest config/state backup OVERWRITES live state (which may hold post-upgrade
 edits made after that backup was taken), so it requires the explicit
 `--restore-config` flag. Without it the script reports the existing backup
 and leaves the live configuration untouched (venv-only rollback). With it,
-the backup is validated through the restored venv before anything is
+the release key (`keys/`) and the HTTP bearer token (`http-token`) are not
+restored: the live ones are carried into the restored configuration, so a
+rotated key or a token rotated because it leaked never comes back. The
+backup is validated through the restored venv before anything is
 displaced, and the live configuration is moved aside (never deleted) to
 `/var/backups/universal-db-mcp/pre-rollback-<ts>/`. The live metadata cache
 is renamed to `metadata.sqlite.pre-rollback` beside it, and the backup cache

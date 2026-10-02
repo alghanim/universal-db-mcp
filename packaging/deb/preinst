@@ -162,7 +162,7 @@ fi
 # The installer also carries a format marker ('# udbmcp-installer-format: N');
 # any pip-running copy without the current number is refused the same way
 # (build-then-switch venvs, --copies interpreters and rollback all depend on it).
-INSTALLER_FORMAT=3
+INSTALLER_FORMAT=4
 if [ -s "$INSTALLER" ] && grep -q "PIP_FIND_LINKS" "$INSTALLER" \
    && ! grep -q "^# udbmcp-installer-format: ${INSTALLER_FORMAT}\$" "$INSTALLER"; then
     fail "the trusted installer at $INSTALLER is an OUTDATED copy (no 'udbmcp-installer-format: ${INSTALLER_FORMAT}' marker).
@@ -175,6 +175,61 @@ half-replaced install). Refresh the trusted tools from the release stick first:
 then re-run this install."
     echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
     exit 1
+fi
+
+# --- prerequisite 4: the trusted verifier can refuse a downgrade -----------
+# postinst verifies with --installed-manifest (anti-rollback). A verifier
+# that parses options (argparse's add_argument) but has none predates that
+# check: refused here, before the old prerm's stop is followed by an unpack
+# this package could only leave half-configured. postinst keeps its own check
+# (and the one its argparse gives away) for a configure run without this
+# preinst. Nothing here runs the verifier.
+if grep -q -- 'add_argument(' "$VERIFIER" && ! grep -q -- '"--installed-manifest"' "$VERIFIER"; then
+    fail "the trusted verifier at $VERIFIER is an OUTDATED copy (no --installed-manifest option): it cannot refuse a downgrade to an older release. Refresh the trusted tools from the release stick first:
+
+    sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh
+
+then re-run this install."
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
+
+# --- prerequisite 5: not an older release than the installed one ----------
+# postinst's verifier refuses an OLDER release than the installed one, but
+# only after dpkg unpacked it over the newer payload, leaving the package
+# half-configured. The payload's release_seq and source revision, written
+# here by scripts/package/build_deb.sh from the signed manifest, are known
+# now, so an older package (or another release with the same release_seq)
+# stops before dpkg unpacks anything. Empty in the repository copy. The
+# verifier in postinst stays the authority for everything this cannot order
+# (releases that predate release_seq, an unreadable installed manifest).
+PAYLOAD_RELEASE_SEQ=""
+PAYLOAD_SOURCE_REV=""
+INSTALLED_MANIFEST="/opt/universal-db-mcp/manifest.json"
+if [ -n "$PAYLOAD_RELEASE_SEQ" ] && [ -f "$INSTALLED_MANIFEST" ] && [ "${UDBMCP_ALLOW_DOWNGRADE:-}" != "1" ] \
+   && command -v python3 >/dev/null 2>&1; then
+    installed="$(python3 -I -S -c 'import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+seq, rev = m.get("release_seq"), m.get("source_rev")
+print(seq if type(seq) is int and seq >= 0 else "")
+print(rev.strip() if isinstance(rev, str) and rev.strip().lower() not in ("", "unknown") else "")' "$INSTALLED_MANIFEST" 2>/dev/null)" || installed=""
+    installed_seq="$(printf '%s\n' "$installed" | sed -n 1p)"
+    installed_rev="$(printf '%s\n' "$installed" | sed -n 2p)"
+    refused=""
+    if [ -n "$installed_seq" ] && [ "$PAYLOAD_RELEASE_SEQ" -lt "$installed_seq" ]; then
+        refused="this package is release_seq $PAYLOAD_RELEASE_SEQ, OLDER than the installed release_seq $installed_seq"
+    elif [ -n "$installed_seq" ] && [ "$PAYLOAD_RELEASE_SEQ" -eq "$installed_seq" ] && [ -n "$PAYLOAD_SOURCE_REV" ] \
+         && [ -n "$installed_rev" ] && [ "$PAYLOAD_SOURCE_REV" != "$installed_rev" ]; then
+        refused="this package (source_rev $PAYLOAD_SOURCE_REV) is another release with the installed release's release_seq $installed_seq (source_rev $installed_rev), which may be the older one"
+    fi
+    if [ -n "$refused" ]; then
+        fail "rollback refused: $refused ($INSTALLED_MANIFEST); nothing was unpacked.
+If the downgrade is intended, run:
+
+    sudo UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <this .deb>"
+        echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+        exit 1
+    fi
 fi
 
 echo "universal-db-mcp preinst: trust prerequisites present."

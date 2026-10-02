@@ -37,7 +37,11 @@
 #   4. service_running: sc.exe query udbmcp shows the service; if it is not
 #      RUNNING it is started and polled (mirrors the deferred sc.exe create
 #      custom action wired by udbmcp.wxs / build_msi.sh; if the service is
-#      absent this check fails closed with the sc.exe exit-1060 diagnostic).
+#      absent this check fails with the sc.exe exit-1060 diagnostic). The
+#      one check whose failure does not stop the gate: the service is
+#      expected to fail with error 1053 until a service wrapper is bundled,
+#      and the checks after it do not need it running. It is recorded as
+#      failed, the checks after it run, and the gate exits nonzero.
 #   5. doctor_smoke: "<venv>\Scripts\python.exe -m universal_db_mcp doctor"
 #      with a demo config exits 0 (the first execution of payload code).
 #   6. stdio_protocol_probe: the full MCP stdio lifecycle (initialize,
@@ -666,12 +670,16 @@ try {
     $scExe = Join-Path $env:SystemRoot 'System32\sc.exe'
     # Stringify the native output: 2>&1 under $ErrorActionPreference='Stop'
     # yields ErrorRecords, and every consumer below wants plain strings.
+    # A failure here is recorded and the gate goes on: the service is
+    # expected not to start yet (error 1053: the bare interpreter does not
+    # answer the service control dispatcher, IMPLEMENTATION_STATUS.md 3c),
+    # and every check after this one runs the payload or msiexec directly,
+    # so stopping here left them all unrun. The gate still fails at the end.
     $qOut = (Invoke-Native { & $scExe query $ServiceName 2>&1 }) | ForEach-Object { "$_" }
-    if ($LASTEXITCODE -eq 1060) {
-        Stop-Gate 'service_running' "service '$ServiceName' does not exist (sc.exe query exit 1060); the deferred sc.exe create custom action did not run or failed - inspect the msiexec log"
-    }
     $stateLine = ($qOut | Where-Object { $_ -match '^\s*STATE' } | Select-Object -First 1)
-    if ($stateLine -match 'RUNNING') {
+    if ($LASTEXITCODE -eq 1060) {
+        Add-Check 'service_running' 'failed' "service '$ServiceName' does not exist (sc.exe query exit 1060); the deferred sc.exe create custom action did not run or failed - inspect the msiexec log (the checks below still run)"
+    } elseif ($stateLine -match 'RUNNING') {
         Add-Check 'service_running' 'passed' "service '$ServiceName' is RUNNING"
     } else {
         Write-Host "==> service not RUNNING ($stateLine); attempting sc.exe start"
@@ -686,7 +694,7 @@ try {
         if ($running) {
             Add-Check 'service_running' 'passed' "service '$ServiceName' RUNNING after sc.exe start"
         } else {
-            Stop-Gate 'service_running' "service '$ServiceName' exists but is not RUNNING (last state: $stateLine); check the Windows event log and the msiexec log"
+            Add-Check 'service_running' 'failed' "service '$ServiceName' exists but is not RUNNING (last state: $stateLine); check the Windows event log and the msiexec log (error 1053 is the known blocker; the checks below still run)"
         }
     }
 

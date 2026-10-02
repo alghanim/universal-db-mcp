@@ -175,15 +175,16 @@ def test_f24_two_processes_at_the_rotation_threshold_keep_every_generation(tmp_p
 
 
 def test_f24_a_hole_in_the_backup_chain_is_not_an_audit_failure(tmp_path: Path) -> None:
-    """A backup removed by an administrator (ENOENT mid-chain) is skipped:
-    rotation still shifts what exists and the record is written."""
+    """A backup removed by an administrator (ENOENT mid-chain) is a free
+    slot: the backups below it shift into it, the older ones stay where they
+    are (no generation is dropped), and the record is written."""
     path = tmp_path / "audit.jsonl"
     _fill_generation(path, "CUR")
     _fill_generation(Path(f"{path}.1"), "G1")
     _fill_generation(Path(f"{path}.3"), "G3")
     AuditLog(str(path), max_bytes=_THRESHOLD_BYTES, max_backups=5, fail_closed=True).record({"event": "x"})
     firsts = {n: json.loads(Path(f"{path}.{n}").read_text().splitlines()[0])["marker"] for n in _backup_numbers(path)}
-    assert firsts == {1: "CUR", 2: "G1", 4: "G3"}
+    assert firsts == {1: "CUR", 2: "G1", 3: "G3"}
     assert json.loads(path.read_text())["event"] == "x"
 
 

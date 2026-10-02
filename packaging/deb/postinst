@@ -99,6 +99,20 @@ for _var in $(compgen -e); do case "$_var" in PYTHON*) unset "$_var" ;; esac; do
 # root's file in between: root's temporary files go to the system's own.
 unset TMPDIR TEMP TMP
 
+# dpkg undoes a failed upgrade or removal (the new package's preinst refused,
+# or its unpack was rolled back): this release's files are the installed ones
+# still, and only the service the prerm stopped has to run again. Nothing is
+# verified or installed again.
+case "${1:-}" in
+  abort-upgrade|abort-remove|abort-deconfigure)
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
+       && systemctl is-enabled --quiet universal-db-mcp 2>/dev/null; then
+      systemctl start universal-db-mcp || echo "WARNING: could not start universal-db-mcp again after dpkg's $1" >&2
+    fi
+    exit 0
+    ;;
+esac
+
 BUNDLE=/usr/share/universal-db-mcp/bundle
 TRUST_DIR=/usr/local/lib/udbmcp-trust
 PUBKEY=/etc/universal-db-mcp/keys/release.pub.pem
@@ -165,7 +179,7 @@ if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
   echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
   exit 1
 fi
-INSTALLER_FORMAT=3
+INSTALLER_FORMAT=4
 if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
    && ! grep -q "^# udbmcp-installer-format: ${INSTALLER_FORMAT}\$" "$TRUST_DIR/install_offline.sh"; then
   echo "FAIL: the trusted installer at $TRUST_DIR/install_offline.sh is an OUTDATED copy" >&2

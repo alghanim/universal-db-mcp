@@ -860,6 +860,32 @@ def _refuse_foreign_symlink(path: Path) -> None:
             )
 
 
+def refuse_foreign_read(path: Path) -> None:
+    """As root, raise ``PermissionError`` when reading ``path`` would read a
+    file a user can have root show them: one reached through their symlink to
+    something they do not own (:func:`_refuse_foreign_symlink`), or one with
+    more than one name (a hard link) that the owner of its directory does not
+    own. ``sudo configure-agents --dry-run`` printed a root-only file a user
+    linked in as their harness config. Without root, reads are the user's own
+    and nothing is checked.
+    """
+    if sys.platform == "win32" or os.geteuid() != 0:
+        return
+    _refuse_foreign_symlink(path)
+    real = Path(os.path.realpath(path))
+    try:
+        st = real.stat()
+        directory = real.parent.stat()
+    except OSError:
+        return  # nothing there to read: the read itself reports it
+    if st.st_nlink > 1 and st.st_uid != directory.st_uid:
+        raise PermissionError(
+            f"{real} has {st.st_nlink} hard links and belongs to uid {st.st_uid}, not to the owner of "
+            f"{real.parent} (uid {directory.st_uid}), and as root this tool does not read it; run "
+            "configure-agents as that user (without sudo), or replace the link with the file"
+        )
+
+
 def _refuse_regrouping(real: Path, st: os.stat_result) -> None:
     """Without root, raise when the replace would give ``real`` (``st``: its
     stat) another group, where its mode gives that group other access than
@@ -1079,9 +1105,16 @@ def absolute_override(value: str, variable: str, *, must_exist: bool = True) -> 
     directory; with ``must_exist`` it must name an existing file there, or
     the override is refused (``CONFIG_ERROR``). Symlinks are deliberately not
     resolved: a venv's ``bin/python`` is a link to the base interpreter, and
-    following it would drop the venv.
+    following it would drop the venv. A ``~user`` naming no account is
+    refused (``CONFIG_ERROR``) too.
     """
-    path = Path(value).expanduser()
+    try:
+        path = Path(value).expanduser()
+    except RuntimeError as exc:  # pathlib: "Could not determine home directory."
+        raise ConfigError(
+            f"{variable}={value!r} starts with a ~user that names no account on this machine ({exc}); "
+            f"set {variable} to an absolute path"
+        ) from exc
     if path.is_absolute():
         return str(path)
     anchored = Path(os.path.abspath(path))
@@ -1208,9 +1241,11 @@ def load_json_or_fail_closed(path: Path) -> tuple[dict[str, Any] | None, str | N
 
     Returns ``(data, None)`` on success or ``(None, reason)`` when the file
     is missing, unreadable, malformed, or not a JSON object. Callers treat
-    the failure case as fail-closed: report, never overwrite.
+    the failure case as fail-closed: report, never overwrite. As root, a
+    file a user's link leads to is not read at all (:func:`refuse_foreign_read`).
     """
     try:
+        refuse_foreign_read(path)
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None, f"{path} does not exist"
@@ -1225,6 +1260,49 @@ def load_json_or_fail_closed(path: Path) -> tuple[dict[str, Any] | None, str | N
     return data, None
 
 
+def load_problem_note(path: Path) -> str:
+    """``" (why)"`` when :func:`load_json_or_fail_closed` cannot load ``path``
+    (missing, unreadable, refused as root, malformed), else ``""``: what a
+    fail-closed summary says about the file instead of showing it."""
+    _data, error = load_json_or_fail_closed(path)
+    return f" ({error})" if error else ""
+
+
+def fail_closed_block(
+    target: Path, servers_key: str, server_key: str, intended: Mapping[str, Any] | None = None
+) -> str:
+    """What a fail-closed plan or result prints about the JSON config ``target``.
+
+    The registration this tool would add (``intended``) and the entry
+    ``target`` holds now under ``servers_key``/``server_key``, and never the
+    rest of the file: harness configs hold other MCP servers' env values (API
+    tokens), and a dry run's output ends up in terminals, logs and support
+    tickets. A file that cannot be read or parsed is described, not shown
+    (the error names the line and column); as root, one a user's link leads
+    to is not read at all (:func:`load_json_or_fail_closed`).
+    """
+    lines: list[str] = []
+    if intended is not None:
+        lines += [
+            f"# this tool would add to {target} (nothing is written while it fails closed):",
+            json.dumps({servers_key: {server_key: dict(intended)}}, indent=2, sort_keys=True),
+        ]
+    data, error = load_json_or_fail_closed(target)
+    servers = data.get(servers_key) if data is not None else None
+    if data is None:
+        lines.append(f"# {error}; its contents are not shown (they may hold other servers' secrets)")
+    elif servers_key in data and not isinstance(servers, dict):
+        lines.append(f'# "{servers_key}" in {target} is not an object; the rest of the file is not shown')
+    elif isinstance(servers, dict) and server_key in servers:
+        lines += [
+            f'# "{servers_key}"["{server_key}"] in {target} now (its other entries are not shown):',
+            json.dumps({servers_key: {server_key: servers[server_key]}}, indent=2, sort_keys=True),
+        ]
+    else:
+        lines.append(f'# {target} holds no "{servers_key}"["{server_key}"] entry (its other entries are not shown)')
+    return "\n".join(lines)
+
+
 def load_yaml_or_fail_closed(path: Path) -> tuple[Any | None, str | None]:
     """Read ``path`` as YAML, reporting problems instead of raising.
 
@@ -1235,6 +1313,7 @@ def load_yaml_or_fail_closed(path: Path) -> tuple[Any | None, str | None]:
     sequences, e.g. the dsh patch layer).
     """
     try:
+        refuse_foreign_read(path)
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None, f"{path} does not exist"

@@ -163,11 +163,18 @@ is read before the cut depends on the engine:
   prepared-statement protocol, which runs nothing). `UNION`, `DISTINCT` and
   `GROUP BY` derived tables materialise before the first row. A statement
   MySQL takes in neither form is refused (`QUERY_ERROR`), as is, on MariaDB,
-  one whose `ORDER BY` the derived table would drop.
+  one whose `ORDER BY` the derived table would drop. A `SELECT *` over a join
+  whose columns share a name is spelled out as `table.name` columns instead
+  (MySQL 5.7 and MariaDB take no derived column list). Where the server will
+  not prepare the statement (`1295`, `max_prepared_stmt_count` reached:
+  `1461`, a proxy: `1047`), it is not described and runs as written.
 - **SQL Server**: `SET TEXTSIZE` bounds text on query connections; every
   query is described first (`EXEC sys.sp_describe_first_result_set`, one
   extra round trip, no extra permission), with an `xml` cast or refusal with guidance.
   pyodbc pooling is off and each connection resets `NOCOUNT`/`TEXTSIZE`.
+  Wide text is decoded leniently: `TEXTSIZE` cuts at a byte count, which can
+  split a UTF-16 surrogate pair, and the half pair (or an unpaired surrogate
+  the value holds) reads as U+FFFD instead of failing the query.
 - **Oracle**: LOBs are read partially; whole-decoded types (native JSON,
   LONG, LONG RAW, objects and collections, XMLType in Thick mode) are fetched
   1, 2, 4, 4, ... rows per round trip (at most 4), back to 1 after a cut
@@ -176,7 +183,9 @@ is read before the cut depends on the engine:
 - **Db2**: CLOB, DBCLOB, BLOB and XML columns are cut on the server
   (`SUBSTRING` in `CODEUNITS32`/`OCTETS`, `XMLSERIALIZE`) through a nested
   table expression, at the cost of one extra prepare; a statement Db2 refuses
-  in that form is refused. `CODEUNITS32` on a non-Unicode database is not
+  in that form is refused. `ORDER BY ORDER OF` keeps the row order only of a
+  statement with an `ORDER BY` of its own (Db2 refuses it otherwise,
+  `SQLSTATE 428FI`). `CODEUNITS32` on a non-Unicode database is not
   verified.
 - **SQLite**: each handle gets `SQLITE_LIMIT_LENGTH = min(max(16 x
   max_response_bytes, 16 MiB), 1,000,000,000 bytes)` (16 MiB by default; the
@@ -194,7 +203,9 @@ is read before the cut depends on the engine:
   more under `LIMIT 0` first. Left whole: columns the statement compares (in a
   join condition, `WHERE`, `GROUP BY`, `HAVING` or `ORDER BY`), and every
   column of a statement that is not one SELECT, uses `DISTINCT` or a bound
-  `LIMIT`, or selects `*` over a join. A stored text value that is not valid
+  `LIMIT`, selects `*` over a join, or has a `GROUP BY` or `ORDER BY` term
+  that names no column and is not a plain position (SQLite reads `(2)`,
+  `+2`, `2 COLLATE x` as a position too). A stored text value that is not valid
   UTF-8 makes the statement run again uncut. Behind that, a process-wide
   `PRAGMA hard_heap_limit` of 32 x `SQLITE_LIMIT_LENGTH` (512 MiB by default),
   shared by every SQLite handle including the metadata cache's and only ever
@@ -220,6 +231,11 @@ is read before the cut depends on the engine:
   JOIN) cannot be narrowed below one input row, so an expansion past the
   budget is refused, not truncated; a `LIMIT` inside the statement returns its
   first rows. The query is stopped with `KILL QUERY` once a limit is reached.
+  The driver sends a statement whose text ends in `LIMIT 0` as a
+  columns-only request it reads whole, outside these budgets: unless it is
+  one SELECT whose own top-level `LIMIT 0` ends it, the connector appends
+  the comment `\n#!''` so it streams like any other (the comment is
+  visible in `system.query_log`); `EXPLAIN` always gets it.
   Per-query settings only tighten (`max_block_size`, `max_result_rows` with
   `result_overflow_mode='break'`, none on `readonly=1` profiles);
   `max_result_bytes` is never sent. Without the driver seam this relies on,

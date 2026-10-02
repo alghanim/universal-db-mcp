@@ -214,6 +214,8 @@ print(source_rev)
 print(os_name)
 print(str(target.get("arch", "")))
 print(build_stamp)
+seq = m.get("release_seq")
+print(seq if type(seq) is int and seq >= 0 else "")
 PYEOF
 if [ "$_fields_ok" -ne 1 ]; then
     rm -f "$FIELDS_TMP"
@@ -225,6 +227,7 @@ SOURCE_REV="$(sed -n '2p' "$FIELDS_TMP")"
 TARGET_OS="$(sed -n '3p' "$FIELDS_TMP")"
 TARGET_ARCH="$(sed -n '4p' "$FIELDS_TMP")"
 BUILD_STAMP="$(sed -n '5p' "$FIELDS_TMP")"
+RELEASE_SEQ="$(sed -n '6p' "$FIELDS_TMP")"
 rm -f "$FIELDS_TMP"
 
 case "$TARGET_ARCH" in
@@ -468,6 +471,22 @@ for script in preinst postinst prerm postrm; do
     cp "$MAINT_DIR/$script" "$DEBROOT/DEBIAN/$script"
     chmod 0755 "$DEBROOT/DEBIAN/$script"
 done
+# The payload's release_seq and source revision go into the preinst: it
+# refuses an OLDER release (or another release with the installed one's
+# release_seq) before dpkg unpacks it over the newer payload. Both come from
+# the signed manifest; source_rev was checked above to hold dpkg-version
+# characters only, and release_seq digits only.
+case "$RELEASE_SEQ" in
+    "" | *[!0-9]*) RELEASE_SEQ="" ;;
+esac
+for _field in PAYLOAD_RELEASE_SEQ PAYLOAD_SOURCE_REV; do
+    [ "$(grep -cx "${_field}=\"\"" "$DEBROOT/DEBIAN/preinst")" = 1 ] \
+        || die "packaging/deb/preinst must hold exactly one ${_field}=\"\" line for the payload's value"
+done
+sed -e "s/^PAYLOAD_RELEASE_SEQ=\"\"\$/PAYLOAD_RELEASE_SEQ=\"$RELEASE_SEQ\"/" \
+    -e "s/^PAYLOAD_SOURCE_REV=\"\"\$/PAYLOAD_SOURCE_REV=\"$SOURCE_REV\"/" \
+    "$MAINT_DIR/preinst" > "$DEBROOT/DEBIAN/preinst"
+chmod 0755 "$DEBROOT/DEBIAN/preinst"
 # --- conffiles gate (fail-loud) ---------------------------------------------
 # packaging/deb/conffiles is a REQUIRED plan Phase 4 input: it registers
 # /etc/universal-db-mcp/config.yaml as a dpkg conffile (the file is staged

@@ -262,15 +262,26 @@ def _serve(args: argparse.Namespace) -> int:
     return 1
 
 
-# After SIGTERM, how long cancelled tool calls get to write their audit records
-# before the process exits although a worker thread is still blocked.
-_SIGTERM_GRACE_SECONDS = 2.0
+# After SIGTERM, what the grace (_sigterm_grace_seconds) allows for writing the
+# 'cancelled' audit records once the executor's cancel hook has returned.
+_SIGTERM_AUDIT_FLUSH_SECONDS = 1.0
 # After SIGTERM, when the kernel ends the process whatever Python is doing: the
-# watchdog above is a thread and needs the GIL, which a C call can keep (a
+# grace watchdog is a thread and needs the GIL, which a C call can keep (a
 # cancel hook the SIGTERM fired, blocked against a frozen host; see
-# _serve_stdio for what the alarm cannot cover). Above the executor's
-# cancel-hook budget (services/executor.py, 2 s) plus the audit write.
+# _serve_stdio for what the alarm cannot cover). Above the grace.
 _SIGTERM_HARD_EXIT_SECONDS = 5
+
+
+def _sigterm_grace_seconds() -> float:
+    """After SIGTERM, how long cancelled tool calls get to write their audit
+    records before the process exits although a worker thread is still
+    blocked: a cancelled call first waits up to the executor's cancel-hook
+    budget for its hook, and only then writes its 'cancelled' records. A
+    grace equal to that budget exited just before the write when the hook
+    blocked (a KILL QUERY against an unresponsive host)."""
+    from universal_db_mcp.services.executor import _CANCEL_HOOK_BUDGET
+
+    return _CANCEL_HOOK_BUDGET + _SIGTERM_AUDIT_FLUSH_SECONDS
 
 
 def _serve_stdio(server: MCPServer) -> None:
@@ -330,7 +341,7 @@ async def _cancel_on_sigterm(scope: anyio.CancelScope) -> None:
     # thread (and no GIL) needed.
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
     signal.alarm(_SIGTERM_HARD_EXIT_SECONDS)
-    watchdog = threading.Timer(_SIGTERM_GRACE_SECONDS, _exit_after_sigterm_grace)
+    watchdog = threading.Timer(_sigterm_grace_seconds(), _exit_after_sigterm_grace)
     watchdog.daemon = True
     watchdog.start()
     scope.cancel()
@@ -472,7 +483,7 @@ def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str],
     """Run one confirmed apply and print the outcome; never raises. Returns
     whether the harness is now configured: an adapter may refuse the write
     by returning a fail-closed Plan instead of raising."""
-    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus, ensure_per_user_harness_config
+    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus
 
     try:
         result = registry.apply_confirmed(name, env, home, True)
@@ -488,15 +499,37 @@ def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str],
     # The advertised config path may be the per-user default (the system
     # deployment is service-account owned and unreadable by this user): seed
     # it so the harness's spawns actually start. Only-if-absent.
-    seeded, note = ensure_per_user_harness_config(env, home)
+    seeded, note, problem = _seed_harness_config(env, home)
     if seeded is not None:
         print(f"  seeded per-user harness config: {seeded} ({note})")
-    if result.status is not AgentStatus.CONFIGURED:
+    if problem is not None:
+        print(f"  -> FAIL CLOSED: {problem}")
+    if result.status is not AgentStatus.CONFIGURED or problem is not None:
         return False
     _warn_env_secret_connections(env, home)
     notice = _agent_credentials_notice(env, home)
     print(_wrap_notice(notice, "  "))
     return True
+
+
+def _seed_harness_config(env: Mapping[str, str], home: Path) -> tuple[Path | None, str, str | None]:
+    """``ensure_per_user_harness_config``, never raising: its ``(seeded path
+    or None, note)`` and None, or ``(None, "", why it could not be seeded)``.
+    As root it refuses a user's link on the way (and any write may fail):
+    that must not end the run with a traceback after the first harness was
+    written."""
+    from universal_db_mcp.agents.core import ensure_per_user_harness_config
+    from universal_db_mcp.errors import ConfigError
+
+    try:
+        seeded, note = ensure_per_user_harness_config(env, home)
+    except (OSError, ConfigError) as exc:
+        return None, "", (
+            f"the per-user harness config the registration names could not be seeded ({exc}); "
+            "the harness cannot start the server until it exists: fix that, then re-run (or create it "
+            "with `udbmcp add-connection`)"
+        )
+    return seeded, note, None
 
 
 def _agent_credentials_notice(env: Mapping[str, str], home: Path) -> str:
@@ -510,7 +543,9 @@ def _agent_credentials_notice(env: Mapping[str, str], home: Path) -> str:
 
 def _warn_env_secret_connections(env: Mapping[str, str], home: Path) -> None:
     """After a registration is written: name every connection whose
-    credentials come from ``username_env``/``password_env``.
+    credentials come from the environment (``username_env``,
+    ``password_env``, the Oracle ``options.wallet_password_env``:
+    ``ConnectionConfig.secret_env_variables``).
 
     The adapters put only UDBMCP_CONFIG into the harness entry's env, so such
     variables must exist in the HARNESS process environment - which a GUI
@@ -531,14 +566,14 @@ def _warn_env_secret_connections(env: Mapping[str, str], home: Path) -> None:
     except ConfigError:
         return  # `doctor --config` reports config problems; this notice is about env-sourced secrets only
     for name, conn in sorted(cfg.connections.items()):
-        variables = [v for v in (conn.username_env, conn.password_env) if v]
+        variables = conn.secret_env_variables()
         if not variables:
             continue
         print(
             f"  WARNING: connection '{name}' in {cfg_path} reads {', '.join(variables)} from the "
             "environment; a GUI harness does not inherit shell variables, so the registered server "
             "will fail at startup unless they are set in the harness's own environment. "
-            "Prefer username_file/password_file (see `udbmcp add-connection`).",
+            "Prefer username_file/password_file/options.wallet_password_file (see `udbmcp add-connection`).",
             file=sys.stderr,
         )
 
@@ -565,7 +600,7 @@ def _configure_agents(args: argparse.Namespace) -> int:
       makes the command exit 1, with or without --json.
     """
     from universal_db_mcp.agents import registry
-    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus, ensure_per_user_harness_config
+    from universal_db_mcp.agents.core import AgentConfigError, AgentStatus
 
     env = os.environ
     home = Path.home()
@@ -650,24 +685,26 @@ def _configure_agents(args: argparse.Namespace) -> int:
                     continue
                 try:
                     result = registry.apply_confirmed(name, env, home, True)
-                    seeded, _seed_note = ensure_per_user_harness_config(env, home)
+                    seeded, _seed_note, seed_error = _seed_harness_config(env, home)
                     if result.status is AgentStatus.CONFIGURED:
                         _warn_env_secret_connections(env, home)  # stderr only; stdout stays JSON
                         print(_agent_credentials_notice(env, home), file=sys.stderr)
-                    applied.append(
-                        {
-                            "agent": name,
-                            "status": result.status.value,
-                            "summary": result.summary,
-                            "backups": [str(p) for p in result.backup_paths],
-                            "config_seeded": str(seeded) if seeded else None,
-                        }
-                    )
+                    row: dict[str, object] = {
+                        "agent": name,
+                        "status": result.status.value,
+                        "summary": result.summary,
+                        "backups": [str(p) for p in result.backup_paths],
+                        "config_seeded": str(seeded) if seeded else None,
+                    }
+                    if seed_error is not None:
+                        row["seed_error"] = seed_error
+                    applied.append(row)
                     # Adapters may report a REFUSED write by returning a
                     # fail-closed Plan instead of raising (e.g. the config
                     # changed state between detection and apply): that is a
-                    # failure for the caller even though nothing raised.
-                    if result.status is not AgentStatus.CONFIGURED:
+                    # failure for the caller even though nothing raised. So
+                    # is a registration whose config could not be seeded.
+                    if result.status is not AgentStatus.CONFIGURED or seed_error is not None:
                         exit_code = 1
                 except AgentConfigError as exc:
                     applied.append({"agent": name, "status": "error", "detail": str(exc)})
@@ -733,13 +770,16 @@ def _configure_agents(args: argparse.Namespace) -> int:
                 print(f"  also: {extra}")
         print(f"  {planned.summary}")
         block = planned.config_block or planned.block
+        fail_closed = planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
         if block:
-            print("  would add:")
+            # A fail-closed block describes the config (only this tool's own
+            # entry in it); nothing would be added.
+            print("  details:" if fail_closed else "  would add:")
             print(_indent_block(block))
 
-        if planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
+        if fail_closed:
             failed.append(name)
-            print("  FAIL CLOSED: fix or inspect the existing config above; nothing will be written")
+            print("  FAIL CLOSED: fix or inspect the config named above; nothing will be written")
             continue
         if planned.status is not AgentStatus.INSTALLED_UNCONFIGURED:
             print(f"  no write offered (status: {planned.status.value})")
@@ -778,7 +818,7 @@ def _configure_agents(args: argparse.Namespace) -> int:
         # as --json: a confirmed write that did not happen fails the run
         print(
             f"\nCONFIG_ERROR: the confirmed registration of {', '.join(not_written)} was not written "
-            "(the reason is shown above)",
+            "or not completed (the reason is shown above)",
             file=sys.stderr,
         )
     if failed and _failed_closed_is_fatal(args):
@@ -838,7 +878,11 @@ def _add_connection(args: argparse.Namespace) -> int:
     if args.config:
         cfg_path = Path(os.path.abspath(os.path.expanduser(args.config)))
     else:
-        cfg_path = Path(os.path.abspath(resolve_harness_config_path(dict(os.environ), Path.home())))
+        try:
+            cfg_path = Path(os.path.abspath(resolve_harness_config_path(dict(os.environ), Path.home())))
+        except ConfigError as exc:  # a UDBMCP_CONFIG naming no ~user, say; starts with CONFIG_ERROR
+            print(exc, file=sys.stderr)
+            return 1
         if cfg_path.is_file() and not os.access(cfg_path, os.W_OK):
             # The wizard WRITES: a readable-but-not-writable default (the
             # root-owned system deployment) must not be chosen - fall back to

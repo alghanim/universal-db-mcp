@@ -40,8 +40,9 @@ Fail-closed rules implemented here (shared by every adapter):
   duplicated or rewritten.
 - An existing config that is unreadable, malformed, not a JSON object, has a
   non-object ``mcpServers``, or holds a *differing* entry under our server
-  key yields ``AgentStatus.UNKNOWN_STATE_FAIL_CLOSED``: the offending file's
-  raw bytes are printed and nothing is written. The one exception is this
+  key yields ``AgentStatus.UNKNOWN_STATE_FAIL_CLOSED``: the reason and this
+  tool's own entry in the file are printed (never its other servers), and
+  nothing is written. The one exception is this
   tool's own pre-``-I`` registration (identical except for the launch args),
   which is upgraded like a fresh write.
 - A config the write would replace or create but may not (read-only,
@@ -68,9 +69,11 @@ from .core import (
     backup_path,
     ensure_directory,
     ensure_replaceable,
+    fail_closed_block,
     holds_legacy_entry,
     is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
     other_unisolated_note,
     require_isolated_import,
     resolve_harness_config_path,
@@ -224,13 +227,10 @@ def _intended_block(entry: Mapping[str, Any]) -> str:
     return json.dumps({MCP_SERVERS_KEY: {SERVER_KEY: dict(entry)}}, indent=2, sort_keys=True)
 
 
-def _fail_closed_block(target: Path) -> str:
-    """Render the offending file's current bytes for operator inspection."""
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"# {target} could not be read: {exc}"
-    return f"# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: Mapping[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, MCP_SERVERS_KEY, SERVER_KEY, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +325,10 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
         else:
             summary = (
                 f"{AGENT_NAME}: {target} is unreadable, malformed, or holds "
-                "unrecognized state; refusing to write (fix or remove the file, "
+                f"unrecognized state{load_problem_note(target)}; refusing to write (fix or remove the file, "
                 "then re-run)"
             ) + unisolated_entry_note(target, MCP_SERVERS_KEY, SERVER_KEY)
-        block = _fail_closed_block(target)
+        block = _fail_closed_block(target, entry)
     else:
         if holds_legacy_entry(target, MCP_SERVERS_KEY, SERVER_KEY, entry):
             summary = (
@@ -373,7 +373,7 @@ def _write_failed(
         status=AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
         backup_paths=(backup,) if backup is not None else (),
         summary=f"{AGENT_NAME}: {step} failed ({exc}); {target} was left as it was{note}",
-        config_block=_fail_closed_block(target),
+        config_block=_fail_closed_block(target, entry),
         entry=dict(entry),
     )
 

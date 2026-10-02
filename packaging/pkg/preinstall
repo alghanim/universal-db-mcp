@@ -13,6 +13,19 @@
 # before a single payload byte lands on disk.
 set -euo pipefail
 
+# >>> run natively on Apple silicon: identical in preinstall and postinstall
+# The Installer runs a package's scripts under Rosetta 2 unless its
+# Distribution declares the arm64 host (build_pkg.sh declares it: this block
+# is the second line of defence). Everything below would then run as x86_64,
+# and so would a universal2 python started from it: the verifier would see an
+# x86_64 machine and refuse the macos-arm64 bundle, and pip the bundle's arm64
+# wheels. On arm64 hardware the script starts over as a native process (once:
+# the guard stops a loop if the kernel still reports translation).
+if [ "$(/usr/sbin/sysctl -n sysctl.proc_translated 2>/dev/null || true)" = 1 ] && [ -z "${UDBMCP_PKG_NATIVE:-}" ]; then
+  UDBMCP_PKG_NATIVE=1 exec /usr/bin/arch -arm64 /bin/bash "$0" "$@"
+fi
+# <<< run natively on Apple silicon
+
 # The OS tools only: nothing below may resolve from a user-writable prefix
 # such as /opt/homebrew/bin.
 PATH="/usr/bin:/bin:/usr/sbin:/sbin"
@@ -30,6 +43,10 @@ trap '[ "$?" -eq 0 ] || rm -f "$DOWNGRADE_FLAG" 2>/dev/null || true' EXIT
 # the signed manifest. Empty in the repository copy, and for a bundle without
 # one (the verifier orders such a release in postinstall).
 PAYLOAD_RELEASE_SEQ=""
+# And its source revision: a release with the installed release's release_seq
+# (a commit timestamp, which one rebase can give two commits alike) is refused
+# unless it is the same release.
+PAYLOAD_SOURCE_REV=""
 
 # Fixed per-machine paths (non-relocatable package; absolute paths are
 # load-bearing). They match docs/offline-deployment.md ("Trust bootstrap")
@@ -77,6 +94,17 @@ if [ ! -s "$VERIFIER" ]; then
   echo "  sudo install -m 644 <trusted-channel>/verify_bundle.py $TRUST_DIR/" >&2
   echo "" >&2
   echo "then re-run this installer." >&2
+  exit 1
+fi
+
+# A verifier that parses options ('--pubkey') but has no --installed-manifest
+# predates the anti-rollback check postinstall runs it with: refused here,
+# before the payload lands (postinstall keeps the same check).
+if grep -q -- '"--pubkey"' "$VERIFIER" && ! grep -q -- '"--installed-manifest"' "$VERIFIER"; then
+  echo "FAIL: the trusted verifier at $VERIFIER is an OUTDATED copy (no --installed-manifest" >&2
+  echo "      option): it cannot refuse a downgrade to an older release. Install verify_bundle.py" >&2
+  echo "      and profiles.py from this release's trusted channel into $TRUST_DIR, then re-run" >&2
+  echo "      this installer. Nothing was installed." >&2
   exit 1
 fi
 
@@ -417,11 +445,22 @@ fi
 # (releases that predate release_seq, an unreadable installed manifest).
 INSTALLED_MANIFEST="$PREFIX/manifest.json"
 if [ -n "$PAYLOAD_RELEASE_SEQ" ] && [ -f "$INSTALLED_MANIFEST" ]; then
-  INSTALLED_SEQ="$("$PY" -I -S -c 'import json, sys
-seq = json.load(open(sys.argv[1], encoding="utf-8")).get("release_seq")
-print(seq if type(seq) is int and seq >= 0 else "")' "$INSTALLED_MANIFEST" 2>/dev/null)" || INSTALLED_SEQ=""
-  if [ -n "$INSTALLED_SEQ" ] && [ "$PAYLOAD_RELEASE_SEQ" -lt "$INSTALLED_SEQ" ] && ! downgrade_authorised; then
-    echo "FAIL: this package is release_seq $PAYLOAD_RELEASE_SEQ, OLDER than the installed release_seq $INSTALLED_SEQ" >&2
+  INSTALLED="$("$PY" -I -S -c 'import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+seq, rev = m.get("release_seq"), m.get("source_rev")
+print(seq if type(seq) is int and seq >= 0 else "")
+print(rev.strip() if isinstance(rev, str) and rev.strip().lower() not in ("", "unknown") else "")' "$INSTALLED_MANIFEST" 2>/dev/null)" || INSTALLED=""
+  INSTALLED_SEQ="$(printf '%s\n' "$INSTALLED" | sed -n 1p)"
+  INSTALLED_REV="$(printf '%s\n' "$INSTALLED" | sed -n 2p)"
+  REFUSED=""
+  if [ -n "$INSTALLED_SEQ" ] && [ "$PAYLOAD_RELEASE_SEQ" -lt "$INSTALLED_SEQ" ]; then
+    REFUSED="this package is release_seq $PAYLOAD_RELEASE_SEQ, OLDER than the installed release_seq $INSTALLED_SEQ"
+  elif [ -n "$INSTALLED_SEQ" ] && [ "$PAYLOAD_RELEASE_SEQ" -eq "$INSTALLED_SEQ" ] && [ -n "$PAYLOAD_SOURCE_REV" ] \
+       && [ -n "$INSTALLED_REV" ] && [ "$PAYLOAD_SOURCE_REV" != "$INSTALLED_REV" ]; then
+    REFUSED="this package (source_rev $PAYLOAD_SOURCE_REV) is another release with the installed release_seq $INSTALLED_SEQ (source_rev $INSTALLED_REV), which may be the older one"
+  fi
+  if [ -n "$REFUSED" ] && ! downgrade_authorised; then
+    echo "FAIL: $REFUSED" >&2
     echo "      ($INSTALLED_MANIFEST); nothing was installed. To install it anyway, run" >&2
     echo "" >&2
     echo "        $ALLOW_DOWNGRADE_CMD" >&2

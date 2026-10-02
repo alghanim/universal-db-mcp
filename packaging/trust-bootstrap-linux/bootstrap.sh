@@ -55,7 +55,9 @@
 # into a signed copy nested on the stick and away from the files next to it.
 # UDBMCP_BOOTSTRAP_ROOT=<dir> treats <dir> as the site's / : every destination
 # and the system openssl are looked up below it (a scratch site for tests; no
-# root needed there).
+# root needed there). It is refused when the script runs as root: `sudo -E`
+# keeps the caller's environment, and root would then trust a key, run an
+# openssl and hand dpkg packages from a directory the caller chose.
 set -euo pipefail
 unset CDPATH  # a relative stick path is taken as typed, never searched for
 # sudo -E keeps the caller's TMPDIR (and python's tempfile takes TEMP or TMP):
@@ -64,6 +66,11 @@ unset CDPATH  # a relative stick path is taken as typed, never searched for
 unset TMPDIR TEMP TMP
 
 ROOT="${UDBMCP_BOOTSTRAP_ROOT:-}"
+if [ -n "$ROOT" ] && [ "$(id -u)" -eq 0 ]; then
+  echo "FAIL: UDBMCP_BOOTSTRAP_ROOT is set ($ROOT): it is a test hook for unprivileged runs and is" >&2
+  echo "      refused as root (sudo -E keeps it). Run: sudo bash <this script> without it. Nothing was installed." >&2
+  exit 1
+fi
 TRUST_DIR="$ROOT/usr/local/lib/udbmcp-trust"
 KEY_DST="$ROOT/etc/universal-db-mcp/keys/release.pub.pem"
 SYSTEM_OPENSSL="$ROOT/usr/bin/openssl"
