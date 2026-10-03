@@ -1,31 +1,31 @@
 {
   "label": "mariadb:10.6",
   "engine": "mysql",
-  "probe_rev": "2140348",
-  "started_utc": "2026-10-03T00:57:33Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:46:22Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 346,
+      "ms": 320,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 8,
+      "ms": 9,
       "detail": "10.6.28-MariaDB-ubu2204"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 6,
+      "ms": 5,
       "detail": "vm"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 0,
+      "ms": 2,
       "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(information_schema.tables.table_rows)', comment=None), TableSummary(schema='vm', name"
     },
     {
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 0,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int(11)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
+      "ms": 1,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int(11)', nullable=False, default=None, comment=None, ordinal=1, default_kind=None), ColumnInfo(schema='vm', table='customers', name='"
     },
     {
       "check": "list_columns_count",
@@ -127,7 +127,7 @@
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 6,
+      "ms": 5,
       "detail": "[122, 'user122@example.com', None]"
     },
     {
@@ -167,7 +167,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-03T00:57:34Z",
+  "finished_utc": "2026-10-03T14:46:22Z",
   "summary": {
     "passed": 22,
     "failed": []

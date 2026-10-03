@@ -1,25 +1,25 @@
 {
   "label": "mariadb:11.4",
   "engine": "mysql",
-  "probe_rev": "2140348",
-  "started_utc": "2026-10-03T00:57:53Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:46:47Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 293,
+      "ms": 319,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 11,
+      "ms": 12,
       "detail": "11.4.13-MariaDB-ubu2404"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 8,
+      "ms": 9,
       "detail": "vm"
     },
     {
@@ -38,7 +38,7 @@
       "check": "list_columns",
       "status": "passed",
       "ms": 0,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int(11)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int(11)', nullable=False, default=None, comment=None, ordinal=1, default_kind=None), ColumnInfo(schema='vm', table='customers', name='"
     },
     {
       "check": "list_columns_count",
@@ -109,7 +109,7 @@
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 10,
+      "ms": 11,
       "detail": "200"
     },
     {
@@ -167,7 +167,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-03T00:57:54Z",
+  "finished_utc": "2026-10-03T14:46:47Z",
   "summary": {
     "passed": 22,
     "failed": []

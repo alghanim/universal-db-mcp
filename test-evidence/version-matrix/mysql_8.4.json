@@ -1,25 +1,25 @@
 {
   "label": "mysql:8.4",
   "engine": "mysql",
-  "probe_rev": "2140348",
-  "started_utc": "2026-10-03T00:57:13Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:46:01Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 833,
+      "ms": 859,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 15,
+      "ms": 11,
       "detail": "8.4.11"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 8,
+      "ms": 10,
       "detail": "vm"
     },
     {
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 0,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='varc"
+      "ms": 1,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int', nullable=False, default=None, comment=None, ordinal=1, default_kind=None), ColumnInfo(schema='vm', table='customers', name='emai"
     },
     {
       "check": "list_columns_count",
@@ -91,7 +91,7 @@
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 0,
+      "ms": 1,
       "detail": "f_one"
     },
     {
@@ -103,19 +103,19 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 14,
+      "ms": 18,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 10,
+      "ms": 11,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 10,
+      "ms": 11,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
@@ -127,7 +127,7 @@
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 8,
+      "ms": 7,
       "detail": "[122, 'user122@example.com', None]"
     },
     {
@@ -167,7 +167,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-03T00:57:14Z",
+  "finished_utc": "2026-10-03T14:46:02Z",
   "summary": {
     "passed": 22,
     "failed": []

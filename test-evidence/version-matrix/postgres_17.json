@@ -1,13 +1,13 @@
 {
   "label": "postgres:17",
   "engine": "postgres",
-  "probe_rev": "2140348",
-  "started_utc": "2026-10-03T00:56:02Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:44:55Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 80,
+      "ms": 87,
       "detail": "seeded"
     },
     {
@@ -19,7 +19,7 @@
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 5,
+      "ms": 6,
       "detail": "vm"
     },
     {
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 3,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
+      "ms": 4,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1, default_kind=None), ColumnInfo(schema='vm', table='customers', name='"
     },
     {
       "check": "list_columns_count",
@@ -97,19 +97,19 @@
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "catalog_estimate(pg_class.reltuples / pg_stat_user_tables)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 11,
+      "ms": 17,
       "detail": "200"
     },
     {
@@ -127,13 +127,13 @@
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 8,
+      "ms": 6,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 6,
+      "ms": 5,
       "detail": "['raw']"
     }
   ],
@@ -167,7 +167,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-03T00:56:02Z",
+  "finished_utc": "2026-10-03T14:44:55Z",
   "summary": {
     "passed": 22,
     "failed": []

@@ -1,25 +1,25 @@
 {
   "label": "clickhouse/clickhouse-server:25.3",
   "engine": "clickhouse",
-  "probe_rev": "2140348",
-  "started_utc": "2026-10-03T00:59:14Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:48:10Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 139,
+      "ms": 206,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 11,
+      "ms": 9,
       "detail": "25.3.14.14"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "vm"
     },
     {
@@ -38,7 +38,7 @@
       "check": "list_columns",
       "status": "passed",
       "ms": 2,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='vm', table='customers', name='email', data_type='S"
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0, default_kind=None), ColumnInfo(schema='vm', table='customers', name='e"
     },
     {
       "check": "list_columns_count",
@@ -55,7 +55,7 @@
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
     },
     {
@@ -103,31 +103,31 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 14,
+      "ms": 6,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 14,
+      "ms": 12,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 10,
+      "ms": 14,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 6,
+      "ms": 7,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
@@ -147,19 +147,21 @@
     "read_only_requested": true,
     "server_read_only_available": true,
     "applied": [
+      "read_only",
       "max_execution_time=60s",
-      "read_only"
+      "max_memory_usage=2147483648"
     ],
     "skipped": [],
     "read_only_enforced": true,
     "read_only_verified": true,
     "server_reports": {
       "readonly": "1",
-      "max_execution_time": "60.0"
+      "max_execution_time": "60.0",
+      "max_memory_usage": "2147483648"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-03T00:59:14Z",
+  "finished_utc": "2026-10-03T14:48:11Z",
   "summary": {
     "passed": 19,
     "failed": []
