@@ -422,7 +422,21 @@
                                  venv from the verified wheelhouse only
                                  (no-index + require-hashes pip modes,
                                  PIP_CONFIG_FILE neutralized). Still no
-                                 payload execution.
+                                 payload execution. A venv an earlier
+                                 install built (a repair or upgrade) is
+                                 never deleted in place: the service that
+                                 runs from it is stopped, and it is moved
+                                 aside whole (a move refuses a folder a
+                                 process still runs from, and the install
+                                 then fails with the venv untouched) and
+                                 kept until the install commits.
+        RollbackBuildVenvCA      rollback twin BEFORE BuildVenvCA: puts the
+                                 venv BuildVenvCA moved aside back, when it
+                                 or any later action fails.
+        CommitBuildVenvCA        commit action AFTER BuildVenvCA: removes
+                                 that previous venv once the whole install
+                                 has succeeded. Return="ignore", as for
+                                 CommitReleaseRecordCA below.
         DoctorSmokeCA            AFTER BuildVenvCA. doctor.ps1 — the FIRST
                                  execution of payload code, strictly after
                                  verification passed — validates the install.
@@ -463,14 +477,15 @@
                                  install did not replace (the marker
                                  manifest.json.kept still there) is left
                                  as it is. The
-                                 verify / venv / doctor actions need no
-                                 rollback twin: they make no machine-global
-                                 change — the MSI transaction itself rolls
-                                 back their installed files, and venv.ps1
-                                 rebuilds any stale venv from the verified
-                                 wheelhouse on the next install attempt
-                                 (a token doctor.ps1 removed was one
-                                 RegisterServiceCA would have replaced).
+                                 verify / doctor actions need no rollback
+                                 twin: they make no machine-global change —
+                                 the MSI transaction itself rolls back
+                                 their installed files (doctor.ps1 removes
+                                 only a token RegisterServiceCA would have
+                                 replaced, and leaves the access of the
+                                 account the service is registered under
+                                 alone). The venv has its own twin,
+                                 RollbackBuildVenvCA, above.
         CommitReleaseRecordCA    commit action AFTER RegisterServiceCA: runs
                                  only once the whole install has succeeded
                                  and removes that rollback copy (and the
@@ -581,6 +596,22 @@
         Return="check" />
 
     <CustomAction
+        Id="RollbackBuildVenvCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\venv.ps1&quot; -VenvDir &quot;[INSTALLFOLDER]venv&quot; -Rollback"
+        Execute="rollback"
+        Impersonate="no"
+        Return="check" />
+
+    <CustomAction
+        Id="CommitBuildVenvCA"
+        Property="POWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\venv.ps1&quot; -VenvDir &quot;[INSTALLFOLDER]venv&quot; -Commit"
+        Execute="commit"
+        Impersonate="no"
+        Return="ignore" />
+
+    <CustomAction
         Id="DoctorSmokeCA"
         Property="POWERSHELLEXE"
         ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\doctor.ps1&quot; -VenvDir &quot;[INSTALLFOLDER]venv&quot; -ConfigPath &quot;[ProgramDataUdbmcpDir]config.yaml&quot; -BundleManifest &quot;[INSTALLFOLDER]bundle\manifest.json&quot; -ServiceAccount &quot;[UDBMCP_SERVICE_ACCOUNT]&quot; -RegisteredAccount &quot;[UDBMCPREGISTEREDACCOUNT]&quot;"
@@ -630,6 +661,8 @@
       <Custom Action="CheckFoldersCA" Before="CreateFolders" Condition="NOT REMOVE" />
       <Custom Action="VerifyBundleCA" After="InstallFiles" Condition="NOT REMOVE" />
       <Custom Action="BuildVenvCA" After="VerifyBundleCA" Condition="NOT REMOVE" />
+      <Custom Action="RollbackBuildVenvCA" Before="BuildVenvCA" Condition="NOT REMOVE" />
+      <Custom Action="CommitBuildVenvCA" After="BuildVenvCA" Condition="NOT REMOVE" />
       <Custom Action="DoctorSmokeCA" After="BuildVenvCA" Condition="NOT REMOVE" />
       <Custom Action="RegisterServiceCA" After="DoctorSmokeCA" Condition="NOT REMOVE" />
       <Custom Action="RollbackRemoveServiceCA" Before="RegisterServiceCA" Condition="NOT REMOVE" />

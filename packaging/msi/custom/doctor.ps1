@@ -36,10 +36,14 @@
 # replace is removed (the payload doctor refuses it as fatal), logs\ is made
 # when missing, and a logs\ granting an earlier service account write access
 # gets the folder's protected DACL back; RegisterServiceCA then provisions
-# the token and grants the service account Modify on logs\. This action has
-# no rollback twin, so an account change it was not asked for (no account
-# given, and the service signs in with a password or logs\ shows it ran as
-# another account) is refused before any of that.
+# the token and grants the service account Modify on logs\. The account the
+# service is registered under (-RegisteredAccount) keeps its token and its
+# Modify on logs\ here even when another one is named: RegisterServiceCA
+# takes them away only once the service runs as the new one, so a failed
+# install leaves a service that still starts. This action has no rollback
+# twin, so an account change it was not asked for (no account given, and
+# the service signs in with a password or logs\ shows it ran as another
+# account) is refused before any of that.
 #
 # PLACEHOLDER TEMPLATES: the config installed to -ConfigPath is the staged
 # template (config-templates/config.template.yaml), which intentionally
@@ -94,6 +98,10 @@ $script:ModifyRights = 0x1301BF
 # Administrators whoever ran this (an elevated administrator's new folder may
 # otherwise be owned by their own account).
 $script:ProtectedDirSddl = 'O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+# The access masks the registration action grants a service account, as
+# icacls (OI)(CI)RX on the config folder and (OI)(CI)M on logs\ write them.
+$script:ReadAccessMask = '0x1200a9'
+$script:ModifyAccessMask = '0x1301bf'
 
 function Fail {
     param([string]$Message)
@@ -146,12 +154,12 @@ function Get-WriteProblem {
     # the folder's DACL replaces neither it nor a protected child's DACL.
     # Inherited ACEs follow the folder, whose DACL the installer sets.
     # $OwnerSid (the service account, for what it wrote in logs\) may own it
-    # and $WriterSid (that account, on logs\ and below) may hold such an ACE,
-    # but a reparse point is refused whoever owns it. With -AccountWriters
+    # and $WriterSid (that account, on logs\ and below; one or more SIDs) may
+    # hold such an ACE, but a reparse point is refused whoever owns it. With -AccountWriters
     # (logs\ itself) an ACE that grants any account a service runs as at most
     # Modify is accepted too: an earlier service account's grant, which the
     # action resets before anything relies on logs\.
-    param([string]$Path, [string]$OwnerSid = '', [string]$WriterSid = $OwnerSid, [switch]$AccountWriters)
+    param([string]$Path, [string]$OwnerSid = '', [string[]]$WriterSid = $OwnerSid, [switch]$AccountWriters)
     $attributes = Get-EntryAttributes -Path $Path
     if ($null -eq $attributes) { return $null }
     if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) {
@@ -167,7 +175,7 @@ function Get-WriteProblem {
     foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
         $sid = $rule.IdentityReference.Value
         if ($rule.IsInherited -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-            ($WriterSid -and $sid -eq $WriterSid) -or (Test-TrustedOwner -Sid $sid)) { continue }
+            ($WriterSid -contains $sid) -or (Test-TrustedOwner -Sid $sid)) { continue }
         $granted = [int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights)
         if ($AccountWriters -and (Test-AccountSid -Sid $sid) -and -not ($granted -band -bnot $script:ModifyRights)) { continue }
         if ($granted -band $script:WriteRights) {
@@ -263,6 +271,18 @@ function Get-AclProblem {
     return $null
 }
 
+function Get-KeptAccessSddl {
+    # The SDDL ACE that keeps the access the registration action granted
+    # $Sid ($Mask: $script:ReadAccessMask on the config folder,
+    # $script:ModifyAccessMask on logs\), inherited by files and folders, to
+    # append to $script:ProtectedDirSddl; '' when there is no such account
+    # (LocalSystem holds Full Control already). The protected DACL is then
+    # put in place in one step that never takes that access away.
+    param([string]$Sid, [string]$Mask)
+    if (-not $Sid) { return '' }
+    return ('(A;OICI;' + $Mask + ';;;' + $Sid + ')')
+}
+
 function Get-TokenProblem {
     # Why the existing bearer token $Path cannot be kept, or $null: it must
     # be a non-empty plain file owned by SYSTEM or Administrators whose DACL
@@ -304,8 +324,9 @@ function Get-ServiceAccountSid {
     # So does a SID no service runs as (Test-AccountSid): this SID is granted
     # access to the config folder, the token and logs\ before sc.exe create
     # could refuse it, and a group or well-known principal would pass that
-    # access on to all its members.
-    param([string]$Account)
+    # access on to all its members. With -OrNull (the account the service is
+    # registered under, whose access is only kept) either returns $null.
+    param([string]$Account, [switch]$OrNull)
     switch -Regex ($Account) {
         '^(\.\\)?LocalSystem$' { return $null }
         '^NT AUTHORITY\\SYSTEM$' { return $null }
@@ -326,10 +347,12 @@ function Get-ServiceAccountSid {
             $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
         }
         catch {
+            if ($OrNull) { return $null }
             Fail ("cannot resolve the SID of service account '" + $Account + "': " + $_.Exception.Message)
         }
     }
     if (-not (Test-AccountSid -Sid $sid)) {
+        if ($OrNull) { return $null }
         Fail ("service account '" + $Account + "' resolves to " + $sid + ', which is no account a service runs as' +
               ' (a group or a well-known principal); name a user, managed service or NT SERVICE account')
     }
@@ -353,9 +376,10 @@ function Get-EarlierAccountSid {
     # directory, not a junction or symbolic link, owned by SYSTEM,
     # Administrators or an administrator (the walk refuses any other).
     # The registration action grants the service account Modify whoever it
-    # is, so $GrantedSid is matched as it is, a member of Administrators (a
-    # gMSA an administrator put there) included. Without it, such an ACE is
-    # an administrator's own, not the mark of an earlier service account.
+    # is, a member of Administrators (a gMSA an administrator put there)
+    # included, and both lookups read such a grant alike: an account's write
+    # access marks it, and a member of Administrators (who may hold access of
+    # their own) only through exactly that Modify.
     param([string]$LogsDir, [string]$ServiceSid, [string]$GrantedSid = '')
     $attributes = Get-EntryAttributes -Path $LogsDir
     if ($null -eq $attributes -or ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
@@ -369,8 +393,10 @@ function Get-EarlierAccountSid {
         if ($GrantedSid) {
             if ($sid -ne $GrantedSid) { continue }
         }
-        elseif ($sid -eq $ServiceSid -or (Test-TrustedOwner -Sid $sid)) { continue }
-        if ([int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights) -band $script:WriteRights) {
+        elseif ($sid -eq $ServiceSid) { continue }
+        $granted = [int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights)
+        if ((Test-TrustedOwner -Sid $sid) -and $granted -ne $script:ModifyRights) { continue }
+        if ($granted -band $script:WriteRights) {
             return $sid
         }
     }
@@ -504,6 +530,16 @@ try {
                           "', the account the service is registered under")
         }
     }
+    # The account the service is registered under keeps its token and its
+    # Modify on logs\ (see the header): only what it holds, so only when
+    # logs\ grants it write access, as the install that registered the
+    # service under it did (msiexec lets anybody set RegisteredAccount when
+    # the service key is absent).
+    $registeredSid = $null
+    if ($RegisteredAccount) {
+        $sid = Get-ServiceAccountSid -Account $RegisteredAccount -OrNull
+        if ($sid -and (Get-EarlierAccountSid -LogsDir (Join-Path $configDir 'logs') -GrantedSid $sid)) { $registeredSid = $sid }
+    }
     # The bearer token is judged on its own below. Whoever owns a token, its
     # value may be known to whoever made it, so an owner change would only
     # launder a planted value: only an entry that is not a plain file is
@@ -536,6 +572,7 @@ try {
     # refusal above, and before any payload runs.
     $tokenSids = @($script:SidSystem, $script:SidAdmins)
     if ($serviceSid) { $tokenSids += $serviceSid }
+    if ($registeredSid) { $tokenSids += $registeredSid }
     if ($null -ne $tokenAttributes) {
         $problem = Get-TokenProblem -Path $tokenFile -AllowedSids $tokenSids
         if ($problem) {
@@ -554,8 +591,9 @@ try {
     # junction. A logs\ that still grants an earlier service account write
     # access (the account changed) gets the folder's protected DACL back
     # before any payload runs; RegisterServiceCA grants the service account
-    # Modify again. Either way the folder is walked again once the DACL is
-    # in place.
+    # Modify again; the account the service is registered under keeps its
+    # Modify in the same step. Either way the folder is walked again once
+    # the DACL is in place.
     $protectLogs = $false
     if ($null -eq $logsAttributes) {
         # No -Force: if something appeared there since the walk above, this
@@ -563,14 +601,15 @@ try {
         New-Item -ItemType Directory -Path $logsDir | Out-Null
         $protectLogs = $true
     }
-    elseif (Get-WriteProblem -Path $logsDir -WriterSid $serviceSid) {
+    elseif (Get-WriteProblem -Path $logsDir -WriterSid @($serviceSid, $registeredSid)) {
         Write-Output ("==> '" + $logsDir + "' grants a service account this install does not run as write access;" +
                       ' resetting its DACL (RegisterServiceCA grants the service account Modify again)')
         $protectLogs = $true
     }
     if ($protectLogs) {
         $security = New-Object System.Security.AccessControl.DirectorySecurity
-        $security.SetSecurityDescriptorSddlForm($script:ProtectedDirSddl)
+        $security.SetSecurityDescriptorSddlForm($script:ProtectedDirSddl +
+            (Get-KeptAccessSddl -Sid $registeredSid -Mask $script:ModifyAccessMask))
         Set-Acl -LiteralPath $logsDir -AclObject $security
         $found = Get-TreeProblem -Directory $configDir -SkipNames @('http-token') -LogsSid $serviceSid
         if ($found) {

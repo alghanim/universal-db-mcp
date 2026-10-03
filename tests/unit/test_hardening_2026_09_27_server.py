@@ -89,6 +89,7 @@ import anyio
 import pytest
 import sqlglot
 from sqlglot import exp
+from test_cr_fix_server import _positions, _width_mask, _width_positions
 
 import universal_db_mcp.server as srv
 from universal_db_mcp.config import load_resolved
@@ -173,6 +174,21 @@ def _assert_no_secret(payload: Any) -> None:
         assert secret not in text, (secret, text[:600])
 
 
+def _refused_or_clean(server: Any, args: dict[str, Any], tool: str = "db_query") -> str | None:
+    """Call ``tool``: no secret comes back, and the masking refusal (its
+    text), if the statement's shape cannot be checked for masked columns
+    (owner decision, 2026-10-03), else None."""
+    try:
+        env = _call(server, tool, args)
+    except Exception as exc:  # noqa: BLE001 - the refusal's text is what is asserted
+        text = str(exc)
+        assert "cannot be checked for them" in text or "masking cannot place them" in text, text
+        _assert_no_secret(text)
+        return text
+    _assert_no_secret(env)
+    return None
+
+
 # ------------------------------------------------------ F01 positional masking
 
 _TAINTED_SHAPES = [
@@ -226,7 +242,7 @@ def test_generic_driver_column_names_do_not_unmask(tmp_path: Path, monkeypatch: 
 def test_apply_masking_by_position_with_synthetic_driver_names(demo_policy: Any) -> None:
     for name in ("upper", "1", "", "x" * 255):
         ast = sqlglot.parse_one("SELECT upper(ssn) FROM customers", read="postgres")
-        positions = srv._sensitive_output_positions(demo_policy, ast, 1)
+        positions = _width_positions(demo_policy, ast, 1)
         state: dict[str, Any] = {"warnings": []}
         cols, rows = srv._apply_masking(demo_policy, [(name, "text")], [["999-90-1111"]], state, positions=positions)
         assert rows == [["<masked>"]] and cols[0][1].endswith("(masked)"), name
@@ -237,12 +253,13 @@ def test_apply_masking_by_position_with_synthetic_driver_names(demo_policy: Any)
     ("sql", "width", "expected"),
     [
         ("SELECT x FROM (SELECT ssn FROM customers) AS q(x)", 1, {0}),
-        ("SELECT CAST(b AS TEXT) FROM customers b", 1, {0}),
-        ("SELECT customer_id, b::text FROM customers AS b", 2, {1}),
+        # a bare table name used as a whole-row value is refused (None)
+        ("SELECT CAST(b AS TEXT) FROM customers b", 1, None),
+        ("SELECT customer_id, b::text FROM customers AS b", 2, None),
         ("SELECT to_json(b.*) FROM customers b", 1, {0}),
         ("SELECT id FROM (SELECT customer_id AS id, ssn FROM customers) q", 1, set()),
-        ("SELECT * FROM customers", 4, set()),  # the driver reports the table's own names
-        ("SELECT *, upper(ssn) FROM customers", 5, {4}),
+        ("SELECT * FROM customers", 4, {3}),  # the catalog lists the star's columns
+        ("SELECT *, upper(ssn) FROM customers", 5, {3, 4}),
         ("SELECT * FROM (SELECT ssn AS a FROM customers) x JOIN (SELECT full_name AS b FROM customers) y ON true",
          2, {0}),
         ("SELECT * FROM (SELECT full_name AS b FROM customers) y, (SELECT ssn AS a FROM customers) x", 2, {1}),
@@ -258,9 +275,9 @@ def test_apply_masking_by_position_with_synthetic_driver_names(demo_policy: Any)
         ("SELECT count(*) FROM customers", 1, set()),
     ],
 )
-def test_sensitive_output_positions(demo_policy: Any, sql: str, width: int, expected: set[int]) -> None:
+def test_sensitive_output_positions(demo_policy: Any, sql: str, width: int, expected: set[int] | None) -> None:
     ast = sqlglot.parse_one(sql, read="postgres")
-    assert srv._sensitive_output_positions(demo_policy, ast, width) == expected
+    assert _width_positions(demo_policy, ast, width) == expected
 
 
 @pytest.mark.parametrize(
@@ -270,12 +287,14 @@ def test_sensitive_output_positions(demo_policy: Any, sql: str, width: int, expe
         ("WITH ssn AS x, x AS y SELECT customer_id, y FROM customers", 2, {1}),
         ("SELECT ssn AS x, x FROM customers", 2, {0, 1}),  # a bare name may be a sibling alias
         ("SELECT customer_id AS x, x FROM customers", 2, set()),
-        ("SELECT upper(x) FROM customers ARRAY JOIN [ssn] AS x", 1, {0}),
+        ("SELECT upper(x) FROM customers ARRAY JOIN [ssn] AS x", 1, None),  # ARRAY JOIN: refused
     ],
 )
-def test_clickhouse_alias_forms_are_traced(demo_policy: Any, sql: str, width: int, expected: set[int]) -> None:
+def test_clickhouse_alias_forms_are_traced(
+    demo_policy: Any, sql: str, width: int, expected: set[int] | None
+) -> None:
     ast = sqlglot.parse_one(sql, read="clickhouse")
-    assert srv._sensitive_output_positions(demo_policy, ast, width) == expected
+    assert _width_positions(demo_policy, ast, width) == expected
 
 
 @pytest.mark.parametrize(
@@ -285,7 +304,7 @@ def test_clickhouse_alias_forms_are_traced(demo_policy: Any, sql: str, width: in
         ("postgres", "SELECT d FROM customers AS t(a, b, c, d)", 1, {0}),
         ("postgres", "SELECT t.d FROM customers t(a, b, c, d)", 1, {0}),
         ("postgres", "SELECT * FROM customers AS t(a, b, c, d)", 4, {0, 1, 2, 3}),
-        ("postgres", "SELECT t.full_name FROM customers t(a)", 1, set()),
+        ("postgres", "SELECT t.full_name FROM customers t(a)", 1, {0}),  # a column list on a table: refused
         # a table function's columns are its own, never those of a lateral source before it
         ("postgres", "SELECT u.v FROM (SELECT 1 AS k) q, customers c, unnest(ARRAY[c.ssn]) AS u(v)", 1, {0}),
         ("postgres", "SELECT v FROM (SELECT 1 AS k) q, customers c, unnest(ARRAY[c.ssn]) AS u(v)", 1, {0}),
@@ -293,7 +312,7 @@ def test_clickhouse_alias_forms_are_traced(demo_policy: Any, sql: str, width: in
         ("postgres", "SELECT l.y FROM (SELECT ssn AS x FROM customers) q, LATERAL (SELECT x AS y FROM customers c2) l",
          1, {0}),
         ("tsql", "SELECT y FROM (VALUES (1)) v(x) CROSS APPLY (SELECT TOP 1 ssn AS y FROM customers) z", 1, {0}),
-        ("tsql", "SELECT x FROM (VALUES (1)) v(x) CROSS APPLY (SELECT TOP 1 ssn AS y FROM customers) z", 1, set()),
+        ("tsql", "SELECT x FROM (VALUES (1)) v(x) CROSS APPLY (SELECT TOP 1 ssn AS y FROM customers) z", 1, {0}),
         # derived tables without an alias (PostgreSQL 16+, ClickHouse)
         ("postgres", "SELECT x FROM (SELECT ssn AS x FROM customers), (SELECT 1 AS y)", 1, {0}),
         ("postgres", "SELECT * FROM (SELECT ssn AS x FROM customers), (SELECT 1 AS y)", 2, {0}),
@@ -305,23 +324,23 @@ def test_clickhouse_alias_forms_are_traced(demo_policy: Any, sql: str, width: in
         # ClickHouse COLUMNS('regex') selects columns the statement never names
         ("clickhouse", "SELECT upper(COLUMNS('ss.*')) FROM customers", 1, {0}),
         ("clickhouse", "SELECT COLUMNS('ss.*') APPLY(upper) FROM customers", 1, {0}),
-        ("clickhouse", "SELECT customer_id, upper(COLUMNS('ss.*')) FROM customers", 2, {1}),
+        ("clickhouse", "SELECT customer_id, upper(COLUMNS('ss.*')) FROM customers", 2, {0, 1}),  # refused
     ],
 )
 def test_output_positions_follow_every_source_form(
     demo_policy: Any, dialect: str, sql: str, width: int, expected: set[int]
 ) -> None:
     ast = sqlglot.parse_one(sql, read=dialect)
-    assert srv._query_mask_positions(demo_policy, ast, [(f"c{i}", "t") for i in range(width)]) == expected
+    assert _width_mask(demo_policy, ast, width) == expected
 
 
 def test_case_sensitive_patterns_match_the_folded_spellings(demo_policy: Any) -> None:
     """Oracle and Db2 fold unquoted names to upper case: an administrator's
     ^NATIONAL_ID$ must catch national_id written in lower case."""
-    policy = dataclasses.replace(demo_policy, sensitive_patterns=[re.compile(r"^NATIONAL_ID$")])
+    policy = dataclasses.replace(demo_policy, engine="oracle", sensitive_patterns=[re.compile(r"^NATIONAL_ID$")])
     for sql in ("SELECT upper(national_id) FROM citizens", 'SELECT upper("NATIONAL_ID") FROM citizens'):
         ast = sqlglot.parse_one(sql, read="oracle")
-        assert srv._sensitive_output_positions(policy, ast, 1) == {0}, sql
+        assert _width_positions(policy, ast, 1, {"citizens": ("ID", "NATIONAL_ID")}) == {0}, sql
 
 
 def test_alias_chains_are_traced_in_linear_time(demo_policy: Any) -> None:
@@ -331,10 +350,9 @@ def test_alias_chains_are_traced_in_linear_time(demo_policy: Any) -> None:
     sql = "SELECT " + ", ".join(f"a{i} AS a{i + 1}" for i in reversed(range(n))) + ", ssn AS a0 FROM customers"
     ast = sqlglot.parse_one(sql, read="clickhouse")
     started = time.perf_counter()
-    names = srv._sensitive_output_names(demo_policy, ast)
-    positions = srv._query_mask_positions(demo_policy, ast, [(f"a{i}", "t") for i in range(n + 1)])
+    positions = _positions(demo_policy, ast, [(f"a{i}", "t") for i in range(n + 1)])
     assert time.perf_counter() - started < 3.0
-    assert names == frozenset(f"a{i}" for i in range(n + 1))
+    # a chain this deep is refused (nothing returned), never traced half-way
     assert positions == set(range(n + 1))
 
 
@@ -358,18 +376,25 @@ _XML_COLUMN = "XML_F52E2B61-18A1-11d1-B105-00805F49916B"
 )
 def test_for_json_and_for_xml_fold_every_value_into_one_masked_column(demo_policy: Any, sql: str, driver: str) -> None:
     ast = sqlglot.parse_one(sql, read="tsql")
-    assert srv._query_mask_positions(demo_policy, ast, [(driver, "str")]) == {0}
+    assert _positions(demo_policy, ast, [(driver, "str")]) == {0}
     state: dict[str, Any] = {"warnings": []}
     _cols, rows = srv._apply_masking(
         demo_policy, [(driver, "str")], [['[{"ssn":"999-90-1111"}]']], state,
-        positions=srv._query_mask_positions(demo_policy, ast, [(driver, "str")]),
+        positions=_positions(demo_policy, ast, [(driver, "str")]),
     )
     assert rows == [["<masked>"]]
 
 
-def test_for_json_over_clean_columns_stays_readable(demo_policy: Any) -> None:
-    ast = sqlglot.parse_one("SELECT customer_id, full_name FROM customers FOR JSON PATH", read="tsql")
-    assert srv._query_mask_positions(demo_policy, ast, [(_JSON_COLUMN, "str")]) == set()
+def test_for_json_over_a_table_with_masked_columns_is_refused(demo_policy: Any) -> None:
+    """FOR JSON/XML folds every value into one column: over a table with a
+    masked column it is refused, whatever it selects (owner decision,
+    2026-10-03); over other tables nothing is masked."""
+    from test_cr_fix_server import _refusal
+
+    policy = dataclasses.replace(demo_policy, engine="mssql")
+    reason = _refusal(policy, "SELECT customer_id, full_name FROM customers FOR JSON PATH")
+    assert reason is not None and "FOR JSON/XML" in reason, reason
+    assert _refusal(policy, "SELECT id FROM orders FOR JSON PATH", {"orders": ("id",)}) is None
 
 
 def test_an_unmapped_result_is_masked_whole_when_anything_is_tainted(demo_policy: Any) -> None:
@@ -378,13 +403,19 @@ def test_an_unmapped_result_is_masked_whole_when_anything_is_tainted(demo_policy
     (or a star run is involved), because the driver may report any value under
     any name."""
     ast = sqlglot.parse_one("SELECT customer_id AS a, ssn AS b FROM customers", read="postgres")
-    assert srv._query_mask_positions(demo_policy, ast, [("a", "t"), ("b", "t"), ("c", "t")]) == {0, 1, 2}
-    # a star run (a folded result reports fewer columns than were projected)
-    ast = sqlglot.parse_one("SELECT *, customer_id AS a, full_name AS b FROM customers", read="postgres")
-    assert srv._query_mask_positions(demo_policy, ast, [("a", "t")]) == {0}
-    # nothing tainted and no star: the traced names stay readable
-    ast = sqlglot.parse_one("SELECT customer_id AS a, full_name AS b FROM customers", read="postgres")
-    assert srv._query_mask_positions(demo_policy, ast, [("a", "t"), ("b", "t"), ("c", "t")]) == {2}
+    plan = srv._MaskProof(demo_policy.sensitive_patterns, ast, "postgres", {
+        id(t): ("customer_id", "full_name", "email", "ssn") for t in ast.find_all(exp.Table)
+    }).output()
+    with pytest.raises(ToolFailure, match="masking cannot place them"):
+        srv._laid_out(plan, [("a", "t"), ("b", "t"), ("c", "t")])
+    with pytest.raises(ToolFailure, match="reported as 'x', not 'a'"):
+        srv._laid_out(plan, [("x", "t"), ("b", "t")])
+    assert srv._laid_out(plan, [("A", "t"), ("b", "t")]) == {1}
+    # a star's columns are checked against the catalog's names too
+    ast = sqlglot.parse_one("SELECT *, customer_id AS a FROM customers", read="postgres")
+    assert _positions(demo_policy, ast, [("a", "t")]) == {0}
+    assert _positions(demo_policy, ast, [("customer_id", "t"), ("full_name", "t"), ("mail", "t"), ("ssn", "t"),
+                                         ("a", "t")]) == set(range(5))
 
 
 def _case_policy(demo_policy: Any, pattern: str) -> Any:
@@ -399,10 +430,11 @@ def test_case_sensitive_patterns_match_driver_and_catalog_names_in_either_case(
     heuristics (a base-table star, sampling, profiling, value search, DEFAULT
     masking) fold like the positional tracer does."""
     policy = _case_policy(demo_policy, pattern)
+    policy = dataclasses.replace(policy, engine="oracle")
     for driver in (["ID", "PASSPORT_NO"], ["id", "passport_no"]):
         ast = sqlglot.parse_one("SELECT * FROM travellers", read="oracle")
         columns = [(n, "t") for n in driver]
-        positions = srv._query_mask_positions(policy, ast, columns)
+        positions = _positions(policy, ast, columns, catalog={"travellers": ("ID", "PASSPORT_NO")})
         assert srv._mask_columns(policy, columns, positions=positions) == {1}, driver
         assert srv._sensitive(policy, driver[1]) and not srv._sensitive(policy, driver[0])
     assert srv._masked_default(policy, "Passport_No", "'X1234567'") == "<masked>"
@@ -443,20 +475,24 @@ def test_a_long_alias_chain_across_many_scopes_is_traced_quickly(demo_policy: An
     )
     ast = sqlglot.parse_one(sql, read="clickhouse")
     started = time.perf_counter()
-    positions = srv._query_mask_positions(demo_policy, ast, [(f"c{i}", "t") for i in range(2 * n + 1)])
+    positions = _width_mask(demo_policy, ast, 2 * n + 1)
     assert time.perf_counter() - started < 2.0
-    assert positions == set(range(n + 1)), "traced exactly: the chain is tainted, the subqueries are not"
+    # a chain this deep is refused (nothing returned), never traced half-way
+    assert positions == set(range(2 * n + 1))
+    short = (
+        "SELECT " + ", ".join(f"a{i + 1} AS a{i}" for i in range(20)) + ", ssn AS a20, "
+        + ", ".join("(SELECT 1)" for _ in range(20)) + " FROM customers"
+    )
+    ast = sqlglot.parse_one(short, read="clickhouse")
+    assert _width_mask(demo_policy, ast, 41) == set(range(21)), "traced exactly: the chain is tainted"
 
 
-def test_a_statement_that_does_not_settle_in_bounded_rounds_is_masked_whole(demo_policy: Any, monkeypatch: Any) -> None:
-    monkeypatch.setattr(srv, "_TAINT_MAX_ROUNDS", 1)
-    ast = sqlglot.parse_one("SELECT customer_id, full_name FROM customers", read="postgres")
-    columns = [("customer_id", "t"), ("full_name", "t")]
-    assert srv._sensitive_output_positions(demo_policy, ast, 2) is None
-    assert srv._query_mask_positions(demo_policy, ast, columns) == {0, 1}
-    monkeypatch.setattr(srv, "_TAINT_MAX_ROUNDS", 16)
-    monkeypatch.setattr(srv, "_TAINT_BUDGET_SECONDS", -1.0)
-    assert srv._sensitive_output_positions(demo_policy, ast, 2) is None
+def test_a_statement_over_the_analysis_time_budget_is_refused(demo_policy: Any, monkeypatch: Any) -> None:
+    from test_cr_fix_server import _refusal
+
+    monkeypatch.setattr(srv, "_PROOF_BUDGET_SECONDS", -1.0)
+    reason = _refusal(dataclasses.replace(demo_policy, engine="postgres"), "SELECT customer_id, ssn FROM customers")
+    assert reason is not None and "in time" in reason, reason
 
 
 def test_db_query_fails_closed_when_the_driver_reports_other_columns(tmp_path: Path, monkeypatch: Any) -> None:
@@ -470,31 +506,25 @@ def test_db_query_fails_closed_when_the_driver_reports_other_columns(tmp_path: P
 
     monkeypatch.setattr(SQLiteConnector, "execute_query", extra_column)
     server, _ = _server(tmp_path)
-    env = _call(server, "db_query", {"connection_id": "shop", "sql": "SELECT customer_id, full_name FROM customers"})
-    assert env["data"]["rows"][0] == [1, "User 0", "<masked>"]
-    assert any("fail closed" in w for w in env["warnings"]), env["warnings"]
-    _assert_no_secret(env)
+    sql = "SELECT customer_id, full_name FROM customers"
+    text = _call_error(server, "db_query", {"connection_id": "shop", "sql": sql})
+    assert "masking cannot place them" in text and "no rows are returned" in text, text
+    assert "999-90" not in text
 
 
 def test_untraceable_output_fails_closed(demo_policy: Any) -> None:
-    # the driver reported more columns than the statement projects: only the
-    # names the statement proves clean survive
+    # the driver reported more columns than the statement projects: refused
     ast = sqlglot.parse_one("SELECT customer_id, full_name FROM customers", read="sqlite")
     columns = [("customer_id", "integer"), ("full_name", "text"), ("mystery", "text")]
-    assert srv._sensitive_output_positions(demo_policy, ast, len(columns)) is None
-    state: dict[str, Any] = {"warnings": []}
-    cols, rows = srv._apply_masking(
-        demo_policy, columns, [[1, "Ada", "999-90-1111"]], state,
-        positions=srv._query_mask_positions(demo_policy, ast, columns),
-    )
-    assert rows == [[1, "Ada", "<masked>"]]
-    # two stars around an engine-named tainted column: every column is suspect
+    assert _positions(demo_policy, ast, columns) == {0, 1, 2}
+    # two stars around an engine-named tainted column: laid out exactly by the catalog
     ast = sqlglot.parse_one(
         "SELECT a.*, upper(b.ssn), b.* FROM customers a JOIN customers b ON a.customer_id = b.customer_id",
         read="postgres",
     )
-    columns = [(f"c{i}", "text") for i in range(9)]
-    assert srv._query_mask_positions(demo_policy, ast, columns) == set(range(9))
+    names = ["customer_id", "full_name", "email", "ssn"]
+    columns = [(n, "text") for n in [*names, "upper", *names]]
+    assert _positions(dataclasses.replace(demo_policy, engine="postgres"), ast, columns) == {3, 4, 8}
 
 
 def test_mask_action_omit_drops_exactly_the_tainted_positions(tmp_path: Path) -> None:
@@ -1934,7 +1964,7 @@ def test_masked_rows_are_cut_again_to_the_byte_ceiling(tmp_path: Path) -> None:
     """The connector fits rows to security.max_response_bytes before masking;
     '<masked>' can be longer than what it replaced (every column is masked
     when the output cannot be traced), so the rows are cut again after it."""
-    cols = ", ".join(f"pin_{i} INTEGER" for i in range(20))
+    cols = ", ".join(f"ssn_{i} INTEGER" for i in range(20))
     script = f"CREATE TABLE wide (id INTEGER, {cols});" + "".join(
         f"INSERT INTO wide VALUES ({i}{', 1' * 20});" for i in range(500)
     )
@@ -1942,7 +1972,7 @@ def test_masked_rows_are_cut_again_to_the_byte_ceiling(tmp_path: Path) -> None:
     env = _call(server, "db_query", {"connection_id": "shop", "max_rows": 500,
                                      "sql": "SELECT * FROM wide UNION ALL SELECT * FROM wide WHERE 0"})
     rows = env["data"]["rows"]
-    assert rows and all(v == "<masked>" for r in rows for v in r)
+    assert rows and all(v == "<masked>" for r in rows for v in r[1:])  # every ssn_ column
     assert sum(len(json.dumps(r).encode()) for r in rows) <= _CEILING
     assert env["truncated"] is True and any(w.startswith("result truncated") for w in env["warnings"])
     fed = _call(server, "db_federated_query", {"max_rows_per_connection": 500,
@@ -2415,9 +2445,10 @@ _CTE = "WITH t AS (SELECT customer_id, ssn FROM customers) "
         (_CTE + "SELECT a.x, b.x FROM t AS a(w, x) JOIN t AS b(x, w) ON true", 2, {0}),
         # a partial list renames the leading columns only
         ("WITH t AS (SELECT ssn AS s, customer_id FROM customers) SELECT x, customer_id FROM t AS d(x)", 2, {0}),
-        # over a base table's star the new names prove nothing
-        ("WITH t AS (SELECT * FROM customers) SELECT * FROM t AS d(a, b, c)", 4, {0, 1, 2, 3}),
-        ("WITH t AS (SELECT * FROM customers) SELECT b FROM t AS d(a, b, c)", 1, {0}),
+        # over a base table's star the catalog lists the columns: renamed exactly
+        ("WITH t AS (SELECT * FROM customers) SELECT * FROM t AS d(a, b, c)", 4, {3}),
+        ("WITH t AS (SELECT * FROM customers) SELECT b FROM t AS d(a, b, c)", 1, set()),
+        ("WITH t AS (SELECT * FROM customers) SELECT d.ssn FROM t AS d(a, b, c)", 1, {0}),
         # Db2 statements are parsed as PostgreSQL; its names fold to upper case
         ("WITH T AS (SELECT CUSTOMER_ID, SSN FROM CUSTOMERS) SELECT X FROM T AS D(W, X)", 1, {0}),
         ("WITH T AS (SELECT CUSTOMER_ID, SSN FROM CUSTOMERS) SELECT W FROM T AS D(W, X)", 1, set()),
@@ -2427,7 +2458,7 @@ def test_a_cte_referenced_through_a_column_list_is_renamed_positionally(
     demo_policy: Any, sql: str, width: int, expected: set[int]
 ) -> None:
     ast = sqlglot.parse_one(sql, read="postgres")
-    assert srv._query_mask_positions(demo_policy, ast, [(f"c{i}", "t") for i in range(width)]) == expected
+    assert _width_mask(demo_policy, ast, width) == expected
 
 
 @pytest.mark.parametrize(
@@ -2453,21 +2484,28 @@ def test_a_cte_referenced_through_a_column_list_is_renamed_positionally(
         # controls: a real column, and a row without a sensitive value
         ("SELECT b.full_name FROM customers b", set()),
         ("SELECT d.customer_id FROM (SELECT customer_id, ssn FROM customers) d", set()),
-        ("SELECT d.to_json FROM (SELECT customer_id FROM customers) d", set()),
+        # a name the source does not output is refused, row without a sensitive value or not
+        ("SELECT d.to_json FROM (SELECT customer_id FROM customers) d", {0}),
         ("SELECT d.full_name FROM (SELECT * FROM customers) d", set()),
     ],
 )
 def test_postgres_attribute_notation_is_a_whole_row_reference(demo_policy: Any, sql: str, expected: set[int]) -> None:
     policy = dataclasses.replace(demo_policy, engine="postgres")
     ast = sqlglot.parse_one(sql, read="postgres")
-    assert srv._query_mask_positions(policy, ast, [("c0", "t")]) == expected
+    assert _width_mask(policy, ast, 1) == expected
 
 
 def test_attribute_notation_function_names_are_columns_on_other_engines(demo_policy: Any) -> None:
-    """Only PostgreSQL reads t.to_json as to_json(t); elsewhere it is a column."""
+    """A qualified name that is no column of its source is refused on every
+    engine (only PostgreSQL reads t.to_json as to_json(t); MySQL fails it);
+    one the catalog lists is a column everywhere."""
+    from test_cr_fix_server import _refusal
+
     policy = dataclasses.replace(demo_policy, engine="mysql")
+    assert "names no column" in str(_refusal(policy, "SELECT b.to_json FROM customers b"))
     ast = sqlglot.parse_one("SELECT b.to_json FROM customers b", read="mysql")
-    assert srv._query_mask_positions(policy, ast, [("to_json", "t")]) == set()
+    catalog = {"customers": ("customer_id", "to_json", "ssn")}
+    assert _positions(policy, ast, [("to_json", "t")], catalog=catalog) == set()
 
 
 @pytest.mark.parametrize(
@@ -2480,16 +2518,18 @@ def test_attribute_notation_function_names_are_columns_on_other_engines(demo_pol
         ("WITH (ssn, 1) AS x, x AS y SELECT y.1 FROM customers", {0}),
         ("SELECT x.1 FROM customers WHERE ((ssn, 1) AS x).1 != ''", {0}),
         ("SELECT x.a FROM customers ARRAY JOIN [CAST((ssn, 1), 'Tuple(a String, b UInt8)')] AS x", {0}),
-        # controls: the same shapes over a column that is not sensitive
-        ("SELECT x.1 FROM customers ARRAY JOIN [(full_name, 1)] AS x", set()),
-        ("WITH (full_name, 1) AS x SELECT x.1 FROM customers", set()),
-        ("SELECT x.1 FROM customers WHERE ((full_name, 1) AS x).1 != ''", set()),
+        # the same shapes over a column that is not sensitive: refused all the
+        # same over a table with a masked column (ARRAY JOIN, a qualifier
+        # that names no FROM item)
+        ("SELECT x.1 FROM customers ARRAY JOIN [(full_name, 1)] AS x", {0}),
+        ("WITH (full_name, 1) AS x SELECT x.1 FROM customers", {0}),
+        ("SELECT x.1 FROM customers WHERE ((full_name, 1) AS x).1 != ''", {0}),
     ],
 )
 def test_clickhouse_tuple_access_through_an_alias_is_traced(demo_policy: Any, sql: str, expected: set[int]) -> None:
     demo_policy = dataclasses.replace(demo_policy, engine="clickhouse")  # tuple access is ClickHouse's
     ast = sqlglot.parse_one(sql, read="clickhouse")
-    assert srv._query_mask_positions(demo_policy, ast, [("c0", "t")]) == expected
+    assert _width_mask(demo_policy, ast, 1) == expected
 
 
 # the texts the loopback PostgreSQL returns (scratchpad impl-server/r2/pg_xml_raw.txt)
@@ -2683,14 +2723,14 @@ def test_index_definitions_are_capped_by_max_cell_bytes(tmp_path: Path, monkeypa
         ("SELECT q.a FROM (TABLE customers) AS q(i, n, e, a)", 1, {0}),
         ("SELECT a FROM (TABLE customers) AS q(i, n, e, a)", 1, {0}),
         ("SELECT * FROM (TABLE customers) AS q(i, n, e, a)", 4, {0, 1, 2, 3}),
-        ("SELECT * FROM (TABLE customers) q", 4, set()),  # the driver reports the table's own names
+        ("SELECT * FROM (TABLE customers) q", 4, {0, 1, 2, 3}),  # refused: write SELECT * FROM customers
     ],
 )
 def test_a_parenthesized_table_reads_the_whole_table(
     demo_policy: Any, sql: str, width: int, expected: set[int]
 ) -> None:
     ast = sqlglot.parse_one(sql, read="postgres")
-    assert srv._query_mask_positions(demo_policy, ast, [(f"c{i}", "t") for i in range(width)]) == expected
+    assert _width_mask(demo_policy, ast, width) == expected
 
 
 # ================================================================ integration wave
@@ -3130,15 +3170,19 @@ def test_a_site_row_function_over_a_base_table_is_masked(demo_policy: Any, sql: 
     policy = _pg_policy(demo_policy)
     ast = sqlglot.parse_one(sql, read="postgres")
     known = _known_columns(ast, {"customer_id", "full_name", "ssn"})
-    assert srv._query_mask_positions(policy, ast, [("c0", "t")], None, known) == expected
+    assert _width_mask(policy, ast, 1, known) == expected
 
 
 def test_without_the_tables_columns_only_the_known_row_functions_are_masked(demo_policy: Any) -> None:
     policy = _pg_policy(demo_policy)
-    for sql, expected in (("SELECT b.site_row_fn FROM customers b", set()),
+    # a name that is no column of the table is refused, a site function or a built-in
+    for sql, expected in (("SELECT b.site_row_fn FROM customers b", {0}),
                           ("SELECT b.row_to_json FROM customers b", {0})):
         ast = sqlglot.parse_one(sql, read="postgres")
-        assert srv._query_mask_positions(policy, ast, [("c0", "t")]) == expected, sql
+        assert _width_mask(policy, ast, 1) == expected, sql
+
+
+_TWO_COLUMNS = "SELECT b.customer_id, b.full_name FROM app.customers b"
 
 
 class _PgRowFake(_FakeConnector):
@@ -3157,21 +3201,29 @@ class _PgRowFake(_FakeConnector):
 
 @pytest.mark.parametrize("security", ["", "  mask_action: omit\n"])
 def test_db_query_masks_a_site_row_function_over_a_base_table(tmp_path: Path, monkeypatch: Any, security: str) -> None:
+    """x.fn over a table that has no column fn is PostgreSQL's fn(x), a site
+    function of the whole row: a name that is no column of its source is
+    refused before the statement runs (owner decision, 2026-10-03)."""
     fake = _PgRowFake()
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=["app"], deny=True,
                                  security=security)
     sql = "SELECT b.site_row_fn, b.full_name FROM app.customers b"
     for _ in range(2):
-        env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-        _assert_no_secret(env)
-        assert "Jane" in json.dumps(env["data"]["rows"])
+        text = _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
+        assert text is not None and "names no column" in text, text
     assert fake.calls == [("app", "customers")], "the table's columns are read once and then cached"
-    fed = _call(server, "db_federated_query", {"sql": "SELECT b.site_row_fn, b.full_name FROM app.customers b"})
+    assert fake.statements == [], "refused before it ran"
+    fed = _call(server, "db_federated_query", {"sql": sql})
     _assert_no_secret(fed)
-    assert fed["data"]["connections_run"] == 1, fed
+    assert fed["data"]["connections_run"] == 0, fed
+    env = _call(server, "db_query", {"connection_id": "remote", "sql": _TWO_COLUMNS})
+    assert env["data"]["rows"][0][1] == "Jane", "its real columns stay readable"
 
 
 def test_a_catalog_failure_leaves_a_warning_not_a_failed_query(tmp_path: Path, monkeypatch: Any) -> None:
+    """A table whose columns cannot be read may hold a masked column: the
+    statement is refused (was: run and masked whole), and the driver's
+    message, which may quote a value, is not repeated."""
     fake = _PgRowFake()
 
     def broken(_schema: str | None, _table: str) -> list[ColumnInfo]:
@@ -3180,11 +3232,10 @@ def test_a_catalog_failure_leaves_a_warning_not_a_failed_query(tmp_path: Path, m
 
     fake.list_columns = broken  # type: ignore[method-assign]
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=["app"], deny=True)
-    sql = "SELECT b.site_row_fn, b.full_name FROM app.customers b"
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    assert env["data"]["rows"] == [["<masked>", "<masked>"]], "fail closed: no name is proven a column"
-    assert any("site-defined" in w and "'customers'" in w for w in env["warnings"]), env["warnings"]
-    assert SECRETS[1] not in json.dumps(env)
+    sql = "SELECT b.full_name FROM app.customers b"
+    text = _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
+    assert text is not None and "columns of 'customers' are not known" in text, text
+    assert SECRETS[1] not in text and fake.statements == []
 
 
 def test_rows_of_one_statement_are_never_folded_into_one_earlier_hit(tmp_path: Path, monkeypatch: Any) -> None:
@@ -3209,8 +3260,8 @@ def test_rows_of_one_statement_are_never_folded_into_one_earlier_hit(tmp_path: P
 
 
 def test_a_failed_catalog_listing_masks_a_bare_tables_qualified_columns(tmp_path: Path, monkeypatch: Any) -> None:
-    """The statement already ran: a listing that fails afterwards (no metadata
-    cache, a flaky catalog) masks, it does not fail the call."""
+    """A listing that fails for masking's catalog lookups (no metadata cache,
+    a flaky catalog) fails the call before the statement runs."""
     fake = _PgRowFake()
     server, app = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=True)
     real = AppContext.tables_for
@@ -3224,28 +3275,25 @@ def test_a_failed_catalog_listing_masks_a_bare_tables_qualified_columns(tmp_path
 
     monkeypatch.setattr(AppContext, "tables_for", flaky)
     fake.tables.append(TableSummary("app", "orders", "table"))
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": "SELECT b.site_row_fn, b.full_name "
-                                     "FROM customers b, orders o WHERE o.customer_id = b.customer_id"})
-    assert env["data"]["rows"] == [["<masked>", "<masked>"]]
-    assert any("site-defined" in w and "could not be read" in w for w in env["warnings"]), env["warnings"]
-    assert calls["n"] == 2, "a failed listing is not asked again for the next bare name"
+    with pytest.raises(Exception, match="server closed the connection"):
+        _call(server, "db_query", {"connection_id": "remote", "sql": "SELECT b.full_name, o.customer_id "
+                                   "FROM customers b, orders o WHERE o.customer_id = b.customer_id"})
+    assert calls["n"] == 2 and fake.statements == []
 
 
 def test_tables_past_the_lookup_budget_are_masked_not_trusted(tmp_path: Path, monkeypatch: Any) -> None:
-    """Decoy tables ahead of the one read through a site function cannot use
-    up the lookups and leave it to the built-in list."""
+    """Decoy tables ahead of the one with masked columns cannot use up the
+    lookups and leave it unread: its columns are then not known, and the
+    statement is refused (a repeated call finds the others cached)."""
     fake = _PgRowFake()
     fake.tables += [TableSummary("app", f"d{i}", "table") for i in range(3)]
+    fake.columns = [*_PG_CUSTOMERS, *(ColumnInfo("app", f"d{i}", "id", "integer") for i in range(3))]
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=["app"], deny=True)
-    monkeypatch.setattr(srv, "_ROW_FUNCTION_TABLES", 2)
+    monkeypatch.setattr(srv, "_MASK_LOOKUPS", 2)
     decoys = ", ".join(f"app.d{i} x{i}" for i in range(3))
-    sql = f"SELECT x0.id, x1.id, x2.id, b.site_row_fn, b.full_name FROM {decoys}, app.customers b"
-    fake.execute_query = lambda spec: QueryOutcome(  # type: ignore[method-assign]
-        columns=[("id", "t"), ("id", "t"), ("id", "t"), ("site_row_fn", "text"), ("full_name", "text")],
-        rows=[[1, 2, 3, f"(1,Jane,{SECRETS[0]})", "Jane"]], truncated=False, rows_seen=1, elapsed_ms=0)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    _assert_no_secret(env)
-    assert any("lookup" in w and "fail closed" in w for w in env["warnings"]), env["warnings"]
+    sql = f"SELECT x0.id, x1.id, x2.id, b.full_name FROM {decoys}, app.customers b"
+    text = _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
+    assert text is not None and "run it again" in text, text
 
 
 # ================================================================ fix-up round 1
@@ -3283,10 +3331,9 @@ def test_a_site_row_function_reached_through_another_scope_is_masked(
     fake = _PgRowFake()
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=True,
                                  security=security)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    _assert_no_secret(env)
-    assert "Jane" in json.dumps(env["data"]["rows"]), "a real column through the star stays readable"
-    assert ("app", "customers") in fake.calls
+    text = _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
+    assert text is not None, "a name that is no column of its source is refused"
+    assert fake.statements == []
 
 
 def test_a_site_row_function_through_a_star_is_masked_in_a_federated_query(tmp_path: Path, monkeypatch: Any) -> None:
@@ -3295,22 +3342,20 @@ def test_a_site_row_function_through_a_star_is_masked_in_a_federated_query(tmp_p
     fed = _call(server, "db_federated_query",
                 {"sql": "SELECT x.site_row_fn, x.full_name FROM (SELECT * FROM app.customers) x"})
     _assert_no_secret(fed)
-    assert fed["data"]["connections_run"] == 1, fed
+    assert fed["data"]["connections_run"] == 0 and "names no column" in json.dumps(fed), fed
 
 
 def test_a_site_row_function_over_a_parenthesized_table_is_masked(tmp_path: Path, monkeypatch: Any) -> None:
-    """(TABLE customers) is SELECT * FROM customers; with nothing restricting
-    names the guard lets the bare name through."""
+    """(TABLE customers) q is refused: write SELECT * FROM customers."""
     fake = _PgRowFake()
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=False)
-    env = _call(server, "db_query", {"connection_id": "remote",
-                                     "sql": "SELECT q.site_row_fn, q.full_name FROM (TABLE customers) q"})
-    _assert_no_secret(env)
-    assert "Jane" in json.dumps(env["data"]["rows"]) and fake.calls == [("app", "customers")]
+    for sql in ("SELECT q.site_row_fn, q.full_name FROM (TABLE customers) q",
+                "SELECT q.full_name FROM (TABLE customers) q"):
+        assert _refused_or_clean(server, {"connection_id": "remote", "sql": sql}) is not None, sql
 
 
 def test_a_cte_named_like_a_table_is_not_looked_up(tmp_path: Path, monkeypatch: Any) -> None:
-    """The walk knows a CTE's columns: no catalog lookup is spent on it."""
+    """The analysis knows a CTE's columns: no catalog lookup is spent on it."""
     fake = _PgRowFake()
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=["app"], deny=True)
     _call(server, "db_query", {"connection_id": "remote",
@@ -3330,12 +3375,13 @@ def test_a_cte_named_like_a_table_is_not_looked_up(tmp_path: Path, monkeypatch: 
         ("WITH x AS (SELECT * FROM customers) SELECT x.full_name FROM x", set()),
         ("WITH x AS (SELECT * FROM customers) SELECT x.site_row_fn FROM x", {0}),
         ("SELECT x.site_row_fn FROM (SELECT * FROM (SELECT * FROM customers) y) x", {0}),
-        ("SELECT q.full_name FROM (TABLE customers) q", set()),
+        ("SELECT q.full_name FROM (TABLE customers) q", {0}),  # (TABLE t) q: refused
         ("SELECT q.site_row_fn FROM (TABLE customers) q", {0}),
         # an explicit column beside the star is still a column
         ("SELECT x.extra FROM (SELECT *, 1 AS extra FROM customers) x", set()),
         # USING merges columns, and their names are still the table's
-        ("SELECT x.full_name FROM (SELECT * FROM customers JOIN customers c USING (customer_id)) x", set()),
+        # a star over USING: its layout is the engine's (refused)
+        ("SELECT x.full_name FROM (SELECT * FROM customers JOIN customers c USING (customer_id)) x", {0}),
         ("SELECT x.site_row_fn FROM (SELECT * FROM customers JOIN customers c USING (customer_id)) x", {0}),
     ],
 )
@@ -3343,15 +3389,15 @@ def test_a_star_over_a_base_table_hands_its_row_on(demo_policy: Any, sql: str, e
     policy = _pg_policy(demo_policy)
     ast = sqlglot.parse_one(sql, read="postgres")
     known = _known_columns(ast, {"customer_id", "full_name", "ssn"})
-    assert srv._query_mask_positions(policy, ast, [("c0", "t")], None, known) == expected
+    assert _width_mask(policy, ast, 1, known) == expected
 
 
 def test_without_the_tables_columns_a_star_leaves_only_the_known_row_functions(demo_policy: Any) -> None:
     policy = _pg_policy(demo_policy)
-    for sql, expected in (("SELECT x.site_row_fn FROM (SELECT * FROM customers) x", set()),
+    for sql, expected in (("SELECT x.site_row_fn FROM (SELECT * FROM customers) x", {0}),
                           ("SELECT x.row_to_json FROM (SELECT * FROM customers) x", {0})):
         ast = sqlglot.parse_one(sql, read="postgres")
-        assert srv._query_mask_positions(policy, ast, [("c0", "t")]) == expected, sql
+        assert _width_mask(policy, ast, 1) == expected, sql
 
 
 def test_a_keyless_row_is_never_shown_with_another_rows_values(tmp_path: Path) -> None:
@@ -3650,9 +3696,9 @@ def test_sqlite_a_cte_naming_a_later_one_reads_but_is_masked_whole(tmp_path: Pat
         tmp_path, {"shop": _CATALOG_SCRIPT}, security=f"  default_deny_objects: {str(deny).lower()}\n"
     )
     sql = "WITH a AS (SELECT id FROM b), b AS (SELECT id FROM users) SELECT id FROM a"
-    env = _call(server, "db_query", {"connection_id": "shop", "sql": sql})
-    assert env["data"]["rows"] == [["<masked>"]], env
-    assert any("could not all be traced" in w for w in env["warnings"]), env["warnings"]
+    # a reference to a later CTE binds differently per engine: refused (was: masked whole)
+    text = _refused_or_clean(server, {"connection_id": "shop", "sql": sql})
+    assert text is not None and "declared after it" in text, text
 
 
 class _StatementFake(_FakeConnector):
@@ -3841,7 +3887,8 @@ class _AnswerFake(_FakeConnector):
     def __init__(self, columns: list[str], row: list[Any], engine: str = "postgres") -> None:
         if engine in ("oracle", "db2"):
             super().__init__([TableSummary("APP", "CUSTOMERS", "table")],
-                             columns=[dataclasses.replace(c, schema="APP", table="CUSTOMERS") for c in _PG_CUSTOMERS])
+                             columns=[dataclasses.replace(c, schema="APP", table="CUSTOMERS", name=c.name.upper())
+                                      for c in _PG_CUSTOMERS])
         else:
             super().__init__([TableSummary("app", "customers", "table")], columns=_PG_CUSTOMERS)
         self.answer = QueryOutcome(columns=[(c, "text") for c in columns], rows=[row], truncated=False, rows_seen=1,
@@ -3879,8 +3926,7 @@ def test_a_from_item_the_engine_binds_otherwise_is_masked(
 ) -> None:
     fake = _AnswerFake(columns, row, engine)
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine=engine, allowed=[], deny=True)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    _assert_no_secret(env)
+    _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
 
 
 @pytest.mark.parametrize(("engine", "sql"), [
@@ -3919,9 +3965,9 @@ def test_a_cte_the_walk_cannot_bind_like_the_engine_is_masked_whole(
     and every column is masked (fail closed)."""
     fake = _AnswerFake(["a"], ["Jane"], engine)
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine=engine, allowed=[], deny=True)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    assert env["data"]["rows"] == [["<masked>"]], env
-    assert any("could not all be traced" in w for w in env["warnings"]), env["warnings"]
+    # refused before it runs (owner decision, 2026-10-03; was: masked whole)
+    text = _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
+    assert text is not None, sql
 
 
 _RECURSIVE_SCRIPT = (
@@ -3995,29 +4041,24 @@ def test_a_bare_table_the_listing_does_not_name_is_masked(
 ) -> None:
     """The reviewer's live case: a partitioned parent (relkind p, never
     listed), a foreign table (not among the listed kinds) or a table created
-    after the listing was cached (None)."""
+    after the listing was cached (None): refused, never run."""
     fake = _PgRowFake()
     fake.tables = [] if kind is None else [TableSummary("app", "customers", kind)]
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=False,
                                  security=security)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    _assert_no_secret(env)
-    assert "Jane" not in json.dumps(env["data"]["rows"]), "fail closed: no name is proven a column"
-    assert any("'customers'" in w and "catalog listing" in w and "schema" in w for w in env["warnings"]), \
-        env["warnings"]
-    assert fake.calls == []
+    assert _refused_or_clean(server, {"connection_id": "remote", "sql": sql}) is not None
+    assert fake.statements == []
 
 
 def test_a_qualified_name_the_listing_does_not_name_keeps_its_columns(tmp_path: Path, monkeypatch: Any) -> None:
-    """The remedy the warning names: the schema-qualified name's columns are
-    read, so its real columns stay readable and the site function is masked."""
+    """A partitioned parent the listing leaves out: its columns are read
+    from the catalog under the name the statement writes, so its real
+    columns stay readable."""
     fake = _PgRowFake()
     fake.tables = [TableSummary("app", "customers", "partitioned_table")]
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=False)
-    env = _call(server, "db_query", {"connection_id": "remote",
-                                     "sql": "SELECT b.site_row_fn, b.full_name FROM app.customers b"})
-    _assert_no_secret(env)
-    assert env["data"]["rows"] == [["<masked>", "Jane"]] and fake.calls == [("app", "customers")]
+    env = _call(server, "db_query", {"connection_id": "remote", "sql": _TWO_COLUMNS})
+    assert env["data"]["rows"][0][1] == "Jane" and fake.calls == [("app", "customers")]
 
 
 @pytest.mark.parametrize("qualified", [False, True])
@@ -4046,8 +4087,7 @@ def test_the_listing_is_read_once_per_statement(
             f"SELECT b{i}.site_row_fn, b{i}.full_name FROM {'app.' if qualified else ''}{t} b{i}"
             for i, t in enumerate(tables)
         )
-        env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-        _assert_no_secret(env)
+        _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
         seen.append(calls["n"])
     assert seen[0] == seen[1], seen
     assert fake.calls[0] == ("app", "customers") and len(fake.calls) == len(set(fake.calls))
@@ -4064,11 +4104,10 @@ def test_a_table_whose_columns_cannot_be_read_is_asked_once_per_statement(tmp_pa
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=True)
     for table in ("customers", "app.customers"):
         fake.calls.clear()
-        sql = " UNION ALL ".join(f"SELECT b{i}.site_row_fn, b{i}.full_name FROM {table} b{i}" for i in range(40))
-        env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-        assert env["data"]["rows"] == [["<masked>", "<masked>"]], table
+        sql = " UNION ALL ".join(f"SELECT b{i}.full_name FROM {table} b{i}" for i in range(40))
+        text = _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
+        assert text is not None and "columns of 'customers' are not known" in text, text
         assert fake.calls == [("app", "customers")], table
-        assert len([w for w in env["warnings"] if "could not be read" in w]) == 1, env["warnings"]
 
 
 class _TwoSchemaFake(_PgRowFake):
@@ -4087,34 +4126,41 @@ class _TwoSchemaFake(_PgRowFake):
 
 
 def test_a_bare_name_in_two_schemas_is_a_column_only_in_both(tmp_path: Path, monkeypatch: Any) -> None:
-    """search_path may bind customers to app.customers, where site_row_fn is a
-    site function over the row, although app2.customers has such a column."""
+    """A bare name the listing holds in two schemas, where the session's
+    lookup is not known: which table it reads is the engine's call, so the
+    statement is refused (qualify it)."""
     fake = _TwoSchemaFake()
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=False)
-    env = _call(server, "db_query", {"connection_id": "remote",
-                                     "sql": "SELECT b.site_row_fn, b.full_name FROM customers b"})
-    _assert_no_secret(env)
-    assert env["data"]["rows"] == [["<masked>", "Jane"]]
-    assert sorted(fake.calls) == [("app", "customers"), ("app2", "customers")]
+    text = _refused_or_clean(server, {"connection_id": "remote", "sql": "SELECT b.full_name FROM customers b"})
+    assert text is not None and "several listed tables" in text, text
+    env = _call(server, "db_query", {"connection_id": "remote", "sql": _TWO_COLUMNS})
+    assert env["data"]["rows"][0][1] == "Jane"
 
 
 def test_a_cached_column_list_expires(tmp_path: Path, monkeypatch: Any) -> None:
     """A column dropped (and a site function of its name created) after the
-    table's columns were read: past _ROW_COLUMNS_TTL they are read again."""
+    table's columns were read: past _COLUMNS_TTL they are read again."""
     fake = _PgRowFake()
     server, app = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=["app"], deny=True)
-    stale = frozenset({"customer_id", "full_name", "ssn", "site_row_fn"})
+    stale = ("customer_id", "full_name", "ssn", "site_row_fn")
     key = ("remote", "app", "customers")
     sql = "SELECT b.site_row_fn, b.full_name FROM app.customers b"
-    app.row_columns[key] = (time.monotonic() - srv._ROW_COLUMNS_TTL / 2, stale)
+    app.row_columns[key] = (time.monotonic() - srv._COLUMNS_TTL / 2, stale)
     env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
     assert fake.calls == [] and SECRETS[0] in json.dumps(env), "a fresh entry is used as it is"
-    app.row_columns[key] = (time.monotonic() - srv._ROW_COLUMNS_TTL - 1, stale)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    _assert_no_secret(env)
-    assert fake.calls == [("app", "customers")] and app.row_columns[key][1] == frozenset(
-        {"customer_id", "full_name", "ssn"}
-    )
+    app.row_columns[key] = (time.monotonic() - srv._COLUMNS_TTL - 1, stale)
+    assert _refused_or_clean(server, {"connection_id": "remote", "sql": sql}) is not None
+    assert fake.calls == [("app", "customers")] and app.row_columns[key][1] == ("customer_id", "full_name", "ssn")
+
+
+def test_the_column_cache_is_bounded_by_the_names_it_holds(tmp_path: Path, monkeypatch: Any) -> None:
+    fake = _PgRowFake()
+    server, app = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=["app"], deny=True)
+    monkeypatch.setattr(srv, "_COLUMNS_CAP_NAMES", 5)
+    app.row_columns[("remote", "app", "other")] = (time.monotonic(), ("a", "b", "c"))
+    app._row_column_names = 3
+    _call(server, "db_query", {"connection_id": "remote", "sql": _TWO_COLUMNS})
+    assert list(app.row_columns) == [("remote", "app", "customers")] and app._row_column_names == 3
 
 
 class _MatviewFake(_PgRowFake):
@@ -4133,6 +4179,7 @@ class _MatviewFake(_PgRowFake):
 @pytest.mark.parametrize("security", ["", "  mask_action: omit\n"])
 @pytest.mark.parametrize(("sql", "allowed"), [
     ("SELECT b.site_row_fn, b.full_name FROM app.customers b", ["app"]),
+    ("SELECT b.full_name FROM app.customers b", ["app"]),
     # a bare name is refused under an allowlist (owner decision 2026-09-27)
     ("SELECT b.site_row_fn, b.full_name FROM customers b", []),
     ("SELECT x.site_row_fn, x.full_name FROM (SELECT * FROM app.customers) x", ["app"]),
@@ -4142,30 +4189,24 @@ def test_a_relation_the_catalog_lists_no_columns_of_is_masked(
 ) -> None:
     """Live on PostgreSQL 17: a site function over a materialized view's row
     (information_schema does not list its columns) returned the masked value
-    in every configuration, default-deny with a schema allowlist included."""
+    in every configuration. Its columns are not known: refused."""
     fake = _MatviewFake()
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=allowed, deny=True,
                                  security=security)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    _assert_no_secret(env)
-    assert "Jane" not in json.dumps(env["data"]["rows"]), "fail closed: no name is proven a column"
-    assert any("'customers'" in w and "lists no columns" in w and "qualifier" in w for w in env["warnings"]), \
-        env["warnings"]
+    text = _refused_or_clean(server, {"connection_id": "remote", "sql": sql})
+    assert text is not None and "columns of 'customers' are not known" in text, text
 
 
 def test_a_bare_name_that_may_bind_to_a_relation_without_listed_columns_is_masked(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """customers is a table in app and a materialized view in app2: search_path
-    may bind the bare name to the one whose columns are unknown."""
+    """customers is a table in app and a materialized view in app2: the bare
+    name may bind to either - refused."""
     fake = _TwoSchemaFake()
     fake.tables[1] = TableSummary("app2", "customers", "materialized_view")
     fake.columns = list(_PG_CUSTOMERS)
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="postgres", allowed=[], deny=False)
-    env = _call(server, "db_query", {"connection_id": "remote",
-                                     "sql": "SELECT b.site_row_fn, b.full_name FROM customers b"})
-    _assert_no_secret(env)
-    assert env["data"]["rows"] == [["<masked>", "<masked>"]]
+    assert _refused_or_clean(server, {"connection_id": "remote", "sql": "SELECT b.full_name FROM customers b"})
 
 
 @pytest.mark.parametrize("keyed", [True, False])

@@ -20,7 +20,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -109,11 +109,17 @@ _MODULE_SHADOWS: dict[str, frozenset[str]] = {
 }
 # SQLite stores a virtual table's definition as "CREATE VIRTUAL TABLE "
 # followed by the statement as written from the table's name on (no IF NOT
-# EXISTS, no schema). Each name alternative is an unrolled loop, linear on
-# any input; the match reads at most the first _MODULE_SCAN characters.
+# EXISTS, no schema), comments included; they are blanked first
+# (_without_comments). A quoted name or module needs no space next to USING
+# ('"posts"USING', 'USING"fts5"'). Each name alternative is an unrolled loop,
+# linear on any input; the match reads at most the first _MODULE_SCAN
+# characters.
 _NAME = r"""(?:"[^"]*(?:""[^"]*)*"|\[[^\]]*\]|`[^`]*(?:``[^`]*)*`|'[^']*(?:''[^']*)*'|[^\s."'`\[(]+)"""
+_AFTER_NAME = r"""(?:\s+|(?<=["\]`'])\s*)"""
+_BEFORE_NAME = r"""(?:\s+|\s*(?=["\[`']))"""
 _VTAB_MODULE = re.compile(
-    rf"CREATE\s+VIRTUAL\s+TABLE\s+(?:{_NAME}\s*\.\s*)?{_NAME}\s+USING\s+({_NAME})", re.IGNORECASE
+    rf"CREATE\s+VIRTUAL\s+TABLE\s+(?:{_NAME}\s*\.\s*)?{_NAME}{_AFTER_NAME}USING{_BEFORE_NAME}({_NAME})",
+    re.IGNORECASE,
 )
 _MODULE_SCAN = 4096
 
@@ -126,13 +132,47 @@ def _fold(name: str) -> str:
     return name.translate(_ASCII_LOWER)
 
 
+def _without_comments(text: str) -> str:
+    """``text`` with each SQL comment ('--' to the end of its line, '/* */')
+    replaced by one space, outside quoted names and strings. One pass:
+    linear on any input."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'`[":
+            close = "]" if ch == "[" else ch
+            end = text.find(close, i + 1)
+            # a doubled quote inside a quoted name or string is two quoted runs
+            end = n if end < 0 else end + 1
+            out.append(text[i:end])
+            i = end
+        elif text.startswith("--", i):
+            end = text.find("\n", i)
+            out.append(" ")
+            i = n if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            out.append(" ")
+            i = n if end < 0 else end + 2
+        else:
+            j = i
+            while j < n and text[j] not in "\"'`[-/":
+                j += 1
+            if j == i:
+                j += 1
+            out.append(text[i:j])
+            i = j
+    return "".join(out)
+
+
 def _module_of(sql: str | None) -> str | None:
     """The module of a virtual table's stored definition, lowercased; ''
-    for one this cannot read (a comment between its words); None for a
-    definition that is not a virtual table's."""
+    for one this cannot read; None for a definition that is not a virtual
+    table's."""
     if not sql or not sql[:21].upper().startswith("CREATE VIRTUAL TABLE"):
         return None
-    found = _VTAB_MODULE.match(sql[:_MODULE_SCAN])
+    found = _VTAB_MODULE.match(_without_comments(sql[:_MODULE_SCAN]))
     if found is None:
         return ""
     module = found.group(1)
@@ -154,15 +194,47 @@ def _unmarked_shadow(name: str, owner_module: str | None, registered: frozenset[
     return known is None or _fold(name).rpartition("_")[2] in known
 
 
-def _table_references(sql: str) -> set[tuple[str | None, str]] | None:
-    """The (schema, name) of every table the statement reads, as SQLite
-    reads a name: a FROM or JOIN item (a quoted string included: FROM 't'),
-    a subquery's, and the table of ``x IN table``. An alias, a column or a
-    literal is no table. None when the statement cannot be parsed."""
+def _parsed(sql: str) -> list[exp.Expr | None] | None:
+    """The statement's parse; None when sqlglot cannot read it."""
     try:
-        trees = sqlglot.parse(sql, read="sqlite")
+        return list(sqlglot.parse(sql, read="sqlite"))
     except Exception:  # noqa: BLE001 - sqlglot's ParseError/TokenError, and whatever else a parser raises
         return None
+
+
+def _name_text(node: exp.Expression) -> str | None:
+    """The name a part of ``x IN <schema>.<table>`` spells: an identifier,
+    or a string, which SQLite reads as a name there."""
+    if isinstance(node, exp.Identifier) or (isinstance(node, exp.Literal) and node.is_string):
+        return str(node.this)
+    return None
+
+
+def _in_table(field: exp.Expression) -> tuple[str | None, str] | None:
+    """The (schema, name) of the table ``x IN <field>`` reads: 't', "t",
+    [t], t, main.'t', 'main'.'t'; None for anything else (a table-valued
+    function's call)."""
+    if isinstance(field, exp.Literal) and field.is_string:
+        return None, str(field.this)
+    if isinstance(field, exp.Column) and (name := _name_text(field.this)) is not None:
+        schema = field.args.get("table")
+        return (_name_text(schema) if schema is not None else None), name
+    if isinstance(field, exp.Table) and field.name:
+        return field.db or None, field.name
+    if isinstance(field, exp.Dot):
+        schema, name = _name_text(field.this), _name_text(field.expression)
+        if schema is not None and name is not None:
+            return schema, name
+    return None
+
+
+def _table_references(trees: list[exp.Expr | None]) -> set[tuple[str | None, str]] | None:
+    """The (schema, name) of every table the statement (``trees``, its
+    parse) reads, as SQLite reads a name: a FROM or JOIN item (a quoted
+    string included: FROM 't'), a subquery's, and the table of ``x IN
+    table`` (a string too: x IN 't'). An alias, a column or a literal is no
+    table. None when the right side of an IN is neither a list, a subquery,
+    a table nor a table-valued function."""
     out: set[tuple[str | None, str]] = set()
     for tree in trees:
         if tree is None:
@@ -172,9 +244,12 @@ def _table_references(sql: str) -> set[tuple[str | None, str]] | None:
                 out.add((table.db or None, table.name))
         for test in tree.find_all(exp.In):
             field = test.args.get("field")
-            if isinstance(field, (exp.Column, exp.Table)) and field.name:
-                schema = field.table if isinstance(field, exp.Column) else field.db
-                out.add((schema or None, field.name))
+            if field is None or isinstance(field, (exp.Anonymous, exp.Func)):
+                continue
+            found = _in_table(field)
+            if found is None:
+                return None
+            out.add(found)
     return out
 
 
@@ -188,17 +263,13 @@ _SQLITE_MAX_LENGTH = 1_000_000_000
 # is SQLite too: writing and reading back its largest entry (64 MiB of JSON)
 # takes about 160 MiB of it, and a 64 MiB limit failed every other
 # connection's large catalog listing (review round 5). Output values are cut
-# inside SQLite (_CUT_FUNCTION), so this only bounds what that cannot reach:
-# a sort, group or DISTINCT over long values, a wide row inside a subquery.
+# inside SQLite (_sql_cut, so a row or a sort holds cut values; live, review
+# round 4: 16 columns of one 8 MiB value grew the server by 327 MB, ORDER BY
+# over 30 rows of 4 MiB by 194 MB), so this only bounds what that cannot
+# reach: a sort, group or DISTINCT over long values, a wide row inside a
+# subquery.
 _HEAP_LIMIT_VALUES = 32
 _heap_limit_enforced: bool | None = None  # this SQLite library counts its heap (decided once)
-# The SQL function that cuts each output value where SQLite computes it, so
-# a row or a sort holds cut values (live, review round 4: 16 columns of one
-# 8 MiB value grew the server by 327 MB, ORDER BY over 30 rows of 4 MiB by
-# 194 MB). CPython reports any failure of such a function, its arguments'
-# conversion included (text that is not UTF-8), in these words.
-_CUT_FUNCTION = "udbmcp_cut"
-_CUT_FAILED = "user-defined function raised exception"
 # How often a cancelled connector interrupts its open handles again until
 # they close: Connection.interrupt() reaches only a statement already
 # running, and SQLite forgets it when a statement starts on an idle handle.
@@ -237,16 +308,25 @@ def _heap_limit_takes(conn: sqlite3.Connection) -> bool:
     return _heap_limit_enforced
 
 
-def _value_cut(keep: int) -> Callable[[Any], Any]:
-    """The _CUT_FUNCTION: a text or blob value cut to ``keep`` characters
-    or bytes, any other value as it is (an integer stays an integer)."""
+def _sql_cut(expression: str, keep: int) -> str:
+    """``expression`` cut in SQL to ``keep`` characters (text) or bytes (a
+    blob); any other value as it is (an integer stays an integer). A Python
+    function here took the GIL once per input row of a sort (13-20x slower
+    next to a busy thread, review round 3); this runs in C. substr()'s
+    bounds are not constants ('random() & 0' is always 0): SQLite gives a
+    function call with a constant argument registers of its own that it never
+    reuses, so each output column kept its whole value until the statement
+    ended (64 columns of an 8 MiB value: 586 MB, against 80 MB this way)."""
+    zero = "(random() & 0)"
+    cut = f"substr({expression}, {zero} + 1, {zero} + {keep})"
+    return f"CASE typeof({expression}) WHEN 'text' THEN {cut} WHEN 'blob' THEN {cut} ELSE {expression} END"
 
-    def cut(value: Any) -> Any:
-        if isinstance(value, (str, bytes)) and len(value) > keep:
-            return value[:keep]
-        return value
 
-    return cut
+def _spellings(name: str) -> set[str]:
+    """``name`` (folded) as a statement may spell it inside quotes: as is,
+    and with the quote character of a quoted name or string doubled (a
+    virtual table named customer's notes is read from 'customer''s notes')."""
+    return {name} | {name.replace(q, q + q) for q in "\"'`" if q in name}
 
 
 def _describe_probe(select: SelectList) -> str | None:
@@ -1023,24 +1103,14 @@ class SQLiteConnector(DatabaseConnector):
                 "the statement", ": sort, group or compare shorter values (substr() cuts a long one), or fewer rows"
             ), self._length_refusals(conn):
                 self._stop_if_cancelled()
-                self._refuse_shadow_tables(conn, spec.sql)
-                conn.create_function(_CUT_FUNCTION, 1, _value_cut(spec.max_cell_bytes + 1), deterministic=True)
-                capped = self._value_capped(conn, spec.sql, parameters)
+                trees = self._refuse_shadow_tables(conn, spec.sql)
+                capped = self._value_capped(conn, spec.sql, parameters, spec.max_cell_bytes, trees)
                 self._stop_if_cancelled()
-                try:
-                    return self._stream(conn, capped or spec.sql, parameters, spec, start)
-                except sqlite3.OperationalError as exc:
-                    if capped is None or str(exc) != _CUT_FAILED:
-                        raise
-                # The cut could not take a value (text that is not UTF-8
-                # reaches no Python function), perhaps in a row the statement
-                # then leaves out: the statement as written decides.
-                self._stop_if_cancelled()
-                return self._stream(conn, spec.sql, parameters, spec, start)
+                return self._stream(conn, capped or spec.sql, parameters, spec, start)
         finally:
             self._close(conn)
 
-    def _refuse_shadow_tables(self, conn: sqlite3.Connection, sql: str) -> None:
+    def _refuse_shadow_tables(self, conn: sqlite3.Connection, sql: str) -> list[exp.Expr | None] | None:
         """Refuse a statement that reads an internal table of a full-text or
         R*Tree index: it holds the indexed values under generic names (c0,
         c1ssn), so masking by column name would not apply. The engine's own
@@ -1049,14 +1119,18 @@ class SQLiteConnector(DatabaseConnector):
         reads counts, not a literal, alias or column of that name; a
         statement that cannot be parsed has every word of its read as one.
         Nothing to look for, and no parse, without a virtual table whose
-        name, then "_", the statement's text contains."""
+        name, then "_", the statement's text contains, under any quoting
+        (_spellings). Returns the statement's parse when it made one."""
         vtabs = self._virtual_tables(conn)
         if not vtabs:
-            return
+            return None
         lowered = _fold(sql)
-        if len(vtabs) <= _VTAB_PREFILTER and not any(f"{name}_" in lowered for name in vtabs):
-            return
-        references = _table_references(sql)
+        if len(vtabs) <= _VTAB_PREFILTER and not any(
+            f"{spelled}_" in lowered for name in vtabs for spelled in _spellings(name)
+        ):
+            return None
+        trees = _parsed(sql)
+        references = _table_references(trees) if trees is not None else None
         if references is None:
             try:
                 tokens = sqlglot.Dialect.get_or_raise("sqlite").tokenize(sql)
@@ -1077,16 +1151,32 @@ class SQLiteConnector(DatabaseConnector):
                 "outside the column names masking applies to; query the index's own table instead",
                 category=ErrorCategory.QUERY,
             )
+        return trees
 
-    def _value_capped(self, conn: sqlite3.Connection, sql: str, parameters: Any) -> str | None:
-        """The statement with each output column cut by _CUT_FUNCTION where
-        SQLite computes it, under the name the statement gives it (masking by
-        name still applies), so a row, and the rows a sort holds, carry cut
-        values; None when that cannot be exact: a statement that is not one SELECT
-        (a UNION, VALUES), a DISTINCT, a LIMIT with a parameter, a star over
-        a join. An output the statement compares keeps its whole value."""
-        select = SelectList.locate(statement_body(sql, "sqlite"), "sqlite")
+    def _value_capped(
+        self,
+        conn: sqlite3.Connection,
+        sql: str,
+        parameters: Any,
+        max_cell_bytes: int,
+        trees: list[exp.Expr | None] | None = None,
+    ) -> str | None:
+        """The statement with each output column cut where SQLite computes
+        it (_sql_cut, in SQL: no Python call per row), under the name the
+        statement gives it (masking by name still applies), so a row, and the
+        rows a sort holds, carry cut values; None when that cannot be exact:
+        a statement that is not one SELECT (a UNION, VALUES), a DISTINCT, a
+        LIMIT with a parameter, a star over a join, a select list with a
+        '?' parameter (the cut repeats its expression, which would number
+        the parameters after it anew). An output the statement compares
+        keeps its whole value. ``trees`` is the statement's parse, when
+        _refuse_shadow_tables made one."""
+        parsed = [t for t in trees or () if t is not None]
+        tree = parsed[0] if len(parsed) == 1 else None
+        select = SelectList.locate(statement_body(sql, "sqlite"), "sqlite", tree=tree)
         if select is None or select.tree.args.get("distinct") or (probe := _describe_probe(select)) is None:
+            return None
+        if any(p.this is None for e in select.tree.expressions for p in e.find_all(exp.Placeholder)):
             return None
         try:
             names = [str(d[0]) for d in conn.execute(probe, parameters).description or []]
@@ -1095,7 +1185,8 @@ class SQLiteConnector(DatabaseConnector):
         cut = set(range(len(names))) - _compared_outputs(select.tree, names)
         if not cut:
             return None
-        return select.rewrite(names, cut, lambda text: f"{_CUT_FUNCTION}({text})", self._quote)
+        keep = max_cell_bytes + 1
+        return select.rewrite(names, cut, lambda text: _sql_cut(text, keep), self._quote)
 
     def _stream(
         self, conn: sqlite3.Connection, sql: str, parameters: Any, spec: QuerySpec, start: float

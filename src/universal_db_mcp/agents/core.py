@@ -891,31 +891,38 @@ def read_config_bytes(path: Path) -> bytes:
     read themselves (``OSError`` otherwise).
 
     Without root this is ``path.read_bytes()``. As root (``sudo
-    configure-agents``) the checks of :func:`refuse_foreign_read` run first,
-    then the file is opened by its resolved path without following a link
-    swapped in since, and what was opened is checked on the descriptor: it
-    must be the file the checks saw, and, in a directory a user owns, either
-    that user's or one its permission bits let that user read. A hard link
-    the user made to a root-only file whose original name was later replaced
-    by a rename has one link left and passed the link count check.
+    configure-agents``) the checks of :func:`refuse_foreign_read` run first
+    (for their messages); then the path is opened one component at a time
+    from the root directory's descriptor (:func:`_open_walking`), never by
+    name: each directory is opened without following a link, a symlink met
+    on the way is resolved by this walk, and one a user owns must lead to
+    something that user owns. So a directory swapped for a link after the
+    checks (a race the user can run in their own home) is either refused or
+    walked under the same rule, and nothing is re-resolved by name. What was
+    opened is checked on the descriptors: a regular file which, in a
+    directory a user owns, is that user's or one its permission bits let
+    that user read, and which has one name unless the directory's owner owns
+    it (a hard link the user made to a root-only file).
     """
     if sys.platform == "win32" or os.geteuid() != 0:
         return path.read_bytes()
     refuse_foreign_read(path)
-    real = os.path.realpath(path)
-    seen = os.stat(real)
-    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    directory_fd, fd = _open_walking(os.path.abspath(path))
     try:
         st = os.fstat(fd)
-        if (st.st_dev, st.st_ino) != (seen.st_dev, seen.st_ino):
-            raise OSError(f"{real} was replaced while it was being read; re-run")
         if not stat.S_ISREG(st.st_mode):
-            raise OSError(f"{real} is not a regular file")
-        directory = os.stat(os.path.dirname(real))
+            raise OSError(f"{path} is not a regular file")
+        directory = os.fstat(directory_fd)
         owner = directory.st_uid
+        if st.st_nlink > 1 and st.st_uid != owner:
+            raise PermissionError(
+                f"{path} has {st.st_nlink} hard links and belongs to uid {st.st_uid}, not to the owner of "
+                f"its directory (uid {owner}), and as root this tool does not read it; run configure-agents "
+                "as that user (without sudo), or replace the link with the file"
+            )
         if owner != 0 and st.st_uid != owner and not _bits_allow(st, owner, directory.st_gid, 4):
             raise PermissionError(
-                f"{real} belongs to uid {st.st_uid} and the owner of its directory (uid {owner}) may not "
+                f"{path} belongs to uid {st.st_uid} and the owner of its directory (uid {owner}) may not "
                 "read it, and as root this tool does not read it for them; run configure-agents as that "
                 "user (without sudo), or give them the file (chown)"
             )
@@ -925,6 +932,82 @@ def read_config_bytes(path: Path) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(fd)
+        os.close(directory_fd)
+
+
+# A marker among the components _open_walking still has to walk: once the
+# components of a link's target are walked, what they reached must belong to
+# the link's owner (the uid it carries).
+class _OwnedBy(int):
+    pass
+
+
+def _open_walking(absolute: str) -> tuple[int, int]:
+    """(descriptor of the directory holding it, descriptor of it) for the
+    absolute path *absolute*, opened component by component from ``/`` with
+    O_NOFOLLOW relative to the directory opened before: nothing is resolved
+    by name twice, so no component can be swapped between a check and the
+    open. A symlink is read where it is (readlink relative to its
+    directory's descriptor) and its target walked the same way; one a user
+    (not root) owns must lead to something that user owns. At most
+    _MAX_LINKS links are followed (ELOOP past that)."""
+    nofollow = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    stack = [os.open("/", os.O_RDONLY | os.O_DIRECTORY)]
+    pending: list[str | _OwnedBy] = list(reversed(absolute.split("/")))
+    links = 0
+    try:
+        while pending:
+            part = pending.pop()
+            if isinstance(part, _OwnedBy):
+                reached = os.fstat(stack[-1])
+                if reached.st_uid != part:
+                    raise PermissionError(
+                        f"{absolute} goes through a symlink owned by uid {int(part)} that leads to something "
+                        f"uid {reached.st_uid} owns, and as root this tool does not read through it; run "
+                        "configure-agents as that user (without sudo), or replace the link with the file"
+                    )
+                continue
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if len(stack) > 1:
+                    os.close(stack.pop())
+                continue
+            if not stat.S_ISDIR(os.fstat(stack[-1]).st_mode):
+                raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), absolute)
+            try:
+                stack.append(os.open(part, nofollow, dir_fd=stack[-1]))
+                continue
+            except OSError as exc:
+                if exc.errno != errno.ELOOP:
+                    raise
+            link = os.stat(part, dir_fd=stack[-1], follow_symlinks=False)
+            if not stat.S_ISLNK(link.st_mode):
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), absolute)
+            target = os.readlink(part, dir_fd=stack[-1])
+            again = os.stat(part, dir_fd=stack[-1], follow_symlinks=False)
+            if (again.st_ino, again.st_uid) != (link.st_ino, link.st_uid):
+                raise OSError(f"{absolute} changed while it was being read; re-run")
+            links += 1
+            if links > _MAX_LINKS:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), absolute)
+            if link.st_uid != 0:
+                pending.append(_OwnedBy(link.st_uid))
+            pending.extend(reversed(target.split("/")))
+            if target.startswith("/"):
+                while len(stack) > 1:
+                    os.close(stack.pop())
+        if len(stack) < 2:
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), absolute)
+        fd = stack.pop()
+        return stack.pop(), fd
+    finally:
+        for leftover in stack:
+            os.close(leftover)
+
+
+# links followed on the way to a file (the kernel's own limit, MAXSYMLINKS)
+_MAX_LINKS = 40
 
 
 def read_config_text(path: Path) -> str:
@@ -1565,18 +1648,20 @@ def _windows_token_is_elevated() -> bool:
 
 
 def ensure_per_user_harness_config(
-    env: Mapping[str, str], home: Path
+    env: Mapping[str, str], home: Path, *, named: bool = False
 ) -> tuple[Path | None, str]:
     """Seed the per-user harness config when the advertised path needs it.
 
     Only-if-absent: an existing per-user config is never clobbered. Returns
     ``(created_path, note)``; ``created_path`` is None when the advertised
     config needs no seeding (explicit env override, readable system
-    deployment, or the per-user file already exists).
+    deployment, or the per-user file already exists). With ``named`` the
+    caller has read an existing registration that names the per-user config,
+    which is then seeded whatever this environment would advertise.
     """
     advertised = resolve_harness_config_path(env, home, for_harness=True)
     per_user = Path(os.path.abspath(home / PER_USER_CONFIG_DIR / "config.yaml"))
-    if advertised != str(per_user):
+    if not named and advertised != str(per_user):
         return None, f"advertised config needs no seeding ({advertised})"
     present = (None, "per-user config already present (left untouched)")
     if per_user.is_file():

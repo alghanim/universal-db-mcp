@@ -123,6 +123,14 @@ _CH_READING_SETTINGS = {
     "enable_global_with_statement": "1",
     "analyzer_compatibility_join_using_top_level_identifier": "0",
 }
+# The memory one statement may use on the server, sent with every request
+# (max_memory_usage) wherever the account's profile accepts settings: without
+# it a guard-accepted sort over system.numbers grew until the kernel killed the
+# server (review round 3). options.max_memory_usage sets another value; a
+# profile that sets a lower one keeps it. A readonly=1 profile refuses every
+# setting, so its own limit has to be set on the account (doctor checks).
+DEFAULT_MAX_MEMORY_USAGE = 2 * 1024 * 1024 * 1024
+_MEMORY_LIMIT_EXCEEDED = 241  # ClickHouse error code (MEMORY_LIMIT_EXCEEDED)
 # The server's own databases (names are case-sensitive: both spellings exist).
 _CH_SYSTEM_DATABASES = ("system", "INFORMATION_SCHEMA", "information_schema")
 # clickhouse-connect sends a statement whose text ends in LIMIT 0 (its own
@@ -174,6 +182,30 @@ def _is_off(value: str) -> bool:
     return value.lower() in ("", "0", "false")
 
 
+def memory_limit_status(client: Any, cap: int) -> dict[str, Any]:
+    """How one statement's server memory is bounded on this account:
+    ``readonly`` (the profile's value), ``profile_limit`` (its own
+    max_memory_usage in bytes, 0 for none or one that cannot be read),
+    ``sent`` (the max_memory_usage to send, 0 for none) and ``why`` nothing
+    is sent."""
+    readonly = _server_setting(client, "readonly")[0]
+    current, changeable = _server_setting(client, "max_memory_usage")
+    try:
+        profile = int(current or 0)
+    except ValueError:
+        profile = 0  # not a plain byte count: no limit this can read
+    status: dict[str, Any] = {"readonly": readonly, "profile_limit": max(profile, 0), "sent": 0, "why": ""}
+    if readonly == "1":
+        status["why"] = "server profile readonly=1 rejects SET; only the account's own limit applies"
+    elif 0 < profile <= cap:
+        status["why"] = f"the account's profile sets max_memory_usage={profile}"
+    elif not changeable:
+        status["why"] = f"the account's profile pins max_memory_usage={current or 0} and does not allow changing it"
+    else:
+        status["sent"] = cap
+    return status
+
+
 def _server_error_code(exc: BaseException | None) -> int | None:
     """The ClickHouse error code of a driver exception: its ``code``
     attribute, else the 'code: N' text of the server response."""
@@ -198,6 +230,20 @@ def _statement_errors() -> Iterator[None]:
         if code is None:
             raise
         text = scrub_exception(exc)
+        if code == _MEMORY_LIMIT_EXCEEDED:
+            raise ConnectorError(
+                "the statement needed more memory on the server than this connection allows one query "
+                "(max_memory_usage; connections.<id>.options.max_memory_usage, or the account's profile, sets "
+                f"it): read fewer rows, or sort, group or join a smaller set ({text})",
+                category=ErrorCategory.LIMIT,
+            ) from exc
+        if code in _SETTING_REFUSED and "max_memory_usage" in text:
+            raise ConnectorError(
+                "the account's profile refuses the max_memory_usage this connection sends with every query: "
+                "set connections.<id>.options.max_memory_usage within the profile's constraint, or drop the "
+                f"constraint ({text})",
+                category=ErrorCategory.CONFIG,
+            ) from exc
         if code == _TIMEOUT_EXCEEDED:
             raise ConnectorError(
                 f"the statement exceeded its time limit and the database cancelled it ({text})",
@@ -629,17 +675,18 @@ class ClickHouseConnector(DatabaseConnector):
             settings["readonly"] = 1  # applied/skipped is decided against the server profile
         if prof.statement_timeout_seconds:
             settings["max_execution_time"] = int(math.ceil(prof.statement_timeout_seconds))
-            self._session_applied(f"max_execution_time={settings['max_execution_time']}s")
         return settings
 
     def _session_readback(self, client: Any) -> dict[str, Any]:
         try:
-            row = client.query("SELECT getSetting('readonly'), getSetting('max_execution_time')").result_rows
+            row = client.query(
+                "SELECT getSetting('readonly'), getSetting('max_execution_time'), getSetting('max_memory_usage')"
+            ).result_rows
         except Exception:  # noqa: BLE001 - reporting only
             return {}
-        if not row or len(row[0]) < 2:
+        if not row or len(row[0]) < 3:
             return {}
-        return {"readonly": str(row[0][0]), "max_execution_time": str(row[0][1])}
+        return {"readonly": str(row[0][0]), "max_execution_time": str(row[0][1]), "max_memory_usage": str(row[0][2])}
 
     def _shared_meta_client(self) -> Any:
         """Lock-guarded reusable metadata client with probe-on-checkout
@@ -721,6 +768,7 @@ class ClickHouseConnector(DatabaseConnector):
                 kw["client_cert_key"] = cfg.tls.client_key_file
         client = self._module.get_client(**kw)
         self._apply_session_settings(client, wanted)
+        self._apply_memory_cap(client)
         self._hold_reading_settings(client)
         if _StreamBudget.seam(client) is None:
             self._session_skipped(
@@ -758,6 +806,8 @@ class ClickHouseConnector(DatabaseConnector):
                 client.set_client_setting(name, value)
             except Exception as exc:  # noqa: BLE001 - reported, and fail-closed below
                 self._session_skipped(name, exc)
+            else:
+                self._session_applied(f"{name}={value}s" if name == "max_execution_time" else f"{name}={value}")
         if ro_value == "1":
             # The same refusal reaches db_query's per-query result ceilings
             # (_result_ceilings): the fetch is bounded by streaming and KILL
@@ -768,6 +818,38 @@ class ClickHouseConnector(DatabaseConnector):
             )
         elif self._ceilings_refused:
             self._session_skipped("per-query result ceilings", RuntimeError(self._ceilings_refused))
+
+    def memory_cap(self) -> int:
+        """The max_memory_usage, in bytes, this connection asks for each
+        statement: options.max_memory_usage, else DEFAULT_MAX_MEMORY_USAGE."""
+        value = self.connection.config.options.get("max_memory_usage")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return DEFAULT_MAX_MEMORY_USAGE
+
+    def _apply_memory_cap(self, client: Any) -> None:
+        """Send max_memory_usage with every request this client makes
+        (metadata, db_query, EXPLAIN), unless the account's profile already
+        sets a lower value or does not let it be changed. A readonly=1
+        profile refuses every setting: nothing is sent and the account's own
+        limit applies (memory_limit_status, doctor --connectivity)."""
+        status = memory_limit_status(client, self.memory_cap())
+        if status["sent"]:
+            client.set_client_setting("max_memory_usage", status["sent"])
+            self._session_applied(f"max_memory_usage={status['sent']}")
+        elif status["profile_limit"]:
+            self._session_applied(f"max_memory_usage={status['profile_limit']} (server profile)")
+        else:
+            self._session_skipped("max_memory_usage", RuntimeError(status["why"]))
+
+    def memory_limit(self) -> dict[str, Any]:
+        """memory_limit_status of a fresh connection (doctor --connectivity)."""
+        with translated_driver_errors():
+            client = self._connect()
+            try:
+                return memory_limit_status(client, self.memory_cap())
+            finally:
+                client.close()
 
     def _hold_reading_settings(self, client: Any) -> None:
         """Send _CH_READING_SETTINGS with every request where the account's
@@ -958,7 +1040,7 @@ class ClickHouseConnector(DatabaseConnector):
         with translated_driver_errors():
             client = self._shared_meta_client()
             rows = client.query(
-                "SELECT name, type, is_in_primary_key, comment "
+                "SELECT name, type, is_in_primary_key, comment, default_kind "
                 "FROM system.columns WHERE database = %(db)s AND table = %(t)s "
                 "ORDER BY position",
                 parameters={"db": schema or self.connection.config.database, "t": table},
@@ -975,6 +1057,8 @@ class ClickHouseConnector(DatabaseConnector):
                 nullable=str(r[1]).startswith("Nullable("),
                 comment=r[3] or None,
                 ordinal=i,
+                # MATERIALIZED, ALIAS and EPHEMERAL columns are not in SELECT *
+                default_kind=str(r[4]) or None,
             )
             for i, r in enumerate(rows)
         ]
@@ -1021,13 +1105,14 @@ class ClickHouseConnector(DatabaseConnector):
         with translated_driver_errors():
             client = self._shared_meta_client()
             rows = client.query(
-                "SELECT table, name, type, comment, position FROM system.columns "
+                "SELECT table, name, type, comment, position, default_kind FROM system.columns "
                 "WHERE database = %(db)s ORDER BY table, position",
                 parameters={"db": db},
             ).result_rows
         return [
             ColumnInfo(schema=db, table=r[0], name=r[1], data_type=r[2],
-                       nullable=str(r[2]).startswith("Nullable("), comment=r[3] or None, ordinal=int(r[4]))
+                       nullable=str(r[2]).startswith("Nullable("), comment=r[3] or None, ordinal=int(r[4]),
+                       default_kind=str(r[5]) or None)
             for r in rows
         ]
 

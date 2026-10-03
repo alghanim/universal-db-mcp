@@ -102,16 +102,37 @@ unset TMPDIR TEMP TMP
 # dpkg undoes a failed upgrade or removal (the new package's preinst refused,
 # or its unpack was rolled back): this release's files are the installed ones
 # still, and only the service the prerm stopped has to run again. Nothing is
-# verified or installed again. Unless the venv is gone: the runbook's package
-# rollback deletes it before `dpkg -i` of the older package, so when that
-# package's preinst refuses, nothing can run. That is recorded ('failed' in the
-# status file the runbook waits on) and this script fails, which leaves the
-# package 'unpacked' in dpkg instead of 'installed': `dpkg --configure
-# universal-db-mcp` then installs this release's payload again.
+# verified or installed again. Unless a deferred install of this release is
+# still running (an earlier configure's worker, which names itself in the
+# owner file and holds the lock): it has not built the venv yet, records its
+# own status and starts the service itself, so nothing here touches either,
+# and the package stays 'installed'. Otherwise, unless the venv is gone: the
+# runbook's package rollback deletes it before `dpkg -i` of the older package,
+# so when that package's preinst refuses, nothing can run. That is recorded
+# ('failed' in the status file the runbook waits on) and this script fails,
+# which leaves the package 'unpacked' in dpkg instead of 'installed': `dpkg
+# --configure universal-db-mcp` then installs this release's payload again.
 case "${1:-}" in
   abort-upgrade|abort-remove|abort-deconfigure)
     ABORT_VENV_PYTHON=/opt/universal-db-mcp/venv/bin/python
     ABORT_STATUS=/var/log/universal-db-mcp-install.status
+    ABORT_LOCK=/run/udbmcp-deferred-install.lock
+    ABORT_OWNER=/run/udbmcp-deferred-install.owner
+    # '<pid> <payload>' in the owner file names a worker; it counts while that
+    # pid is still a worker (its script is /var/tmp/udbmcp-postinst-worker.*)
+    # and the lock is held. Else the name is stale (that worker was killed and
+    # its pid may be another process now), and the lock, if held, is the
+    # refused package's postrm holder, which installs nothing.
+    abort_worker=""
+    { command -v flock >/dev/null 2>&1 && { read -r abort_worker _ < "$ABORT_OWNER"; } 2>/dev/null \
+      && [[ "$abort_worker" =~ ^[0-9]+$ ]] \
+      && grep -qaF -- /var/tmp/udbmcp-postinst-worker. "/proc/$abort_worker/cmdline" 2>/dev/null \
+      && ! (exec 8>>"$ABORT_LOCK" && flock -n 8) 2>/dev/null; } || abort_worker=""
+    if [ -n "$abort_worker" ]; then
+      echo "universal-db-mcp postinst: dpkg's $1 leaves the deferred install (pid $abort_worker) of the release dpkg records" >&2
+      echo "      to finish; it starts the service itself. Track it: cat $ABORT_STATUS" >&2
+      exit 0
+    fi
     if [ ! -x "$ABORT_VENV_PYTHON" ]; then
       abort_status="could not be written"
       if { echo failed > "$ABORT_STATUS"; } 2>/dev/null; then abort_status="now says 'failed'"; fi
@@ -156,8 +177,8 @@ manifest_id() {
 
 # >>> one install at a time
 # Whether no deferred install holds the lock. A holder that lets go within 15
-# seconds (the one the preinst of a refused upgrade leaves until its dpkg run
-# is over) is waited for.
+# seconds (the one the postrm leaves while dpkg undoes a failed upgrade, until
+# that dpkg run is over) is waited for.
 deferred_lock_free() {
   local _
   [ -e "$DEFERRED_LOCK" ] || return 0  # no worker ever ran since boot (/run is a tmpfs)
@@ -174,7 +195,7 @@ deferred_lock_free() {
 # names nothing (an earlier package's) and a stale name of an ended one.
 deferred_worker_installs() {
   local pid id
-  read -r pid id < "$DEFERRED_OWNER" 2>/dev/null || return 1
+  { read -r pid id < "$DEFERRED_OWNER"; } 2>/dev/null || return 1
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$pid" 2>/dev/null && [ "$id" = "$1" ]
 }

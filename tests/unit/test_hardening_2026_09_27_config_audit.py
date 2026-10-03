@@ -1562,6 +1562,8 @@ def test_f71_log_and_lock_are_opened_once_across_records(tmp_path: Path, monkeyp
     expected = Counter({str(path): 1, f"{path}.lock": 1})
     if sys.platform == "win32":  # the log is closed after each record there (rotation needs it)
         expected[str(path)] = 20
+    if sys.platform == "darwin":  # each state-file open reads its directory's ACL (third review)
+        expected[str(tmp_path)] = 2
     assert Counter(opened) == expected
     if sys.platform != "win32":
         assert log._fd is not None and os.path.samestat(os.fstat(log._fd), os.stat(path))

@@ -51,6 +51,7 @@ LOADER = SCRIPTS / "load_images_offline.sh"
 DEB_GATE = SCRIPTS / "package" / "test_package_deb.sh"
 PREINST = REPO / "packaging" / "deb" / "preinst"
 POSTINST = REPO / "packaging" / "deb" / "postinst"
+POSTRM = REPO / "packaging" / "deb" / "postrm"
 
 
 def _git_show(rev_path: str) -> str | None:
@@ -517,7 +518,7 @@ state() { dpkg-query -W -f='${Version} ${db:Status-Abbrev}' universal-db-mcp 2>/
 mkpkg() {  # version, maintainer-script dir, output
     local d; d=$(mktemp -d); mkdir -p "$d/DEBIAN"
     printf 'Package: universal-db-mcp\nVersion: %s\nArchitecture: all\nMaintainer: t <t@example.invalid>\nDescription: simulated\n' "$1" > "$d/DEBIAN/control"
-    for s in preinst postinst prerm; do [ ! -f "$2/$s" ] || install -m 755 "$2/$s" "$d/DEBIAN/$s"; done
+    for s in preinst postinst prerm postrm; do [ ! -f "$2/$s" ] || install -m 755 "$2/$s" "$d/DEBIAN/$s"; done
     dpkg-deb --build --root-owner-group "$d" "$3" >/dev/null
 }
 wait_for() { for _ in $(seq 1 "$2"); do eval "$1" && return 0; sleep 1; done; return 1; }
@@ -627,6 +628,7 @@ def _container_inputs(tmp_path: Path) -> Path:
     (w / "old" / "postinst").write_text(_OLD_POSTINST, encoding="utf-8")
     (w / "old" / "prerm").write_text("#!/bin/bash\n" + log_line.format(tag="old-prerm") + "exit 0\n")
     shutil.copy2(PREINST, w / "new" / "preinst")  # this release's preinst, verbatim
+    shutil.copy2(POSTRM, w / "new" / "postrm")  # and its postrm, which holds the lock for dpkg's unwind
     (w / "new" / "postinst").write_text("#!/bin/bash\n" + log_line.format(tag="new-postinst") + "exit 0\n")
     (w / "new" / "prerm").write_text("#!/bin/bash\n" + log_line.format(tag="new-prerm") + "exit 0\n")
     previous = _git_show("33a8477:packaging/deb/preinst")
@@ -672,15 +674,16 @@ def test_v3d_dpkg_sequences_in_a_container(tmp_path: Path) -> None:
     assert expected <= set(checks), sorted(checks)
 
 
-def test_v3d_every_preinst_exit_but_success_hands_the_lock_on(tmp_path: Path) -> None:
-    text = PREINST.read_text(encoding="utf-8")
-    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-    trap = code.index("trap on_preinst_exit EXIT")
-    first_refusal = code.index("exit 1")
-    assert trap < first_refusal, "the EXIT trap must be armed before the first refusal"
+def test_v3d_dpkgs_abort_upgrade_hands_the_lock_on(tmp_path: Path) -> None:
+    """The holder moved from the preinst's EXIT trap to the postrm's abort-upgrade (review 3, A7-1): dpkg
+    runs the new postrm with abort-upgrade, before the installed postinst, on every path that undoes an
+    upgrade, a failed unpack after the preinst passed included."""
+    assert not re.search(r"(?m)^\s*trap\s", PREINST.read_text(encoding="utf-8"))
+    text = POSTRM.read_text(encoding="utf-8")
     holder = _between(text, "hold_the_unwind() {", "\n}\n")
-    assert '[ "$PREINST_ACTION" = upgrade ]' in holder and '"${DPKG_MAINTSCRIPT_NAME:-}" = preinst' in holder
+    assert '"${DPKG_MAINTSCRIPT_NAME:-}" = postrm' in holder
     assert 'setsid --fork /bin/bash -c "$UNWIND_HOLDER" udbmcp-unwind-holder "$PPID"' in holder
+    assert "    abort-upgrade)\n" in text and "hold_the_unwind || true" in _between(text, "    abort-upgrade)", ";;")
 
 
 def test_v3d_outside_dpkg_a_refusal_spawns_nothing(tmp_path: Path) -> None:

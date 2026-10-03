@@ -218,7 +218,7 @@ def test_g4_a_seeding_failure_after_a_write_does_not_abort_the_run(
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
-    def refuse(*_args: Any) -> Any:
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise PermissionError("~/.universal-db-mcp is a symlink to /etc, which its owner does not own")
 
     monkeypatch.setattr(agents_core, "ensure_per_user_harness_config", refuse)

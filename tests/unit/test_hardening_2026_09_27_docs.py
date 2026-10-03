@@ -1245,7 +1245,7 @@ def test_config_example_names_every_clickhouse_reading_setting() -> None:
     if not hasattr(clickhouse, "_CH_READING_SETTINGS"):
         return
     text = _flat(ROOT / "config.example.yaml").replace(" # ", " ")
-    at = text.index("ClickHouse: the account's settings profile")
+    at = text.index("ClickHouse: the connector sends max_memory_usage")
     comment = text[at : text.index("PostgreSQL example", at)]
     for name in clickhouse._CH_READING_SETTINGS:
         assert name in comment, name

@@ -1081,8 +1081,10 @@ connections:
     # Each case runs and is judged on its own. The planted folder is then
     # removed, the admin's folder restored, and the same repair must pass,
     # proving the squat was the only cause. Checks 9, 10 and 11 record a
-    # failure (Stop-Check) and the gate goes on with the next one; only a
-    # folder that cannot be put back stops the gate.
+    # failure (Stop-Check) and the gate goes on with the next one; only the
+    # admin's folder sitting aside stops the gate: one that cannot be put
+    # back, or a backup an interrupted run left (found before anything is
+    # changed).
     if ($SkipMsiInstall) {
         Add-Check 'folder_squat_refused' 'passed' 'skipped (-SkipMsiInstall); needs msiexec runs against the MSI'
     } else {
@@ -1097,6 +1099,12 @@ connections:
         $SquatMoved = $false
         $squatLogs = @()
         $squatFailures = @()
+        # A backup an interrupted run left holds the admin's folder: the
+        # repairs below (checks 10 and 11 too) would run while it sits
+        # aside, so the gate stops before anything is changed.
+        if (Test-Path -LiteralPath $SquatBackup) {
+            Stop-Gate 'folder_squat_refused' "$SquatBackup already exists (an interrupted gate run?): it holds the admin's config folder. Restore it first (remove $ProgramDataDir, rename $SquatBackupName back to $ProgramDataName), then rerun the gate"
+        }
         try {
             # A running service can hold the venv and files in the folder open.
             (Invoke-Native { & $scExe stop $ServiceName 2>&1 }) | Out-Null
@@ -1105,9 +1113,6 @@ connections:
                     Where-Object { $_ -match '^\s*STATE' } | Select-Object -First 1)
                 if (-not $stateLine -or $stateLine -match 'STOPPED') { break }
                 Start-Sleep -Seconds 2
-            }
-            if (Test-Path -LiteralPath $SquatBackup) {
-                Stop-Check 'folder_squat_refused' "$SquatBackup already exists (an interrupted gate run?); restore it to $ProgramDataDir or remove it, then rerun the gate"
             }
             Rename-Item -LiteralPath $ProgramDataDir -NewName $SquatBackupName
             $SquatMoved = $true

@@ -956,13 +956,14 @@ def test_the_guard_and_the_server_bind_clickhouse_ctes_alike(sql: str) -> None:
 def test_clickhouse_a_cte_naming_a_later_one_reads_but_is_masked_whole(
     tmp_path: Path, monkeypatch: Any, sql: str, columns: list[str]
 ) -> None:
-    """The walk (sqlglot) sees only the CTEs before, and took zz for a base
-    table with clean columns: the value came back unmasked."""
+    """The walk (sqlglot) saw only the CTEs before, and took zz for a base
+    table with clean columns: the value came back unmasked. A reference to a
+    later CTE binds differently on different engines: the masking analysis
+    refuses it before it runs (owner decision, 2026-10-03; was: masked whole)."""
     fake = _AnswerFake(columns, [SECRETS[0]])
     server, _ = _fake_app_server(tmp_path, monkeypatch, fake, engine="clickhouse", allowed=[], deny=True)
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    assert env["data"]["rows"] == [["<masked>"]], env
-    assert any("could not all be traced" in w for w in env["warnings"]), env["warnings"]
+    text = _call_error(server, "db_query", {"connection_id": "remote", "sql": sql})
+    assert "cannot be checked for them" in text and "declared after it" in text, text
 
 
 def test_clickhouse_a_recursion_the_walk_binds_like_the_engine_stays_readable(

@@ -66,10 +66,28 @@
 #
 # Idempotency: a service already registered under the name (a repair; a
 # major upgrade's uninstall of the old product has removed its service) is
-# stopped and updated in place (sc.exe config), never deleted: a failure at
-# any point leaves it registered, and the rollback twin keeps it on a repair
-# (uninstall.ps1 -Repair). On a fresh install the query reports the service
-# absent and it is created (sc.exe create); a failure after that removes it.
+# stopped and updated in place, never deleted: a failure at any point leaves
+# it registered, and the rollback twin keeps it on a repair (uninstall.ps1
+# -Repair). The update re-applies what a newly created service gets
+# (description, failure actions, the Environment value, the service's DACL
+# and SID type, its type, error control, display name and no dependencies)
+# and only then switches the account and binPath (sc.exe config). A service
+# marked for deletion that Windows removed once it stopped is created; one
+# still marked (a handle to it is open) fails the install, which names the
+# remedy. On a fresh install the query reports the service absent and it is
+# created (sc.exe create); a failure after that removes it.
+#
+# A repair that names another account: the account the service is
+# registered under keeps its read access to the folder, its Modify on logs\
+# and its token until the service has been switched; the new account is
+# granted its access first. Only once sc.exe config has switched the service
+# is the earlier account's access removed (its token, kept aside until
+# then, too: the new account gets a new one). A failure before the switch
+# leaves the service as it was, able to start, and takes back what the new
+# account was granted. Switching from a password account to a managed
+# service or virtual account (which take no password) also clears the
+# earlier account's password the Service Control Manager stored, by passing
+# through LocalService (password= "").
 #
 # The service account: -ServiceAccount (UDBMCP_SERVICE_ACCOUNT, which
 # msiexec does not keep between runs), else the account the service is
@@ -134,6 +152,16 @@ $script:ModifyRights = 0x1301BF
 # create entries), SYSTEM and Administrators Full Control, owned by
 # Administrators.
 $script:ProtectedDirSddl = 'O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+# The access masks the registration action grants a service account, as
+# icacls (OI)(CI)RX on the config folder and (OI)(CI)M on logs\ write them.
+$script:ReadAccessMask = '0x1200a9'
+$script:ModifyAccessMask = '0x1301bf'
+# The service's own DACL, set on every install (a repair included): the
+# Windows default for a new service. SYSTEM queries, starts and stops it,
+# Administrators have full control, interactive and service logons query it.
+# A repair replaces whatever was granted since (SERVICE_CHANGE_CONFIG to
+# Users would let anybody point binPath at their own program).
+$script:ServiceSddl = 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)'
 
 # sc.exe / reg.exe exit codes: ERROR_SERVICE_DOES_NOT_EXIST,
 # ERROR_SERVICE_NOT_ACTIVE, ERROR_SERVICE_MARKED_FOR_DELETE.
@@ -145,12 +173,27 @@ $script:Created = $false
 # A service was registered under the name when this action began (it is
 # updated in place, and kept whatever fails).
 $script:Existing = $false
+# The service has been switched to the account this install registers.
+$script:Switched = $false
+# Set while a failure must give the account the service is registered under
+# back what it had, and take back what the new account was granted.
+$script:UndoPending = $false
+# Where the token the registered account reads waits until the switch.
+$script:TokenKept = $null
+# A new token was written while the account changes.
+$script:TokenNew = $false
 
 function Fail {
     # Hard exit for failures BEFORE the service is created: nothing to clean
-    # up, and "exit" deliberately bypasses catch blocks.
+    # up, and "exit" deliberately bypasses catch blocks. A failure before an
+    # account change has switched the service gives the account it runs as
+    # its access back first (Undo-AccountChange).
     param([string]$Message)
     Write-Output ("SERVICE-ACTION FAILED: " + $Message)
+    if ($script:UndoPending) {
+        $script:UndoPending = $false
+        Undo-AccountChange
+    }
     exit 1
 }
 
@@ -287,12 +330,12 @@ function Get-WriteProblem {
     # the folder's DACL replaces neither it nor a protected child's DACL.
     # Inherited ACEs follow the folder, whose DACL the installer sets.
     # $OwnerSid (the service account, for what it wrote in logs\) may own it
-    # and $WriterSid (that account, on logs\ and below) may hold such an ACE,
-    # but a reparse point is refused whoever owns it. With -AccountWriters
+    # and $WriterSid (that account, on logs\ and below; one or more SIDs) may
+    # hold such an ACE, but a reparse point is refused whoever owns it. With -AccountWriters
     # (logs\ itself) an ACE that grants any account a service runs as at most
     # Modify is accepted too: an earlier service account's grant, which the
     # action resets before anything relies on logs\.
-    param([string]$Path, [string]$OwnerSid = '', [string]$WriterSid = $OwnerSid, [switch]$AccountWriters)
+    param([string]$Path, [string]$OwnerSid = '', [string[]]$WriterSid = $OwnerSid, [switch]$AccountWriters)
     $attributes = Get-EntryAttributes -Path $Path
     if ($null -eq $attributes) { return $null }
     if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) {
@@ -308,7 +351,7 @@ function Get-WriteProblem {
     foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
         $sid = $rule.IdentityReference.Value
         if ($rule.IsInherited -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-            ($WriterSid -and $sid -eq $WriterSid) -or (Test-TrustedOwner -Sid $sid)) { continue }
+            ($WriterSid -contains $sid) -or (Test-TrustedOwner -Sid $sid)) { continue }
         $granted = [int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights)
         if ($AccountWriters -and (Test-AccountSid -Sid $sid) -and -not ($granted -band -bnot $script:ModifyRights)) { continue }
         if ($granted -band $script:WriteRights) {
@@ -404,6 +447,18 @@ function Get-AclProblem {
     return $null
 }
 
+function Get-KeptAccessSddl {
+    # The SDDL ACE that keeps the access the registration action granted
+    # $Sid ($Mask: $script:ReadAccessMask on the config folder,
+    # $script:ModifyAccessMask on logs\), inherited by files and folders, to
+    # append to $script:ProtectedDirSddl; '' when there is no such account
+    # (LocalSystem holds Full Control already). The protected DACL is then
+    # put in place in one step that never takes that access away.
+    param([string]$Sid, [string]$Mask)
+    if (-not $Sid) { return '' }
+    return ('(A;OICI;' + $Mask + ';;;' + $Sid + ')')
+}
+
 function Get-TokenProblem {
     # Why the existing bearer token $Path cannot be kept, or $null: it must
     # be a non-empty plain file owned by SYSTEM or Administrators whose DACL
@@ -470,8 +525,9 @@ function Get-ServiceAccountSid {
     # So does a SID no service runs as (Test-AccountSid): this SID is granted
     # access to the config folder, the token and logs\ before sc.exe create
     # could refuse it, and a group or well-known principal would pass that
-    # access on to all its members.
-    param([string]$Account)
+    # access on to all its members. With -OrNull (the account the service is
+    # registered under, whose access is only kept) either returns $null.
+    param([string]$Account, [switch]$OrNull)
     switch -Regex ($Account) {
         '^(\.\\)?LocalSystem$' { return $null }
         '^NT AUTHORITY\\SYSTEM$' { return $null }
@@ -492,10 +548,12 @@ function Get-ServiceAccountSid {
             $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
         }
         catch {
+            if ($OrNull) { return $null }
             Fail ("cannot resolve the SID of service account '" + $Account + "': " + $_.Exception.Message)
         }
     }
     if (-not (Test-AccountSid -Sid $sid)) {
+        if ($OrNull) { return $null }
         Fail ("service account '" + $Account + "' resolves to " + $sid + ', which is no account a service runs as' +
               ' (a group or a well-known principal); name a user, managed service or NT SERVICE account')
     }
@@ -519,9 +577,10 @@ function Get-EarlierAccountSid {
     # directory, not a junction or symbolic link, owned by SYSTEM,
     # Administrators or an administrator (the walk refuses any other).
     # The registration action grants the service account Modify whoever it
-    # is, so $GrantedSid is matched as it is, a member of Administrators (a
-    # gMSA an administrator put there) included. Without it, such an ACE is
-    # an administrator's own, not the mark of an earlier service account.
+    # is, a member of Administrators (a gMSA an administrator put there)
+    # included, and both lookups read such a grant alike: an account's write
+    # access marks it, and a member of Administrators (who may hold access of
+    # their own) only through exactly that Modify.
     param([string]$LogsDir, [string]$ServiceSid, [string]$GrantedSid = '')
     $attributes = Get-EntryAttributes -Path $LogsDir
     if ($null -eq $attributes -or ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
@@ -535,8 +594,10 @@ function Get-EarlierAccountSid {
         if ($GrantedSid) {
             if ($sid -ne $GrantedSid) { continue }
         }
-        elseif ($sid -eq $ServiceSid -or (Test-TrustedOwner -Sid $sid)) { continue }
-        if ([int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights) -band $script:WriteRights) {
+        elseif ($sid -eq $ServiceSid) { continue }
+        $granted = [int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights)
+        if ((Test-TrustedOwner -Sid $sid) -and $granted -ne $script:ModifyRights) { continue }
+        if ($granted -band $script:WriteRights) {
             return $sid
         }
     }
@@ -647,6 +708,44 @@ function Remove-ServiceBestEffort {
     }
 }
 
+function Undo-AccountChange {
+    # A failure before the service was switched to the account this install
+    # registers: the service still runs as the account it is registered
+    # under ($previousSid), which gets back the token it read (kept aside),
+    # or read access to the new one; the new account ($serviceSid) loses the
+    # access this action granted it. Reports, never throws: it runs on the
+    # way out of a failure.
+    Write-Output ("==> the service still runs as '" + $RegisteredAccount + "', which keeps its access; taking back" +
+                  " what this action granted '" + $ServiceAccount + "'")
+    try {
+        $restored = $false
+        if ($script:TokenKept -and $null -ne (Get-EntryAttributes -Path $script:TokenKept)) {
+            if ($null -ne (Get-EntryAttributes -Path $tokenFile)) { Remove-Item -LiteralPath $tokenFile -Force }
+            Move-Item -LiteralPath $script:TokenKept -Destination $tokenFile
+            $restored = $true
+        }
+        $steps = @()
+        if ($serviceSid) {
+            foreach ($target in @($configDir, $logsDir, $tokenFile)) {
+                if ($null -ne (Get-EntryAttributes -Path $target)) {
+                    $steps += ('"' + (ConvertTo-ScArgument $target) + '" /remove:g *' + $serviceSid)
+                }
+            }
+        }
+        if ($previousSid -and $script:TokenNew -and -not $restored -and $null -ne (Get-EntryAttributes -Path $tokenFile)) {
+            $steps += ('"' + (ConvertTo-ScArgument $tokenFile) + '" /grant *' + $previousSid + ':R')
+        }
+        foreach ($arguments in $steps) {
+            $r = Invoke-Tool -Tool $script:IcaclsExe -Arguments $arguments
+            Write-ToolOutput $r
+            if ($r.ExitCode -ne 0) { Write-Output ('==> WARNING: icacls ' + $arguments + ' exited ' + $r.ExitCode) }
+        }
+    }
+    catch {
+        Write-Output ('==> WARNING: ' + $_.Exception.Message + "; inspect the access to '" + $configDir + "'")
+    }
+}
+
 try {
     # --- the rollback copy of the installed-release record --------------------
     # The record (see the end of this action) is replaced only once the one
@@ -752,6 +851,26 @@ try {
                           "', the account the service is registered under")
         }
     }
+    # The account the service is registered under keeps its access until the
+    # service is switched (see the header): $registeredSid, only what it
+    # holds, so only when logs\ grants it write access as the install that
+    # registered the service under it did. When this install names another
+    # one, $previousSid: its access goes only once the switch has succeeded.
+    # RegisteredAccount is the service key's ObjectName only while the
+    # service exists (msiexec lets anybody set it otherwise).
+    $registeredSid = $null
+    $accountChanges = $false
+    if ($RegisteredAccount -and (-not $accountGiven -or (Test-ServiceExists -Name $ServiceName))) {
+        $sid = Get-ServiceAccountSid -Account $RegisteredAccount -OrNull
+        $accountChanges = $accountGiven -and ([string]$sid -ne [string]$serviceSid)
+        if ($sid -and (Get-EarlierAccountSid -LogsDir (Join-Path $configDir 'logs') -GrantedSid $sid)) { $registeredSid = $sid }
+    }
+    $previousSid = $null
+    if ($accountChanges) {
+        $previousSid = $registeredSid
+        Write-Output ("==> the service account changes from '" + $RegisteredAccount + "' to '" + $ServiceAccount +
+                      "': the earlier one keeps its access until the service is switched")
+    }
     # The token is checked on its own below: an unsafe one is replaced.
     $found = Get-TreeProblem -Directory $configDir -SkipNames @('http-token') -LogsSid $serviceSid
     if ($found) {
@@ -762,10 +881,13 @@ try {
     # previously configured service account was granted, and Set-Acl
     # propagates the new inheritable ACEs to the entries already in the
     # folder, which on an upgrade still carry the ones they inherited from
-    # C:\ProgramData. A dedicated account then gets read access to its config
-    # and to the token.
+    # C:\ProgramData. The account the service is registered under keeps its
+    # read access in the same step (it is removed only once the service runs
+    # as another one). A dedicated account then gets read access to its
+    # config and to the token.
     $security = New-Object System.Security.AccessControl.DirectorySecurity
-    $security.SetSecurityDescriptorSddlForm($script:ProtectedDirSddl)
+    $security.SetSecurityDescriptorSddlForm($script:ProtectedDirSddl +
+        (Get-KeptAccessSddl -Sid $registeredSid -Mask $script:ReadAccessMask))
     Set-Acl -LiteralPath $configDir -AclObject $security
 
     # --- logs\: the one place the service account writes ---------------------
@@ -792,9 +914,14 @@ try {
     elseif (-not ($logsAttributes -band [System.IO.FileAttributes]::Directory)) {
         Fail ("'" + $logsDir + "' is not a directory; inspect it, then move it out of this folder and rerun the install")
     }
+    $security.SetSecurityDescriptorSddlForm($script:ProtectedDirSddl +
+        (Get-KeptAccessSddl -Sid $registeredSid -Mask $script:ModifyAccessMask))
     Set-Acl -LiteralPath $logsDir -AclObject $security
     $tokenGrants = '*' + $script:SidSystem + ':F *' + $script:SidAdmins + ':F'
     $tokenSids = @($script:SidSystem, $script:SidAdmins)
+    # From here on a failure before the switch takes back what the new
+    # account is granted, and gives the registered one its token back.
+    $script:UndoPending = $accountChanges
     if ($serviceSid) {
         $r = Invoke-Tool -Tool $script:IcaclsExe -Arguments (
             '"' + (ConvertTo-ScArgument $configDir) + '" /grant:r *' + $serviceSid + ':(OI)(CI)RX')
@@ -821,6 +948,12 @@ try {
     }
 
     Stop-ExistingService -Name $ServiceName
+    if ($script:Existing -and -not (Test-ServiceExists -Name $ServiceName)) {
+        # Marked for deletion (sc.exe delete while it ran): Windows removed
+        # it once it had stopped and its last handle was closed.
+        Write-Output ("==> service '" + $ServiceName + "' was marked for deletion and is gone now that it stopped: it is created")
+        $script:Existing = $false
+    }
 
     # --- bearer token (HTTP listener's only authentication) --------------------
     # The service runs --transport http; serve refuses to start without a
@@ -834,12 +967,29 @@ try {
     # file is created empty, handed to Administrators, locked down, and only
     # then written. The value comes from the verified venv interpreter and is
     # never printed or logged.
+    # A token the account the service is registered under reads, when this
+    # install names another account, is moved aside for it (that account
+    # knows its value): it comes back if anything fails before the switch,
+    # and goes once the service runs as the new account, which gets a new
+    # one. A copy an interrupted install left there is removed.
     $needToken = $true
+    $tokenKept = $tokenFile + '.previous'
+    if ($null -ne (Get-EntryAttributes -Path $tokenKept)) {
+        Remove-Item -LiteralPath $tokenKept -Force
+    }
     if ($null -ne $tokenAttributes) {
-        $problem = Get-TokenProblem -Path $tokenFile -AllowedSids $tokenSids
+        $judgedSids = $tokenSids
+        if ($previousSid) { $judgedSids += $previousSid }
+        $problem = Get-TokenProblem -Path $tokenFile -AllowedSids $judgedSids
         if ($problem) {
             Write-Output ("==> '" + $tokenFile + "' " + $problem + "; regenerating it")
             Remove-Item -LiteralPath $tokenFile -Force
+        }
+        elseif ($previousSid -and (Get-AclProblem -Path $tokenFile -AllowedSids $tokenSids)) {
+            Write-Output ("==> '" + $tokenFile + "' is read by '" + $RegisteredAccount + "': kept aside for it until the" +
+                          " service is switched; provisioning a new one")
+            Move-Item -LiteralPath $tokenFile -Destination $tokenKept
+            $script:TokenKept = $tokenKept
         }
         else {
             $needToken = $false
@@ -864,6 +1014,7 @@ try {
         if (-not (Test-Path -LiteralPath $tokenFile -PathType Leaf)) {
             Fail ("bearer token file was not created at '" + $tokenFile + "'")
         }
+        $script:TokenNew = $accountChanges
     }
 
     # --- create, or update in place ---------------------------------------------
@@ -877,54 +1028,58 @@ try {
     # the service reads no PYTHON* variables, user site or working directory.
     $binPath = '"' + $python + '" -I -m universal_db_mcp serve --transport http'
     $serviceArgs = ' binPath= "' + (ConvertTo-ScArgument $binPath) + '"' +
-        ' start= auto' +
-        ' obj= "' + (ConvertTo-ScArgument $ServiceAccount) + '"'
+        ' start= auto'
+    $accountArgs = ' obj= "' + (ConvertTo-ScArgument $ServiceAccount) + '"'
     # The password is deliberately NOT part of this command line: command
     # lines are captured into durable OS audit logs (Event 4688 with
     # include-command-line, Sysmon EID 1). It is written through the Service
     # Control Manager API below, once the service is registered.
+    $describe = 'description ' + $ServiceName + ' "' +
+        (ConvertTo-ScArgument 'UniversalDB MCP server (air-gapped): stdio/HTTP MCP gateway over local databases.') + '"'
+    $markedRemedy = ("service '" + $ServiceName + "' is marked for deletion: Windows removes it once it has stopped and" +
+                     ' every handle to it is closed (services.msc, or any tool that has it open), at the latest when' +
+                     ' the host restarts; close them or restart the host, then rerun the install')
 
     if ($script:Existing) {
-        # ChangeServiceConfig keeps the stored password when none is given,
-        # which a managed service or virtual account requires; LocalSystem,
-        # LocalService and NetworkService take an empty one (the earlier
-        # account's is dropped).
-        if ($ServiceAccount -match '^((\.\\)?LocalSystem|NT AUTHORITY\\(SYSTEM|Local ?Service|Network ?Service))$') {
-            $serviceArgs += ' password= ""'
-        }
+        # The first change doubles as the probe: a service marked for
+        # deletion refuses every change (1072), and one Windows removed
+        # meanwhile is gone (1060) and is created. Nothing was changed yet.
         Write-Output ("==> updating service '" + $ServiceName + "' in place (start= auto, account " + $ServiceAccount + ")")
-        $r = Invoke-Tool -Tool $script:ScExe -Arguments ('config ' + $ServiceName + $serviceArgs)
+        $r = Invoke-Tool -Tool $script:ScExe -Arguments $describe
         Write-ToolOutput $r
-        if ($r.ExitCode -eq $script:ErrServiceMarkedForDelete) {
-            Fail ("service '" + $ServiceName + "' is marked for deletion; reboot the host and rerun the install")
+        if ($r.ExitCode -eq $script:ErrServiceAbsent) {
+            Write-Output ("==> service '" + $ServiceName + "' is gone (it was marked for deletion): it is created")
+            $script:Existing = $false
         }
-        if ($r.ExitCode -ne 0) {
-            Fail ("sc.exe config " + $ServiceName + " failed with exit code " + $r.ExitCode + "; the service is unchanged")
+        elseif ($r.ExitCode -eq $script:ErrServiceMarkedForDelete) {
+            Fail ($markedRemedy + ' (the service was not changed)')
+        }
+        elseif ($r.ExitCode -ne 0) {
+            Abort ("sc.exe description " + $ServiceName + " failed with exit code " + $r.ExitCode)
         }
     }
-    else {
+    if (-not $script:Existing) {
         Write-Output ("==> creating service '" + $ServiceName + "' (start= auto, account " + $ServiceAccount + ")")
-        $r = Invoke-Tool -Tool $script:ScExe -Arguments ('create ' + $ServiceName + $serviceArgs)
+        $r = Invoke-Tool -Tool $script:ScExe -Arguments ('create ' + $ServiceName + $serviceArgs + $accountArgs)
         Write-ToolOutput $r
         if ($r.ExitCode -ne 0) {
             Fail ("sc.exe create " + $ServiceName + " failed with exit code " + $r.ExitCode)
         }
         $script:Created = $true
-    }
 
-    # --- credential (SCM API, never a command line) ---------------------------
-    if ($ServicePassword) {
-        Write-Output ("==> setting the service account credential via the SCM API (never via a command line)")
-        Set-ServiceLogonCredential -Name $ServiceName -Account $ServiceAccount -Password $ServicePassword
-    }
+        # --- credential (SCM API, never a command line) -----------------------
+        if ($ServicePassword) {
+            Write-Output ("==> setting the service account credential via the SCM API (never via a command line)")
+            Set-ServiceLogonCredential -Name $ServiceName -Account $ServiceAccount -Password $ServicePassword
+        }
+        $script:Switched = $true
 
-    # --- description ----------------------------------------------------------
-    $r = Invoke-Tool -Tool $script:ScExe -Arguments (
-        'description ' + $ServiceName + ' "' +
-        (ConvertTo-ScArgument 'UniversalDB MCP server (air-gapped): stdio/HTTP MCP gateway over local databases.') + '"')
-    Write-ToolOutput $r
-    if ($r.ExitCode -ne 0) {
-        Abort ("sc.exe description " + $ServiceName + " failed with exit code " + $r.ExitCode)
+        # --- description ------------------------------------------------------
+        $r = Invoke-Tool -Tool $script:ScExe -Arguments $describe
+        Write-ToolOutput $r
+        if ($r.ExitCode -ne 0) {
+            Abort ("sc.exe description " + $ServiceName + " failed with exit code " + $r.ExitCode)
+        }
     }
 
     # --- failure recovery (mirrors systemd Restart=on-failure) ----------------
@@ -958,6 +1113,97 @@ try {
     if ($r.ExitCode -ne 0) {
         Abort ("could not write the service Environment value under " + $svcKey +
                " (reg.exe exit code " + $r.ExitCode + ")")
+    }
+
+    # --- the service's own DACL and SID type --------------------------------------
+    # Set on every install, so a repair replaces what was granted or changed
+    # since (see $script:ServiceSddl). Unrestricted: the service SID joins
+    # the process token (what a virtual account's service runs with anyway).
+    foreach ($arguments in @(('sdset ' + $ServiceName + ' ' + $script:ServiceSddl), ('sidtype ' + $ServiceName + ' unrestricted'))) {
+        $r = Invoke-Tool -Tool $script:ScExe -Arguments $arguments
+        Write-ToolOutput $r
+        if ($r.ExitCode -ne 0) {
+            Abort ("sc.exe " + $arguments.Split(' ')[0] + " " + $ServiceName + " failed with exit code " + $r.ExitCode)
+        }
+    }
+
+    # --- the switch: binPath, account and what a new service gets ----------------
+    if ($script:Existing) {
+        # Type, error control, display name and dependencies as sc.exe create
+        # leaves them ('depend= /': none).
+        # With a password, Win32_Service.Change below sets the account and
+        # its password together: a failure there leaves the account as it was.
+        $configArgs = $serviceArgs + ' type= own error= normal depend= / DisplayName= ' + $ServiceName
+        if (-not $ServicePassword) {
+            # ChangeServiceConfig keeps the stored password when none is
+            # given, which a managed service or virtual account requires;
+            # LocalSystem, LocalService and NetworkService take an empty one
+            # (the earlier account's is dropped).
+            if ($ServiceAccount -match '^((\.\\)?LocalSystem|NT AUTHORITY\\(SYSTEM|Local ?Service|Network ?Service))$') {
+                $accountArgs += ' password= ""'
+            }
+            $configArgs += $accountArgs
+        }
+        $r = Invoke-Tool -Tool $script:ScExe -Arguments ('config ' + $ServiceName + $configArgs)
+        Write-ToolOutput $r
+        if ($r.ExitCode -eq $script:ErrServiceMarkedForDelete) {
+            Fail $markedRemedy
+        }
+        if ($r.ExitCode -eq $script:ErrServiceAbsent) {
+            Fail ("service '" + $ServiceName + "' disappeared while it was updated (it was marked for deletion);" +
+                  ' rerun the install, which creates it')
+        }
+        if ($r.ExitCode -ne 0) {
+            Fail ("sc.exe config " + $ServiceName + " failed with exit code " + $r.ExitCode + "; the service keeps its" +
+                  ' binPath and account')
+        }
+        if ($ServicePassword) {
+            Write-Output ("==> setting the service account and its credential via the SCM API (never via a command line)")
+            Set-ServiceLogonCredential -Name $ServiceName -Account $ServiceAccount -Password $ServicePassword
+        }
+        $script:Switched = $true
+    }
+
+    # --- the earlier account's access goes, now that the service is switched -----
+    if ($accountChanges) {
+        $script:UndoPending = $false
+        # A password account's password stays stored with the service when
+        # the new account takes none (ChangeServiceConfig must be given no
+        # password for a managed service or virtual account): passing through
+        # LocalService with an empty password clears it.
+        if ($script:Existing -and (Test-PasswordAccount -Account $RegisteredAccount) -and
+            $ServiceAccount -match '^(NT SERVICE\\.+|.+\$)$') {
+            Write-Output ("==> clearing the password stored for '" + $RegisteredAccount + "'")
+            $r = Invoke-Tool -Tool $script:ScExe -Arguments ('config ' + $ServiceName + ' obj= "NT AUTHORITY\LocalService" password= ""')
+            Write-ToolOutput $r
+            if ($r.ExitCode -ne 0) {
+                Write-Output ("==> WARNING: sc.exe config exited " + $r.ExitCode + ": the password stored for '" +
+                              $RegisteredAccount + "' could not be cleared; the service runs as '" + $ServiceAccount + "'")
+            }
+            else {
+                $r = Invoke-Tool -Tool $script:ScExe -Arguments ('config ' + $ServiceName + $accountArgs)
+                Write-ToolOutput $r
+                if ($r.ExitCode -ne 0) {
+                    Abort ("sc.exe config " + $ServiceName + " exited " + $r.ExitCode + " after clearing the stored password:" +
+                           " the service is registered under NT AUTHORITY\LocalService; rerun the install naming '" +
+                           $ServiceAccount + "'")
+                }
+            }
+        }
+        if ($previousSid) {
+            foreach ($target in @($configDir, $logsDir)) {
+                $r = Invoke-Tool -Tool $script:IcaclsExe -Arguments ('"' + (ConvertTo-ScArgument $target) + '" /remove:g *' + $previousSid)
+                Write-ToolOutput $r
+                if ($r.ExitCode -ne 0) {
+                    Abort ("icacls could not remove the access of '" + $RegisteredAccount + "' (" + $previousSid + ") to '" +
+                           $target + "' (exit code " + $r.ExitCode + ")")
+                }
+            }
+        }
+        if ($script:TokenKept -and $null -ne (Get-EntryAttributes -Path $script:TokenKept)) {
+            Remove-Item -LiteralPath $script:TokenKept -Force
+        }
+        Write-Output ("==> the service runs as '" + $ServiceAccount + "': '" + $RegisteredAccount + "' no longer has access")
     }
 
     # --- record the installed release --------------------------------------------
@@ -999,8 +1245,10 @@ try {
 catch {
     if ($script:Created) { Remove-ServiceBestEffort -Name $ServiceName }
     elseif ($script:Existing) {
+        $kept = 'it keeps its binPath and account'
+        if ($script:Switched) { $kept = "it runs as '" + $ServiceAccount + "'" }
         Write-Output ("==> the service '" + $ServiceName + "' was registered before this action, which updates it in" +
-                      ' place and does not remove it (it is stopped)')
+                      ' place and does not remove it (it is stopped; ' + $kept + ')')
     }
     Fail ("service registration failed: " + $_.Exception.Message)
 }

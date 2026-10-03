@@ -250,10 +250,12 @@ def test_binpath_embedding_round_trips(
 
 def test_password_is_never_part_of_a_command_line(service_src: str) -> None:
     code = code_lines(service_src)
-    # sc.exe's password flag carries no password: its one use is the empty
+    # sc.exe's password flag carries no password: its uses are the empty
     # literal sc.exe config passes when it switches the service to
-    # LocalSystem, LocalService or NetworkService.
-    assert code.count("password= ") == 1 and code.count("$serviceArgs += ' password= \"\"'") == 1, (
+    # LocalSystem, LocalService or NetworkService, and the one that passes
+    # through LocalService to clear a password account's stored password.
+    assert code.count("obj= \"NT AUTHORITY\\LocalService\" password= \"\"") == 1
+    assert code.count("password= ") == 2 and code.count("$accountArgs += ' password= \"\"'") == 1, (
         "service.ps1 passes the service-account password as a sc.exe "
         "command-line token; command lines are captured into durable OS audit "
         "logs (Event 4688 include-command-line / Sysmon EID 1)"

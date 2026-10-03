@@ -75,10 +75,10 @@ def _slow_rewrite(monkeypatch: pytest.MonkeyPatch, entered: threading.Event, rel
     the test: the window between the handle's open and the statement's start."""
     real = SQLiteConnector._value_capped
 
-    def slow(self: SQLiteConnector, conn: sqlite3.Connection, sql: str, parameters: Any) -> str | None:
+    def slow(self: SQLiteConnector, conn: sqlite3.Connection, sql: str, parameters: Any, *rest: Any) -> str | None:
         entered.set()
         release.wait(10)
-        return real(self, conn, sql, parameters)
+        return real(self, conn, sql, parameters, *rest)
 
     monkeypatch.setattr(SQLiteConnector, "_value_capped", slow)
 
@@ -147,9 +147,9 @@ async def test_x1_a_deadline_in_the_rewrite_window_stops_the_worker(
     conn = _docs(tmp_path)
     real = SQLiteConnector._value_capped
 
-    def slow(self: SQLiteConnector, handle: sqlite3.Connection, sql: str, parameters: Any) -> str | None:
+    def slow(self: SQLiteConnector, handle: sqlite3.Connection, sql: str, parameters: Any, *rest: Any) -> str | None:
         time.sleep(0.6)
-        return real(self, handle, sql, parameters)
+        return real(self, handle, sql, parameters, *rest)
 
     monkeypatch.setattr(SQLiteConnector, "_value_capped", slow)
     svc = ExecutionService(max_concurrent=4)

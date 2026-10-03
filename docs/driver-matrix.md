@@ -242,12 +242,24 @@ Notes:
   `max_result_bytes` is never sent (a byte cut under `break` would be silent);
   `send_receive_timeout` is the hard timeout plus 5 s. The byte budget uses a
   seam of clickhouse-connect 1.8; without it, results carry a warning and the
-  session report lists the budget as skipped. **The ClickHouse server's own
-  memory is bounded only by the account profile:** a guard-accepted statement
-  computing very wide rows (`SELECT repeat(col, 700000) FROM <big table>`)
-  OOM-killed the test container. Give the MCP account a settings profile with
-  `max_memory_usage` and `max_result_bytes` set (the provisioning SQL below
-  weighs `readonly = 1` against `readonly = 2`). Value search folds case with
+  session report lists the budget as skipped. **Server memory:** a
+  guard-accepted statement computing very wide rows (`SELECT repeat(col,
+  700000) FROM <big table>`), or a sort over `system.numbers`, OOM-killed the
+  test container. So every request carries `max_memory_usage`
+  (`options.max_memory_usage`, bytes, default 2 GiB, at least 1 MiB) where the
+  account's profile accepts settings (`readonly = 0` or `2`), unless the
+  profile already sets a lower value or pins it; the session report lists it
+  under `applied`, and `db_test_connection` reads it back. A statement over it
+  is `LIMIT_EXCEEDED` (`... more memory on the server than this connection
+  allows one query ...`); a profile constraint that refuses the value is
+  `CONFIG_ERROR`. A `readonly = 1` profile refuses every setting, so its own
+  `max_memory_usage` is the only bound: `doctor --connectivity` logs in,
+  reads the profile, and reports `connection-<id>-memory-limit` FATAL when it
+  sets none (remedy: `ALTER USER <user> SETTINGS max_memory_usage = ...`, or
+  the same in its settings profile), unless the connection sets
+  `options.memory_limit_from_profile: true` to acknowledge that the account's
+  own limits bound it. Set `max_result_bytes` in the profile either way (the
+  provisioning SQL below weighs `readonly = 1` against `readonly = 2`). Value search folds case with
   `lowerUTF8`, so non-ASCII capitals match. The guard follows ClickHouse's
   CTE scope: a bare name counts as a CTE only where ClickHouse binds it (the
   query its WITH heads, the other CTEs of that WITH in either order, and its
@@ -393,7 +405,8 @@ ALTER ROLE db_datareader ADD MEMBER udbmcp_ro;   -- never db_owner
 GRANT VIEW DEFINITION TO udbmcp_ro;               -- catalog metadata
 GRANT SHOWPLAN TO udbmcp_ro;                      -- db_explain (plans only, no data access)
 
--- ClickHouse: the profile is what bounds the server's own memory
+-- ClickHouse: with readonly = 1 the profile is what bounds the server's own
+-- memory (the connector's per-query max_memory_usage needs readonly = 2)
 -- Leave dialect, implicit_select, prefer_column_name_to_alias,
 -- enable_global_with_statement and
 -- analyzer_compatibility_join_using_top_level_identifier at their defaults
@@ -404,14 +417,16 @@ CREATE SETTINGS PROFILE udbmcp_ro_profile SETTINGS readonly = 1,
   max_memory_usage = 4000000000, max_result_bytes = 100000000,   -- size for your server
   max_execution_time = 60;           -- security.hard_query_timeout_seconds
 -- readonly = 1 also refuses every setting the MCP server sends per query, and
--- db_test_connection lists them under `skipped`: max_execution_time (hence the
+-- db_test_connection lists them under `skipped`: max_memory_usage (hence the
+-- profile's own value, which doctor --connectivity requires), max_execution_time (hence the
 -- profile's own value), the per-query result ceilings (a first block too wide
 -- for the stream budget is refused, not fetched again on smaller blocks) and
 -- db_explain's 1000-row planning ceiling (every plan then warns that producing
 -- it may have read table data). readonly = 2 keeps all three and still refuses
 -- writes, but lets a session change any setting a constraint does not pin: the
 -- guard refuses SET and SETTINGS, a client holding the credentials would not.
--- Pin the memory bounds with MAX there. The connector's readonly = 2 handling
+-- Pin the memory bounds with MAX there (options.max_memory_usage must then be
+-- within the MAX, or every query is CONFIG_ERROR). The connector's readonly = 2 handling
 -- is unit-tested; no fixture in this repository runs such a profile.
 --   CREATE SETTINGS PROFILE udbmcp_ro_profile SETTINGS readonly = 2,
 --     max_memory_usage = 4000000000 MAX 4000000000,

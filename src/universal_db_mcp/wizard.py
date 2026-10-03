@@ -1017,7 +1017,7 @@ def plan_merge(config_path: Path, name: str, connection: ConnectionConfig, *, re
     header, body = _split_header(original.decode("utf-8"))
     try:
         data = yaml.safe_load("".join(body))
-    except yaml.YAMLError as exc:
+    except Exception as exc:  # noqa: BLE001 - a tagged value fails with ValueError quoting it
         raise WizardError(f"config is not valid YAML; refusing to edit ({describe_yaml_error(exc)})") from None
     if data is None:
         data = {}
@@ -1337,7 +1337,7 @@ def _existing_block(cfg_path: Path, name: str, engine: str) -> dict[str, Any]:
     here: plan_merge refuses a config that load_config rejects."""
     try:
         data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+    except Exception:  # noqa: BLE001 - OSError, a decode or YAML error, a tagged value's ValueError
         return {}
     connections = data.get("connections") if isinstance(data, dict) else None
     block = connections.get(name) if isinstance(connections, dict) else None

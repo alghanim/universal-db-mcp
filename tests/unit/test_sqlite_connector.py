@@ -482,7 +482,7 @@ def test_long_values_are_cut_inside_sqlite_and_keep_their_types(tmp_path, monkey
     sql = "SELECT id, body, raw, n, r, note FROM docs ORDER BY id"
     out = conn.execute_query(QuerySpec(sql=sql, max_cell_bytes=100))
     assert [c[0] for c in out.columns] == ["id", "body", "raw", "n", "r", "note"]
-    assert any("udbmcp_cut(body)" in s for s in ran), ran
+    assert any("CASE typeof(body)" in s and "(random() & 0) + 101)" in s for s in ran), ran
     first, second, third = out.rows
     assert first[0] == 1 and first[1] == "p" * 100 and first[2]["$truncated"] is True
     assert (first[3], first[4], first[5]) == (str(2**62), 1.5, None)

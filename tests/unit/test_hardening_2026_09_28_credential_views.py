@@ -395,7 +395,10 @@ def test_with_default_deny_a_synonym_is_refused_as_unlisted_and_never_looked_up(
 @pytest.mark.parametrize("engine", ["postgres", "mysql", "clickhouse"])
 def test_engines_without_synonyms_are_not_asked(tmp_path: Path, monkeypatch: Any, engine: str) -> None:
     server, _fake, asked = _synonym_server(tmp_path, monkeypatch, engine, {}, deny=False)
-    _call(server, "db_query", {"connection_id": "remote", "sql": "SELECT buoy_id FROM ocean.somewhere"})
+    # a table whose columns the catalog does not list may hold a masked
+    # column: masking refuses the statement (owner decision, 2026-10-03)
+    text = _call_error(server, "db_query", {"connection_id": "remote", "sql": "SELECT buoy_id FROM ocean.somewhere"})
+    assert "columns of 'somewhere' are not known" in text, text
     assert asked == []
 
 

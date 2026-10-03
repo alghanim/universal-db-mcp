@@ -171,10 +171,13 @@ is read before the cut depends on the engine:
   over a join (`*`, or `o.*, c.*`) whose columns share a name is spelled out
   as `table.name` columns instead (MySQL 5.7 and MariaDB take no derived
   column list). A column the statement compares, or names by position in
-  `GROUP BY` or `ORDER BY` (`2`, `(2)`, `2 COLLATE x`), is not cut in the
-  select list: the statement runs as a derived table instead, and so does a
-  statement with a term there that names no column (`NULL`, `'2'`, a bound
-  value), which MySQL may read as a position. Where the server will
+  `GROUP BY` or `ORDER BY` (`2`, `(2)`, `+2`, `2 COLLATE x`), is not cut in
+  the select list: the statement runs as a derived table instead, and so
+  does a statement with a bound parameter there (PyMySQL writes an integer,
+  a boolean or an integral decimal as an integer literal, which MySQL reads
+  as a position). Any other term that names no column (`RAND()`, `NULL`,
+  `COUNT(*)`, `'2'`, `2.0`, `-2`) sorts or groups by its value, and the
+  outputs are cut in the select list as usual. Where the server will
   not prepare the statement (`1295`, `max_prepared_stmt_count` reached:
   `1461`, a proxy: `1047`), it is not described and runs as written.
 - **SQL Server**: `SET TEXTSIZE` bounds text on query connections; every
@@ -207,18 +210,19 @@ is read before the cut depends on the engine:
   security.max_response_bytes raises the limit`; where the limit in force is
   SQLite's own ceiling, the text says `(N MiB: SQLite's own ceiling, which no
   setting of this server raises)` and offers no remedy. Output values are cut
-  inside SQLite to `max_cell_bytes + 1` by a per-handle function
-  (`udbmcp_cut`) in the select list; each query prepares its statement once
-  more under `LIMIT 0` first. Left whole: columns the statement compares (in a
+  inside SQLite to `max_cell_bytes + 1` characters (text) or bytes (a blob)
+  by a `substr()` expression in the select list, plain SQL with no Python
+  call per row; each query prepares its statement once more under `LIMIT 0`
+  first. Left whole: columns the statement compares (in a
   join condition, `WHERE`, `GROUP BY`, `HAVING` or `ORDER BY`, or named by
   position in `GROUP BY` or `ORDER BY` under any spelling of an integer
   SQLite reads as one: `2`, `(2)`, `+2`, `0x2`, `-(-2)`, `2 COLLATE x`), and
   every column of a statement that is not one SELECT, uses `DISTINCT` or a
-  bound `LIMIT`, or selects `*` over a join. A `GROUP BY` or `ORDER BY` term
+  bound `LIMIT`, selects `*` over a join, or has a `?` parameter in its
+  select list. A `GROUP BY` or `ORDER BY` term
   that names no column and is no position (`random()`, `NULL`, a bound
   parameter, `'2'`, `2.0`) compares no output, and the other columns are
-  still cut. A stored text value that is not valid
-  UTF-8 makes the statement run again uncut. Behind that, a process-wide
+  still cut. Behind that, a process-wide
   `PRAGMA hard_heap_limit` of 32 x `SQLITE_LIMIT_LENGTH` (512 MiB by default),
   shared by every SQLite handle including the metadata cache's and only ever
   lowered, refuses a statement that needs more memory as `LIMIT_EXCEEDED`
@@ -254,13 +258,17 @@ is read before the cut depends on the engine:
   seconds on adversarial input near the 64 KiB statement cap (long runs of
   whitespace or unclosed comments).
   Per-query settings only tighten (`max_block_size`, `max_result_rows` with
-  `result_overflow_mode='break'`, none on `readonly=1` profiles);
+  `result_overflow_mode='break'`, `max_memory_usage`; none on `readonly=1`
+  profiles);
   `max_result_bytes` is never sent. Without the driver seam this relies on,
-  results carry a warning. **The ClickHouse server's own memory is bounded
-  only by the account profile:** a guard-accepted statement that computes very
-  wide rows (for example `repeat(col, 700000)` over a large table) OOM-killed
-  the test container. Give the MCP account a `readonly` profile with
-  `max_memory_usage` (and `max_result_bytes` in the profile) set;
+  results carry a warning. **Server memory:** a guard-accepted statement
+  that computes very wide rows (for example `repeat(col, 700000)` over a
+  large table) OOM-killed the test container. Every request carries
+  `max_memory_usage` (`options.max_memory_usage`, 2 GiB by default) where
+  the account's profile accepts settings and sets no lower limit; a
+  `readonly = 1` profile refuses it, and there the profile's own
+  `max_memory_usage` is the bound (`doctor --connectivity` is FATAL without
+  one unless `options.memory_limit_from_profile: true` acknowledges it).
   `docs/driver-matrix.md` has the profile and what `readonly = 1` gives up.
 
 ## Defense in depth (read-only)

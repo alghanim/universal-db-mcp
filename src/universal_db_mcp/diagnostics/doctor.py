@@ -1,6 +1,7 @@
 """Doctor: checks installed artifacts and effective policy without any
 network access. Local prerequisite checks never require database credentials
-(connectivity probes are opt-in via ``--connectivity``)."""
+(connectivity probes are opt-in via ``--connectivity``; the ClickHouse memory
+limit check is the one of them that logs in, to read the account's profile)."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import errno
 import json
 import os
 import platform
+import shlex
 import stat
 import subprocess
 import sys
@@ -20,8 +22,8 @@ from universal_db_mcp.config import (
     AppConfig,
     ConnectionConfig,
     ResolvedConnection,
-    darwin_directory_acl_problems,
-    darwin_secret_file_acl_problems,
+    darwin_state_directory_acl_problems,
+    darwin_state_file_acl_problems,
     default_audit_path,
     is_system_config,
     load_config,
@@ -187,11 +189,19 @@ def _expanded(path: str) -> Path | None:
 
 
 def _state_acl_problems(path: Path) -> list[str]:
-    """What macOS extended ACLs grant other accounts on the state file *path*
+    """What macOS extended ACLs let other accounts do to the state file *path*
     (the audit log or the metadata cache), its sidecars (lock, rotated
-    backups, SQLite journals) and its directory, whose inheritable entries
-    every new one of them takes."""
-    problems: list[str] = []
+    backups, SQLite journals) and its directory: read, change, delete or
+    re-permission a file; add, delete or rename files in the directory; or
+    give every new file an inheritable entry (the rules the server applies,
+    config.darwin_state_file_acl_problems and
+    darwin_state_directory_acl_problems)."""
+    return [problem for _name, problem in _state_acl_findings(path)]
+
+
+def _state_acl_findings(path: Path) -> list[tuple[Path, str]]:
+    """_state_acl_problems, each with the path whose ACL is at fault."""
+    problems: list[tuple[Path, str]] = []
     directory = path.parent
     try:
         names = os.listdir(directory)
@@ -207,24 +217,24 @@ def _state_acl_problems(path: Path) -> list[str]:
         member = directory / name
         if member.is_symlink() or not member.is_file():
             continue  # the audit checks refuse links; only regular files are read
-        problems += [f"'{member}': {problem}" for problem in _acl_problems(member)]
+        problems += [(member, f"'{member}': {problem}") for problem in _acl_problems(member)]
     try:
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
         return problems
     try:
-        problems += [f"'{directory}': {problem}" for problem in darwin_directory_acl_problems(fd)]
+        found = [(directory, f"'{directory}': {problem}") for problem in darwin_state_directory_acl_problems(fd)]
     except OSError as exc:
-        problems.append(f"'{directory}': its access control list cannot be read ({exc.strerror or exc})")
+        found = [(directory, f"'{directory}': its access control list cannot be read ({exc.strerror or exc})")]
     finally:
         os.close(fd)
-    return problems
+    return found + problems  # the directory first: chmod -N on it stops new files inheriting
 
 
 def _acl_problems(path: Path) -> list[str]:
-    """darwin_secret_file_acl_problems, with an ACL that cannot be read as one."""
+    """darwin_state_file_acl_problems, with an ACL that cannot be read as one."""
     try:
-        return darwin_secret_file_acl_problems(path)
+        return darwin_state_file_acl_problems(path)
     except OSError as exc:
         return [f"its access control list cannot be read ({exc.strerror or exc})"]
 
@@ -377,6 +387,68 @@ def _session_check(name: str, conn: ConnectionConfig) -> dict[str, Any]:
             f"{conn.type} supports, so only the SQL guard refuses writes",
         )
     return _check(f"session-{name}", True, detail)
+
+_CH_MEMORY_REMEDY = (
+    "Set a limit on the account itself: ALTER USER <user> SETTINGS max_memory_usage = 2147483648, or ALTER "
+    "SETTINGS PROFILE <profile> SETTINGS max_memory_usage = 2147483648 (or <max_memory_usage> in the profile "
+    "of users.xml); or use a profile with readonly=2, which accepts the connector's own per-query limit"
+)
+
+
+def _clickhouse_memory_check(
+    name: str, conn: ConnectionConfig, security: Any, connectivity: bool
+) -> dict[str, Any]:
+    """How one ClickHouse statement's server memory is bounded. The connector
+    sends max_memory_usage (options.max_memory_usage, 2 GiB by default) with
+    every request where the account's profile accepts settings; a readonly=1
+    profile refuses them all, and without a limit of its own one statement can
+    take the server's whole memory. Offline this says what will be sent; with
+    --connectivity it connects (sending the connection's credentials) and reads
+    the account's profile: readonly=1 without a profile limit is FATAL unless
+    options.memory_limit_from_profile acknowledges it."""
+    from universal_db_mcp.connectors.clickhouse import DEFAULT_MAX_MEMORY_USAGE, ClickHouseConnector
+    from universal_db_mcp.security.policy import EffectivePolicy
+
+    key = f"connection-{name}-memory-limit"
+    acknowledged = conn.options.get("memory_limit_from_profile") is True
+    raw = conn.options.get("max_memory_usage")
+    cap = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else DEFAULT_MAX_MEMORY_USAGE
+    sends = f"sends max_memory_usage={cap} with every query where the account's profile accepts settings"
+    if not connectivity:
+        return _check(
+            key,
+            True,
+            f"{sends}; a readonly=1 profile refuses it (run doctor --connectivity to check the account)"
+            + ("; options.memory_limit_from_profile: true relies on the account's own limit there"
+               if acknowledged else ""),
+        )
+    try:
+        resolved = ResolvedConnection(name, conn)
+        status = ClickHouseConnector(resolved, EffectivePolicy.build(security, resolved)).memory_limit()
+    except Exception as exc:  # noqa: BLE001 - a diagnostic reports, it never ends in a traceback
+        return _check(key, False, f"could not read the account's settings profile: {_failure_detail(exc)}")
+    if status["sent"]:
+        return _check(key, True, f"{sends}: the account's profile (readonly={status['readonly'] or '0'}) accepts it")
+    if status["profile_limit"]:
+        return _check(
+            key, True, f"the account's profile limits each query to max_memory_usage={status['profile_limit']}"
+        )
+    if acknowledged:
+        return _check(
+            key,
+            True,
+            f"{status['why']}; the profile sets no max_memory_usage, and options.memory_limit_from_profile: true "
+            "acknowledges that the account's own limits bound a query's memory",
+        )
+    return _check(
+        key,
+        False,
+        f"{status['why']}, and the profile sets no max_memory_usage: one statement can use all of the server's "
+        f"memory. {_CH_MEMORY_REMEDY}; then set "
+        f"connections.{name}.options.memory_limit_from_profile: true to acknowledge the account-level limit",
+        fatal=True,
+    )
+
 
 def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
@@ -693,6 +765,8 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
             # UR" or "postgres read-only server-side" before an upgrade, and
             # which of those the server must accept (fail-closed) vs may skip.
             results.append(_session_check(name, conn))
+            if conn.type == "clickhouse":
+                results.append(_clickhouse_memory_check(name, conn, cfg.security, connectivity))
             # driver availability: our connector class AND the real vendor
             # module (a registered class can exist while the driver wheel is
             # absent; the tool layer would fail with DRIVER_MISSING).
@@ -925,12 +999,20 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
         # service account is unknown, so the owner is reported, not compared.
         cache_path = cfg.application.metadata_cache_path
         if cache_path and sys.platform != "win32":
-            from universal_db_mcp.services.metadata import cache_file_problems
+            from universal_db_mcp.services.metadata import TransientCacheCheckError, cache_file_problems
 
             cp = Path(cache_path)
             euid = os.geteuid()
-            problems = cache_file_problems(cp, owner_uid=None if euid == 0 else euid)
-            if problems:
+            transient = ""
+            try:
+                problems = cache_file_problems(cp, owner_uid=None if euid == 0 else euid)
+            except TransientCacheCheckError as exc:
+                problems, transient = [], str(exc.strerror)
+            if transient:
+                results.append(
+                    _check("metadata-cache-perms", False, f"{transient} (re-run doctor; the server checks again)")
+                )
+            elif problems:
                 results.append(
                     _check(
                         "metadata-cache-perms",
@@ -963,13 +1045,15 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                 ("audit-path-acl", cfg.application.audit_path),
                 ("metadata-cache-acl", cfg.application.metadata_cache_path),
             ):
-                if state_path and (problems := _state_acl_problems(Path(state_path))):
+                if state_path and (findings := _state_acl_findings(Path(state_path))):
+                    named = " ".join(shlex.quote(str(name)) for name in dict.fromkeys(n for n, _p in findings))
                     results.append(
                         _check(
                             label,
                             False,
-                            f"exposed to other local users by an access control list: {'; '.join(problems)}; "
-                            "remove it (chmod -N <path>) from each file and the directory",
+                            "exposed to other local users by an access control list: "
+                            f"{'; '.join(problem for _n, problem in findings)}; remove the access control "
+                            f"lists with: chmod -N {named}",
                             fatal=True,
                         )
                     )

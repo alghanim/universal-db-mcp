@@ -187,7 +187,12 @@ harness is reported `unknown_state_fail_closed`, with `refusing to write:
   a file that user may not read themselves (`... may not read it, and as
   root this tool does not read it for them`): as root such a file is not
   even read (a dry run printed a root-only file a user had linked in). The
-  file is opened without following a link and checked again once open;
+  path is then opened one component at a time from `/`, each without
+  following a link: a symlink on the way is resolved by that walk, and one
+  a user owns must lead to something that user owns (`... goes through a
+  symlink owned by uid N that leads to something uid M owns ...`), so a
+  directory swapped for a link after the checks is refused too. What was
+  opened is checked again on its descriptors;
 - a config another program created after `configure-agents` found it absent
   (re-run to add the registration to it).
 
@@ -249,7 +254,10 @@ seeded ...`; with `--json` the harness carries `seed_error`), or a write
 needs `--yes` and stdin is not a terminal. A re-run after a failed seeding
 finds the registration in place and the config it names missing: it offers
 to seed it (`Seed it? [y/N]`; `--yes` seeds it, `--dry-run` only notes it,
-a non-terminal stdin without `--yes` exits 1 with `NOT CONFIRMED`). With
+a non-terminal stdin without `--yes` exits 1 with `NOT CONFIRMED`). Only the
+per-user config a registration actually names counts: a `dsh` row written
+while `UDBMCP_CONFIG` named another file names that file, and nothing is
+offered or seeded for it. With
 `--json`, plain detection reports it as `config_missing`, and `--yes` as
 `config_seeded` (or `seed_error`, exit 1); `2` for an unknown `--agent`, or
 when a

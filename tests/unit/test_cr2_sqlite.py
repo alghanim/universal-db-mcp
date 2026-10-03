@@ -358,7 +358,7 @@ def test_a_module_this_build_lacks_marks_its_shadow_tables_by_its_own_suffixes()
         ('CREATE VIRTUAL TABLE "my using t" USING rtree(id, a, b)', "rtree"),
         ("CREATE VIRTUAL TABLE [a b]\n  USING \"rtree_i32\"(id, a, b)", "rtree_i32"),
         ("CREATE VIRTUAL TABLE main.g USING geopoly", "geopoly"),
-        ("CREATE VIRTUAL TABLE f /* c */ USING fts5(x)", ""),
+        ("CREATE VIRTUAL TABLE f /* c */ USING fts5(x)", "fts5"),  # comments are read past (review round 3)
         ("CREATE TABLE f (x)", None),
     ],
 )
@@ -447,8 +447,9 @@ def test_order_by_random_cuts_long_values_in_the_engine(tmp_path: Path) -> None:
                         ("SELECT id, body FROM big ORDER BY NULL", None),
                         ("SELECT id, body FROM big ORDER BY ?", (2,))):
         with conn._handle() as handle:
-            capped = conn._value_capped(handle, sql, params or ())
-        assert capped is not None and "udbmcp_cut(body)" in capped.replace('"', ""), (sql, capped)
+            capped = conn._value_capped(handle, sql, params or (), 100)
+        assert capped is not None and "CASE typeof(body)" in capped.replace('"', ""), (sql, capped)
+        assert "(random() & 0) + 101)" in capped, (sql, capped)
         out = conn.execute_query(QuerySpec(sql=sql, parameters=params, max_cell_bytes=100))
         assert sorted(r[0] for r in out.rows) == [0, 1, 2, 3, 4]
 

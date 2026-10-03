@@ -69,8 +69,10 @@ driver states (`[xxxxx]`), ODBC wrapper names, `LINE n:`, `argument n` and
 version strings. PostgreSQL XML errors lose their DETAIL. Names you supplied
 (a connection id, an object name) are echoed as their first 64 characters, and
 an error's text is capped at 2000 characters. A driver error longer than 16 KiB
-(one that echoes a long bound value) is cut to its first 16 KiB before it is
-redacted, so redaction time stays bounded. A connector's own refusal that
+(one that echoes a long bound value) is cut to its first 4 KiB before it is
+redacted, so redaction time stays bounded; the engine's message is shown
+from that redacted head, less any text at its end that redaction left
+verbatim (where a secret cut in two at the boundary could sit). A connector's own refusal that
 is not built from a driver error (for example ClickHouse's "more than 8 MiB
 ... even on 1-row blocks") is shown as written, numbers and quoted names
 included, and so is a connector's own diagnostic wrapped like a driver error
@@ -91,7 +93,7 @@ ones). Auth failures: ClickHouse's login is hidden (`DB::Exception:
 | `db_list_schemas` | policy-filtered, paginated |
 | `db_list_tables` | kinds filter, search, catalog row estimates marked as estimates. On every engine the database's own objects come first, then those of the system schemas or dictionary owners the policy opens: under the default `security.allowed_system_schemas: [information_schema]` that is `information_schema` on PostgreSQL and MySQL (kind `view` on MySQL), SQL Server's `INFORMATION_SCHEMA` views when views are requested, and ClickHouse's `INFORMATION_SCHEMA` and `information_schema`. Oracle decides a dictionary owner as the policy does (`PDBADMIN` is user data, `APEX_nnnnnn` a dictionary); Db2 lists `SYSCAT` and `SYSIBM` last. Oracle `SYS.DUAL` and Db2 `SYSIBM.SYSDUMMY1` are listed only when `SYS` or `SYSIBM` is opened. SQLite's own `sqlite_*` tables and the internal tables of its FTS and R*Tree indexes, the views of other sessions' SQL, of column statistics, of stored credentials and of other objects' definitions (`information_schema.VIEWS`, `ROUTINES`, `COLUMNS`, ...; `docs/security.md`), and a SQL Server `dbo` table named like a compatibility view are never listed, even with `include_system` or with their schema opened |
 | `db_get_table` | columns/keys/indexes/definition/estimate. Each column carries `sensitive`; a sensitive column's DEFAULT reads `<masked>`. A definition is withheld (null, with a warning) when a sensitive column has a DEFAULT or the definition names a sensitive column beside a string literal, and is otherwise cut to `security.max_cell_bytes`. A foreign key into a schema the policy hides reads `<not permitted>`. On SQL Server a bare name resolves where SQL Server resolves it (the login's default schema, then `dbo`) and `schema` names the one found. For schema arguments under an allowlist, see Schema arguments below |
-| `db_list_columns` | paginated; sensitive DEFAULTs masked; the SQL Server bare-name rule above |
+| `db_list_columns` | paginated; sensitive DEFAULTs masked; each column carries `default_kind` (ClickHouse's `DEFAULT`, `MATERIALIZED`, `ALIAS` or `EPHEMERAL`, which decides whether `*` returns it; null elsewhere), as in `db_get_table`; the SQL Server bare-name rule above |
 | `db_list_views` | definitions only where the engine reports them, cut to `max_cell_bytes`, and withheld when they name a sensitive column beside a string literal (DDL text is read with a tokenizer under every reading the engine may use, backslash escapes and nested comments or not; a comment counts as a literal, and text no reading can finish is withheld wherever it names a sensitive word). It lists the engine's view catalog within the allowlist, without the system-schema filter of `db_list_tables`: without an allowlist, PostgreSQL, Oracle and Db2 list their dictionary views too, by name only (live on the fixtures: PostgreSQL's `pg_tables` and `pg_roles`, Db2's `SYSCAT.TABLES`). Called without a schema it leaves out the views of a namesake schema (one differing only in case from an allowed one), as `db_list_synonyms` and `db_list_routines` do. It never lists a view of other sessions' SQL, of column statistics, of stored credentials or of other objects' definitions (`pg_stat_activity`, `pg_stats`, `SYSIBMADM.MON_CURRENT_SQL`, `SYSCAT.COLDIST`), with or without an allowlist |
 | `db_list_synonyms` | targets listed, remote links never traversed; paged (`next_cursor`). Scoped like `db_list_views`, by the allowlist only: without one, Oracle lists the synonyms `ALL_SYNONYMS` holds, the PUBLIC synonyms for its dictionary views (`ALL_USERS`) included, by name only. On Oracle and Db2 a synonym or alias is left out when its own name, its target, or any synonym or alias further along its chain is a view no statement may read (Oracle's PUBLIC `V$SQL` and `ALL_TAB_HISTOGRAMS`); for a schema, Oracle reads that owner's synonyms and each local synonym they name in turn (`CONNECT BY NOCYCLE`) and lists only the owner's, and Db2 reads every alias and filters by schema |
 | `db_list_routines` | metadata only; never executed; paged. Scoped like `db_list_views`, by the allowlist only (without one, Db2 lists the routines of `SYSIBM`, `SYSIBMADM`, `SYSPROC`, `SYSFUN` and its other system schemas too) |
@@ -109,7 +111,7 @@ ones). Auth failures: ClickHouse's login is hidden (`DB::Exception:
 | `db_search_values` | a value searched across permitted tables of many connections without SQL (details below) |
 | `db_infer_relationships` | declared foreign keys + inferred join candidates (name/type match, `<table>_id` convention) within and across connections, metadata only (details below) |
 | `db_review_schema` | optimization review of a schema or whole connection: every permitted table profiled on a bounded sample under one time budget (biggest tables first, paged), findings prioritized by severity with evidence and a suggestion; `sensitive` columns counted only; `recommendations` count against `max_response_bytes` |
-| `db_federated_query` | one validated read statement on several connections (or one statement per connection): per-connection results, each guarded, bounded and masked under its own policy, plus a merged view with a leading `connection` column when the column names agree; one failing connection is a warning (a refused statement is reported in that connection's `results[].error` and not run); one time budget; the strictest `max_response_bytes` among the connections binds the whole response, `merged` included (cut with a warning), and each statement runs with what is left of it, so a statement that ran is always reported; every statement leaves its own audit record (`db_federated_query:statement`, same request id, its connection and fingerprint) |
+| `db_federated_query` | one validated read statement on several connections (or one statement per connection): per-connection results, each guarded, bounded and masked under its own policy, plus a merged view with a leading `connection` column when the column names agree; one failing connection is a warning (a refused statement is reported in that connection's `results[].error` and not run); one time budget; the strictest `max_response_bytes` among the connections binds the whole response, `merged` included (cut with a warning), and each statement runs with what is left of it, so a statement that ran is always reported; every statement leaves its own audit record (`db_federated_query:statement`, same request id, its connection and fingerprint). Before anything reads a statement, each distinct one is held to the guard's 64 KiB and all of them together to 256 KiB (`VALIDATION_ERROR`, split the call). Named `parameters` go to each statement by the names its placeholders use, compared exactly, except on Oracle, whose driver binds names ignoring case (`:ID` takes `{"id": 5}`) |
 | `db_federated_join` | a client-side hash join of two bounded read results from two connections (or the same one) on key columns: inner or left, row-capped, keys compared as normalised text so `5`, `5.0` and `'5'` from different engines match; `on` lists 1 to 16 `[left, right]` pairs (more is `VALIDATION_ERROR`, a repeated pair counts once); masked values never match; the joined output is bounded by the stricter of the two policies' `max_response_bytes` (a partial join is `truncated` with a warning); either side refused fails the call; each side leaves its own audit record; nothing is written |
 | `db_document_schema` | Markdown data dictionary of a schema or whole connection (paged): columns with declared and portable types, nullability, defaults, keys, indexes, comments, declared relationships; metadata only; comments and definitions cut to `max_cell_bytes`; a page can end early on the discovery time budget |
 
@@ -207,11 +209,15 @@ unless it was the only connection named.
   ClickHouse and SQLite: `x IN t`, `x IN db.t`, and any expression there that
   holds a name (`x IN tuple(t)`, `x IN CAST(t AS String)`) are refused with `a
   name after IN without parentheses is not permitted: it reads a table; write
-  IN (SELECT <column> FROM <schema>.<table>)`, as is ClickHouse `x IN (t)`
+  IN (SELECT <column> FROM <schema>.<table>)`, and so is a string there (`x
+  IN 'docs_content'`, which SQLite reads as that table: `a string after IN
+  without parentheses is not permitted ...`; write `IN ('value', ...)`). So
+  is ClickHouse `x IN (t)`
   with a single name, whatever parentheses and aliases wrap it (`x IN ((t AS
   z))`, `(+(t AS z))`, the `NOT IN`, `GLOBAL IN` and `GLOBAL NOT IN` forms:
   `IN (<name>) with a single name is not permitted on ClickHouse ...`). A
-  placeholder or a constant there is a value and is accepted: ClickHouse's
+  placeholder or a constant other than a string there is a value and is
+  accepted: ClickHouse's
   `x IN {ids:Array(UInt64)}`, `IN tuple(1, 2)`, `IN array(1, 2)`, `IN ((1 AS
   z))`, and a driver's `IN %(p)s` (which PostgreSQL and MySQL themselves
   reject). On every engine an `IN` with nothing after it, and `IN` right
@@ -297,7 +303,10 @@ unless it was the only connection named.
   list after its alias is refused, and the sample, profile and metadata
   tools refuse these views whole. MySQL's `information_schema.STATISTICS`
   (the index list) is read the same way without its `EXPRESSION` column,
-  which holds a functional index's SQL with its literals.
+  which holds a functional index's SQL with its literals. A statement over
+  one of these views with a `NATURAL` join or a ClickHouse `COLUMNS(...)`
+  matcher is refused as well (join with `ON`, or `USING` with named
+  columns).
 - **SQLite.** A statement reads only the tables and views `db_list_tables`
   lists, with or without `default_deny_objects`. `sqlite_schema` and every
   other `sqlite_*` table are refused (`POLICY_VIOLATION`), as are SQLite's
@@ -536,54 +545,91 @@ built-in patterns plus any you add; matched against the name as written and in
 lower and upper case, and, for a name outside ASCII or with blanks around it,
 also in its NFKC form stripped: with a pattern `^mrn$`, `ＭＲＮ` and `MRN `
 match, and `ſſn` matches the built-in `ssn`; the same match marks `sensitive`
-in the metadata tools). Masking follows each output column back to its source
-columns on the parsed statement, through aliases, set operations (UNION
-branches), column lists, derived tables and CTEs (recursive ones included),
-whole-row references, table functions, PostgreSQL attribute notation,
-ClickHouse aliases, tuple access and `COLUMNS`/`APPLY`, and SQL Server `FOR
-JSON`/`FOR XML` (masked whole when any projection is sensitive or a star is
-used). A result position is masked when a sensitive column flows into it,
-whatever the output column is called.
+in the metadata tools).
 
-It fails closed: when the output cannot be traced (the analysis is bounded at
-16 rounds and 2 s; a CTE binding the analysis cannot mirror, such as a CTE
-used with another letter case on SQL Server or MySQL, a CTE naming one
-declared after it on SQLite or ClickHouse, or a ClickHouse recursion whose
-first branch names its own CTE), every column the
-statement does not prove clean is masked, with the warning `the result's
-columns could not all be traced to their source columns; every column the
-statement does not prove clean was masked (fail closed)`. A masked result is
-cut again to `max_response_bytes` after masking. In particular:
+A statement that reads a table or view with a sensitive column, or one whose
+columns the catalog does not list (which may have one), or that names a
+sensitive name anywhere (a struct field, an attribute), is masked by
+position: each output column is mapped to the source columns its value can
+carry, through aliases, joins, derived tables and subqueries (with column
+lists), CTEs (recursive ones written as `anchor UNION [ALL] recursive
+branch`), set operations of equal width, `*` and `t.*` over plain FROM items,
+and ClickHouse's `WITH <expression> AS name`. Every column an expression
+reads counts, wherever it stands (a `CASE` condition, a window's `PARTITION
+BY`); a subquery in an output expression counts every column its own clauses
+read (`WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, `QUALIFY`, `ORDER BY`) as
+well as what it outputs. `rowid`, `oid`, `_rowid_` and `_rowid` (which may
+return an `INTEGER PRIMARY KEY`'s value) count as every column of their
+table. A result position is masked when a sensitive column flows into it,
+whatever the output column is called; the output names are matched too, as
+a backstop.
 
-- PostgreSQL `(expr).*` and ClickHouse `untuple(t)` are traced as a run of
-  columns of unknown width, never as one column.
-- A statement with Oracle `MATCH_RECOGNIZE` or PostgreSQL `SEARCH`/`CYCLE`
-  (whose `ord`/`path` columns carry the BY columns' values) is untraceable:
-  every column it does not prove clean is masked.
-- A column qualifier the analysis binds to no source (other than on
-  ClickHouse), or one two FROM items share in different case (`"A"` and
-  `a`) where the engine may bind either, is not proven clean. A PIVOT or
-  UNPIVOT alias binds to its FROM item and is traced through it.
-- SQLite names an unaliased expression by its text (`upper(x)`) and a second
-  column of one name `x:1`: such names, and a name no source outputs, are
-  masked when the source may carry a sensitive value.
-- Where a star expands to a run of unknown width, each alias the statement
-  wrote must be reported by the driver at the position the trace gives it;
-  otherwise every column not proven clean is masked. A PostgreSQL alias over
-  63 bytes is matched as the server reports it, cut to its first 63 bytes.
-- A star the statement wraps or aliases (`(b.*)`, `((b).*)`, PostgreSQL's
-  `b.* AS x`, ClickHouse's `(s.*)`), a parenthesised join's columns, and a
-  table function whose alias list does not prove its width (`WITH
-  ORDINALITY`, `unnest(a, b)`, a composite array) are runs of unknown width,
-  never one column.
-- A CTE is a qualifier's source only where a `FROM` of the scope reads it: a
-  correlated `w.k` binds to the enclosing query's `w`, whatever spare CTE
-  named `w` is in reach.
-- On SQLite, a subquery, derived table or CTE column aliased `true`,
-  `false`, `columnN` or `name:N` (names SQLite may give another column) makes
-  the statement untraceable: every column it does not prove clean is masked.
-- Engines that fold names are traced as they fold (Oracle by Unicode's
-  rules), so a CTE decoy in another case does not hide a table.
+Masking accepts only the shapes it fully understands. Any other statement
+over such a table is refused before it runs, with `POLICY_VIOLATION: this
+statement reads a table with masked columns, and its shape cannot be checked
+for them: <construct>. Name the columns you need in plain SELECT lists over
+tables, views, subqueries and CTEs (joins, GROUP BY, window functions and
+UNION are fine)`. Refused constructs:
+
+- `VALUES`, `UNNEST`, `LATERAL` and `APPLY`, table functions and any other
+  FROM item that is not a table, view, subquery or CTE; ClickHouse `ARRAY
+  JOIN`; `SEMI`, `ANTI` and `ASOF` joins; `PIVOT`/`UNPIVOT`; Oracle
+  `MATCH_RECOGNIZE`; PostgreSQL `SEARCH`/`CYCLE`; SQL Server `FOR JSON`/`FOR
+  XML`; `SELECT ... INTO`;
+- PostgreSQL `(expr).*`, ClickHouse `untuple()`, `COLUMNS(...)` and `APPLY`,
+  and a table named inside an expression;
+- a star with `EXCEPT`, `REPLACE`, `RENAME` or `ILIKE`; a star in
+  parentheses or under an alias (`(b.*)`, `b.* AS x`); a star over a `USING`
+  or `NATURAL` join (whose layout the engine decides; name the columns, or
+  join with `ON`); a star with no FROM item;
+- a column list after a base table's alias (`FROM t AS x(a, b)`: alias the
+  columns in a subquery), a column list with names that repeat or that names
+  more columns than its query has, an aliased parenthesized join, and an
+  empty alias;
+- a qualifier that names no FROM item, or that may name several (names that
+  differ only in case, or one inside a subquery and one around it: give them
+  distinct aliases); `t.x` where `x` is no column of `t` (PostgreSQL reads it
+  as a function of the whole row); a bare name no FROM item has (a whole
+  row, a string in double quotes); a column spelled otherwise than the
+  catalog lists it under the engine's case rules;
+- on SQLite, an alias of a subquery or CTE column that SQLite may rename
+  (`true`, `false`, `columnN`, a name with a colon, an empty one);
+- a FROM item the analysis cannot bind for certain to a CTE or a table: a
+  reference to a CTE declared after it, a non-recursive CTE that names
+  itself, one `WITH` declaring a name twice in some spelling, a CTE spelled
+  otherwise than the reference (`rename the CTE`), and a recursive CTE that is
+  not `anchor UNION recursive branch`;
+- a table whose columns the catalog does not list (see below), and a
+  statement nested too deeply or too large to check in 2 s.
+
+After the statement runs, the columns the driver reports must be the ones
+the analysis placed: the same count, and each alias or star column under
+its name (as written, cut to PostgreSQL's 63 bytes, qualified by its table
+as ClickHouse reports `s2.x`, or numbered as SQLite's `x:1`). Otherwise no
+rows are returned: `POLICY_VIOLATION: this statement reads a table with
+masked columns and <the difference>, so masking cannot place them; ...`. A
+masked result is cut again to `max_response_bytes` after masking.
+
+The columns of each table come from the catalog (`db_list_columns`), in
+order, kept per connection for 300 s, with at most 64 uncached lookups per
+statement (more: refused, run it again). A bare name is the table the
+session reads (the first schema of its search path that holds it); an
+Oracle, SQL Server or Db2 synonym is followed to the table it ends at.
+PostgreSQL materialized views are listed (from `pg_attribute`) and masked
+like tables. A table the catalog lists no columns for (an object the
+listing hides, a synonym of another database's, one the login may not read)
+is treated as possibly masked: a statement reading it is refused. On
+ClickHouse `*` leaves out `MATERIALIZED`, `ALIAS` and `EPHEMERAL` columns,
+as ClickHouse does; named explicitly, they resolve. A profile that sets
+`asterisk_include_materialized_columns` or
+`asterisk_include_alias_columns` widens `*`, and such a statement is then
+refused after it runs (the width differs). `db_list_columns` and
+`db_get_table` report each column's `default_kind` (ClickHouse's
+`DEFAULT`, `MATERIALIZED`, `ALIAS` or `EPHEMERAL`; null for a plain column
+and on every other engine).
+
+A statement that reads no table with a sensitive column is not analysed:
+its output names alone decide.
 
 Definitions (`db_get_table`, `db_list_views`, index definitions) are read
 with a tokenizer, so an apostrophe in a quoted name, a comment or a MySQL
@@ -596,16 +642,6 @@ unqualified column in scope of the view's own query (or a qualified name);
 any other counts as a literal, and so does every one when the query does
 not parse or a table it reads cannot be listed. `db_list_views` and
 `db_get_table` apply the same rule.
-
-PostgreSQL attribute notation (`b.fn` meaning `fn(b)`): a qualified name is
-checked against the base table's catalog columns (one `information_schema`
-lookup per table, cached 300 s, at most 16 new lookups per statement). A
-qualified name that is not a real column is masked. When the columns cannot
-be read, the budget is exceeded, the relation is a materialized view (which
-`information_schema` does not list), or a bare name is missing from the
-catalog listing (a partitioned parent, a foreign table, a table newer than the
-listing), every column named through that qualifier is masked with a warning;
-name those columns without the qualifier, or schema-qualify the table.
 
 **Limitation (owner decision):** masking protects projected values only. A
 `WHERE`, `ORDER BY`, `GROUP BY` or `JOIN` condition on a masked column is

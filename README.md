@@ -118,7 +118,8 @@ Details and limitations: `docs/security.md`.
   SQL Server `QUOTED_IDENTIFIER`, ...) at the values the guard parsed
   under, or is refused (`docs/session-safety.md`).
 - **Bounded, masked, audited results.** Row, byte, cell and time ceilings;
-  sensitive columns masked by where each output value comes from; driver
+  sensitive columns masked by where each output value comes from (a
+  statement over them whose shape can't be checked is refused); driver
   error text sanitized; every call audited (repeats of one refusal are
   counted into summary records, and the SQL text kept per window is capped),
   by default to the platform's state directory (`/var/log/universal-db-mcp/audit.jsonl` for the service's

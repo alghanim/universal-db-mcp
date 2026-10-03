@@ -80,13 +80,16 @@ def test_v4g_the_granted_account_is_matched_as_it_is() -> None:
     for path in (SERVICE_PS1, DOCTOR_PS1):
         lookup = H._function(_code(path), "Get-EarlierAccountSid")
         granted = lookup[lookup.index("if ($GrantedSid) {") :]
-        # with $GrantedSid: that SID, whoever it is; Administrators members
-        # are skipped only when looking for an earlier account
+        # with $GrantedSid: that SID, whoever it is; without: any account but
+        # the service's. A member of Administrators counts in both through
+        # the registration's Modify only (cr3 A8-5: both paths alike).
         assert re.match(
             r"if \(\$GrantedSid\) \{\s*\n\s*if \(\$sid -ne \$GrantedSid\) \{ continue \}\s*\n\s*\}\s*\n"
-            r"\s*elseif \(\$sid -eq \$ServiceSid -or \(Test-TrustedOwner -Sid \$sid\)\) \{ continue \}",
+            r"\s*elseif \(\$sid -eq \$ServiceSid\) \{ continue \}\s*\n"
+            r"[^\n]*\n\s*if \(\(Test-TrustedOwner -Sid \$sid\) -and "
+            r"\$granted -ne \$script:ModifyRights\) \{ continue \}",
             granted,
-        ), granted[:300]
+        ), granted[:400]
         common = lookup[lookup.index("foreach ($rule in") : lookup.index("if ($GrantedSid) {")]
         assert "Test-TrustedOwner" not in common, path.name
         assert "-not (Test-AccountSid -Sid $sid)" in common, "a group or well-known principal never counts"
@@ -143,10 +146,17 @@ def test_exec_v4g_a_gmsa_in_administrators_logs_does_not_grant_is_refused(host, 
 
 @executed
 def test_exec_v4g_an_administrators_own_grant_still_is_no_earlier_service_account(host) -> None:  # noqa: ANN001
-    # Without -GrantedSid the lookup is unchanged: an ACE for a member of
-    # Administrators on logs\ is an administrator's, and does not stop a
-    # repair that keeps LocalSystem.
-    code, out, calls = host.service(_gmsa_logs(host, H.ADMIN_USER_SID), account="", H_ADMIN_MEMBERS=H.ADMIN_USER_SID)
+    # An ACE an administrator gave themselves on logs\ (Full Control, not the
+    # registration's Modify) does not stop a repair that keeps LocalSystem.
+    # (cr3 A8-5: a member's Modify does, as any account's; test_cr3_msi.py.)
+    logs = host.cfgdir / "logs"
+    logs.mkdir()
+    acl = {
+        host.cfgdir: H.SAFE,
+        host.config: H.SAFE,
+        logs: H._entry(SID_ADMINS, [H.ADMIN_USER_SID, "Allow", "F", False]),
+    }
+    code, out, calls = host.service(acl, account="", H_ADMIN_MEMBERS=H.ADMIN_USER_SID)
     assert code == 0, out
 
 
@@ -168,11 +178,14 @@ def test_v4j_a_registered_service_is_updated_in_place_never_deleted() -> None:
     assert "if ($script:Created) { Remove-ServiceBestEffort -Name $ServiceName }" in body
     created = [m.start() for m in re.finditer(r"\$script:Created = \$true", body)]
     assert len(created) == 1
-    branch = body[body.index("if ($script:Existing) {") : created[0]]
-    config, create = "('config ' + $ServiceName + $serviceArgs)", "('create ' + $ServiceName + $serviceArgs)"
-    assert branch.index(config) < branch.index("else {") < branch.index(create)
+    # a registered service is probed by its first change, created only when
+    # it is gone; the switch (sc.exe config) comes last (cr3 A8-1, A8-4)
+    probe = body.index("if ($script:Existing) {")
+    create = body.index("('create ' + $ServiceName + $serviceArgs + $accountArgs)")
+    config = body.index("('config ' + $ServiceName + $configArgs)")
+    assert probe < body.index("if (-not $script:Existing) {") < create < created[0] < config
     # the password never goes on a command line
-    args = body[body.index("$serviceArgs = ' binPath= ") : body.index("if ($script:Existing) {")]
+    args = body[body.index("$serviceArgs = ' binPath= ") : probe]
     assert "Password" not in args
 
 
@@ -222,11 +235,13 @@ def test_exec_v4j_a_repair_updates_the_service_in_place(host) -> None:  # noqa: 
     python = host.venv / "Scripts" / "python.exe"
     assert config == (
         f'sc [config] [udbmcp] [binPath=] ["{python}" -I -m universal_db_mcp serve --transport http]'
-        " [start=] [auto] [obj=] [LocalSystem] [password=] []"
+        " [start=] [auto] [type=] [own] [error=] [normal] [depend=] [/] [DisplayName=] [udbmcp]"
+        " [obj=] [LocalSystem] [password=] []"
     ), config
     assert "updating service 'udbmcp' in place" in out
     lines = calls.splitlines()
-    assert lines.index(_sc(calls, "stop")[0]) < lines.index(config) < lines.index(_sc(calls, "description")[0])
+    # description first (the probe), the switch last (cr3 A8-1, A8-4)
+    assert lines.index(_sc(calls, "stop")[0]) < lines.index(_sc(calls, "description")[0]) < lines.index(config)
 
 
 @executed
@@ -254,13 +269,15 @@ def test_exec_v4j_a_repair_failing_after_the_update_keeps_the_service(host, fail
     # The reviewer's scenario: any failure after the service was registered
     # again (sc.exe description / failure, the Environment value, the
     # release record) deleted the service, and the rollback twin, run with
-    # -Repair, kept nothing. Now neither run deletes it.
+    # -Repair, kept nothing. Now neither run deletes it. (Since cr3 these
+    # steps run before the switch, so the service also keeps its account.)
     env = {"H_REG_FAIL": "1"} if fail == "reg" else {"H_SC_FAIL": fail}
     code, out, calls = _repair(host, **env)
     assert code == 1, out
     assert "SERVICE-ACTION FAILED: service registration failed" in out, out
     assert "was registered before this action, which updates it in place and does not remove it" in out, out
-    assert _sc(calls, "config") and not _sc(calls, "delete") and not _sc(calls, "create"), calls
+    assert "it keeps its binPath and account" in out, out
+    assert not _sc(calls, "config") and not _sc(calls, "delete") and not _sc(calls, "create"), calls
     record = host.root / "ProgramFiles" / "UniversalDB MCP" / "manifest.json"
     record.parent.mkdir(parents=True, exist_ok=True)
     params = {"ServiceName": "udbmcp", "InstalledManifest": str(record), "Repair": "1"}
@@ -280,9 +297,9 @@ def test_exec_v4j_a_failed_update_leaves_the_service_registered(host, marked: bo
     code, out, calls = _repair(host, **env)
     assert code == 1, out
     if marked:
-        assert "service 'udbmcp' is marked for deletion; reboot the host and rerun the install" in out, out
+        assert "service 'udbmcp' is marked for deletion: Windows removes it once it has stopped" in out, out
     else:
-        assert "sc.exe config udbmcp failed with exit code 5; the service is unchanged" in out, out
+        assert "sc.exe config udbmcp failed with exit code 5; the service keeps its binPath and account" in out, out
     assert not _sc(calls, "delete") and not _sc(calls, "create"), calls
 
 
@@ -325,9 +342,10 @@ def test_v4i_each_squat_case_expects_the_action_that_refuses_it() -> None:
 def test_v4i_checks_9_to_11_record_a_failure_and_go_on() -> None:
     code = _code(GATE_PS1)
     region = _region_code()
-    # only the admin's folder that cannot be put back stops the gate
+    # only the admin's folder sitting aside stops the gate: a backup an
+    # interrupted run left (cr3 D-5), or one that cannot be put back
     stops = re.findall(r"Stop-Gate '(\w+)'", region)
-    assert stops == ["folder_squat_cleanup_reinstalled"], stops
+    assert stops == ["folder_squat_refused", "folder_squat_cleanup_reinstalled"], stops
     assert "could not restore $ProgramDataDir from $SquatBackup" in region
     for name in ALL_CHECKS:
         assert f"Add-CheckFailure '{name}' $_" in region, name
@@ -536,17 +554,14 @@ def test_exec_v4i_a_failed_launch_case_is_recorded_and_check_11_runs(tmp_path: P
 
 
 @executed
-def test_exec_v4i_a_leftover_backup_is_recorded_and_checks_10_11_run(tmp_path: Path) -> None:
+def test_exec_v4i_a_leftover_backup_stops_the_gate(tmp_path: Path) -> None:
+    # cr3 D-5: a leftover backup holds the admin's folder, so checks 10 and
+    # 11 must not run repairs while it sits aside: the gate stops first.
     gate = _Gate(tmp_path)
     backup = gate.program_data.with_name(gate.program_data.name + ".gate-backup")
     backup.mkdir()
     code, out, checks, runs = gate.run()
     assert code == 1, out
-    assert _status(checks) == {
-        "folder_squat_refused": "failed",
-        "folder_squat_cleanup_reinstalled": "not_run",
-        "launch_conditions": "passed",
-        "repair_keeps_account": "passed",
-    }, checks
+    assert _status(checks) == {"folder_squat_refused": "failed"}, checks
     assert (gate.program_data / "config.yaml").read_text(encoding="utf-8") == "admin: config\n"
-    assert not [r for r in runs if "REINSTALL=ALL REINSTALLMODE=omus /qn" in r], "no squat or restore repair ran"
+    assert runs == [], "no repair ran"

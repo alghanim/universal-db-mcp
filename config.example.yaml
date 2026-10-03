@@ -124,7 +124,10 @@ security:
   # mask_columns:
   #   - "(?i)salary"
   # Masking follows each output value to its source column (aliases, UNIONs,
-  # CTEs, whole-row references); an untraceable statement is masked whole.
+  # CTEs, joins, subqueries). A statement over a table with masked columns
+  # whose shape it cannot check (VALUES, UNNEST, LATERAL, star modifiers,
+  # (expr).*, a star over USING/NATURAL, ...) is refused before it runs:
+  # select the columns explicitly (docs/tools.md, Masking).
   # It protects projected values only: a WHERE, ORDER BY or GROUP BY on a
   # masked column can still reveal its values. Column-level grants or views
   # are the real control for secrets.
@@ -222,12 +225,24 @@ connections:
   #     os_authentication: true   # deliberately use the driver's implicit
   #                               # identity (OS user, or 'default' on
   #                               # clickhouse) instead of a configured username
+  #   clickhouse:
+  #     max_memory_usage: 2147483648     # bytes one query may use on the server
+  #                               # (default 2 GiB, at least 1 MiB), sent with
+  #                               # every request where the profile accepts
+  #                               # settings; a lower profile limit is kept
+  #     memory_limit_from_profile: true  # readonly=1 profiles only (they refuse
+  #                               # every setting): acknowledges that the
+  #                               # account's own limits bound a query's
+  #                               # memory; without it and without a profile
+  #                               # max_memory_usage, doctor --connectivity
+  #                               # is FATAL
   #
-  # ClickHouse: the account's settings profile is the only bound on the
-  # server's own memory. Give the MCP login a readonly profile with
-  # max_memory_usage and max_result_bytes set (docs/driver-matrix.md), and
-  # leave dialect, implicit_select, prefer_column_name_to_alias,
-  # enable_global_with_statement and
+  # ClickHouse: the connector sends max_memory_usage (above) with every
+  # request where the account's profile accepts settings (readonly=0 or 2).
+  # A readonly=1 profile refuses it, so there the profile itself must set
+  # max_memory_usage (docs/driver-matrix.md); max_result_bytes belongs in the
+  # profile in either case. Leave dialect, implicit_select,
+  # prefer_column_name_to_alias, enable_global_with_statement and
   # analyzer_compatibility_join_using_top_level_identifier at their
   # defaults, and compatibility unset or above 21.x: a readonly=1 profile
   # that changes them refuses the connection (docs/session-safety.md).

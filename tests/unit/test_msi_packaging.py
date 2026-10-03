@@ -93,6 +93,10 @@ ROLLBACK_ACTION = ("RollbackRemoveServiceCA", "uninstall.ps1")
 # The commit action that removes the rollback copy of the installed-release
 # record once the install has succeeded.
 COMMIT_ACTION = ("CommitReleaseRecordCA", "uninstall.ps1")
+# The venv's rollback twin (puts back the venv BuildVenvCA moved aside) and
+# commit action (removes it once the install has succeeded).
+VENV_ROLLBACK_ACTION = ("RollbackBuildVenvCA", "venv.ps1")
+VENV_COMMIT_ACTION = ("CommitBuildVenvCA", "venv.ps1")
 # The folder check before CreateFolders: its script (folders.ps1) is not an
 # installed file (nothing is installed yet), but the embedded property
 # UdbmcpFolderCheck, run as a script block.
@@ -366,6 +370,8 @@ def test_wxs_wires_the_deferred_custom_actions_as_authored_xml() -> None:
     expected[DEFERRED_UNINSTALL_ACTION[0]] = DEFERRED_UNINSTALL_ACTION[1]
     expected[ROLLBACK_ACTION[0]] = ROLLBACK_ACTION[1]
     expected[COMMIT_ACTION[0]] = COMMIT_ACTION[1]
+    expected[VENV_ROLLBACK_ACTION[0]] = VENV_ROLLBACK_ACTION[1]
+    expected[VENV_COMMIT_ACTION[0]] = VENV_COMMIT_ACTION[1]
     check = deferred.pop(FOLDER_CHECK_ACTION, None)
     assert check is not None, f"{FOLDER_CHECK_ACTION} must be authored (it runs before CreateFolders)"
     assert (check.get("Execute"), check.get("Impersonate"), check.get("Return"), check.get("Property")) == (
@@ -381,7 +387,7 @@ def test_wxs_wires_the_deferred_custom_actions_as_authored_xml() -> None:
         assert ca.get("Impersonate") == "no", (
             f"{action_id} must run impersonate=no (LocalSystem), got {ca.get('Impersonate')!r}"
         )
-        if action_id == COMMIT_ACTION[0]:
+        if action_id in (COMMIT_ACTION[0], VENV_COMMIT_ACTION[0]):
             # it runs once the install has committed: nothing is left to roll back
             assert ca.get("Return") == "ignore", f"{action_id} must use Return=ignore"
         else:
@@ -401,6 +407,12 @@ def test_wxs_wires_the_deferred_custom_actions_as_authored_xml() -> None:
     )
     assert deferred[COMMIT_ACTION[0]].get("Execute") == "commit", (
         "CommitReleaseRecordCA must be a commit action (it runs only once the install succeeded)"
+    )
+    assert deferred[VENV_ROLLBACK_ACTION[0]].get("Execute") == "rollback", (
+        "RollbackBuildVenvCA must be a rollback action (it puts the previous venv back)"
+    )
+    assert deferred[VENV_COMMIT_ACTION[0]].get("Execute") == "commit", (
+        "CommitBuildVenvCA must be a commit action (it removes the previous venv only once the install succeeded)"
     )
 
 

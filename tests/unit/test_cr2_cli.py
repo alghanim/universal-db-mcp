@@ -457,11 +457,15 @@ def test_v2h_as_root_a_file_swapped_after_the_check_is_not_read(
     h.target.write_text('{"mcpServers": {}}', encoding="utf-8")
     swapped = tmp_path / "swapped.json"
     swapped.write_text('{"mcpServers": {"universal-db": {"d": "RACED-SECRET"}}}', encoding="utf-8")
+    swapped.chmod(0o600)
+    _report_owner(monkeypatch, swapped, os.getuid() + 1)  # a file the user may not read
     hard._as_root(monkeypatch)
     real_open = os.open
 
     def racing_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
-        if os.fspath(path) == os.path.realpath(h.target):
+        # third review: the file is opened by name relative to its directory's
+        # descriptor (no path is resolved twice); swap it right before that
+        if os.fspath(path) in (os.path.realpath(h.target), h.target.name) and swapped.exists():
             os.replace(swapped, h.target)
         return real_open(path, flags, *args, **kwargs)
 

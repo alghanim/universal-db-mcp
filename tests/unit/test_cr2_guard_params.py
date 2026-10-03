@@ -301,14 +301,28 @@ def test_v10c_mysql_parenthesized_positions_are_compared(term: str) -> None:
         assert _mysql_compared_outputs(tree, ["n", "body", "id"]) == {1}, clause  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("term", ["NULL", "'2'", "?", "2.0", "-(-2)", "(SELECT 2)", "0x2", "RAND()"])
-def test_v10c_mysql_a_constant_term_compares_every_output(term: str) -> None:
+@pytest.mark.parametrize("term", ["?", "(?)", "? COLLATE utf8mb4_bin"])
+def test_v10c_mysql_a_bound_term_compares_every_output(term: str) -> None:
+    """PyMySQL writes an int (or bool, or integral Decimal) into the text as
+    an integer literal, which MySQL reads as a position."""
     import sqlglot
 
     from universal_db_mcp.connectors.mysql import _mysql_compared_outputs
 
     tree = sqlglot.parse_one(f"SELECT id, body FROM docs ORDER BY {term}", read="mysql")
     assert _mysql_compared_outputs(tree, ["id", "body"]) == {0, 1}  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("term", ["NULL", "'2'", "2.0", "-(-2)", "(SELECT 2)", "0x2", "RAND()", "COUNT(*)"])
+def test_v10c_mysql_a_constant_term_compares_no_output(term: str) -> None:
+    """Review round 3 (#11): MySQL 9.7 sorts and groups by these terms'
+    values (live), so they compare no output and the in-place cut stays."""
+    import sqlglot
+
+    from universal_db_mcp.connectors.mysql import _mysql_compared_outputs
+
+    tree = sqlglot.parse_one(f"SELECT id, body FROM docs ORDER BY {term}", read="mysql")
+    assert _mysql_compared_outputs(tree, ["id", "body"]) == set()  # type: ignore[arg-type]
 
 
 def test_v10c_mysql_column_terms_still_let_other_outputs_be_cut() -> None:
@@ -638,8 +652,9 @@ def test_v10e_a_star_beside_another_entry_is_still_refused_on_57() -> None:
 def test_public_cte_key_is_the_guards() -> None:
     from universal_db_mcp.security.sql_guard import cte_key
 
-    assert cte_key("oracle", "ς") == cte_key("oracle", "σ") == ("Σ",)
-    assert cte_key("postgres", "Ab") == ("ab", "ab") and cte_key("mysql", "Ab") == ("ab",)
+    # ASCII-exact since review cr3 VD-2 (non-ASCII CTE names are refused on Oracle, Db2, PostgreSQL)
+    assert cte_key("oracle", "ς") != cte_key("oracle", "σ") and cte_key("oracle", "ab") == "AB"
+    assert cte_key("postgres", "Ab") == "ab" and cte_key("mysql", "Ab") == "ab"
     guard = _guard("oracle", set(), database="d")
     assert guard._cte_key("ς") == cte_key("oracle", "ς")
 
@@ -663,8 +678,8 @@ def test_catalog_checks_are_cached_and_bounded() -> None:
         ss.loose_name(name)
     assert time.perf_counter() - start < 0.1
     assert ss.is_session_sql_view("mysql", "information_schema", "PROCESSLıST")
-    assert ss._loose_cached.cache_info().maxsize == ss._session_sql_view_cached.cache_info().maxsize == 32768
+    assert ss._LOOSE_CACHE.max_entries == ss._SESSION_SQL_CACHE.max_entries == 32768
     long_name = "x" * 70000
-    before = ss._loose_cached.cache_info().currsize
+    before = len(ss._LOOSE_CACHE)
     ss.loose_name(long_name)
-    assert ss._loose_cached.cache_info().currsize == before, "a long name is computed, not kept"
+    assert len(ss._LOOSE_CACHE) == before, "a long name is computed, not kept"

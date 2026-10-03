@@ -103,6 +103,15 @@ class ColumnInfo:
     default: str | None = None
     comment: str | None = None
     ordinal: int | None = None
+    # How the engine fills the column where that is not a plain stored value:
+    # ClickHouse's DEFAULT, MATERIALIZED, ALIAS or EPHEMERAL (SELECT * leaves
+    # out the last three: STAR_EXCLUDED_KINDS). None on every other engine.
+    default_kind: str | None = None
+
+
+# The default kinds whose columns SELECT * does not return (ClickHouse, unless
+# the session sets asterisk_include_materialized_columns / _alias_columns).
+STAR_EXCLUDED_KINDS = frozenset({"MATERIALIZED", "ALIAS", "EPHEMERAL"})
 
 
 @dataclass

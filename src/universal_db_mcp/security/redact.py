@@ -133,10 +133,12 @@ def redact_value(value: Any) -> Any:
     return value
 
 
-# scrub_exception shows 500 characters; it redacts at most this many, cut
-# before any pattern runs: a driver error can echo a parameter value of any
-# length, and redaction ran over all of it on the request's thread (V7-h).
+# scrub_exception shows 500 characters. An error up to _SCRUB_MAX_CHARS is
+# redacted whole; a longer one only its first _SCRUB_HEAD_CHARS, cut before
+# any pattern runs: a driver error can echo a parameter value of any length,
+# and redaction ran over all of it on the request's thread (V7-h).
 _SCRUB_MAX_CHARS = 16384
+_SCRUB_HEAD_CHARS = 4096
 _SCRUB_SHOWN_CHARS = 500
 
 
@@ -145,16 +147,25 @@ def scrub_exception(exc: BaseException) -> str:
     text = f"{type(exc).__name__}: {exc}"
     if len(text) <= _SCRUB_MAX_CHARS:
         return redact_text(text.replace("\n", " "))[:_SCRUB_SHOWN_CHARS]
-    # Cut first. A secret or a login cut in two at the boundary is no longer
-    # whole for redaction, and the end of the redacted text is the text just
-    # before the cut, verbatim: that end is dropped, as far back as the
-    # longest registered secret (and a margin), so no part of it is shown.
+    # Cut first, then redact the head. A secret or a login cut in two at the
+    # boundary is no longer whole for redaction, and it can only be in the
+    # text the redaction left verbatim at the end of the head: that tail is
+    # dropped, as far back as the longest registered secret (and a margin).
+    # The verbatim tail is no longer than the common suffix of the head and
+    # its redaction; a value redaction that shrank the head (password=<4 KiB>)
+    # leaves none, and the head of the engine's message stays (cr3 A6-7: it
+    # collapsed to 'TypeName:  [...]').
     margin = max([256, *(len(s) + 64 for s in _REGISTERED_SECRETS)])
-    redacted = redact_text(text[:_SCRUB_MAX_CHARS].replace("\n", " "))
-    keep = min(_SCRUB_SHOWN_CHARS, len(redacted) - margin)
-    if keep < _SCRUB_SHOWN_CHARS:
-        return redacted[: max(len(type(exc).__name__) + 2, keep)] + " [...]"
-    return redacted[:keep]
+    head = text[:_SCRUB_HEAD_CHARS].replace("\n", " ")
+    redacted = redact_text(head)
+    limit = min(margin, len(head), len(redacted))
+    verbatim = 0
+    while verbatim < limit and redacted[-1 - verbatim] == head[-1 - verbatim]:
+        verbatim += 1
+    kept = redacted[: len(redacted) - verbatim]
+    if len(kept) >= _SCRUB_SHOWN_CHARS:
+        return kept[:_SCRUB_SHOWN_CHARS]
+    return kept.rstrip() + " [...]"
 
 
 # Quoted literals in the unrolled form: the old (?:[^']|'')* pushed one

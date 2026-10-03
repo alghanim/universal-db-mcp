@@ -225,12 +225,17 @@ def _mysql_compared_outputs(tree: exp.Select, names: list[str]) -> set[int]:
     output column, so cutting it there would order, group or compare by its
     first max_cell_bytes characters.
 
-    MySQL reads a GROUP BY or ORDER BY term as a position under parentheses
-    and COLLATE too ((2), ((2)), 2 COLLATE x; live, 9.7: GROUP BY (2) merged
-    the groups of a cut column), and +2 (the parse drops the plus). Any
-    other term that names no column (NULL, '2', a bound value PyMySQL
-    writes into the text as 2, a subquery) may be one: every output is then
-    compared, and none is cut (the derived-table forms run instead)."""
+    MySQL reads a GROUP BY or ORDER BY term as a position when it is an
+    integer literal, under parentheses too ((2), ((2)); live, 9.7: GROUP BY
+    (2) merged the groups of a cut column), and +2 (the parse drops the
+    plus); 2 COLLATE x is taken as one too (MySQL 9.7 does not, MariaDB
+    unmeasured). A bound parameter there may be one: PyMySQL writes an int,
+    a bool or an integral Decimal into the text as an integer literal, so
+    such a term compares every output, and none is cut in place. Any other
+    term that names no column (RAND(), NULL, COUNT(*), '2', 2.0, -2, 0x2, a
+    subquery) sorts or groups by its value (live, 9.7) and compares no
+    output (review round 3: treating them as positions refused such
+    statements on MariaDB and materialized them on MySQL)."""
     lowered = [n.lower() for n in names]
     out: set[int] = set()
     for key in ("order", "group", "having"):
@@ -251,7 +256,7 @@ def _mysql_compared_outputs(tree: exp.Select, names: list[str]) -> set[int]:
                 and key_expr.this.isdigit()
             ):
                 out.add(int(key_expr.this) - 1)
-            elif key_expr.find(exp.Column) is None:
+            elif isinstance(key_expr, exp.Placeholder):
                 return set(range(len(names)))
     return out
 

@@ -309,6 +309,11 @@ def _names_our_id(entries: Any) -> bool:
     return any(isinstance(e, dict) and e.get("id") == REGISTRATION_ID for e in items)
 
 
+class _UnparsedMerge(ValueError):
+    """The merged patch file did not parse; the message describes why
+    without quoting it."""
+
+
 def _scan_rows(data: Any) -> tuple[bool, bool, str | None]:
     """Scan patch rows. Returns ``(registered, broken, reason)``.
 
@@ -401,6 +406,21 @@ def _registrations(data: Any) -> list[dict[str, Any]]:
         for entry in row["insert"]
         if isinstance(entry, dict) and entry.get("id") == REGISTRATION_ID
     ]
+
+
+def registered_config_path(env_home: Path) -> str | None:
+    """The ``UDBMCP_CONFIG`` the registration row in ``env_home``'s patch file
+    names, or None (no single readable row naming one). dsh counts a row with
+    our id as configured whatever config it names, so a registration made with
+    ``UDBMCP_CONFIG`` set elsewhere still names that config later."""
+    data, reason = _load_patch(env_home / PATCH_FILENAME)
+    rows = _registrations(data) if reason is None else []
+    if len(rows) != 1:
+        return None
+    config = rows[0].get("config")
+    env = config.get("env") if isinstance(config, dict) else None
+    named = env.get("UDBMCP_CONFIG") if isinstance(env, dict) else None
+    return named if isinstance(named, str) and named else None
 
 
 def _unisolated_registrations(data: Any) -> int:
@@ -702,7 +722,12 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
     # Verification gate: the merged document must parse as a sequence that now
     # contains our registration. Otherwise roll back and fail closed.
     try:
-        merged = yaml.safe_load(payload)
+        try:
+            merged = yaml.safe_load(payload)
+        except Exception as exc:  # noqa: BLE001 - described, never quoted (the payload holds the other rows)
+            from universal_db_mcp.config import describe_yaml_error
+
+            raise _UnparsedMerge(describe_yaml_error(exc)) from None
         registered, broken, row_reason = _scan_rows(merged)
         if broken:
             raise ValueError(row_reason)
@@ -716,9 +741,7 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
         # Verification runs BEFORE the write, so patch still holds the
         # original bytes; nothing to roll back, just fail closed. A parse
         # error is described, never quoted (the payload holds the other rows).
-        from universal_db_mcp.config import describe_yaml_error
-
-        why = describe_yaml_error(exc) if isinstance(exc, yaml.YAMLError) else str(exc)
+        why = str(exc)  # _UnparsedMerge carries a content-free description; the rest are this module's own
         return ApplyResult(
             AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED, False, backup,
             f"FAIL CLOSED: merged patch failed verification ({why}); original content restored",

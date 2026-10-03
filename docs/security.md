@@ -113,7 +113,9 @@ reporting only).
 - Exactly one statement; parser failure is a denial, not approval. An
   unterminated literal, comment or `[identifier]` is a `POLICY_VIOLATION`
   parse denial. Statements over 64 KiB are refused; the pre-parse scans are
-  linear, so a 64 KiB statement costs milliseconds.
+  linear, so a 64 KiB statement costs milliseconds. `db_federated_query`
+  refuses a statement over 64 KiB, or statements over 256 KiB together,
+  before it lexes any of them for their parameters.
 - Modifying CTEs inside SELECT are denied (full-AST walk).
 - Unknown/dangerous functions and table functions denied; `SELECT INTO`,
   ATTACH, PRAGMA, SET denied.
@@ -169,15 +171,18 @@ reporting only).
   placeholder count that does not match the values, a `%(name)s` with no
   value, a named value no placeholder uses, or both styles at once is
   `VALIDATION_ERROR` before anything runs. `db_federated_query` hands each
-  statement only the named values its own placeholders use; a name no
-  statement uses is `VALIDATION_ERROR`.
+  statement only the named values its own placeholders use (on Oracle
+  compared ignoring case, as its driver binds them); a name no statement
+  uses is `VALIDATION_ERROR`.
 - A name after `IN` without parentheses is refused, since ClickHouse and
   SQLite read it as a table (`x IN t`, `x IN db.t`, and any expression there
-  holding a name, such as `x IN tuple(t)`); on ClickHouse `IN (<single name>)`
+  holding a name, such as `x IN tuple(t)`), and so is a string there, which
+  SQLite reads as a table name (`x IN 'docs_content'`: `a string after IN
+  without parentheses is not permitted ...; write IN ('value', ...)`); on ClickHouse `IN (<single name>)`
   is refused whatever parentheses and aliases wrap the name (`x IN ((t AS
   z))`, `(+(t AS z))`, and the `NOT IN`, `GLOBAL IN` and `GLOBAL NOT IN`
   forms), and so are `{name:Identifier}` parameters. A placeholder or a
-  constant after `IN` is a value and is accepted (ClickHouse's `x IN
+  constant other than a string after `IN` is a value and is accepted (ClickHouse's `x IN
   {ids:Array(UInt64)}`, `IN tuple(1, 2)`, `IN ((1 AS z))`, a driver's `IN
   %(p)s`). On every engine an `IN` with nothing after it, and `IN` straight
   after `IN`, are refused: that is how the validator reads ClickHouse's
@@ -260,11 +265,18 @@ reporting only).
   not see), in statements and in the `object_name` of the metadata tools
   (`VALIDATION_ERROR`, each part must be a non-empty name). On SQLite a bare,
   unqualified `""` is accepted: SQLite reads it as the empty string.
-- A bare FROM item is taken for a CTE only when the engine binds it to that
-  CTE under every case folding it may apply: Oracle upper-cases an unquoted
-  name by Unicode's rules, character by character (`WITH "é" ... FROM é`
-  reads the table `É` and is authorized as one); on PostgreSQL and Db2 the
-  ASCII and the Unicode folding must agree.
+- On Oracle, Db2 and PostgreSQL a CTE name outside ASCII (quoted or not),
+  and an unquoted table or schema name outside ASCII, are refused
+  (`POLICY_VIOLATION: the CTE name ... is not permitted on <engine>: a CTE
+  name must be ASCII here ...`, `the unquoted name ... is not permitted as a
+  table or schema name ...; quote the exact name as the catalog spells it
+  ("<name>"), or use an ASCII name`). Each of these engines folds such a name
+  by rules of its own (Oracle by Unicode's, Db2 by its code page,
+  PostgreSQL by the locale), so the validator could not tell whether a FROM
+  item names a CTE or a table. A quoted table name is read exactly as
+  written and stays allowed, as do columns, aliases and literals outside
+  ASCII. ASCII names fold as the engine folds them, and a bare FROM item is
+  a CTE's only when the folded names are equal.
 
 ### SQL Server (T-SQL) specifics
 
@@ -321,9 +333,10 @@ refusal then ends `; a CTE of that name does not cover this reference:
 ClickHouse reads the table there (...)`. So `WITH RECURSIVE payroll AS
 (SELECT * FROM payroll) SELECT * FROM payroll` reads the table `payroll`: it is
 refused under default-deny or an allowlist, and runs, reporting `payroll`,
-with neither. A CTE that names one declared after it is accepted, and its
-result is masked whole (fail closed), as on SQLite; so is a recursion whose
-first branch names its own CTE.
+with neither. A CTE that names one declared after it, or a recursion whose
+first branch names its own CTE, passes the guard; when the statement reads a
+table with masked columns, masking refuses it (`... cannot be checked for
+them: ...`), as on SQLite.
 
 Refused on ClickHouse (`POLICY_VIOLATION`), whatever the policy:
 
@@ -655,7 +668,16 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
   name; that refusal ends `; a CTE of the name '<name>' does not change this
   ...: give the CTE another name`. `... SELECT n FROM cols` and `SELECT
   COUNT(*) ...` stay allowed. A user table such as `TRAVEL.COLS` is an
-  ordinary table.
+  ordinary table. MySQL's `information_schema.STATISTICS` is read the same
+  way without its `EXPRESSION` column (a functional index's SQL with its
+  literals). A statement that reads one of these views and has a `NATURAL`
+  join or a ClickHouse `COLUMNS(...)` matcher anywhere is refused too, since
+  those read columns the statement does not name (a `NATURAL` join with a
+  derived table of a string column named `EXPRESSION` was a blind equality
+  oracle on another schema's index literals): `... this statement shape
+  cannot be checked for those columns: it has a NATURAL join ...; select the
+  columns you need explicitly and join with ON (or USING with named
+  columns)`.
 - **Stored credentials.** Views and tables of password hashes, or of the
   passwords and connection details a database keeps for other servers, are
   refused to every tool whatever `allowed_system_schemas` or
@@ -727,13 +749,15 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
   R*Tree indexes hold the indexed values under generic column names (`c0`,
   `c1ssn`), where masking by name cannot apply: they are not listed, have no
   columns or detail, and a statement that reads one (a `FROM` or `JOIN`
-  item, as a name, a quoted string or a quoted identifier, in a subquery
+  item, as a name, a quoted string or a quoted identifier, its quote
+  characters doubled or not (`FROM 'notes''s_content'`), in a subquery
   too, or the table of `x IN table`) is refused (`QUERY_ERROR: '<name>' is
   an internal table of a full-text or R*Tree index ...`); query the index's
   own table. A shadow table is one SQLite marks so, or, where the build
   lacks the virtual table's module, a table named `<virtual table>_<suffix>`
   with a suffix of that module (an unknown module keeps every such name
-  back). Other tables are ordinary, whatever their names, and a literal,
+  back; the virtual table's definition is read with its comments skipped,
+  so a comment between its name and `USING` hides no module). Other tables are ordinary, whatever their names, and a literal,
   alias or column of a shadow table's name refuses nothing; a statement
   that cannot be parsed has every word with a `_` checked as a table.
   Residual: a view the database owner creates over a shadow table is an
@@ -747,13 +771,19 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
 
 Masking replaces the values of columns whose names match
 `security.mask_columns` (built-in patterns plus your additions) with
-`<masked>`, or omits them (`mask_action: omit`). It follows each output value
-to its source columns on the parsed statement, so aliases, UNION branches,
-CTE and derived column lists, whole-row references and engine-specific forms
-do not unmask a column, and it fails closed when a statement cannot be traced.
-A name outside ASCII or with blanks around it is also matched in its NFKC
-form, stripped (`ＭＲＮ` and `MRN ` as `MRN`). `docs/tools.md` (Masking) has
-the details.
+`<masked>`, or omits them (`mask_action: omit`). When a statement reads a
+table with such a column (or one whose columns the catalog does not list),
+each output value is mapped to its source columns by position, so aliases,
+UNION branches, CTE and derived column lists, joins and subqueries do not
+unmask a column. Only statement shapes the analysis fully understands are
+accepted; every other one is refused before it runs (`POLICY_VIOLATION:
+this statement reads a table with masked columns, and its shape cannot be
+checked for them: <construct>. ...`), and a result whose columns are not the
+ones the analysis placed returns no rows (owner decision 2026-10-03: refuse
+what cannot be proven, instead of tracing each exotic shape). A name outside
+ASCII or with blanks around it is also matched in its NFKC form, stripped
+(`ＭＲＮ` and `MRN ` as `MRN`). `docs/tools.md` (Masking) lists the accepted
+shapes and the refused constructs.
 
 Plans can carry values too. MySQL reads const tables while it plans and
 prints their values into TREE and JSON plans, so `db_explain` withholds such a
@@ -965,11 +995,17 @@ by default).
   and is finished by the next record. A log loosened while the server keeps
   it open (`chmod 644`) is set back to 0600 before the next record is
   appended. On macOS the log and its lock are not written (an audit write
-  failure, so `audit_fail_closed` applies) while an extended ACL entry
-  grants another account access to them (`-rw-------+` with `everyone
-  allow read`); remove it with `chmod -N <path>`. Doctor reports this, for
-  the rotated backups and the
-  directory too, as `audit-path-acl`.
+  failure, so `audit_fail_closed` applies) while an extended ACL entry lets
+  another account read, change, delete or re-permission them (`-rw-------+`
+  with `everyone allow read`, or `allow delete`), or while the directory's
+  ACL lets another account add, delete or rename files there, rewrite its
+  ACL or owner, or carries an inheritable (`file_inherit`) entry that would
+  give every new file (each rotation creates one) such a right. A read-only
+  directory entry (`list`, `search`, the read rights) is accepted, as mode
+  0750 is. The refusal names every path to clear in one command, the
+  directory first: `chmod -N <dir> <log> <lock> <backups>`. Doctor reports
+  this, for the rotated backups and the directory too, as `audit-path-acl`,
+  with the same command.
 
 ## Local state files
 
@@ -977,10 +1013,15 @@ by default).
   permitted-object set, so the cache file must be owned by the server's user,
   have no group or other bits, not be a symlink or hard link, and sit in a
   directory owned by that user or root with no group or other write bit
-  (sticky directories such as `/tmp` included); on macOS no extended ACL
-  entry on the file, its sidecars or the directory may grant another account
-  access (doctor: `metadata-cache-acl`). Otherwise caching is disabled
-  with a stderr line (live catalog reads; nothing fails). Future-dated entries
+  (sticky directories such as `/tmp` included); on macOS the same ACL rules
+  as for the audit log apply to the file, its sidecars and the directory
+  (doctor: `metadata-cache-acl`). A cache directory reached through a
+  symlink is checked where it leads, and accepted. Otherwise caching is
+  disabled with a stderr line (live catalog reads; nothing fails). A check
+  that cannot run right now (out of file descriptors or memory: `EMFILE`,
+  `ENFILE`, `ENOMEM`, `EINTR`, `EAGAIN`) makes that one lookup a miss and
+  the next one checks again; it does not disable the cache (doctor warns:
+  re-run). Future-dated entries
   are ignored; lists are cached whole or not at all (up to about 500k objects
   or 64 MiB); SQLite errors while running are cache misses; a non-SQLite file
   at the path still fails startup. Doctor reports `metadata-cache-perms`.

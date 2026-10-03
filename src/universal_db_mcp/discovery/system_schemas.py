@@ -10,9 +10,12 @@ allowed_schemas) names it.
 
 from __future__ import annotations
 
-import functools
+import collections
 import re
+import threading
 import unicodedata
+from collections.abc import Hashable
+from typing import Any
 
 SYSTEM_SCHEMAS: dict[str, frozenset[str]] = {
     "postgres": frozenset({"pg_catalog", "information_schema", "pg_toast"}),
@@ -79,7 +82,14 @@ def loose_name(name: str) -> str:
     more spellings than an engine reads, never fewer. SQL Server's collations
     fold more than this, which is why the guard admits only printable ASCII
     names there."""
-    return _loose_cached(name) if len(name) <= _CACHED_NAME_CHARS else _loose(name)
+    if len(name) > _CACHED_NAME_CHARS:
+        return _loose(name)
+    folded: str | None = _LOOSE_CACHE.get(name)
+    if folded is None:
+        folded = _loose(name)
+        if len(folded) <= _CACHED_NAME_CHARS:  # NFKD expands U+FDFA 18-fold: such an answer is not kept
+            _LOOSE_CACHE.put(name, folded, len(name) + len(folded))
+    return folded
 
 
 def _loose(name: str) -> str:
@@ -88,14 +98,60 @@ def _loose(name: str) -> str:
     return unmarked.upper().lower().strip()
 
 
+class _SizedCache:
+    """A least-recently-used memo bounded by the characters it stores (keys
+    and values, ``budget``) as well as by its entries (``max_entries``): an
+    entry count alone let callers choosing the names keep hundreds of MiB
+    for good (review cr3 A4-5: 70 calls naming 128-character identifiers of
+    U+FDFA, +349 MiB never released). Thread-safe."""
+
+    def __init__(self, *, budget: int, max_entries: int) -> None:
+        self.budget = budget
+        self.max_entries = max_entries
+        self.stored = 0
+        self._entries: collections.OrderedDict[Hashable, tuple[Any, int]] = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, key: Hashable) -> Any:
+        """The value kept for ``key``, or None."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            self._entries.move_to_end(key)
+            return entry[0]
+
+    def put(self, key: Hashable, value: Any, size: int) -> None:
+        """Keep ``value`` for ``key`` (``size`` characters), dropping the
+        least recently used entries past either bound; never one larger
+        than a hundredth of the budget."""
+        if size > self.budget // 100:
+            return
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self.stored -= old[1]
+            self._entries[key] = (value, size)
+            self.stored += size
+            while self.stored > self.budget or len(self._entries) > self.max_entries:
+                _, (_, dropped) = self._entries.popitem(last=False)
+                self.stored -= dropped
+
+
 # loose_name and is_session_sql_view run for every object of every catalog
 # page and every name of every statement: their answers are kept for names
-# up to an engine's identifier length (128: Oracle, SQL Server, Db2), in
-# caches bounded in entries, so a long or hostile name is computed, never
-# kept, and the memory stays bounded (a few tens of MiB at worst).
+# up to an engine's identifier length (128: Oracle, SQL Server, Db2) whose
+# folded form is no longer, in caches bounded by entries and by the
+# characters stored (a 4 KiB name is never kept, a long expansion neither):
+# at most _CACHE_CHARS characters each, a few MiB with Python's per-entry
+# overhead (32768 entries) at worst.
 _CACHED_NAME_CHARS = 128
 _CACHE_ENTRIES = 32768
-_loose_cached = functools.lru_cache(maxsize=_CACHE_ENTRIES)(_loose)
+_CACHE_CHARS = 1 << 20
+_LOOSE_CACHE = _SizedCache(budget=_CACHE_CHARS, max_entries=_CACHE_ENTRIES)
 
 
 def is_listed_system_schema(engine: str, schema: str) -> bool:
@@ -515,9 +571,14 @@ def is_session_sql_view(engine: str, schema: str | None, name: str) -> bool:
     DEFINITION_VIEWS, in any spelling loose_name folds to one: a view that
     hands back values masking hides, or credentials, refused to every tool
     and left out of every listing."""
-    if len(name) <= _CACHED_NAME_CHARS and (schema is None or len(schema) <= _CACHED_NAME_CHARS):
-        return _session_sql_view_cached(engine, schema, name)
-    return _session_sql_view(engine, schema, name)
+    if len(name) > _CACHED_NAME_CHARS or (schema is not None and len(schema) > _CACHED_NAME_CHARS):
+        return _session_sql_view(engine, schema, name)
+    key = (engine, schema, name)
+    found = _SESSION_SQL_CACHE.get(key)
+    if found is None:
+        found = _session_sql_view(engine, schema, name)
+        _SESSION_SQL_CACHE.put(key, found, len(engine) + len(schema or "") + len(name))
+    return bool(found)
 
 
 def _session_sql_view(engine: str, schema: str | None, name: str) -> bool:
@@ -531,7 +592,7 @@ def _session_sql_view(engine: str, schema: str | None, name: str) -> bool:
     )
 
 
-_session_sql_view_cached = functools.lru_cache(maxsize=_CACHE_ENTRIES)(_session_sql_view)
+_SESSION_SQL_CACHE = _SizedCache(budget=_CACHE_CHARS, max_entries=_CACHE_ENTRIES)
 
 
 def is_system_object(engine: str, schema: str | None, table: str) -> bool:

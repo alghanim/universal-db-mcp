@@ -18,6 +18,7 @@ while the server runs (a busy file, one removed or replaced) is a miss too.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -55,6 +56,26 @@ _SIDECARS = ("-wal", "-shm", "-journal")
 
 class _CacheDisabled(Exception):
     """The cache file cannot be trusted; the cache is off for this process."""
+
+
+class TransientCacheCheckError(OSError):
+    """The cache's files could not be inspected for a reason that passes (out
+    of file descriptors or memory, an interrupted call): the check has no
+    answer right now, which is neither trust nor a reason to stop trying."""
+
+
+# errno values that say "not now" rather than "not this file"
+_TRANSIENT_ERRNOS = frozenset(
+    {errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EINTR, errno.EAGAIN, errno.ENOBUFS}
+)
+
+
+def _inspection_failed(exc: OSError, what: str) -> str:
+    """The problem for an *exc* inspecting *what*; a transient one raises
+    TransientCacheCheckError instead."""
+    if exc.errno in _TRANSIENT_ERRNOS:
+        raise TransientCacheCheckError(exc.errno, f"cannot inspect {what} right now: {exc.strerror or exc}") from exc
+    return f"cannot inspect {what}: {exc}"
 
 
 def connection_target(connection: ResolvedConnection) -> str:
@@ -95,8 +116,12 @@ def cache_file_problems(path: Path, *, owner_uid: int | None) -> list[str]:
     or others (owners are not compared when *owner_uid* is None). A sticky
     directory such as /tmp is refused too: the sidecar names are
     predictable, so another user could plant one between this check and
-    SQLite opening it. POSIX only: on Windows the state directory's ACL is
-    the control (docs/offline-deployment.md)."""
+    SQLite opening it. On macOS an extended ACL that lets another account
+    read, change or delete a file, or add, delete or rename files in the
+    directory (or that every new file there would inherit), is refused too.
+    POSIX only: on Windows the state directory's ACL is the control
+    (docs/offline-deployment.md). Raises TransientCacheCheckError when a
+    file cannot be inspected right now (EMFILE and the like)."""
     if sys.platform == "win32":
         return []
     problems: list[str] = []
@@ -105,7 +130,7 @@ def cache_file_problems(path: Path, *, owner_uid: int | None) -> list[str]:
     except FileNotFoundError:
         return []  # nothing there to trust yet; the cache creates it 0700
     except OSError as exc:
-        return [f"cannot inspect directory '{path.parent}': {exc}"]
+        return [_inspection_failed(exc, f"directory '{path.parent}'")]
     if dst.st_mode & 0o022:
         problems.append(
             f"directory '{path.parent}' is writable by other users ({stat.filemode(dst.st_mode)}, "
@@ -120,7 +145,7 @@ def cache_file_problems(path: Path, *, owner_uid: int | None) -> list[str]:
         except FileNotFoundError:
             continue
         except OSError as exc:
-            problems.append(f"cannot inspect '{f}': {exc}")
+            problems.append(_inspection_failed(exc, f"'{f}'"))
             continue
         if stat.S_ISLNK(st.st_mode):
             problems.append(f"'{f}' is a symlink")
@@ -140,33 +165,38 @@ def cache_file_problems(path: Path, *, owner_uid: int | None) -> list[str]:
 
 
 def _acl_problems(file: Path) -> list[str]:
-    """macOS: what an extended ACL on *file* grants beyond its 0600 mode."""
+    """macOS: what an extended ACL on *file* grants beyond its 0600 mode
+    (read, write, delete, attribute or security rights to another account)."""
     if sys.platform != "darwin":
         return []
-    from universal_db_mcp.config import darwin_secret_file_acl_problems
+    from universal_db_mcp.config import darwin_state_file_acl_problems
 
     try:
-        granted = darwin_secret_file_acl_problems(file)
+        granted = darwin_state_file_acl_problems(file)
     except OSError as exc:
-        return [f"cannot read the access control list of '{file}': {exc}"]
+        return [_inspection_failed(exc, f"the access control list of '{file}'")]
     return [f"'{file}' has an access control list that grants others access ({'; '.join(granted)})"] if granted else []
 
 
 def _directory_acl_problems(directory: Path) -> list[str]:
-    """macOS: what an extended ACL on the cache's directory grants anyone but
-    its owner (another account that may add files could plant a sidecar)."""
-    from universal_db_mcp.config import darwin_directory_acl_problems
+    """macOS: what an extended ACL on the cache's directory lets anyone but its
+    owner do (config.darwin_state_directory_acl_problems): add, delete or
+    rename files there (and so plant a sidecar), rewrite its ACL, or give
+    every new file an inherited entry. A read-only entry (list, search) is
+    accepted, as mode 0750 is. The directory is opened following a symlink,
+    as the os.stat above it checks it."""
+    from universal_db_mcp.config import darwin_state_directory_acl_problems
 
     try:
-        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except FileNotFoundError:
         return []
     except OSError as exc:
-        return [f"cannot inspect directory '{directory}': {exc}"]
+        return [_inspection_failed(exc, f"directory '{directory}'")]
     try:
-        granted = darwin_directory_acl_problems(fd)
+        granted = darwin_state_directory_acl_problems(fd)
     except OSError as exc:
-        return [f"cannot read the access control list of directory '{directory}': {exc}"]
+        return [_inspection_failed(exc, f"the access control list of directory '{directory}'")]
     finally:
         os.close(fd)
     if not granted:
@@ -206,7 +236,12 @@ class MetadataCache:
 
     def _refuse_if_unsafe(self, path: Path) -> None:
         owner_uid = None if sys.platform == "win32" else os.geteuid()
-        problems = cache_file_problems(path, owner_uid=owner_uid)
+        try:
+            problems = cache_file_problems(path, owner_uid=owner_uid)
+        except TransientCacheCheckError as exc:
+            # no answer right now (EMFILE...): this lookup is a miss, and the
+            # next one checks again instead of the cache staying off for good
+            raise _CacheDisabled(str(exc)) from exc
         if problems:
             raise self._disable("; ".join(problems))
 

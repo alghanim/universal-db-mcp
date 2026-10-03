@@ -713,22 +713,89 @@ def _open_state_file(path: Path, flags: int) -> int:
             if created:
                 _give_to_directory_owner(fd, path.parent)
         if sys.platform == "darwin":
-            # 0600 says nothing about an extended ACL: '-rw-------+' with
-            # 'everyone allow read' is readable by every local user
-            from universal_db_mcp.config import darwin_secret_file_acl_problems
-
-            granted = darwin_secret_file_acl_problems(path)
-            if granted:
-                raise OSError(
-                    errno.EACCES,
-                    f"refused: its access control list grants others access ({'; '.join(granted)}); "
-                    f"remove it with chmod -N",
-                    str(path),
-                )
+            _refuse_shared_state(fd, path)
     except OSError:
         os.close(fd)
         raise
     return fd
+
+
+# More state-file names than this in one refusal are named by a glob instead.
+_MAX_NAMED_STATE_FILES = 20
+
+
+def _refuse_shared_state(fd: int, path: Path) -> None:
+    """macOS: refuse the just-opened state file *path* (descriptor *fd*) when
+    an extended ACL lets another account read, change, delete or re-permission
+    it, or when its directory's ACL lets one add, delete or rename files there
+    or carries an inheritable entry that every file created there later (each
+    rotation creates a log) would take: mode 0600 says nothing about an ACL,
+    and '-rw-------+' with 'everyone allow read' is readable by every local
+    user. The refusal names, in one chmod -N command, the directory and every
+    audit file (log, lock, backups) that carries such an entry, so clearing
+    what it names is enough: a rotation cannot re-create a refused file."""
+    import shlex
+
+    from universal_db_mcp.config import darwin_state_directory_acl_problems, darwin_state_file_acl_problems
+
+    granted = [f"'{path}': {problem}" for problem in darwin_state_file_acl_problems(fd)]
+    directory = path.parent
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except PermissionError:
+        # a directory this account may search and write but not list (-wx):
+        # its ACL is read by name
+        dir_problems = darwin_state_directory_acl_problems(directory)
+    else:
+        try:
+            dir_problems = darwin_state_directory_acl_problems(dir_fd)
+        finally:
+            os.close(dir_fd)
+    dir_granted = [f"directory '{directory}': {problem}" for problem in dir_problems]
+    if not granted and not dir_granted:
+        return
+    stem = path.name.removesuffix(".lock")
+    names = [shlex.quote(str(directory))] if dir_granted else []
+    files = _acl_bearing_state_files(directory, stem)
+    if path.name not in files and granted:
+        files.insert(0, path.name)
+    if len(files) > _MAX_NAMED_STATE_FILES:
+        names.append(shlex.quote(str(directory / stem)) + "*")
+    else:
+        names += [shlex.quote(str(directory / name)) for name in files]
+    raise OSError(
+        errno.EACCES,
+        "refused: an access control list lets other accounts read, change or delete the audit trail "
+        f"({'; '.join(dir_granted + granted)}); remove the access control lists with: chmod -N {' '.join(names)}",
+    )  # no filename: the command must end the message (it names every path)
+
+
+def _acl_bearing_state_files(directory: Path, stem: str) -> list[str]:
+    """The names of the audit files in *directory* (the log *stem*, its lock,
+    staging name and numbered backups) whose ACL grants another account a
+    state-file right, or cannot be read."""
+    from universal_db_mcp.config import darwin_state_file_acl_problems
+
+    found: list[str] = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return found
+    for name in names:
+        if not name.startswith(stem):
+            continue
+        rest = name[len(stem) :]
+        if rest not in ("", ".lock", ".rotating") and not (rest[:1] == "." and rest[1:].isdigit()):
+            continue
+        member = directory / name
+        try:
+            if not stat.S_ISREG(os.lstat(member).st_mode):
+                continue
+            if darwin_state_file_acl_problems(member):
+                found.append(name)
+        except OSError:
+            found.append(name)
+    return found
 
 
 def _give_to_directory_owner(fd: int, directory: Path) -> None:

@@ -86,45 +86,15 @@ EOF
 
 # --- what dpkg runs after a refusal here ------------------------------------
 # On an upgrade dpkg has already run the INSTALLED release's prerm, which
-# stopped the service, and a refusal here makes it run the installed
-# release's postinst with abort-upgrade. A postinst from before this release
-# ignores its argument and configures again: for a bundle with OS packages it
-# spawns a deferred install worker that re-installs the installed release
-# (replacing venv.previous, the rollback point) and can still be running when
-# the admin retries this install, so that dpkg records this package while
-# the worker publishes the older code. Every such postinst spawns no worker
-# while $DEFERRED_LOCK is held. So on any nonzero exit under dpkg's upgrade,
-# this preinst takes that lock and hands it to a small detached process
-# (its fd 9 is the one taken here) that holds it until this dpkg run has
-# ended, then starts the service again when it is enabled and not running
-# (what this release's own postinst does for abort-upgrade). A lock already
-# held means an install worker is running: nothing is spawned then. Outside
-# dpkg (no DPKG_MAINTSCRIPT_NAME), or without flock/setsid, nothing is done.
+# stopped the service. A refusal here, or a failed unpack after this script
+# passed (a file conflict, a full disk), makes dpkg run this package's postrm
+# with abort-upgrade and then the installed release's postinst with
+# abort-upgrade. A postinst from before this release ignores its argument and
+# configures again, spawning a deferred install worker that re-installs the
+# installed release (replacing venv.previous, the rollback point). This
+# package's postrm keeps it from doing that (see 'abort-upgrade' there): the
+# postrm is the one script dpkg runs on every path that undoes an upgrade.
 DEFERRED_LOCK=/run/udbmcp-deferred-install.lock
-PREINST_ACTION="${1:-}"
-UNWIND_HOLDER='i=0
-while kill -0 "$1" 2>/dev/null && [ "$i" -lt 7200 ]; do sleep 0.5; i=$((i + 1)); done
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
-   && systemctl is-enabled --quiet universal-db-mcp 2>/dev/null \
-   && ! systemctl is-active --quiet universal-db-mcp 2>/dev/null; then
-  systemctl start --no-block universal-db-mcp 2>/dev/null || true
-fi'
-hold_the_unwind() {
-    [ "$PREINST_ACTION" = upgrade ] && [ "${DPKG_MAINTSCRIPT_NAME:-}" = preinst ] || return 0
-    command -v flock >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 || return 0
-    exec 9>>"$DEFERRED_LOCK" 2>/dev/null || return 0
-    if flock -n 9; then
-        setsid --fork /bin/bash -c "$UNWIND_HOLDER" udbmcp-unwind-holder "$PPID" </dev/null >/dev/null 2>&1 \
-            && echo "universal-db-mcp preinst: the installed release's postinst is kept from starting an install worker while dpkg undoes this upgrade." >&2
-    fi
-    exec 9>&-
-}
-on_preinst_exit() {
-    local rc=$?
-    [ "$rc" -eq 0 ] || hold_the_unwind || true
-    return "$rc"
-}
-trap on_preinst_exit EXIT
 
 # --- prerequisite 1: the trusted verifier -----------------------------------
 # Installed by the admin with `install -m 644`, so it is executed via
@@ -283,8 +253,8 @@ fi
 # the other release's code and starts the service on it (an earlier
 # package's postinst spawns one when dpkg undoes a refused upgrade). Refused
 # here, before anything is unpacked. A holder that ends within 15 seconds
-# (the one a refused run of this preinst leaves until its dpkg run is over)
-# is waited for.
+# (the one this package's postrm leaves while dpkg undoes a failed upgrade,
+# until that dpkg run is over) is waited for.
 if command -v flock >/dev/null 2>&1 && [ -e "$DEFERRED_LOCK" ]; then
     deferred_free=""
     for _ in $(seq 1 30); do

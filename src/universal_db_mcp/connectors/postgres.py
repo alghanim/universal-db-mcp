@@ -345,6 +345,23 @@ def _pg_type(data_type: Any, char_len: Any, precision: Any, scale: Any) -> str:
     return base
 
 
+# The columns of materialized views, which information_schema.columns leaves
+# out, in the shape of its rows (list_columns, list_all_columns): user
+# columns in attnum order (information_schema's ordinal_position), no dropped
+# one, and only where information_schema would list them - the login owns
+# the relation (a role it is a member of) or holds a privilege on the column.
+_PG_MATVIEW_COLUMNS = (
+    "SELECT a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod), "
+    "CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, NULL::text, a.attnum::int, NULL::int, NULL::int, "
+    "NULL::int "
+    "FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relkind = 'm' AND a.attnum > 0 AND NOT a.attisdropped "
+    "AND (pg_catalog.pg_has_role(c.relowner, 'USAGE') "
+    "OR pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'))"
+)
+
+
 class PostgresConnector(DatabaseConnector):
     engine = "postgres"
 
@@ -722,13 +739,14 @@ class PostgresConnector(DatabaseConnector):
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
         schema = schema or "public"
         sql = (
-            "SELECT column_name, data_type, is_nullable, column_default, ordinal_position, "
-            "character_maximum_length, numeric_precision, numeric_scale "
+            "SELECT column_name::text, data_type::text, is_nullable::text, column_default::text, "
+            "ordinal_position::int, character_maximum_length::int, numeric_precision::int, numeric_scale::int "
             "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
-            "ORDER BY ordinal_position"
+            f"UNION ALL {_PG_MATVIEW_COLUMNS} AND n.nspname = %s AND c.relname = %s "
+            "ORDER BY 5"
         )
         with self._shared_meta_conn() as conn:
-            rows = conn.execute(sql, (schema, table)).fetchall()
+            rows = conn.execute(sql, (schema, table, schema, table)).fetchall()
         return [
             ColumnInfo(
                 schema=schema,
@@ -801,12 +819,16 @@ class PostgresConnector(DatabaseConnector):
     def list_all_columns(self, schema: str | None) -> list[ColumnInfo]:
         schema = schema or "public"
         sql = (
-            "SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position, "
-            "character_maximum_length, numeric_precision, numeric_scale "
-            "FROM information_schema.columns WHERE table_schema = %s ORDER BY table_name, ordinal_position"
+            # table_name as name: ordered byte-wise (collation "C"), as before
+            "SELECT table_name::name, column_name::text, data_type::text, is_nullable::text, "
+            "column_default::text, ordinal_position::int, character_maximum_length::int, "
+            "numeric_precision::int, numeric_scale::int "
+            "FROM information_schema.columns WHERE table_schema = %s "
+            f"UNION ALL {_PG_MATVIEW_COLUMNS.replace('SELECT ', 'SELECT c.relname, ', 1)} AND n.nspname = %s "
+            "ORDER BY 1, 6"
         )
         with self._shared_meta_conn() as conn:
-            rows = conn.execute(sql, (schema,)).fetchall()
+            rows = conn.execute(sql, (schema, schema)).fetchall()
         return [
             ColumnInfo(schema=schema, table=r[0], name=r[1], data_type=_pg_type(r[2], r[6], r[7], r[8]),
                        nullable=r[3] == "YES", default=r[4], ordinal=r[5])

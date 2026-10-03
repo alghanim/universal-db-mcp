@@ -798,15 +798,30 @@ def test_m4_a_quoted_cte_does_not_cover_a_differently_folded_name(engine: str, s
     [
         ("oracle", "WITH e AS (SELECT 1 AS x FROM DUAL) SELECT * FROM E"),
         ("oracle", 'WITH "E" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM e'),
-        ("oracle", 'WITH "É" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM é'),
         ("postgres", "WITH s AS (SELECT 1 AS x) SELECT * FROM S"),
         ("postgres", 'WITH "s" AS (SELECT 1 AS x) SELECT * FROM S'),
-        ("postgres", 'WITH "ölstand" AS (SELECT 1 AS x) SELECT * FROM "ölstand"'),
         ("mysql", "WITH s AS (SELECT 1 AS x) SELECT * FROM S"),
+        ("mysql", 'WITH "É" AS (SELECT 1 AS x) SELECT * FROM É'),
     ],
 )
 def test_m4_a_cte_the_engine_binds_stays_a_cte(engine: str, sql: str) -> None:
     _guard(engine, {("travel", "bookings")}).validate_select(sql)
+
+
+@pytest.mark.parametrize(
+    ("engine", "sql"),
+    [
+        ("oracle", 'WITH "É" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM é'),
+        ("postgres", 'WITH "ölstand" AS (SELECT 1 AS x) SELECT * FROM "ölstand"'),
+    ],
+)
+def test_m4_a_non_ascii_cte_is_refused_where_names_fold(engine: str, sql: str) -> None:
+    """Owner decision 2026-10-03 (review cr3 VD-2): on Oracle, Db2 and
+    PostgreSQL a CTE name outside ASCII is refused, even where the engine
+    would bind it, rather than modelling each engine's Unicode folding."""
+    with pytest.raises(ToolFailure) as info:
+        _guard(engine, {("travel", "bookings")}).validate_select(sql)
+    assert info.value.category == ErrorCategory.POLICY and "ASCII" in str(info.value)
 
 
 # --------------------------------------------------------------------------

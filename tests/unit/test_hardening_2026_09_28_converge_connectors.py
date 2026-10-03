@@ -606,7 +606,7 @@ def test_clickhouse_server_without_the_settings_reads_text_the_default_way(
 ) -> None:
     client = _CHClient({"readonly": _Setting("0")})
     _ch(tmp_path, monkeypatch, client)._connect()
-    assert set(client.params) == {"readonly", "max_execution_time"}
+    assert set(client.params) == {"readonly", "max_execution_time", "max_memory_usage"}
 
 
 @pytest.mark.parametrize(

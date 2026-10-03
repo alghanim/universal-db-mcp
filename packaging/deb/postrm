@@ -77,6 +77,44 @@ UNIT_DROPIN_DIR="/etc/systemd/system/universal-db-mcp.service.d"
 UNIT_RECORD_DIR="/var/lib/universal-db-mcp-package"
 SHIPPED_UNIT_RECORD="/var/lib/universal-db-mcp/.shipped-unit.sha256"
 
+# --- abort-upgrade: keep the installed release from re-installing itself ----
+# dpkg undoes an upgrade (this package's preinst refused, or the unpack failed
+# after it passed: a file conflict, a full disk) by running this script with
+# abort-upgrade and then the INSTALLED release's postinst with abort-upgrade.
+# dpkg runs this script first on every path that undoes an upgrade. A
+# postinst from before this release ignores its argument and configures again:
+# for a bundle with OS packages it spawns a deferred install worker that
+# re-installs the installed release (replacing venv.previous, the rollback
+# point) and can still be running when the admin retries, so that dpkg
+# records the new package while the worker publishes the older code. Every
+# such postinst spawns no worker while $DEFERRED_LOCK is held. So this script
+# takes that lock and hands it to a small detached process (its fd 9 is the
+# one taken here) that holds it until this dpkg run has ended, then starts
+# the service again when it is enabled and not running (what this release's
+# own postinst does for abort-upgrade). A lock already held means an install
+# worker is running: nothing is spawned then. Outside dpkg (no
+# DPKG_MAINTSCRIPT_NAME), or without flock/setsid, nothing is done. Never
+# fails: a failing postrm abort-upgrade would leave the package half-installed.
+DEFERRED_LOCK=/run/udbmcp-deferred-install.lock
+UNWIND_HOLDER='i=0
+while kill -0 "$1" 2>/dev/null && [ "$i" -lt 7200 ]; do sleep 0.5; i=$((i + 1)); done
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
+   && systemctl is-enabled --quiet universal-db-mcp 2>/dev/null \
+   && ! systemctl is-active --quiet universal-db-mcp 2>/dev/null; then
+  systemctl start --no-block universal-db-mcp 2>/dev/null || true
+fi'
+hold_the_unwind() {
+    [ "${DPKG_MAINTSCRIPT_NAME:-}" = postrm ] || return 0
+    command -v flock >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 || return 0
+    { exec 9>>"$DEFERRED_LOCK"; } 2>/dev/null || return 0
+    if flock -n 9; then
+        if setsid --fork /bin/bash -c "$UNWIND_HOLDER" udbmcp-unwind-holder "$PPID" </dev/null >/dev/null 2>&1; then
+            echo "universal-db-mcp postrm: the installed release's postinst is kept from starting an install worker while dpkg undoes this upgrade." >&2
+        fi
+    fi
+    exec 9>&-
+}
+
 warn() {
     echo "WARN: $1" >&2
 }
@@ -145,7 +183,12 @@ case "${1:-}" in
              "installer-generated $VENV_DIR and $MANIFEST_FILE and the deployed" \
              "unit $UNIT_FILE are retained (purge deletes them)."
         ;;
-    upgrade|failed-upgrade|abort-install|abort-upgrade)
+    abort-upgrade)
+        # No cleanup: the installed release's files are back in place. See
+        # hold_the_unwind above.
+        hold_the_unwind || true
+        ;;
+    upgrade|failed-upgrade|abort-install)
         # No cleanup: the installation continues or rolls back as-is.
         ;;
     "")

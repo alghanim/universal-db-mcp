@@ -229,17 +229,38 @@ def _follows_identifier(sql: str, i: int) -> bool:
     return i > 0 and _IDENT_CHAR.match(sql[i - 1]) is not None
 
 
-def _block_comment_end(sql: str, i: int, *, nested: bool) -> int:
+class _NextFinder:
+    """``sql.find(needle, i)`` for a growing ``i``, each needle searched
+    once per occurrence: a find from every comment opener to the end of
+    the text was quadratic (review cr3 C-1/F-1: 1 MiB of '--' lines held
+    the event loop for 3 s, nested '/*' openers 14 s at 256 KiB)."""
+
+    def __init__(self, sql: str) -> None:
+        self._sql = sql
+        self._next: dict[str, int] = {}
+
+    def find(self, needle: str, i: int) -> int:
+        """The first occurrence of ``needle`` at or after ``i``, or -1."""
+        at = self._next.get(needle)
+        if at is None or (at != -1 and at < i):
+            at = self._sql.find(needle, i)
+            self._next[needle] = at
+        return at
+
+
+def _block_comment_end(sql: str, i: int, *, nested: bool, finder: _NextFinder | None = None) -> int:
     """The index just past the block comment opened at ``i`` (the end of
-    the text when it is unterminated)."""
+    the text when it is unterminated). Linear in the comment's length with
+    a shared ``finder`` (each '*/' and '/*' is searched for once)."""
+    finder = finder or _NextFinder(sql)
     depth = 1
     k = i + 2
     while depth:
-        close = sql.find("*/", k)
+        close = finder.find("*/", k)
         if close == -1:
             return len(sql)
-        reopen = sql.find("/*", k, close) if nested else -1
-        if reopen != -1:
+        reopen = finder.find("/*", k) if nested else -1
+        if reopen != -1 and reopen + 2 <= close:  # as sql.find('/*', k, close)
             depth += 1
             k = reopen + 2
         else:
@@ -252,10 +273,12 @@ def _spans(sql: str, lex: _Lexing) -> Iterator[tuple[str, int, int]]:
     """``sql`` cut into ``(kind, start, end)`` spans as ``lex`` bounds its
     literals: ``code`` (a maximal run between the others), ``string`` (a
     string literal, a $tag$ quote), ``name`` (a quoted identifier) and
-    ``comment``. An unterminated span runs to the end of the text."""
+    ``comment``. An unterminated span runs to the end of the text. Linear
+    in the text's length (_NextFinder)."""
     i = 0
     n = len(sql)
     code_start = 0
+    finder = _NextFinder(sql)
     while i < n:
         ch = sql[i]
         nxt = sql[i + 1 : i + 2]
@@ -268,10 +291,10 @@ def _spans(sql: str, lex: _Lexing) -> Iterator[tuple[str, int, int]]:
         if (ch == "-" and nxt == "-" and not (lex.dash_needs_space and follower > " " and follower != "\x7f")) or (
             ch == "#" and lex.hash_comments
         ):
-            ends = [k for k in (sql.find(e, i) for e in lex.line_ends) if k != -1]
+            ends = [k for k in (finder.find(e, i) for e in lex.line_ends) if k != -1]
             kind, j = "comment", (min(ends) + 1 if ends else n)
         elif ch == "/" and nxt == "*":
-            kind, j = "comment", _block_comment_end(sql, i, nested=lex.nested_comments)
+            kind, j = "comment", _block_comment_end(sql, i, nested=lex.nested_comments, finder=finder)
         elif dollar is not None:
             close = sql.find(dollar.group(), dollar.end())
             kind, j = "string", (n if close == -1 else close + len(dollar.group()))
@@ -653,42 +676,35 @@ _TSQL_LITERAL_TOKENS = frozenset({
 # ASCII letter there (live: user_tableſ reads USER_TABLES, ınıtial_extent is
 # INITIAL_EXTENT); ß, ẞ, the Kelvin sign, ligatures and İ stay as they are.
 _ORACLE_FOLDS_ONTO_ASCII = frozenset("ıſ")  # ı -> I, ſ -> S
-# How an engine may fold an unquoted name before it compares it with a CTE's
-# (SqlGuard._cte_key): each folding it may apply.
-_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+# The engines that fold an unquoted name (Oracle and Db2 to upper case,
+# PostgreSQL to lower case). Outside ASCII each folds by rules of its own
+# (Oracle by Unicode's, Db2 by its code page, PostgreSQL by the locale in a
+# single-byte encoding), which no model here reproduces: there a CTE's name
+# and an unquoted table or schema name must be ASCII (owner decision
+# 2026-10-03; SqlGuard._deny_non_ascii_names), and names fold ASCII-exact.
+_ASCII_NAME_ENGINES = frozenset({"oracle", "db2", "postgres"})
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
-
-def _charwise(fold: Callable[[str], str]) -> Callable[[str], str]:
-    """``fold`` one character at a time, keeping a character it would expand
-    (ß, ligatures, İ): the engines fold a name in place."""
-    return lambda name: "".join(f if len(f := fold(ch)) == 1 else ch for ch in name)
-
-
-_CTE_FOLDS: dict[str, tuple[Callable[[str], str], ...]] = {
-    "oracle": (_charwise(str.upper),),  # by Unicode's rules (live; _ORACLE_FOLDS_ONTO_ASCII)
-    "db2": (_charwise(str.upper), lambda n: n.translate(_ASCII_UPPER)),
-    "postgres": (_charwise(str.lower), lambda n: n.translate(_ASCII_LOWER)),
-}
-
-def cte_key(engine: str, name: exp.Identifier | str) -> tuple[str, ...]:
+def cte_key(engine: str, name: exp.Identifier | str) -> str:
     """What a CTE's name, or a bare FROM item's, is compared as on
-    ``engine``: on an engine that folds unquoted names (_CTE_FOLDS), the
-    name under each folding it may apply (a quoted name as written), so a
-    FROM item is taken for a CTE only when it is that CTE under every one.
-    Oracle upper-cases by Unicode's rules: FROM é reads table É, which the
-    CTE "é" does not cover (review M4); PostgreSQL folds ASCII only, or by
-    the locale in a single-byte encoding. Elsewhere, case-insensitively as
-    before (ClickHouse's own binding is _clickhouse_cte_refs). The one
-    source of truth for the guard and the server's masking."""
+    ``engine``; a FROM item is taken for a CTE's reference only when the
+    keys are equal. Oracle and Db2 upper-case an unquoted name and
+    PostgreSQL lower-cases it, ASCII letters only (unquoted_name), and read
+    a quoted one as written; there the guard has refused a CTE name outside
+    ASCII and an unquoted table name outside ASCII (_ASCII_NAME_ENGINES),
+    so the ASCII folding is the engine's own. Elsewhere the name with its
+    ASCII letters lowered, quoted or not: SQLite's own rule; SQL Server
+    admits only ASCII names; MySQL's case rule is a server setting and
+    ClickHouse's binding is _clickhouse_cte_refs, the server checking both.
+    No Unicode case model. The one source of truth for the guard and the
+    server's masking."""
     text = name.name if isinstance(name, exp.Identifier) else name
-    folds = _CTE_FOLDS.get(engine)
-    if folds is None:
-        return (text.lower(),)
+    if engine not in _ASCII_NAME_ENGINES:
+        return text.translate(_ASCII_LOWER)
     if isinstance(name, exp.Identifier) and name.quoted:
-        return tuple(text for _ in folds)
-    return tuple(fold(text) for fold in folds)
+        return text
+    return unquoted_name(engine, text)
 
 
 # Engine names from config -> sqlglot dialect names. sqlglot has no 'mssql'
@@ -1265,6 +1281,13 @@ _CLICKHOUSE_CTE_NOTE = (
 )
 
 
+def _cte_ident_name(cte: exp.CTE) -> str:
+    """A CTE's name as written, whatever kind of CTE (_walk_validate's key)."""
+    alias = cte.args.get("alias")
+    ident = alias.this if isinstance(alias, exp.TableAlias) else None
+    return ident.name if isinstance(ident, exp.Identifier) else cte.alias_or_name
+
+
 def _cte_name(cte: exp.CTE) -> str | None:
     """The name a relation CTE declares, as written; None for ClickHouse's
     WITH <expression> AS name, which names a value."""
@@ -1507,8 +1530,8 @@ class SqlGuard:
         self._dialect = _DIALECT_MAP.get(dialect, dialect)
         self._policy = policy
         self._resolver = resolver
-        # (statement, its names, whether it reads every column): _statement_columns
-        self._columns_of: tuple[exp.Expression, frozenset[str], bool] | None = None
+        # (statement, its names, whether it reads every column, a construct reading unnamed columns): _statement_columns
+        self._columns_of: tuple[exp.Expression, frozenset[str], bool, str] | None = None
         # the names default-deny matched to listed tables that the server checks against how the
         # session binds names (_check_listed_spelling), from every statement this guard validated
         self.bindings: list[ListedBinding] = []
@@ -1675,7 +1698,7 @@ class SqlGuard:
 
     def _walk_validate(self, root: exp.Expression) -> list[ObjectRef]:
         _deny_with_after_set_operator(root)
-        cte_aliases: set[tuple[str, ...]] = set()
+        cte_aliases: set[str] = set()
         for cte in root.find_all(exp.CTE):
             alias = cte.args.get("alias")
             ident = alias.this if isinstance(alias, exp.TableAlias) else None
@@ -1695,6 +1718,8 @@ class SqlGuard:
         for ident in root.find_all(exp.Identifier):
             # before any table check, which would compare the name as written
             self._check_name(ident)
+        if self._engine in _ASCII_NAME_ENGINES:
+            self._deny_non_ascii_names(root)
         unbound = _clickhouse_unbound_columns(root) if self._dialect == "clickhouse" else {}
 
         refs: list[ObjectRef] = []
@@ -1790,7 +1815,37 @@ class SqlGuard:
                 refs.append(ObjectRef(schema=schema, name=name, catalog=catalog, looked_up=self._looked_up_ref(node)))
         return refs
 
-    def _cte_key(self, name: exp.Identifier | str) -> tuple[str, ...]:
+    def _deny_non_ascii_names(self, root: exp.Expression) -> None:
+        """Refuse, on Oracle, Db2 and PostgreSQL (_ASCII_NAME_ENGINES), a CTE
+        name outside ASCII, quoted or not, and an unquoted table or schema
+        name outside ASCII. Each engine folds such a name by rules of its own
+        (Oracle upper-cases by Unicode's, 82 code points differently from
+        Python; Db2 by its code page; PostgreSQL by the locale in a
+        single-byte encoding), so a CTE spelled like a FROM item could be
+        that item's CTE to the guard and a table to the engine, read past
+        default-deny and the allowlists (review 1 M4, review 2 V1-a, review 3
+        VD-2). A quoted table name is read exactly as written and stays
+        allowed, as do columns, aliases and literals outside ASCII."""
+        engine = {"oracle": "Oracle", "db2": "Db2", "postgres": "PostgreSQL"}[self._engine]
+        for cte in root.find_all(exp.CTE):
+            name = _cte_ident_name(cte)
+            if not name.isascii():
+                raise _deny(
+                    f"the CTE name {ascii(name)} is not permitted on {engine}: a CTE name must be ASCII here, since "
+                    f"{engine} folds a name outside ASCII by its own case rules and the validator could not tell "
+                    f"whether a FROM item names the CTE or a table; rename the CTE with ASCII letters, digits and _"
+                )
+        for table in root.find_all(exp.Table):
+            for part in (table.args.get("catalog"), table.args.get("db"), table.this):
+                if isinstance(part, exp.Identifier) and not part.quoted and not part.name.isascii():
+                    raise _deny(
+                        f"the unquoted name {ascii(part.name)} is not permitted as a table or schema name on "
+                        f"{engine}: {engine} folds an unquoted name outside ASCII by its own case rules, so the "
+                        f"validator could not tell which object it reads; quote the exact name as the catalog "
+                        f'spells it ("{part.name}"), or use an ASCII name'
+                    )
+
+    def _cte_key(self, name: exp.Identifier | str) -> str:
         """cte_key under this guard's engine."""
         return cte_key(self._engine, name)
 
@@ -1907,10 +1962,17 @@ class SqlGuard:
             return
         alias = table.args.get("alias")
         renamed = isinstance(alias, exp.TableAlias) and bool(alias.columns)
-        names, every = self._statement_columns(root)
+        names, every, implicit = self._statement_columns(root)
+        shown = f"{schema}.{name}" if schema else name
+        if implicit:
+            raise _deny(
+                f"'{shown}' carries each column's low and high values or an index expression's SQL with its "
+                f"literals ({', '.join(sorted(c.upper() for c in carried))}), and this statement shape cannot be "
+                f"checked for those columns: it has a {implicit}, whose columns are not named in the statement; "
+                f"select the columns you need explicitly and join with ON (or USING with named columns)"
+            )
         if names.isdisjoint(carried) and not every and not renamed:
             return
-        shown = f"{schema}.{name}" if schema else name
         raise _deny(
             f"'{shown}' carries each column's low and high values or an index expression's SQL with its literals "
             f"({', '.join(sorted(c.upper() for c in carried))}), which would hand back values column masking "
@@ -1918,12 +1980,18 @@ class SqlGuard:
             f"alias (which renames them by position)"
         )
 
-    def _statement_columns(self, root: exp.Expression) -> tuple[frozenset[str], bool]:
-        """Every name in ``root`` (loose_name), and whether it reads every
-        column somewhere (* or t.* outside COUNT): read once per statement,
-        the first time a column catalog with value columns is met. A walk
-        per reference took 70 s for one 64 KiB statement naming COLS 5500
-        times (review, round 2)."""
+    def _statement_columns(self, root: exp.Expression) -> tuple[frozenset[str], bool, str]:
+        """Every name in ``root`` (loose_name), whether it reads every
+        column somewhere (* or t.* outside COUNT), and the first construct
+        that reads columns it does not name, if any ('' for none): a NATURAL
+        join (on every column its two sides share: a derived table with a
+        string-literal column named EXPRESSION made information_schema
+        .STATISTICS a blind equality oracle on another schema's index
+        literals, live MySQL, review cr3 VD-1) or ClickHouse's COLUMNS('re')
+        matcher. A USING join names its columns, which are among the names.
+        Read once per statement, the first time a column catalog with value
+        columns is met: a walk per reference took 70 s for one 64 KiB
+        statement naming COLS 5500 times (review, round 2)."""
         cached = self._columns_of
         if cached is None or cached[0] is not root:
             names = frozenset(loose_name(n) for n in {ident.name for ident in root.find_all(exp.Identifier)})
@@ -1931,8 +1999,16 @@ class SqlGuard:
                 not isinstance(star.parent.parent if isinstance(star.parent, exp.Column) else star.parent, exp.Count)
                 for star in root.find_all(exp.Star)
             )
-            cached = self._columns_of = (root, names, every)
-        return cached[1], cached[2]
+            implicit = ""
+            for node in root.find_all(exp.Join, exp.Columns):
+                if isinstance(node, exp.Columns):
+                    implicit = "COLUMNS(...) matcher"
+                    break
+                if str(node.args.get("method") or "").upper() == "NATURAL":
+                    implicit = "NATURAL join"
+                    break
+            cached = self._columns_of = (root, names, every, implicit)
+        return cached[1], cached[2], cached[3]
 
     def _check_cte_namesake(self, table: exp.Table, root: exp.Expression) -> None:
         """The value columns of a bare name the walk takes for a CTE's, as
@@ -2102,7 +2178,9 @@ class SqlGuard:
         ClickHouse binds a lone name to a table before a column of that name,
         whatever parentheses and aliases stand around it (x IN ((t AS z))).
         A value in that place names nothing (_NAME_NODES) and stays allowed:
-        ClickHouse's `x IN {ids:Array(UInt64)}`, a driver's `x IN %(p)s`.
+        ClickHouse's `x IN {ids:Array(UInt64)}`, a driver's `x IN %(p)s`;
+        a string literal there is refused, SQLite reading `x IN 'name'` as
+        the table of that name.
         An IN with nothing after it is sqlglot's reading of the functional
         in() (_FUNCTIONAL_IN), refused on every engine."""
         how = "write IN (SELECT <column> FROM <schema>.<table>)"
@@ -2113,6 +2191,16 @@ class SqlGuard:
             isinstance(n, _NAME_NODES) for n in field.walk(prune=lambda n: isinstance(n, _VALUE_PARAMETERS))
         ):
             raise _deny(f"a name after IN without parentheses is not permitted: it reads a table; {how}")
+        if field is not None and any(
+            isinstance(n, exp.Literal) and n.is_string
+            for n in field.walk(prune=lambda n: isinstance(n, _VALUE_PARAMETERS))
+        ):
+            # SQLite reads x IN 'docs_content' (and IN 'sqlite_master') as the table of that name, a
+            # membership test on any table (review cr3 VC-2); elsewhere a list needs parentheses
+            raise _deny(
+                f"a string after IN without parentheses is not permitted: SQLite reads it as a table name; "
+                f"write IN ('value', ...) for values, or {how}"
+            )
         if self._dialect == "clickhouse" and not node.args.get("query") and len(node.expressions) == 1:
             item = node.expressions[0]
             # ClickHouse drops parentheses, an alias and a unary plus (as sqlglot does) around that one

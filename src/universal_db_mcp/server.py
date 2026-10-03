@@ -30,7 +30,7 @@ import time
 import unicodedata
 import weakref
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any, Literal, cast
 
@@ -45,11 +45,11 @@ from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import CallToolResult, InputRequiredResult, TextContent, ToolAnnotations
 from pydantic import Field, ValidationError
 from sqlglot import exp
-from sqlglot.optimizer.scope import Scope, ScopeType, traverse_scope
 
 from universal_db_mcp.config import AppConfig, ResolvedConnection
 from universal_db_mcp.connectors import registry
 from universal_db_mcp.connectors.base import (
+    STAR_EXCLUDED_KINDS,
     ConnectorError,
     DatabaseConnector,
     DriverUnavailableError,
@@ -145,12 +145,6 @@ _ENVELOPE_ALLOWANCE = 2048
 _RESPONSE_SLACK = 64 * 1024
 _MAX_WARNINGS = 50
 _TOOL_NAME_CHARS = 128  # a tool name the SDK refused is recorded up to this length
-# PostgreSQL attribute notation (b.fn is fn(b)): masking reads the column
-# names of the base tables a statement qualifies columns with, at most this
-# many per statement, and reuses them for _ROW_COLUMNS_TTL seconds.
-_ROW_FUNCTION_TABLES = 16
-_ROW_COLUMNS_TTL = 300.0
-_ROW_COLUMNS_CAP = 4096  # cached (connection, schema, table) entries before the cache starts over
 # The whole schema list a connection's allowlist compares spellings with
 # (AppContext.schema_names) is read again after this many seconds, the
 # metadata cache's TTL.
@@ -258,9 +252,10 @@ class AppContext:
         self.cursors = CursorCodec()
         self.identity = _process_identity()
         self.history: deque[dict[str, Any]] = deque(maxlen=_HISTORY_CAP)
-        # (connection, schema, table) -> (read at, its column names): what
-        # masking needs to tell a PostgreSQL column from a row function
-        self.row_columns: dict[tuple[str, str, str], tuple[float, frozenset[str]]] = {}
+        # (connection, schema, table) -> (read at, its column names in
+        # order): what masking lays a statement's output over (columns_of)
+        self.row_columns: dict[tuple[str, str, str], tuple[float, tuple[str, ...]]] = {}
+        self._row_column_names = 0  # names row_columns holds in all
         # connection -> (read at, its whole schema list): schema_names
         self._schema_names: dict[str, tuple[float, list[str]]] = {}
         # connection -> (read at, how its sessions bind names): name_binding
@@ -328,13 +323,16 @@ class AppContext:
         a tool that asks for it again - for the namesakes of the schema list
         (_schema_view), a schema argument's spelling, the readable tables -
         reuses it instead of listing the whole catalog again where the
-        metadata cache is off (review SW-2). Consumers never change it."""
+        metadata cache is off (review SW-2). Consumers never change it. Only
+        the latest connection's listing is kept: a federated call over many
+        connections held every catalog it read until it ended (review 3)."""
         memo = _CALL_LISTINGS.get()
         key = (policy.connection_id, policy_fingerprint(policy), id(connector))
         if memo is not None and key in memo:
             return cast(list[Any], memo[key])
         listing = await self._tables_for(policy, connector)
         if memo is not None:
+            memo.clear()
             memo[key] = listing
         return listing
 
@@ -440,6 +438,39 @@ class AppContext:
         self._name_bindings[policy.connection_id] = (now, binding)
         return binding
 
+    async def columns_of(
+        self, policy: EffectivePolicy, schema: str | None, name: str, lookups: list[int]
+    ) -> tuple[str, ...] | None:
+        """A listed table's column names in order, as the catalog spells
+        them, with those SELECT * leaves out (_Listed), kept per connection
+        for _COLUMNS_TTL seconds (the cache starts over past
+        _COLUMNS_CAP_NAMES names in all). None where the catalog lists none
+        or cannot be read, or where ``lookups`` (one statement's count of
+        uncached reads) has reached _MASK_LOOKUPS."""
+        key = (policy.connection_id, schema or "", name)
+        now = time.monotonic()
+        kept = self.row_columns.get(key)
+        if kept is not None and now - kept[0] < _COLUMNS_TTL:
+            return kept[1] or None
+        if lookups[0] >= _MASK_LOOKUPS:
+            return None
+        lookups[0] += 1
+        try:
+            cols = await run_meta(self, policy.connection_id, _meta_call("list_columns", schema, name))
+        except ConnectorError:  # not known: the statement is refused, never masked by guess
+            return None
+        names = _Listed(str(c.name) for c in cols)
+        names.unstarred = frozenset(
+            str(c.name) for c in cols if getattr(c, "default_kind", None) in STAR_EXCLUDED_KINDS
+        )
+        if self._row_column_names + len(names) > _COLUMNS_CAP_NAMES:
+            self.row_columns.clear()
+            self._row_column_names = 0
+        old = self.row_columns.pop(key, None)
+        self._row_column_names += len(names) - (len(old[1]) if old else 0)
+        self.row_columns[key] = (now, names)
+        return names or None
+
     def record_history(self, record: dict[str, Any]) -> None:
         self.history.append({"identity": self.identity, **record})
 
@@ -529,58 +560,24 @@ _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _ASCII_UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
 
 
-class _UnicodeCase(dict[int, str]):
-    """A str.translate table that folds every character by Unicode's case
-    rules, not only ASCII's, one character for one as the engines do: a
-    character whose case mapping is longer (ß to SS, İ to i̇) stays itself.
-    It remembers only the code points below _UNICODE_CASE_CACHED (Latin,
-    Greek, Cyrillic and the like, at most that many entries): a table
-    shared by every statement must not grow with the code points callers
-    choose (review V6-b: 1.1 million entries, ~150 MiB, per table)."""
-
-    def __init__(self, *, upper: bool) -> None:
-        super().__init__()
-        self._upper = upper
-
-    def __missing__(self, key: int) -> str:
-        ch = chr(key)
-        mapped = ch.upper() if self._upper else ch.lower()
-        folded = mapped if len(mapped) == 1 else ch
-        if key < _UNICODE_CASE_CACHED:
-            self[key] = folded
-        return folded
-
-
-_UNICODE_CASE_CACHED = 0x800
-
-
 # How an engine folds a bare name before it compares it with a CTE's:
 # (unquoted, quoted) translation tables, None keeping the name as written.
-# ASCII only where the engine does so (PostgreSQL on UTF-8, SQLite); Oracle
-# upper-cases an unquoted name by Unicode's rules (é names É, live). An
-# engine not listed compares names as written (SQL Server's and MySQL's case
-# sensitivity is a collation's or a server setting's), which can take a CTE
-# reference for a table, and authorize it, but never a table for a CTE.
+# ASCII only: on Oracle, Db2 and PostgreSQL the guard refuses a CTE name, or
+# an unquoted table name, outside ASCII (owner decision, 2026-10-03), so no
+# Unicode case model is needed. An engine not listed compares names as
+# written (SQL Server's and MySQL's case sensitivity is a collation's or a
+# server setting's), which can take a CTE reference for a table, and
+# authorize it, but never a table for a CTE.
 _CASE_INSENSITIVE: _Folding = (_ASCII_LOWER, _ASCII_LOWER)
 _NAME_FOLDING: dict[str, _Folding] = {
     "sqlite": _CASE_INSENSITIVE,
     "postgres": (_ASCII_LOWER, None),
-    "oracle": (_UnicodeCase(upper=True), None),
+    "oracle": (_ASCII_UPPER, None),
     "db2": (_ASCII_UPPER, None),
 }
-# How an engine may also fold an unquoted name outside ASCII, where it is
-# not known to keep it: Db2 may upper-case it by Unicode's rules, and
-# PostgreSQL lower-cases it on a database in a single-byte encoding. A FROM
-# item is a CTE's only where both readings bind it to one (_cte_hidden_tables
-# probes it as a table otherwise, and _cte_misbound leaves the statement
-# untraced).
-_UNICODE_FOLDING: dict[str, _Folding] = {
-    "db2": (_UnicodeCase(upper=True), None),
-    "postgres": (_UnicodeCase(upper=False), None),
-}
 # Engines whose names a collation or a server setting makes case-insensitive
-# or not: a statement whose CTE binding depends on it cannot be traced
-# (_cte_misbound).
+# or not: a reference the guard took for a CTE's only in another case is
+# probed as a table (_validate_in_scope).
 _CASE_UNKNOWN_ENGINES = frozenset({"mssql", "mysql"})
 # Engines where a CTE naming itself is recursive, RECURSIVE keyword or not:
 # SQL Server, Oracle and Db2 have no such keyword, and SQLite reports a
@@ -653,24 +650,6 @@ def _cte_ident(cte: exp.CTE) -> exp.Identifier | str:
     return ident if isinstance(ident, exp.Identifier) else cte.alias_or_name
 
 
-def _cte_name_keys(engine: str, name: exp.Identifier | str) -> set[tuple[str, ...]]:
-    """The keys a bare FROM item, or a CTE's name, is compared with others
-    by when the server decides which FROM items to look at as possible CTE
-    references: the guard's own (sql_guard.cte_key, one source of truth for
-    which items it skips as a CTE's), and besides it every Unicode case
-    reading of the name (lower, upper and casefold, whole and one character
-    for one), so the set is never narrower than any folding an engine, or
-    the guard, applies. Taking in a FROM item no CTE covers costs a probe of
-    a table the guard already authorized; leaving one out let Oracle's
-    FROM ς pass as the CTE σ unchecked (review V1-a)."""
-    text = name.name if isinstance(name, exp.Identifier) else name
-    keys = {("guard", *cte_key(engine, name))}
-    for kind, fold in (("lower", str.lower), ("upper", str.upper), ("casefold", str.casefold)):
-        keys.add((kind, fold(text)))
-        keys.add((kind + "/1", "".join(f if len(f := fold(ch)) == 1 else ch for ch in text)))
-    return keys
-
-
 def _cte_bindings(engine: str, ast: exp.Expression, folding: _Folding | None = None) -> list[tuple[exp.Table, bool]]:
     """Each bare FROM item whose name some CTE of the statement declares, in
     whatever scope (the guard takes each for a CTE's reference, and so leaves
@@ -679,9 +658,9 @@ def _cte_bindings(engine: str, ast: exp.Expression, folding: _Folding | None = N
     names a value, never a table. ``folding`` replaces the engine's
     (_NAME_FOLDING). Each WITH's names are read once, so a statement at the
     size ceiling with thousands of CTEs costs a pass, not their square."""
-    skipped: set[tuple[str, ...]] = set()
-    for cte in ast.find_all(exp.CTE):
-        skipped |= _cte_name_keys(engine, _cte_ident(cte))
+    # the FROM items the guard skips as a CTE's (sql_guard.cte_key, one
+    # source of truth): the others it authorized as tables
+    skipped = {cte_key(engine, _cte_ident(cte)) for cte in ast.find_all(exp.CTE)}
     if not skipped:
         return []
     declared: dict[int, dict[str, int]] = {}
@@ -706,110 +685,18 @@ def _cte_bindings(engine: str, ast: exp.Expression, folding: _Folding | None = N
         ident = table.this
         if not isinstance(ident, exp.Identifier) or table.db or table.catalog:
             continue
-        if skipped.isdisjoint(_cte_name_keys(engine, ident)):
+        if cte_key(engine, ident) not in skipped:
             continue
         name = _folded_name(engine, ident, folding)
         bindings.append((table, _cte_in_reach(engine, table, name, declared, position, recursive, memo)))
     return bindings
 
 
-def _unicode_folding(engine: str, ast: exp.Expression) -> _Folding | None:
-    """``engine``'s other reading of names outside ASCII (_UNICODE_FOLDING),
-    where the statement names a table or CTE outside ASCII (only then can
-    the readings differ)."""
-    if engine not in _UNICODE_FOLDING:
-        return None
-    names = itertools.chain(
-        (t.name for t in ast.find_all(exp.Table)), (c.alias_or_name for c in ast.find_all(exp.CTE))
-    )
-    return None if all(name.isascii() for name in names) else _UNICODE_FOLDING[engine]
-
-
-def _foldings(engine: str, ast: exp.Expression) -> list[_Folding | None]:
-    """Every way ``engine`` may fold the statement's names (None: _NAME_FOLDING's)."""
-    out: list[_Folding | None] = [None]
-    if engine in _CASE_UNKNOWN_ENGINES:
-        out.append(_CASE_INSENSITIVE)
-    if (unicode := _unicode_folding(engine, ast)) is not None:
-        out.append(unicode)
-    return out
-
-
 def _cte_hidden_tables(engine: str, ast: exp.Expression) -> list[exp.Table]:
     """The FROM items the guard takes for CTE references that no CTE in
     reach declares (_cte_bindings): a CTE of the same name inside EXISTS hid
-    the outer pg_stat_activity or sqlite_schema from default-deny. Where the
-    engine may also fold a name outside ASCII (_UNICODE_FOLDING), one that a
-    CTE covers under only one reading is hidden too: Db2 may read WITH "é"
-    ... FROM é as the table É."""
-    foldings: list[_Folding | None] = [None]
-    if (unicode := _unicode_folding(engine, ast)) is not None:
-        foldings.append(unicode)
-    hidden: dict[int, exp.Table] = {}
-    for folding in foldings:
-        for table, bound in _cte_bindings(engine, ast, folding):
-            if not bound:
-                hidden.setdefault(id(table), table)
-    return list(hidden.values())
-
-
-def _engine_view(
-    ast: exp.Expression, engine: str, table_columns: dict[int, frozenset[str]] | None
-) -> tuple[exp.Expression, dict[int, frozenset[str]]]:
-    """A copy of the statement for the taint walk, which binds a FROM item as
-    sqlglot does - by the exact name, and a CTE's self-reference only under
-    RECURSIVE - with the names CTEs declare, and the bare FROM items that
-    name one of them, folded as the engine folds them (_NAME_FOLDING), and
-    each WITH read as RECURSIVE where a CTE naming itself is recursive without
-    the keyword (_SELF_RECURSIVE_CTES): otherwise the walk traced a clean
-    CTE's literals over the table the engine read, or took a self-reference
-    for a base table whose columns trace clean. ``table_columns`` is re-keyed
-    to the copy's FROM items."""
-    view = ast.copy()
-    columns = {}
-    if table_columns:
-        for original, copied in zip(ast.find_all(exp.Table), view.find_all(exp.Table), strict=True):
-            if id(original) in table_columns:
-                columns[id(copied)] = table_columns[id(original)]
-    declared: set[tuple[str, ...]] = set()
-    for with_ in view.find_all(exp.With):
-        if engine in _SELF_RECURSIVE_CTES:
-            with_.set("recursive", True)
-        for cte in with_.expressions:
-            alias = cte.args.get("alias")
-            if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier):
-                declared |= _cte_name_keys(engine, alias.this)
-                alias.this.set("this", _folded_name(engine, alias.this))
-    for table in view.find_all(exp.Table):
-        ident = table.this
-        if (
-            isinstance(ident, exp.Identifier)
-            and not table.db
-            and not table.catalog
-            and not declared.isdisjoint(_cte_name_keys(engine, ident))
-        ):
-            ident.set("this", _folded_name(engine, ident))
-    return view, columns
-
-
-def _cte_misbound(engine: str, view: exp.Expression, scopes: list[Scope]) -> bool:
-    """Whether sqlglot's scopes over the walk's view (_engine_view) bind some
-    FROM item to a CTE, or another query, where the engine reads a table, or
-    to a table where the engine reads a CTE (_cte_bindings): a CTE declared
-    after the one naming it (SQLite, PostgreSQL's RECURSIVE, ClickHouse), a
-    ClickHouse anchor naming its own CTE, or a name SQL Server's or MySQL's
-    collation may compare case-insensitively. The walk would trace the
-    values from the wrong source."""
-    analysed = {
-        id(table)
-        for scope in scopes
-        for table in scope.tables
-        if isinstance(source := scope.sources.get(table.alias_or_name), Scope) and source.expression is not table
-    }
-    return any(
-        analysed != {id(table) for table, bound in _cte_bindings(engine, view, folding) if bound}
-        for folding in _foldings(engine, view)
-    )
+    the outer pg_stat_activity or sqlite_schema from default-deny."""
+    return [table for table, bound in _cte_bindings(engine, ast) if not bound]
 
 
 def _validate_in_scope(guard: SqlGuard, engine: str, validate: Callable[[SqlGuard], GuardResult]) -> GuardResult:
@@ -1766,114 +1653,171 @@ def _tabular_plan(plan: Any) -> bool:
     return isinstance(rows, list) and bool(rows) and all(isinstance(r, list) and len(r) > 1 for r in rows)
 
 
-def _sensitive_output_names(policy: EffectivePolicy, ast: exp.Expression) -> frozenset[str]:
-    """Lowercased output names that expose a sensitive source column, even
-    under an alias or through a derived table / CTE. A projection's emitted
-    name is tainted when the expression behind it references a sensitive
-    column or a name that is already tainted; the fixpoint follows alias
-    chains across scopes (``SELECT password AS p``, ``SELECT p FROM
-    (SELECT password AS p ...) sub``, CTEs). A name alone never proves a
-    column clean - drivers report generic names for unaliased expressions
-    ('upper', '1', '') and set operations carry the first branch's names -
-    so this is only an extra check on top of the positional taint of
-    :func:`_sensitive_output_positions`."""
-    if not policy.sensitive_patterns:
-        return frozenset()
+# ------------------------------------------------------------------ masking
+#
+# A statement that reads a table with a column masking hides - or one whose
+# columns the catalog does not list, which may have one - is masked by
+# position: _MaskProof maps every output column to the source columns its
+# value can carry. It accepts only the statement shapes it fully understands
+# and refuses every other one (_Refused) with the construct to avoid; nothing
+# is traced half-way (owner decision, 2026-10-03: three reviews in a row found
+# that each special case traced for an exotic shape opened the next leak). A
+# statement that reads no such table is masked by the output names alone.
+# The output names are a backstop either way: drivers report generic names
+# for expressions, so a name never proves a column clean.
 
-    def sensitive(name: str) -> bool:
-        return _sensitive_name(policy.sensitive_patterns, name)
-
-    # A worklist over "name -> the outputs that read it": linear in the
-    # statement. Re-scanning every projection until nothing grew was
-    # quadratic in an alias chain (14 s for a 60 KiB statement).
-    tainted: set[str] = set()
-    readers: dict[str, list[str]] = {}
-    pending: list[str] = []
-    for proj in (p for sel in ast.find_all(exp.Select) for p in sel.expressions):
-        out = proj.alias_or_name.lower()
-        if not out:
-            continue
-        refs = [c.name for c in proj.find_all(exp.Column)]
-        if any(sensitive(r) for r in refs):
-            pending.append(out)
-        for ref in refs:
-            readers.setdefault(ref.lower(), []).append(out)
-    while pending:
-        name = pending.pop()
-        if name not in tainted:
-            tainted.add(name)
-            pending.extend(readers.get(name, ()))
-    return frozenset(tainted)
-
-
-# A run of output columns whose width only the driver knows: a star over a
-# base table ("base": the driver reports the table's own column names, so the
-# name heuristics decide) or columns that cannot be traced to their sources
-# ("unknown": every one of them is treated as sensitive).
-_SPREAD_BASE = "base"
-_SPREAD_UNKNOWN = "unknown"
-# The positional taint walk runs after the statement did, on a worker thread:
-# rounds over the whole statement, and the time they may take, are bounded.
-_TAINT_MAX_ROUNDS = 16
-_TAINT_BUDGET_SECONDS = 2.0
-# PostgreSQL reads t.fn as fn(t) when t has no column fn (attribute notation):
-# these functions take a whole row and hand back its values (to_json,
-# record_out, quote_literal, the aggregates), its hash or its size. They are
-# the built-ins that resolve so on PostgreSQL 17 (pg_proc: one record,
-# polymorphic or "any" argument), plus hstore and PostGIS; the ones that
-# return nothing of the values (count, num_nulls, pg_typeof) are left out, so
-# a table's own column of that name stays readable. A site's own function
-# over a row type is known only where the source's columns are (a derived
-# table or CTE, or a base table whose columns _row_function_columns read from
-# the catalog, directly or through a star that hands its row on): there any
-# name that is not a column is a function.
-_PG_ROW_FUNCTIONS = frozenset({
-    "any_value", "array_agg", "concat", "hash_record", "json_agg", "json_agg_strict", "json_build_array",
-    "jsonb_agg", "jsonb_agg_strict", "jsonb_build_array", "pg_column_size", "quote_literal", "quote_nullable",
-    "record_out", "record_send", "row_to_json", "to_json", "to_jsonb",
-    "hstore", "st_asflatgeobuf", "st_asgeobuf", "st_asgeojson", "st_asmvt",
+# Names an engine answers itself where no source has such a column: no
+# value of a source column.
+_PSEUDO_COLUMNS = frozenset({
+    "rownum", "level", "ora_rowscn", "sysdate", "systimestamp", "user", "uid", "ctid", "xmin", "xmax", "cmin",
+    "cmax", "tableoid", "current_date", "current_time", "current_timestamp", "localtime", "localtimestamp",
+    "current_user", "session_user",
 })
+# A row's id, which SQLite (rowid, oid, _rowid_) and MySQL (_rowid) hand back
+# as the value of an INTEGER PRIMARY KEY column: as sensitive as the row's
+# columns. Oracle's ROWID and PostgreSQL's oid are counted so too (fail closed).
+_ROWID_NAMES = frozenset({"rowid", "oid", "_rowid_", "_rowid"})
+# Clauses of a SELECT that never change what its output columns are.
+_PLAIN_SELECT_ARGS = frozenset({
+    "expressions", "from_", "joins", "where", "group", "having", "order", "limit", "offset", "distinct", "with_",
+    "qualify", "windows", "hint", "settings", "format", "prewhere", "sample", "connect", "options",
+    "operation_modifiers", "locks",
+})
+_PLAIN_SETOP_ARGS = frozenset({
+    "this", "expression", "distinct", "with_", "order", "limit", "offset", "settings", "format", "options", "locks",
+})
+_PLAIN_JOIN_KINDS = frozenset({"", "INNER", "OUTER", "CROSS", "ANY", "ALL"})
+# The analysis of one statement runs on a worker thread after its catalog
+# lookups; it is linear in the statement, and bounded in time all the same.
+_PROOF_BUDGET_SECONDS = 2.0
+# Catalog column lookups one statement may cause (the rest come from the
+# per-connection cache, AppContext.columns_of), and what that cache may hold.
+_MASK_LOOKUPS = 64
+_COLUMNS_TTL = 300.0
+_COLUMNS_CAP_NAMES = 200_000
+# The dummy tables, by engine and unquoted (schema, name), upper-cased.
+_DUMMY_TABLES: dict[str, dict[tuple[str | None, str], tuple[str, ...]]] = {
+    "oracle": {(None, "DUAL"): ("DUMMY",), ("SYS", "DUAL"): ("DUMMY",), ("PUBLIC", "DUAL"): ("DUMMY",)},
+    "db2": {("SYSIBM", "SYSDUMMY1"): ("IBMREQD",)},
+    "mysql": {(None, "DUAL"): ()},
+}
+
+
+class _Refused(Exception):
+    """A statement shape the masking analysis does not prove: refused."""
+
+
+class _Listed(tuple[str, ...]):
+    """A table's column names in order, as the catalog lists them
+    (AppContext.columns_of), and those of them a star leaves out:
+    ClickHouse's MATERIALIZED, ALIAS and EPHEMERAL columns, which a statement
+    reads only by name."""
+
+    unstarred: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
-class _OutCol:
-    """One traced output column: the name SQL gives it (lowercased; None
-    when the engine invents one) and whether its value can carry a
-    sensitive source value."""
+class _Col:
+    """One output column: the name it is bound and reported by (folded as
+    the engine folds it, _col_key; None where the engine makes one up),
+    whether its value can carry a masked column's, whether the driver must
+    report that name at its position (an alias, a star's column), for a
+    name the engine makes up, the plain names it may be (_engine_names), and
+    whether a star over its source returns it (_Listed.unstarred)."""
 
     name: str | None
     tainted: bool
-    # the name is an alias the statement wrote, which every engine reports as
-    # the column's name (_map_positions checks the layout against it)
-    explicit: bool = False
+    checked: bool = False
+    aka: frozenset[str] = frozenset()
+    starred: bool = True
 
 
-_OutItem = _OutCol | str  # a traced column or a _SPREAD_* run
-# A qualifier the analysis cannot bind to one source: two FROM items whose
-# names differ only in case, where the engine may bind either (_lookup).
-_AMBIGUOUS = object()
-# A name made only of word characters: the names SQLite gives an unaliased
-# expression ("upper(x)", "+x") or a duplicate column ("x:1") never are.
+@dataclasses.dataclass
+class _Source:
+    """A FROM item: the names a qualifier binds it by (an alias, else the
+    table's or CTE's name; ClickHouse also binds a table's own name behind
+    its alias) and its columns."""
+
+    names: list[exp.Identifier]
+    columns: list[_Col]
+
+
+@dataclasses.dataclass
+class _Scope:
+    """One SELECT being analysed: its FROM items, the query around it (a
+    correlated reference reads that one's), and its aliases, read once."""
+
+    select: exp.Select
+    parent: _Scope | None
+    sources: list[_Source] = dataclasses.field(default_factory=list)
+    merged: bool = False  # a USING or NATURAL join: a star's layout is the engine's
+    aliases: dict[str, list[exp.Alias]] | None = None
+
+
+# A name an engine may make up for an expression without being its text:
+# PostgreSQL names upper(x) "upper", x::text "x", CASE "case".
 _PLAIN_NAME = re.compile(r"[^\W\d]\w*")
-# Bare names an engine answers itself where no source has such a column
-# (Oracle's ROWNUM in a pagination wrapper, SQLite's rowid): no value of a
-# source column.
-_PSEUDO_COLUMNS = frozenset({
-    "rownum", "level", "rowid", "ora_rowscn", "sysdate", "systimestamp", "user", "uid", "_rowid_", "oid",
-    "ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "current_date", "current_time", "current_timestamp",
-    "localtime", "localtimestamp", "current_user", "session_user",
-})
 
 
-def _engine_named(node: exp.Expr) -> str | None:
-    """The name an engine gives an unaliased output: a column's (through
-    parentheses and COLLATE, as PostgreSQL and SQLite name ``(x)`` and ``x
-    COLLATE nocase`` x), else None - a name the engine makes up."""
-    while isinstance(node, exp.Paren | exp.Collate):
-        node = node.this
-    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
-        return node.name.lower() or None
-    return None
+def _engine_names(node: exp.Expr) -> frozenset[str]:
+    """The plain names an engine may give an unaliased expression (loose):
+    a column's it reads, a function's or a keyword's in it. An engine that
+    names it by its text gives it no plain name (_PLAIN_NAME) but these."""
+    names: set[str] = set()
+    for sub in node.walk():
+        if isinstance(sub, exp.Column | exp.Identifier):
+            names.add(_loose(sub.name))
+        elif isinstance(sub, exp.Func):
+            names.add(_loose(sub.name if isinstance(sub, exp.Anonymous) else sub.sql_name()))
+        names.add(sub.key)
+    return frozenset(names)
+
+
+def _column_hits(columns: Iterable[_Col], ident: exp.Identifier) -> tuple[list[_Col], list[_Col]]:
+    """The columns a name may read: (those it names, those whose name the
+    engine made up and may be it - any such for a name that is no plain
+    name, which may be an expression's text: SQLite's "upper(x)")."""
+    want = _loose(ident.name)
+    plain = bool(_PLAIN_NAME.fullmatch(ident.name))
+    named, made_up = [], []
+    for col in columns:
+        if col.name is not None:
+            if _loose(col.name) == want:
+                named.append(col)
+        elif not plain or want in col.aka:
+            made_up.append(col)
+    return named, made_up
+
+
+def _loose(name: str) -> str:
+    """A name with every case and compatibility spelling one: two names that
+    differ only so may be one name to some engine."""
+    return unicodedata.normalize("NFKC", name).casefold()
+
+
+def _col_key(engine: str, name: str, quoted: bool) -> str:
+    """A column or alias name as ``engine`` compares it: PostgreSQL folds an
+    unquoted name to lower case, Oracle and Db2 to upper case (ASCII only:
+    a name that folds otherwise outside ASCII then differs from the catalog's
+    and is refused, never modelled), ClickHouse compares exactly, and SQLite,
+    MySQL and SQL Server ignore case."""
+    if engine == "postgres":
+        return name if quoted else name.translate(_ASCII_LOWER)
+    if engine in ("oracle", "db2"):
+        return name if quoted else name.translate(_ASCII_UPPER)
+    if engine == "clickhouse":
+        return name
+    return name.translate(_ASCII_LOWER) if engine == "sqlite" else name.lower()
+
+
+def _catalog_key(engine: str, name: str) -> str:
+    """A column name as the catalog spells it, keyed as _col_key keys a
+    reference to it."""
+    return name if engine in ("postgres", "oracle", "db2", "clickhouse") else _col_key(engine, name, True)
+
+
+def _ident_key(engine: str, ident: exp.Identifier) -> str:
+    return _col_key(engine, ident.name, bool(ident.quoted))
 
 
 def _unparenthesized(node: exp.Expr) -> exp.Expr:
@@ -1886,939 +1830,587 @@ def _is_star(node: exp.Expr) -> bool:
     return isinstance(node, exp.Star) or (isinstance(node, exp.Column) and isinstance(node.this, exp.Star))
 
 
-def _expands(node: exp.Expr) -> bool:
-    """A select item that is several output columns: PostgreSQL's composite
-    expansion ``(expr).*`` and ClickHouse's ``untuple(t)``, in any number
-    of parentheses (``((b).*)`` is the same run: review M1, second pass)."""
-    node = _unparenthesized(node)
-    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Star):
-        return True
-    return isinstance(node, exp.Anonymous) and str(node.this).lower() == "untuple"
-
-
 def _sqlite_renamed_name(name: str) -> bool:
-    """A name SQLite may give a subquery's column other than as written: it
-    renames TRUE and FALSE to columnN, and a name already taken to name:N,
-    so an alias spelled columnN or name:N may be another column's."""
+    """A name SQLite may give a subquery's column other than as written:
+    TRUE and FALSE become columnN, an empty or taken name name:N."""
     lowered = name.lower()
-    head, colon, digits = lowered.rpartition(":")
     return (
-        lowered in ("true", "false")
+        not lowered
+        or ":" in lowered
+        or lowered in ("true", "false")
         or (lowered.startswith("column") and lowered[6:].isdigit())
-        or (bool(colon) and bool(head) and digits.isdigit())
     )
 
 
-def _sqlite_renamed_alias(ast: exp.Expression) -> bool:
-    """Whether a column name of a subquery, derived table or CTE is one
-    SQLite may rename (_sqlite_renamed_name): its result columns then keep
-    the alias only at the top level, and a reference by name may read
-    another column than the walk binds (review P2, second pass:
-    ``ssn AS "true"`` came back as column1, an alias "x:1" beside two x
-    as the second x)."""
-    top: set[int] = set()
-    stack: list[exp.Expr] = [ast]
-    while stack:  # the outermost query's own branches name the result as written
-        node = stack.pop()
-        top.add(id(node))
-        if isinstance(node, exp.SetOperation):
-            stack.extend(n for n in (node.left, node.right) if n is not None)
-    for select in ast.find_all(exp.Select):
-        if id(select) in top:
+def _cte_targets(
+    engine: str, ast: exp.Expression
+) -> tuple[dict[int, exp.CTE], dict[int, str], list[exp.Table]]:
+    """Which FROM items name a CTE: (the CTE of each, by the FROM item's id;
+    the reason each FROM item that may or may not name one cannot be bound;
+    every other named FROM item - a base table or view). A bare name binds
+    to a CTE only when the nearest WITH around it that declares the name in
+    any case or compatibility spelling declares it once, under a name the
+    engine surely reads as the same (_same_cte_name), and in reach: the WITH
+    of a query around it, an earlier CTE of the same WITH, or the CTE itself
+    where a CTE naming itself is recursive. Engines differ on everything
+    else (forward references, a non-recursive self-reference, case rules
+    a collation decides), which is refused, never modelled."""
+    declared: dict[int, dict[str, list[exp.CTE]]] = {}  # per WITH, loose name -> its CTEs
+    for with_ in ast.find_all(exp.With):
+        names = declared[id(with_)] = {}
+        for cte in with_.expressions:
+            if not cte.args.get("scalar") and isinstance(cte.this, exp.Query):  # not ClickHouse's WITH <expr> AS x
+                names.setdefault(_loose(cte.alias_or_name), []).append(cte)
+    targets: dict[int, exp.CTE] = {}
+    conflicts: dict[int, str] = {}
+    base: list[exp.Table] = []
+    memo: dict[tuple[int, str], tuple[list[exp.CTE], exp.CTE | None] | None] = {}
+    for table in ast.find_all(exp.Table):
+        ident = table.this
+        if not isinstance(ident, exp.Identifier):
             continue
-        if any(isinstance(e, exp.Alias) and _sqlite_renamed_name(e.alias) for e in select.expressions):
-            return True
-    for alias in ast.find_all(exp.TableAlias):
-        if any(_sqlite_renamed_name(c.name) for c in alias.columns):
-            return True
-    return False
+        found = None if table.db or table.catalog or not declared else _nearest_ctes(table, declared, memo)
+        if found is None:
+            base.append(table)
+            continue
+        same, inside = found
+        cte = same[0]
+        alias = cte.args["alias"].this
+        reason = None
+        if len(same) > 1:
+            reason = f"one WITH declares {_id_text(ident.name)} {len(same)} times in some spelling"
+        elif not isinstance(alias, exp.Identifier) or not _same_cte_name(engine, alias, ident):
+            reason = f"it is spelled otherwise than the CTE {_id_text(cte.alias_or_name)}"
+        elif inside is not None:
+            with_ = cast(exp.With, cte.parent)
+            position = next(i for i, e in enumerate(with_.expressions) if e is cte)
+            at = next(i for i, e in enumerate(with_.expressions) if e is inside)
+            recursive = bool(with_.args.get("recursive")) or engine in _SELF_RECURSIVE_CTES
+            if not (position < at or (position == at and recursive)):
+                reason = f"the CTE {_id_text(cte.alias_or_name)} is declared after it, or is not recursive"
+        if reason is None:
+            targets[id(table)] = cte
+        else:
+            conflicts[id(table)] = reason
+            base.append(table)  # the engine may read the table of that name
+    return targets, conflicts, base
 
 
-class _TableSpread(str):
-    """A _SPREAD_BASE run (equal to it wherever positions are laid out) over
-    base tables whose column names the catalog listed: ``columns`` holds
-    every name the run can output, as the catalog spells them."""
-
-    columns: frozenset[str]
-
-    def __new__(cls, columns: frozenset[str]) -> _TableSpread:
-        run = super().__new__(cls, _SPREAD_BASE)
-        run.columns = columns
-        return run
+def _same_cte_name(engine: str, declared: exp.Identifier, written: exp.Identifier) -> bool:
+    """Whether a FROM item's name is a CTE's on ``engine`` for certain: as
+    PostgreSQL, Oracle, Db2 and SQLite fold names (ASCII: the guard refuses
+    any other there), exactly on ClickHouse, and spelled identically where a
+    collation or a server setting decides (SQL Server, MySQL)."""
+    if engine in ("postgres", "oracle", "db2", "sqlite"):
+        return cte_key(engine, declared) == cte_key(engine, written)
+    return declared.name == written.name
 
 
-class _Untraceable(Exception):
-    """The statement's output columns cannot be mapped to their sources."""
+def _nearest_ctes(
+    table: exp.Table,
+    declared: dict[int, dict[str, list[exp.CTE]]],
+    memo: dict[tuple[int, str], tuple[list[exp.CTE], exp.CTE | None] | None],
+) -> tuple[list[exp.CTE], exp.CTE | None] | None:
+    """The CTEs of the nearest WITH around ``table`` that declares its name
+    in some spelling, and the CTE of that WITH whose body holds ``table``
+    (None when the query that owns the WITH does). ``memo``: the answer of
+    each node walked so far, per name (a long UNION is one deep tree)."""
+    want = _loose(table.name)
+    walked: list[tuple[int, str]] = []
+    node: exp.Expr = table
+    found: tuple[list[exp.CTE], exp.CTE | None] | None = None
+    while node.parent is not None:
+        if (id(node), want) in memo:
+            found = memo[(id(node), want)]
+            break
+        walked.append((id(node), want))
+        parent = node.parent
+        with_ = parent if isinstance(parent, exp.With) else None
+        if with_ is None and isinstance(parent, exp.Query) and isinstance(parent.args.get("with_"), exp.With):
+            with_ = parent.args["with_"] if node is not parent.args["with_"] else None
+        if with_ is not None and want in declared.get(id(with_), {}):
+            found = declared[id(with_)][want], node if isinstance(node, exp.CTE) and node.parent is with_ else None
+            break
+        node = parent
+    for key in walked:
+        memo[key] = found
+    return found
 
 
-def _tainted_out_names(items: list[_OutItem]) -> set[str]:
-    return {i.name for i in items if isinstance(i, _OutCol) and i.tainted and i.name}
-
-
-@dataclasses.dataclass(frozen=True)
-class _OutIndex:
-    """One scope's traced output, indexed for lookups by name."""
-
-    names: dict[str, bool]  # name -> whether a column of that name is tainted
-    unknown: bool  # an untraceable run
-    anonymous: bool  # an engine-named tainted column
-    row: bool  # the row used as a value may carry a sensitive value
-    spread: bool  # a run of columns whose names only the driver knows
-    # every name the runs can output, when the catalog listed them all (_TableSpread)
-    spread_columns: frozenset[str] | None = None
-    # the catalog listed some of the runs' tables but not every run (a star
-    # over a table and unnest or VALUES): a name may be a function of the row
-    partly_listed: bool = False
-
-    @classmethod
-    def of(cls, items: list[_OutItem]) -> _OutIndex:
-        names: dict[str, bool] = {}
-        for item in items:
-            if isinstance(item, _OutCol) and item.name:
-                names[item.name] = names.get(item.name, False) or item.tainted
-        runs = [i for i in items if isinstance(i, str)]
-        listed = [i.columns for i in runs if isinstance(i, _TableSpread)]
-        return cls(
-            names,
-            unknown=_SPREAD_UNKNOWN in items,
-            anonymous=any(isinstance(i, _OutCol) and i.name is None and i.tainted for i in items),
-            row=any(not isinstance(i, _OutCol) or i.tainted for i in items),
-            spread=bool(runs),
-            spread_columns=frozenset().union(*listed) if len(listed) == len(runs) else None,
-            partly_listed=bool(listed) and len(listed) != len(runs),
-        )
-
-
-_NO_OUTPUT = _OutIndex({}, unknown=False, anonymous=False, row=False, spread=False)  # not evaluated yet
-
-
-@dataclasses.dataclass
-class _Reach:
-    """What an unqualified name can read in one scope, merged over every
-    candidate source so a lookup costs the same with 1 or 1000 FROM items."""
-
-    always: bool = False  # a source the analysis cannot see into: every name is suspect
-    tainted: set[str] = dataclasses.field(default_factory=set)
-    known: set[str] = dataclasses.field(default_factory=set)  # every name a derived source outputs
-    closed: bool = True  # every source is a derived one whose every output name is known
-    scope_row: bool = False  # a derived source's row may carry a sensitive value
-    anonymous: int = 0  # sources with an engine-named tainted column
-    named_in_anonymous: dict[str, int] = dataclasses.field(default_factory=dict)
-    rows: dict[str, bool] = dataclasses.field(default_factory=dict)  # alias -> its row is tainted
-    any_row: bool = False
-
-
-class _OutputTaint:
-    """Positional taint of a validated statement's output columns.
-
-    Scopes (CTEs, derived tables, set-operation branches, subqueries, table
-    functions) are evaluated innermost first. A projection is tainted when a
-    column in it resolves to a sensitive source column, to a tainted output
-    of an inner scope (by name, or by position through an explicit column
-    list such as ``WITH t(a)``, ``AS q(a)`` or ``customers AS t(a, b)``), to
-    an alias the scope defines anywhere (ClickHouse resolves ``(ssn AS x)``
-    from WHERE in the SELECT list), or to a whole row that may hold one
-    (``CAST(t AS text)``, ``to_json(t.*)``, ``COLUMNS('re')``); a scalar
-    subquery taints it when anything the subquery reads is sensitive. A set
-    operation taints a position when any branch does, and stars expand
-    positionally over inner scopes. Recursive CTEs are iterated to a
-    fixpoint. Whatever cannot be traced is tainted: the analysis fails
-    closed. ``engine`` is the connection's engine: PostgreSQL alone reads
-    ``t.fn`` as a function of t's whole row. ``table_columns`` holds the
-    column names of base tables, by the id of their FROM item, where the
-    catalog provided them (_row_function_columns)."""
+class _MaskProof:
+    """The output columns of a validated statement that reads a table with a
+    masked column, each with its taint, or _Refused. ``catalog`` holds the
+    columns of each base-table FROM item (by its id), as the catalog lists
+    them in order; a FROM item without an entry is not known and refused."""
 
     def __init__(
         self,
         patterns: list[re.Pattern[str]],
         ast: exp.Expression,
-        engine: str = "",
-        table_columns: dict[int, frozenset[str]] | None = None,
+        engine: str,
+        catalog: Mapping[int, tuple[str, ...]],
+        targets: tuple[dict[int, exp.CTE], dict[int, str], list[exp.Table]] | None = None,
+        unknown: Mapping[int, str] | None = None,
     ) -> None:
         self._patterns = patterns
+        self._ast = ast
         self._engine = engine
-        self._row_functions = _PG_ROW_FUNCTIONS if engine == "postgres" else frozenset()
-        self._table_columns = (table_columns or {}) if engine == "postgres" else {}
-        self._scopes = list(traverse_scope(ast))
-        if not self._scopes:
-            raise _Untraceable("no query scope")
-        if _cte_misbound(engine, ast, self._scopes):
-            raise _Untraceable("the engine may bind a FROM item to a CTE where the analysis does not, or the reverse")
-        if engine == "sqlite" and _sqlite_renamed_alias(ast):
-            raise _Untraceable("SQLite renames an alias of a subquery or CTE column")
-        if any(w.args.get("search") for w in ast.find_all(exp.With)) or any(
-            s.args.get("match") for s in ast.find_all(exp.Select)
-        ):
-            # PostgreSQL's SEARCH/CYCLE add columns holding the BY columns'
-            # values (ord, path) and Oracle's MATCH_RECOGNIZE computes
-            # MEASURES over the rows: outputs this walk does not model
-            raise _Untraceable("SEARCH/CYCLE or MATCH_RECOGNIZE output")
-        self._scope_of = {id(s.expression): s for s in self._scopes}
-        self._out: dict[int, list[_OutItem]] = {}
-        self._index: dict[int, _OutIndex] = {}
-        self._rollup: dict[int, bool] = {}  # anything the (sub)query reads is sensitive
-        self._tainted_names: set[str] = set()
-        # the tainted names a SELECT binds anywhere in it (_alias_closure)
-        self._aliases: dict[int, set[str]] = {}
-        # ClickHouse `WITH <expression> AS name` and `WITH (<subquery>) AS name`
-        # bind a scalar, not a relation
-        self._scalars = {
-            cte.alias.lower(): cte.this
-            for cte in ast.find_all(exp.CTE)
-            if cte.args.get("scalar") or not isinstance(cte.this, exp.Query)
-        }
-        self._resolving: set[str] = set()
-        self._candidates_of: dict[int, list[tuple[str, Any, Any]]] = {}
-        self._named_of: dict[int, dict[str, list[tuple[Any, Any, exp.Identifier]]]] = {}
-        self._reach_of: dict[int, _Reach] = {}  # rebuilt every round
-        self._ref_index_of: dict[int, _OutIndex] = {}  # rebuilt every round
+        self._catalog = catalog
+        self._unknown = unknown or {}
+        self._targets, self._conflicts, _base = targets or _cte_targets(engine, ast)
+        self._ctes: dict[int, list[_Col] | None] = {}  # None: being proven
+        self._cte_parent: dict[int, _Scope | None] = {}
+        self._scalars: dict[str, tuple[exp.Expression, _Scope | None]] = {}
+        self._visiting: set[int] = set()
+        self._alias_memo: dict[int, bool] = {}
+        self._deadline = time.monotonic() + _PROOF_BUDGET_SECONDS
 
-    def root_items(self) -> list[_OutItem]:
-        root = self._scopes[-1]
-        deadline = time.monotonic() + _TAINT_BUDGET_SECONDS
-        # Scopes are visited innermost first and a SELECT's aliases are closed
-        # over each other before its projections are traced, so one round
-        # settles everything but back edges (recursive CTEs). A round is
-        # linear in the statement; a statement that needs more rounds than
-        # this, or more time, is untraceable - and so masked whole - instead
-        # of holding a worker thread for one round per link of a chain.
-        for _ in range(_TAINT_MAX_ROUNDS):
-            before = (dict(self._out), dict(self._rollup), dict(self._aliases), len(self._tainted_names))
-            self._reach_of.clear()
-            self._ref_index_of.clear()
-            for scope in self._scopes:
-                if time.monotonic() > deadline:
-                    raise _Untraceable("taint analysis over its time budget")
-                key = id(scope.expression)
-                if isinstance(scope.expression, exp.Select):
-                    self._aliases[key] = self._alias_closure(scope)
-                raw = self._scope_items(scope)
-                self._aliases[key] = self._aliases.get(key, set()) | _tainted_out_names(raw)
-                items = self._rename(raw, scope.outer_columns)
-                self._out[key] = items
-                self._index[key] = _OutIndex.of(items)
-                self._tainted_names.update(n for n, tainted in self._index[key].names.items() if tainted)
-                self._rollup[key] = not scope.is_root and (
-                    self._index[key].row or self._expr_tainted(scope, scope.expression)
-                )
-            if (self._out, self._rollup, self._aliases, len(self._tainted_names)) == before:
-                return self._out[id(root.expression)]
-        raise _Untraceable("taint did not settle")
+    def output(self) -> list[_Col]:
+        try:
+            return self._query(self._ast, None, root=True)
+        except RecursionError:
+            raise _Refused("the statement nests too deeply to be checked") from None
+
+    def _tick(self) -> None:
+        if time.monotonic() > self._deadline:
+            raise _Refused("the statement is too large to be checked in time")
 
     def _sensitive(self, name: str) -> bool:
         return _sensitive_name(self._patterns, name)
 
-    def _walk(self, node: exp.Expr) -> Iterator[exp.Expr]:
-        """The nodes of ``node``'s own scope: a nested scope's query is
-        yielded, never entered."""
-        stack = [node]
-        while stack:
-            sub = stack.pop()
-            yield sub
-            if sub is node or id(sub) not in self._scope_of:
-                stack.extend(sub.iter_expressions())
+    def _key(self, ident: exp.Identifier) -> str:
+        return _ident_key(self._engine, ident)
 
-    def _own_scopes(self, scope: Scope) -> list[Scope]:
-        """The child scopes inside ``scope``'s own expression; a table
-        function's sources also hold the lateral FROM items before it."""
-        found = []
-        for source in scope.sources.values():
-            if isinstance(source, Scope):
-                node: exp.Expr | None = source.expression
-                while node is not None and node is not scope.expression:
-                    node = node.parent
-                if node is not None:
-                    found.append(source)
-        return found
+    # ------------------------------------------------------------- queries
 
-    def _scope_items(self, scope: Scope) -> list[_OutItem]:
-        node = scope.expression
+    def _query(
+        self, node: exp.Expr, parent: _Scope | None, *, root: bool = False, rollup: bool = False
+    ) -> list[_Col]:
+        """The output columns of a query. ``rollup``: a subquery inside an
+        output expression, whose value counts every column its own clauses
+        read (WHERE, JOIN ... ON, GROUP BY, HAVING, ORDER BY), as a CASE
+        condition does."""
+        self._tick()
+        while isinstance(node, exp.Subquery):
+            if node.args.get("pivots") or node.args.get("alias"):
+                raise _Refused("a PIVOT/UNPIVOT or an aliased parenthesized query")
+            node = node.this
+        if not isinstance(node, exp.Select | exp.SetOperation):
+            raise _Refused(f"a {node.key.upper()} where a query is expected (select the columns explicitly)")
+        with_ = node.args.get("with_")
+        if isinstance(with_, exp.With):
+            if with_.args.get("search") or with_.args.get("cycle"):
+                raise _Refused("SEARCH/CYCLE on a recursive CTE")
+            for cte in with_.expressions:
+                if cte.args.get("scalar") or not isinstance(cte.this, exp.Query):
+                    self._scalars[_loose(cte.alias_or_name)] = (cte.this, parent)
+                else:
+                    self._cte_parent[id(cte)] = parent
         if isinstance(node, exp.Select):
-            items = [item for proj in node.expressions for item in self._projection(scope, proj)]
-            for_ = node.args.get("for_")
-            if isinstance(for_, exp.ForClause) and str(for_.args.get("kind") or "").upper() in ("JSON", "XML"):
-                # SQL Server FOR JSON / FOR XML fold every row into one column
-                # the driver names JSON_F52E2B61-... or XML_F52E2B61-...: it
-                # carries every value the projections carry, a base table's
-                # sensitive columns under a star included
-                suspect = any(not isinstance(i, _OutCol) or i.tainted for i in items)
-                return [_SPREAD_UNKNOWN if suspect else _OutCol(None, False)]
-            return items
-        if isinstance(node, exp.SetOperation):
-            if len(scope.union_scopes) != 2:
-                raise _Untraceable("set operation without two branches")
-            left, right = (self._out.get(id(s.expression), []) for s in scope.union_scopes)
-            return self._merge(left, right)
-        own = self._own_scopes(scope)
-        if isinstance(node, exp.Subquery | exp.Lateral) and len(own) == 1:
-            return self._source_items(own[0])  # a parenthesized query or a LATERAL subquery
-        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
-            # a parenthesized table (sqlglot reads PostgreSQL's `(TABLE t)`
-            # so): the table's own columns, renamed by a column list after it;
-            # a parenthesized join `(t r CROSS JOIN (...) b(j)) x` also has
-            # its joined items' columns after them (review V11-e: b's were
-            # dropped and its callsigns returned under x.*)
-            joins = node.args.get("joins") or []
-            joined: list[_OutItem] = [self._table_run(node)]
-            joined += [item for j in joins for item in self._from_item_items(scope, j.this)]
-            if any(j.args.get("using") or str(j.args.get("method") or "").upper() == "NATURAL" for j in joins):
-                suspect = any(i == _SPREAD_UNKNOWN if isinstance(i, str) else i.tainted for i in joined)
-                return [_SPREAD_UNKNOWN if suspect else self._spread_of(joined)]
-            return joined
-        # a table-valued expression (VALUES, UNNEST, ...): its columns carry
-        # whatever it reads
-        tainted = self._expr_tainted(scope, node)
-        run = _SPREAD_UNKNOWN if tainted else _SPREAD_BASE
-        if scope.outer_columns:
-            named: list[_OutItem] = [_OutCol(None, tainted) for _ in scope.outer_columns]
-            if self._values_width(node) == len(named):
-                return named
-            # the alias list may name fewer columns than the function returns:
-            # WITH ORDINALITY adds one, unnest(a, b) is one per array and an
-            # array of a composite type its fields (PostgreSQL keeps the
-            # unnamed ones): the rest is a run of unknown width
-            return [*named, run]
-        return [run]
-
-    @staticmethod
-    def _values_width(node: exp.Expr) -> int | None:
-        """How many columns a table-valued expression has where the statement
-        alone proves it: a VALUES list whose rows agree, and unnest over
-        array literals of scalar literals (one column each, no ORDINALITY);
-        None for anything else (its width is the engine's)."""
-        if isinstance(node, exp.Unnest):
-            scalar = (exp.Literal, exp.Null, exp.Boolean)
-            arrays = node.expressions
-            if node.args.get("offset") or not arrays or not all(
-                isinstance(a, exp.Array) and all(isinstance(_unparenthesized(v), scalar) for v in a.expressions)
-                for a in arrays
-            ):
-                return None
-            return len(arrays)
-        if not isinstance(node, exp.Values):
-            return None
-        widths = {len(row.expressions) if isinstance(row, exp.Tuple) else 1 for row in node.expressions}
-        return widths.pop() if len(widths) == 1 else None
-
-    def _projection(self, scope: Scope, proj: exp.Expression) -> list[_OutItem]:
-        if isinstance(proj, exp.Star) or (isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)):
-            return self._expand_star(scope, proj)
-        body = proj.unalias()
-        if _is_star(inner := _unparenthesized(body)):
-            # a star the statement wrapped or aliased: ``(b.*)`` and
-            # ClickHouse's ``(s.*)`` expand as ``b.*`` does, and so does
-            # PostgreSQL's ``b.* AS name``, whose alias may equal the first
-            # column's name. The walk does not prove how many columns it is
-            # (an engine may also read it as one row value): a run of
-            # unknown width, never one column
-            items = self._expand_star(scope, cast(exp.Expression, inner))
-            suspect = any(i == _SPREAD_UNKNOWN if isinstance(i, str) else i.tainted for i in items)
-            return [_SPREAD_UNKNOWN if suspect else self._spread_of(items)]
-        if _expands(body):
-            # (expr).* and untuple(t) are as many columns as the row has: a
-            # run, never one column a star beside it would make up for
-            expansion = _unparenthesized(body)
-            return [_SPREAD_UNKNOWN if self._expr_tainted(scope, expansion.this) else _SPREAD_BASE]
-        if isinstance(body, exp.Apply) or proj.find(exp.Columns):
-            # ClickHouse `* APPLY(f)` and COLUMNS('re') expand to columns the
-            # statement never names
-            return [_SPREAD_UNKNOWN if self._expr_tainted(scope, proj) else _SPREAD_BASE]
-        tainted = self._expr_tainted(scope, proj)
-        if isinstance(proj, exp.Alias) and proj.alias:
-            return [_OutCol(proj.alias.lower(), tainted, explicit=True)]
-        return [_OutCol(_engine_named(body), tainted)]
-
-    def _expand_star(self, scope: Scope, proj: exp.Expression) -> list[_OutItem]:
-        star = proj.this if isinstance(proj, exp.Column) else proj
-        if star.args.get("replace") or star.args.get("rename"):
-            return [_SPREAD_UNKNOWN]  # a value may now sit under another column's name
-        select = scope.expression
-        joins = select.args.get("joins") or []
-        if isinstance(proj, exp.Column) and proj.table:
-            node, source = self._lookup(scope, proj.args["table"])
-            parts = [self._source_items(source, node)]
-        else:
-            from_ = select.args.get("from_")
-            nodes = [from_.this, *(j.this for j in joins)] if from_ is not None else []
-            parts = [self._from_item_items(scope, n) for n in nodes]
-        items = [item for part in parts for item in part]
-        merged = len(parts) > 1 and any(
-            j.args.get("using") or str(j.args.get("method") or "").upper() == "NATURAL" for j in joins
-        )
-        if merged or star.args.get("except_") or star.args.get("ilike"):
-            # USING/NATURAL merge columns and EXCEPT/ILIKE drop some: positions shift
-            suspect = any(i == _SPREAD_UNKNOWN if isinstance(i, str) else i.tainted for i in items)
-            return [_SPREAD_UNKNOWN if suspect else self._spread_of(items)]
-        return items
-
-    @staticmethod
-    def _spread_of(items: list[_OutItem]) -> str:
-        """One run for ``items`` whose positions shift: it keeps the names
-        they can have when every one of them is known."""
-        names: set[str] = set()
-        for item in items:
-            if isinstance(item, _TableSpread):
-                names |= item.columns
-            elif isinstance(item, _OutCol) and item.name:
-                names.add(item.name)
+            return self._select(node, parent, root, rollup)
+        branches: list[exp.Expr] = []
+        stack: list[exp.Expr] = [node]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, exp.SetOperation) and (current is node or not current.args.get("with_")):
+                extra = {k for k, v in current.args.items() if v and k not in _PLAIN_SETOP_ARGS}
+                if extra:
+                    raise _Refused(f"a set operation with {', '.join(sorted(extra)).upper()}")
+                stack.extend((current.expression, current.this))
             else:
-                return _SPREAD_BASE
-        return _TableSpread(frozenset(names))
+                branches.append(current)
+        merged: list[_Col] | None = None
+        for branch in branches:
+            cols = self._query(branch, parent, root=root, rollup=rollup)
+            if merged is None:
+                merged = cols
+            elif len(cols) != len(merged):
+                raise _Refused("set-operation branches of different widths")
+            else:
+                merged = [
+                    _Col(m.name, m.tainted or c.tainted, m.checked, m.aka) for m, c in zip(merged, cols, strict=True)
+                ]
+        return merged or []
 
-    def _from_item_items(self, scope: Scope, node: exp.Expression) -> list[_OutItem]:
+    def _select(self, select: exp.Select, parent: _Scope | None, root: bool, rollup: bool) -> list[_Col]:
+        extra = {k for k, v in select.args.items() if v and k not in _PLAIN_SELECT_ARGS}
+        if extra:
+            names = {"match": "MATCH_RECOGNIZE", "laterals": "LATERAL VIEW", "for_": "FOR JSON/XML", "into": "INTO"}
+            raise _Refused(", ".join(sorted(names.get(k, k.upper()) for k in extra)))
+        scope = _Scope(select, parent)
+        from_ = select.args.get("from_")
+        if from_ is not None:
+            self._from_item(from_.this, scope)
+        for join in select.args.get("joins") or []:
+            self._join(join, scope)
+        out: list[_Col] = []
+        for proj in select.expressions:
+            out.extend(self._projection(proj, scope))
+        if rollup:
+            clauses: list[exp.Expr] = [j.args["on"] for j in select.args.get("joins") or [] if j.args.get("on")]
+            clauses += [select.args[k] for k in ("where", "group", "having", "qualify", "order") if select.args.get(k)]
+            if any([self._expr(clause, scope) for clause in clauses]):
+                out = [dataclasses.replace(c, tainted=True) for c in out]
+        if self._engine == "sqlite" and not root:
+            for proj in select.expressions:
+                if isinstance(proj, exp.Alias) and _sqlite_renamed_name(proj.alias):
+                    raise _Refused(
+                        f"the alias {_id_text(proj.alias)} of a subquery or CTE column, which SQLite may rename"
+                    )
+        return out
+
+    # ---------------------------------------------------------- FROM items
+
+    def _join(self, join: exp.Join, scope: _Scope) -> None:
+        kind = str(join.args.get("kind") or "").upper()
+        method = str(join.args.get("method") or "").upper()
+        if kind not in _PLAIN_JOIN_KINDS or method not in ("", "NATURAL"):
+            raise _Refused(f"a {' '.join(filter(None, (method, kind)))} JOIN")
+        if join.args.get("match_condition") or join.args.get("directed") or join.args.get("pivots"):
+            raise _Refused("an ASOF/directed join or a PIVOT")
+        if join.args.get("using") or method == "NATURAL":
+            scope.merged = True
+        self._from_item(join.this, scope)
+
+    def _from_item(self, node: exp.Expr, scope: _Scope) -> None:
+        self._tick()
         if node.args.get("pivots"):
-            return [_SPREAD_UNKNOWN]  # PIVOT/UNPIVOT reshape the columns
-        # a derived table or table function is found by identity: unaliased
-        # ones (PostgreSQL 16+, ClickHouse) all share the alias ""
-        inner = self._scope_of.get(id(node.this if isinstance(node, exp.Subquery) else node))
-        if inner is not None:
-            return self._source_items(inner)
-        found = self._named(scope).get(node.alias_or_name.lower()) or []
-        own = [e for e in found if e[0] is node]
-        if own:
-            return self._source_items(own[0][1], node)
-        if found:
-            return self._source_items(found[0][1] if len({id(e[1]) for e in found}) == 1 else _AMBIGUOUS, node)
-        if isinstance(node, exp.Table | exp.Subquery):
-            return [_SPREAD_UNKNOWN]
-        # an expression joined as rows (ClickHouse ARRAY JOIN arr AS x)
-        return [_SPREAD_UNKNOWN if self._expr_tainted(scope, node) else _SPREAD_BASE]
+            raise _Refused("PIVOT/UNPIVOT")
+        alias = node.args.get("alias")
+        renames = list(alias.columns) if isinstance(alias, exp.TableAlias) else []
+        alias_ident = alias.this if isinstance(alias, exp.TableAlias) else None
+        alias_ident = alias_ident if isinstance(alias_ident, exp.Identifier) else None
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
+            self._table(node, alias_ident, renames, scope)
+            return
+        if isinstance(node, exp.Subquery):
+            inner = node.this
+            if isinstance(inner, exp.Table) and isinstance(inner.this, exp.Identifier) and alias_ident is None:
+                # (a JOIN b ON ...) and (t): the joined items as written, one by one
+                if renames:
+                    raise _Refused("a column list on a parenthesized join")
+                inner_alias = inner.args.get("alias")
+                self._table(
+                    inner,
+                    inner_alias.this if isinstance(inner_alias, exp.TableAlias) else None,
+                    list(inner_alias.columns) if isinstance(inner_alias, exp.TableAlias) else [],
+                    scope,
+                    joined=True,
+                )
+                for join in inner.args.get("joins") or []:
+                    self._join(join, scope)
+                return
+            if not isinstance(inner, exp.Query):
+                raise _Refused("an aliased parenthesized join or table")
+            cols = self._rename(self._query(inner, scope.parent), renames)
+            scope.sources.append(_Source([alias_ident] if alias_ident is not None else [], cols))
+            return
+        names = {exp.Lateral: "LATERAL/APPLY", exp.Unnest: "UNNEST", exp.Values: "VALUES"}
+        raise _Refused(next((v for k, v in names.items() if isinstance(node, k)), f"a {node.key.upper()} source"))
 
-    @staticmethod
-    def _source_key(source: Scope) -> int | None:
-        """The key of a scope's output, or None when a PIVOT/UNPIVOT on the
-        derived table reshapes it."""
-        node = source.expression
-        while isinstance(node.parent, exp.SetOperation):
-            # a recursive CTE's self-reference is scoped to its anchor
-            # branch; what it returns is the whole CTE's output
-            node = node.parent
-        if isinstance(node.parent, exp.Subquery) and node.parent.args.get("pivots"):
-            return None
-        return id(node)
+    def _table(
+        self,
+        table: exp.Table,
+        alias: exp.Identifier | None,
+        renames: list[exp.Identifier],
+        scope: _Scope,
+        *,
+        joined: bool = False,
+    ) -> None:
+        ident = cast(exp.Identifier, table.this)
+        if table.args.get("pivots") or (table.args.get("joins") and not joined):
+            raise _Refused("PIVOT/UNPIVOT or a parenthesized join")
+        cte = self._targets.get(id(table))
+        names = [alias] if alias is not None else [ident]
+        if self._engine == "clickhouse" and alias is not None:
+            names.append(ident)  # ClickHouse binds t.x through FROM t AS a too
+        if cte is not None:
+            scope.sources.append(_Source(names, self._rename(self._cte(cte), renames)))
+            return
+        if id(table) in self._conflicts:
+            raise _Refused(f"the FROM item {_id_text(ident.name)}: {self._conflicts[id(table)]}; rename the CTE")
+        if renames:
+            raise _Refused(f"a column list on the table {_id_text(ident.name)} (alias its columns in a subquery)")
+        columns = self._catalog.get(id(table))
+        if columns is None:
+            why = self._unknown.get(id(table), "the catalog lists none")
+            raise _Refused(f"the columns of {_id_text(table.name)} are not known: {why}")
+        unstarred = columns.unstarred if isinstance(columns, _Listed) else frozenset()
+        scope.sources.append(_Source(names, [
+            _Col(_catalog_key(self._engine, c), self._sensitive(c), starred=c not in unstarred) for c in columns
+        ]))
 
-    @staticmethod
-    def _alias_columns(node: Any) -> list[str]:
-        """The column list of a FROM item's alias (``customers AS t(a, b)``,
-        ``cte AS d(w, x)``), which renames its columns positionally."""
-        alias = node.args.get("alias") if isinstance(node, exp.Table) else None
-        return [c.name for c in alias.columns] if isinstance(alias, exp.TableAlias) else []
+    def _cte(self, cte: exp.CTE) -> list[_Col]:
+        key = id(cte)
+        if key in self._ctes:
+            done = self._ctes[key]
+            if done is None:
+                raise _Refused(f"the CTE {_id_text(cte.alias_or_name)} reads itself outside its recursive branch")
+            return done
+        parent = self._cte_parent.get(key)
+        names = list(cte.args["alias"].columns)
+        body = cte.this
+        selfref = [t for t in body.find_all(exp.Table) if self._targets.get(id(t)) is cte]
+        self._ctes[key] = None
+        if not selfref:
+            cols = self._rename(self._query(body, parent), names)
+        else:
+            # recursive: the anchor, then the recursive branch over what the
+            # CTE holds so far, until no column's taint changes
+            while isinstance(body, exp.Subquery) and not body.args.get("alias"):
+                body = body.this
+            if not isinstance(body, exp.Union) or any(
+                self._targets.get(id(t)) is cte for t in body.this.find_all(exp.Table)
+            ):
+                raise _Refused(f"the recursive CTE {_id_text(cte.alias_or_name)} is not ANCHOR UNION recursive branch")
+            cols = self._rename(self._query(body.this, parent), names)
+            for _ in range(len(cols) + 2):
+                self._ctes[key] = cols
+                self._alias_memo.clear()  # an alias's taint may grow with the CTE's
+                step = self._rename(self._query(body.expression, parent), names)
+                if len(step) != len(cols):
+                    raise _Refused("recursive CTE branches of different widths")
+                grown = [
+                    dataclasses.replace(c, tainted=c.tainted or s.tainted) for c, s in zip(cols, step, strict=True)
+                ]
+                if grown == cols:
+                    break
+                cols = grown
+        self._ctes[key] = cols
+        return cols
 
-    @classmethod
-    def _renamed(cls, table: exp.Table) -> set[str]:
-        return {c.lower() for c in cls._alias_columns(table)}
+    def _rename(self, cols: list[_Col], names: list[exp.Identifier]) -> list[_Col]:
+        """An explicit column list renames positionally, the leading columns
+        where it names fewer (PostgreSQL)."""
+        if not names:
+            return cols
+        if len(names) > len(cols):
+            raise _Refused("a column list that names more columns than its query has")
+        keys = [self._key(n) for n in names]
+        if len({_loose(k) for k in keys}) != len(keys) or (
+            self._engine == "sqlite" and any(_sqlite_renamed_name(n.name) for n in names)
+        ):
+            raise _Refused("a column list with names that repeat (in some spelling) or that SQLite renames")
+        return [*(_Col(k, c.tainted) for k, c in zip(keys, cols, strict=False)), *cols[len(keys):]]
 
-    def _source_items(self, source: Any, ref: Any = None) -> list[_OutItem]:
-        """The output of ``source`` as the FROM item ``ref`` names it: a CTE
-        referenced as ``t AS d(w, x)`` is renamed for that reference only."""
-        if isinstance(source, Scope):
-            key = self._source_key(source)
-            # not evaluated yet (recursion): the fixpoint revisits it
-            items: list[_OutItem] = [_SPREAD_UNKNOWN] if key is None else self._out.get(key, [])
-            return self._rename(items, self._alias_columns(ref))
-        if isinstance(source, exp.Table) and not source.args.get("pivots") and not self._renamed(source):
-            return [self._table_run(source)]
-        return [_SPREAD_UNKNOWN]
+    # --------------------------------------------------------- projections
 
-    def _table_run(self, table: exp.Table) -> str:
-        """A base table's columns as one run, named when the catalog listed them."""
-        known = self._table_columns.get(id(table))
-        return _SPREAD_BASE if known is None else _TableSpread(known)
+    def _projection(self, proj: exp.Expression, scope: _Scope) -> list[_Col]:
+        if _is_star(proj):
+            return self._star(proj, scope)
+        alias = proj.args.get("alias") if isinstance(proj, exp.Alias) else None
+        body = proj.this if isinstance(proj, exp.Alias) else proj
+        inner = _unparenthesized(body)
+        if _is_star(inner):
+            raise _Refused("a star in parentheses or under an alias (select the columns explicitly)")
+        if isinstance(inner, exp.Dot) and isinstance(inner.expression, exp.Star):
+            raise _Refused("a composite expansion (expr).* (select the fields explicitly)")
+        tainted = self._expr(body, scope)
+        if isinstance(alias, exp.Identifier):
+            if not alias.name:
+                raise _Refused("an empty alias")
+            return [_Col(self._key(alias), tainted, checked=True)]
+        if isinstance(body, exp.Column) and isinstance(body.this, exp.Identifier):
+            return [_Col(self._key(body.this), tainted)]
+        return [_Col(None, tainted, aka=_engine_names(body))]
 
-    def _ref_index(self, ref: Any, source: Scope) -> _OutIndex:
-        """The indexed output of an evaluated scope as ``ref`` names it."""
-        if not self._alias_columns(ref):
-            key = self._source_key(source)
-            return self._index.get(key, _NO_OUTPUT) if key is not None else _OutIndex.of([_SPREAD_UNKNOWN])
-        index = self._ref_index_of.get(id(ref))
-        if index is None:
-            index = self._ref_index_of[id(ref)] = _OutIndex.of(self._source_items(source, ref))
-        return index
+    def _star(self, proj: exp.Expression, scope: _Scope) -> list[_Col]:
+        star = proj.this if isinstance(proj, exp.Column) else proj
+        if any(star.args.get(k) for k in ("except_", "replace", "rename", "ilike")):
+            raise _Refused("a star with EXCEPT/REPLACE/RENAME/ILIKE (select the columns explicitly)")
+        if scope.merged:
+            raise _Refused("a star over a USING or NATURAL join, whose layout the engine decides")
+        if isinstance(proj, exp.Column) and proj.table:
+            cols = self._lookup(scope, proj.args["table"]).columns
+        elif scope.sources:
+            cols = [c for s in scope.sources for c in s.columns]
+        else:
+            raise _Refused("a star without a FROM item")
+        # the columns * returns: not those it leaves out (_Listed.unstarred);
+        # a session that widens it (asterisk_include_*_columns) reports
+        # another width, refused after the statement ran (_laid_out)
+        return [_Col(c.name, c.tainted, c.name is not None, c.aka) for c in cols if c.starred]
 
-    def _named(self, scope: Scope) -> dict[str, list[tuple[Any, Any, exp.Identifier]]]:
-        """``scope``'s sources by lowercased name, each as (the FROM item that
-        names it, or None for a source the scope sees but does not select
-        from - never a CTE, which only a FROM item can name; the source; the
-        name as written). Names that differ only in case are
-        kept apart (_lookup); a PIVOT/UNPIVOT's alias names its FROM item."""
-        named = self._named_of.get(id(scope))
-        if named is None:
-            named = {}
-            for alias, (node, source) in scope.selected_sources.items():
-                for ident in self._source_names(alias, node):
-                    named.setdefault(ident.name.lower(), []).append((node, source, ident))
-            for alias, source in scope.sources.items():
-                # a CTE no FROM of this scope reads is no qualifier's: a
-                # correlated w.k binds to the enclosing query's FROM item w,
-                # whatever CTE named w the subquery can see (review M2,
-                # second pass: the spare CTE's clean k stood in for it)
-                if alias not in scope.selected_sources and not (isinstance(source, Scope) and source.is_cte):
-                    named.setdefault(alias.lower(), []).append((None, source, exp.to_identifier(alias)))
-            self._named_of[id(scope)] = named
-        return named
+    # ---------------------------------------------------------- expressions
 
-    @staticmethod
-    def _source_names(alias: str, node: Any) -> list[exp.Identifier]:
-        """The identifiers that name a selected source: its alias (or bare
-        table name) as written, quoting and all, and a PIVOT's alias."""
-        if not isinstance(node, exp.Expression):
-            return [exp.Identifier(this=alias, quoted=False)]
-        written: list[Any] = []
-        for holder in (node, node.parent):  # (TABLE t) q: q is the parenthesis's alias
-            alias_node = holder.args.get("alias") if isinstance(holder, exp.Expression) else None
-            if isinstance(alias_node, exp.TableAlias):
-                written.append(alias_node.this)
-        if isinstance(node, exp.Table):
-            written.append(node.this)
-        names = [next(
-            (i for i in written if isinstance(i, exp.Identifier) and i.name == alias),
-            exp.Identifier(this=alias, quoted=False),
-        )]
-        for pivot in node.args.get("pivots") or []:
-            pivot_alias = pivot.args.get("alias")
-            if isinstance(pivot_alias, exp.TableAlias) and isinstance(pivot_alias.this, exp.Identifier):
-                names.append(pivot_alias.this)
-        return names
-
-    def _fold(self, ident: exp.Identifier) -> str:
-        """A name as the engine compares it: folded where the engine's rule
-        is known (_NAME_FOLDING), else as written (SQL Server's and MySQL's
-        collations decide; ClickHouse compares names exactly)."""
-        return _folded_name(self._engine, ident) if self._engine in _NAME_FOLDING else ident.name
-
-    def _lookup(self, scope: Scope | None, qualifier: Any) -> tuple[Any, Any]:
-        """(FROM item, source) a qualifier names, in ``scope`` or an enclosing
-        one; (None, None) when it names no source, and (None, _AMBIGUOUS)
-        when names that differ only in case leave the engine's choice open:
-        two FROM items "A" and a, or an inner a and an outer "A" where the
-        engine's folding is unknown or the spelling matches neither."""
-        ident = qualifier if isinstance(qualifier, exp.Identifier) else exp.to_identifier(str(qualifier))
-        want, folded = ident.name.lower(), self._fold(ident)
-        skipped: list[tuple[Any, Any]] = []  # nearer sources whose name matches only ignoring case
-        while scope is not None:
-            entries = self._named(scope).get(want)
-            if entries:
-                matching = {id(e[1]): e for e in entries if self._fold(e[2]) == folded}
-                if matching:
-                    if len(matching) > 1 or (skipped and self._engine not in _NAME_FOLDING):
-                        return None, _AMBIGUOUS
-                    node, source, _ident = next(iter(matching.values()))
-                    return node, source
-                distinct = {id(e[1]): e for e in entries}
-                skipped.append((None, _AMBIGUOUS) if len(distinct) > 1 else entries[0][:2])
-            scope = scope.parent
-        if len(skipped) == 1 and self._engine not in _NAME_FOLDING:
-            return skipped[0]  # the engine bound it ignoring case, or the statement failed
-        return (None, _AMBIGUOUS) if skipped else (None, None)
-
-    def _candidates(self, scope: Scope) -> list[tuple[str, Any, Any]]:
-        """The sources an unqualified column may read, as (alias, FROM item,
-        source): this scope's, plus the enclosing ones for a (correlated)
-        subquery, a table function or a scope with no FROM."""
-        cached = self._candidates_of.get(id(scope))
-        if cached is not None:
-            return cached
-        found: list[tuple[str, Any, Any]] = []
-        seen: set[int] = set()
-        current: Scope | None = scope
-        while current is not None:
-            for alias, (node, source) in current.selected_sources.items():
-                seen.add(id(source))
-                found.append((alias, node, source))
-            # unaliased derived tables share the alias "": only the last one is a named source
-            for source in current.table_scopes:
-                if id(source) not in seen:
-                    seen.add(id(source))
-                    found.append(("", None, source))
-            if found and current.scope_type not in (ScopeType.SUBQUERY, ScopeType.UDTF):
-                break
-            current = current.parent
-        self._candidates_of[id(scope)] = found
-        return found
-
-    def _col_tainted(self, scope: Scope, col: exp.Column) -> bool:
-        if isinstance(col.this, exp.Star):  # t.* used as a value: the whole row
-            return self._whole_row_tainted(self._lookup(scope, col.args["table"])[1] if col.table else None)
-        name = col.name.lower()
-        if self._sensitive(col.name):
-            return True
-        if col.table:
-            node, source = self._lookup(scope, col.args["table"])
-            if source is not None:
-                return self._by_name(source, name, node, col.this)
-            if col.db:
-                # t.objcol.attr (an Oracle object column's attribute): the
-                # value is objcol's
-                node, source = self._lookup(scope, col.args["db"])
-                if source is not None:
-                    return self._by_name(source, col.table.lower(), node, col.args["table"])
-            if self._engine != "clickhouse":
-                # a qualifier the walk binds to no source (a PIVOT's, a
-                # MATCH_RECOGNIZE's, a construct it does not model): its
-                # column is not proven clean
-                return True
-            return self._qualifier_tainted(scope, col)
-        if self._scalar_tainted(scope, name):
-            return True
-        # ClickHouse resolves a bare name to an alias defined anywhere in the SELECT
-        if name in self._aliases.get(id(scope.expression), ()):
-            return True
-        if not self._candidates(scope):
-            return name in self._tainted_names
-        reach = self._reach(scope)
-        plain = bool(_PLAIN_NAME.fullmatch(name))
-        return (
-            reach.always
-            or name in reach.tainted
-            # an engine-named column (PostgreSQL names upper(x) "upper") may be
-            # the one referenced; SQLite names it "upper(x)", the first of
-            # several, so an explicit alias of that text does not tell them apart
-            or (bool(reach.anonymous) and (not plain or reach.named_in_anonymous.get(name, 0) < reach.anonymous))
-            # a bare table alias is a whole-row reference (PostgreSQL: SELECT t FROM t)
-            or reach.rows.get(name, False)
-            # a name no source outputs: one the engine made (SQLite's "x:1"
-            # for a second x), unless a base table or a star may hold it
-            or (
-                name not in reach.known and name not in _PSEUDO_COLUMNS and reach.scope_row
-                and (reach.closed or not plain)
-            )
-        )
-
-    def _qualifier_tainted(self, scope: Scope, col: exp.Column) -> bool:
-        """A qualified column whose qualifier is not a FROM item: a struct or
-        tuple column (ClickHouse n.field), or an element of a tuple bound by
-        an alias (x.1 over ARRAY JOIN [(ssn, 1)] AS x, or over an alias in
-        WHERE) or by a WITH scalar."""
-        qualifier = col.table.lower()
-        if self._sensitive(col.table) or {col.name.lower(), qualifier} & self._tainted_names:
-            return True
-        current: Scope | None = scope
-        while current is not None:
-            if qualifier in self._aliases.get(id(current.expression), ()):
-                return True
-            current = current.parent
-        return self._scalar_tainted(scope, qualifier)
-
-    def _scalar_tainted(self, scope: Scope, name: str) -> bool:
-        """Whether ``name`` is a ClickHouse WITH scalar that reads a sensitive
-        value (a scalar may read another; a cycle reads nothing new)."""
-        if name not in self._scalars or name in self._resolving:
-            return False
-        self._resolving.add(name)
-        try:
-            return self._expr_tainted(scope, self._scalars[name])
-        finally:
-            self._resolving.discard(name)
-
-    def _reach(self, scope: Scope) -> _Reach:
-        reach = self._reach_of.get(id(scope))
-        if reach is not None:
-            return reach
-        reach = _Reach()
-        for alias, node, source in self._candidates(scope):
-            row = self._whole_row_tainted(source)
-            reach.any_row = reach.any_row or row
-            if alias:
-                reach.rows[alias.lower()] = reach.rows.get(alias.lower(), False) or row
-            key = self._source_key(source) if isinstance(source, Scope) else None
-            if key is not None:
-                index = self._ref_index(node, source)
-                reach.always = reach.always or index.unknown
-                reach.tainted.update(n for n, tainted in index.names.items() if tainted)
-                reach.known.update(index.names)
-                reach.closed = reach.closed and not index.spread
-                reach.scope_row = reach.scope_row or index.row
-                if index.anonymous:
-                    reach.anonymous += 1
-                    for n in index.names:
-                        reach.named_in_anonymous[n] = reach.named_in_anonymous.get(n, 0) + 1
-            elif isinstance(source, exp.Table) and not source.args.get("pivots"):
-                # a base table's own column names were checked against the patterns
-                reach.tainted.update(self._renamed(source))
-                reach.closed = False
-            else:
-                reach.always = True
-        self._reach_of[id(scope)] = reach
-        return reach
-
-    def _alias_closure(self, scope: Scope) -> set[str]:
-        """Tainted aliases a SELECT defines anywhere in it - its projections,
-        and those in WHERE, ORDER BY or ARRAY JOIN that ClickHouse lets the
-        SELECT list read - closed over the bare names they read from each
-        other with a worklist, so an alias chain settles in one pass."""
-        key = id(scope.expression)
-        self._aliases[key] = set()  # each alias's own taint first, without its siblings'
-        pending: list[str] = []
-        readers: dict[str, list[str]] = {}
-        for node in self._walk(scope.expression):
-            if not (isinstance(node, exp.Alias) and node.alias):
+    def _expr(self, node: exp.Expr, scope: _Scope) -> bool:
+        """Whether the value of ``node`` (evaluated in ``scope``) can carry a
+        masked column's value. Every column it reads counts, wherever it
+        stands in it (a CASE condition, a window's PARTITION BY), and a
+        subquery counts by what it outputs."""
+        tainted = False
+        params: set[str] = set()
+        stack: list[exp.Expr] = [node]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, exp.Subquery | exp.Query):
+                query = current.this if isinstance(current, exp.Subquery) else current
+                tainted = any(c.tainted for c in self._query(query, scope, rollup=True)) or tainted
                 continue
-            name = node.alias.lower()
-            if self._expr_tainted(scope, node.this):
-                pending.append(name)
-            for sub in self._walk(node.this):
-                if isinstance(sub, exp.Column) and not sub.table and not isinstance(sub.this, exp.Star):
-                    readers.setdefault(sub.name.lower(), []).append(name)
-        tainted: set[str] = set()
-        while pending:
-            name = pending.pop()
-            if name not in tainted:
-                tainted.add(name)
-                pending.extend(readers.get(name, ()))
+            if isinstance(current, exp.Count) and _is_star(current.this):
+                continue
+            if isinstance(current, exp.Column):
+                if isinstance(current.this, exp.Star):  # t.* as a value: the whole row
+                    tainted = any(c.tainted for c in self._lookup(scope, current.args["table"]).columns) or tainted
+                elif current.name not in params:
+                    tainted = self._column(current, scope) or tainted
+                continue
+            if isinstance(current, exp.Star):  # * as a value
+                tainted = any(c.tainted for s in scope.sources for c in s.columns) or tainted
+                continue
+            if isinstance(current, exp.Dot) and isinstance(current.expression, exp.Star):
+                raise _Refused("a composite expansion (expr).*")
+            if isinstance(current, exp.Columns | exp.Apply) or (
+                isinstance(current, exp.Anonymous) and str(current.this).lower() == "untuple"
+            ):
+                raise _Refused("COLUMNS(), APPLY or untuple(), which expand to columns the statement does not name")
+            if isinstance(current, exp.Table):
+                raise _Refused("a table named inside an expression")
+            if isinstance(current, exp.Lambda):
+                params.update(p.name for p in current.expressions if isinstance(p, exp.Identifier))
+            stack.extend(current.iter_expressions())
         return tainted
 
-    def _by_name(self, source: Any, name: str, ref: Any = None, ident: Any = None) -> bool:
-        """Taint of ``q.name`` where q names ``source`` through the FROM item
-        ``ref``. A base table's own column names were already checked against
-        the patterns; on PostgreSQL q.to_json is to_json(q), its whole row,
-        and so is q.site_fn over a table the catalog says has no such column,
-        or over a derived table or CTE whose star hands such a table's row on
-        (``ident`` is the name as written: PostgreSQL folds it unless quoted)."""
-        if not isinstance(source, Scope):
-            if isinstance(source, exp.Table) and not source.args.get("pivots"):
-                if name in self._renamed(source) or name in self._row_functions:
-                    return True
-                known = self._table_columns.get(id(source))
-                return known is not None and ident is not None and _pg_identifier(ident) not in known
-            return True
-        if self._source_key(source) is None:
-            return True
-        index = self._ref_index(ref, source)
-        tainted = index.names.get(name)
-        plain = bool(_PLAIN_NAME.fullmatch(name))
-        if tainted is not None:
-            # SQLite names an unaliased expression by its text: an alias of
-            # that text names the second of the two
-            return tainted or index.unknown or (index.anonymous and not plain)
-        # Not a column the scope outputs by name: an engine-named column
-        # (PostgreSQL names upper(x) "upper", SQLite a second x "x:1"), or on
-        # PostgreSQL a function of the whole row - any name where every
-        # column is known (a star's too, where the catalog listed its
-        # tables) or where it listed some and a run beside them leaves the
-        # rest to the driver, else a known row function.
-        listed = index.spread_columns
-        return index.unknown or index.anonymous or (
-            index.row and (
-                not index.spread
-                or not plain
-                or name in self._row_functions
-                or (bool(self._row_functions) and index.partly_listed)
-                or (listed is not None and _pg_identifier(name if ident is None else ident) not in listed)
-            )
-        )
-
-    def _whole_row_tainted(self, source: Any) -> bool:
-        """A row used as a value carries every column of it; a base table's
-        columns are not known here, so its row counts as sensitive."""
-        if isinstance(source, Scope):
-            key = self._source_key(source)
-            return key is None or self._index.get(key, _NO_OUTPUT).row
-        return True
-
-    def _expr_tainted(self, scope: Scope, node: exp.Expr) -> bool:
-        for sub in self._walk(node):
-            if sub is not node and id(sub) in self._scope_of:
-                if self._rollup.get(id(sub), False):  # a subquery: anything it reads
-                    return True
-            elif isinstance(sub, exp.Column):
-                if self._col_tainted(scope, sub):
-                    return True
-            elif isinstance(sub, exp.Select | exp.SetOperation) and sub is not node:
-                return True  # a query the scope analysis did not place
-            elif isinstance(sub, exp.Columns) or (
-                isinstance(sub, exp.Star) and not isinstance(sub.parent, exp.Column | exp.Count)
-            ):
-                # a row used as a value (not COUNT(*))
-                if not self._candidates(scope) or self._reach(scope).any_row:
-                    return True
-        return False
-
-    @staticmethod
-    def _rename(items: list[_OutItem], names: list[str]) -> list[_OutItem]:
-        """An explicit column list (``WITH t(a, b)``, ``AS q(a, b)``) renames
-        positionally."""
-        if not names:
-            return items
-        lowered = [n.lower() for n in names]
-        # the columns before any run of unknown width have known positions
-        lead = list(itertools.takewhile(lambda i: isinstance(i, _OutCol), items))
-        if len(lowered) > len(lead):
-            # the renamed positions cannot be matched to their values
-            return [*(_OutCol(n, True) for n in lowered), _SPREAD_UNKNOWN]
-        renamed = [_OutCol(n, c.tainted) for n, c in zip(lowered, cast(list[_OutCol], lead), strict=False)]
-        return [*renamed, *items[len(lowered):]]
-
-    @staticmethod
-    def _merge(left: list[_OutItem], right: list[_OutItem]) -> list[_OutItem]:
-        """A set operation: names come from the left branch, values from both."""
-        lcols = [i for i in left if isinstance(i, _OutCol)]
-        rcols = [i for i in right if isinstance(i, _OutCol)]
-        if len(lcols) == len(left) and len(rcols) == len(right) and len(left) == len(right):
-            return [_OutCol(lc.name, lc.tainted or rc.tainted) for lc, rc in zip(lcols, rcols, strict=True)]
-        if len(rcols) == len(right) and not any(rc.tainted for rc in rcols):
-            return left  # the right branch adds no sensitive value (or is not evaluated yet)
-        return [_SPREAD_UNKNOWN]
-
-
-def _pg_identifier(ident: Any) -> str:
-    """A PostgreSQL identifier as the catalog spells it: folded to lower case
-    unless quoted."""
-    if isinstance(ident, exp.Identifier):
-        return str(ident.this) if ident.quoted else str(ident.this).translate(_ASCII_LOWER)
-    return str(getattr(ident, "name", ident)).translate(_ASCII_LOWER)
-
-
-def _pg_table_ident(table: exp.Table) -> Any:
-    """The identifier that names ``table``'s relation: sqlglot reads
-    PostgreSQL's ``(TABLE t)`` as a table named TABLE aliased t (an unquoted
-    TABLE is a reserved word, never a table's name)."""
-    this, alias = table.this, table.args.get("alias")
-    if (
-        isinstance(this, exp.Identifier) and not this.quoted and str(this.this).upper() == "TABLE"
-        and isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier)
-    ):
-        return alias.this
-    return this
-
-
-async def _row_function_columns(
-    app: AppContext, connector: DatabaseConnector, policy: EffectivePolicy, ast: exp.Expression, warnings: list[str]
-) -> dict[int, frozenset[str]]:
-    """PostgreSQL reads ``b.fn`` as ``fn(b)`` when the table b names has no
-    column fn (attribute notation), so a site's own function over a base
-    table's row hands the row back under a name no pattern matches. This
-    reads, from the catalog, the column names of each base table a qualified
-    column names, and of each one a derived table or CTE hands on whole
-    (``SELECT *``, ``TABLE t``: x.fn is then fn over t's row), keyed by the
-    id of its FROM item, so the taint walk can tell a column from such a
-    call. A table whose columns cannot be read, or that information_schema
-    lists none of (a materialized view), a bare name the catalog listing does
-    not hold, or one that comes after _ROW_FUNCTION_TABLES lookups, maps to
-    no columns, so every name qualified by it is masked (fail closed): decoy
-    tables ahead of it cannot use the lookups up. The listing is read once
-    per statement, and a table named again is not resolved again."""
-    if policy.engine != "postgres" or not policy.sensitive_patterns:
-        return {}
-    qualifiers = {c.table.lower() for c in ast.find_all(exp.Column) if c.table}
-    if not qualifiers:
-        return {}
-    try:
-        # the scopes of the walk's own view, where a FROM item binds to a CTE
-        # as PostgreSQL folds the names (_engine_view): WITH "CUSTOMERS" ...
-        # FROM CUSTOMERS reads the table customers
-        view, _ = _engine_view(ast, policy.engine, None)
-        scopes = list(traverse_scope(view))
-    except Exception:  # noqa: BLE001 - the taint walk cannot follow it either, and masks the result whole
-        return {}
-    # the view's FROM items, by id, to the statement's (the copy keeps their order)
-    original = {id(v): id(t) for t, v in zip(ast.find_all(exp.Table), view.find_all(exp.Table), strict=True)}
-    # A FROM item names a CTE only where its scope says so: a CTE of the same
-    # name inside EXISTS or a scalar subquery leaves an outer table a table.
-    # (A parenthesized TABLE t is a scope of its own, not a reference to one.)
-    cte_refs = {
-        original.get(id(node))
-        for s in scopes
-        for node, source in s.selected_sources.values()
-        if isinstance(source, Scope) and source.expression is not node
-    }
-    handed_on = {
-        original.get(id(source))
-        for s in scopes
-        if not s.is_root
-        and (isinstance(s.expression, exp.Table) or (isinstance(s.expression, exp.Select) and s.expression.is_star))
-        for source in s.sources.values()
-        if isinstance(source, exp.Table)
-    }
-    now = time.monotonic()
-    out: dict[int, frozenset[str]] = {}
-    resolved: dict[tuple[str | None, str], frozenset[str]] = {}  # (schema as written, name) -> its columns
-    listed: list[Any] | Exception | None = None  # the catalog listing, read on the first bare name
-    lookups = 0
-    over_budget = False
-    for table in ast.find_all(exp.Table):
-        if not isinstance(table.this, exp.Identifier) or id(table) in cte_refs:
-            continue  # a table function, or a CTE, whose columns the walk knows
-        if table.alias_or_name.lower() not in qualifiers and id(table) not in handed_on:
-            continue
-        name = _pg_identifier(_pg_table_ident(table))
-        written = _pg_identifier(table.args["db"]) if table.db else None
-        if (written, name) in resolved:  # the same table named again (a long UNION) is resolved once
-            out[id(table)] = resolved[(written, name)]
-            continue
-        known: frozenset[str] | None = None
-        columnless = False  # a relation it may name lists no columns
-        try:
-            if written is not None:
-                schemas = [written]
-            else:  # search_path picks among the tables the listing holds under this name
-                if listed is None:
-                    try:
-                        listed = await app.tables_for(policy, connector)
-                    except Exception as exc:  # noqa: BLE001 - every bare name is then reported below
-                        listed = exc
-                if isinstance(listed, Exception):
-                    raise listed
-                schemas = sorted({t.schema for t in listed if t.schema and t.name == name})
-                if not schemas:
-                    # Nothing restricting names, the guard let PostgreSQL bind
-                    # one the listing leaves out: a partitioned parent, a
-                    # foreign table, a table newer than the cached listing.
-                    warnings.append(
-                        f"{_id_text(name)} is not in the catalog listing, so its columns are unknown: every "
-                        "column named through it was masked, since PostgreSQL may read such a name as a "
-                        "site-defined function of the whole row (fail closed); qualify it with its schema"
-                    )
-                    known = frozenset()
-            for schema in schemas:
-                key = (policy.connection_id, schema, name)
-                cached = app.row_columns.get(key)
-                if cached is not None and now - cached[0] < _ROW_COLUMNS_TTL:
-                    names = cached[1]
-                elif lookups >= _ROW_FUNCTION_TABLES:
-                    over_budget, known = True, frozenset()
-                    break
-                else:
-                    lookups += 1
-                    cols = await run_meta(app, policy.connection_id, _meta_call("list_columns", schema, name))
-                    names = frozenset(str(c.name) for c in cols)
-                    if len(app.row_columns) >= _ROW_COLUMNS_CAP:
-                        app.row_columns.clear()
-                    app.row_columns[key] = (now, names)
-                columnless = columnless or not names
-                # a bare name may bind to any of these: only a column of every one is surely a column
-                known = names if known is None else known & names
-            if columnless:
-                warnings.append(
-                    f"the catalog lists no columns for {_id_text(name)} (information_schema leaves out a "
-                    "materialized view's): every column named through it with a qualifier was masked, since "
-                    "PostgreSQL may read such a name as a site-defined function of the whole row (fail closed); "
-                    "name its columns without the qualifier"
+    def _column(self, col: exp.Column, scope: _Scope) -> bool:
+        ident = col.this
+        if not isinstance(ident, exp.Identifier):
+            raise _Refused(f"a column reference of an unusual form ({col.key})")
+        if self._sensitive(ident.name):
+            return True  # a masked name is masked, whatever it binds to
+        if col.table:
+            return self._of_source(self._lookup(scope, col.args["table"]), col.args["table"], ident)
+        want = _loose(ident.name)
+        # ClickHouse's WITH <expression> AS name may stand for the name ahead
+        # of a column: its value counts wherever the name is read
+        scalar = want in self._scalars
+        if scalar:
+            expression, where = self._scalars[want]
+            if self._guarded(id(expression), lambda: self._expr(expression, where or scope)):
+                return True
+        current: _Scope | None = scope
+        while current is not None:
+            hits, made_up = _column_hits((c for s in current.sources for c in s.columns), ident)
+            aliases = self._aliases(current).get(want, [])
+            if hits or made_up or aliases:
+                if any(c.name != self._key(ident) for c in hits):
+                    raise _Refused(f"the column {_id_text(ident.name)} is spelled otherwise than the catalog's")
+                return any(c.tainted for c in (*hits, *made_up)) or any(
+                    self._alias_tainted(a, current) for a in aliases
                 )
-        except Exception as exc:  # noqa: BLE001 - the statement ran; only its masking is at stake
-            warnings.append(
-                f"the columns of {_id_text(name)} could not be read ({_error_text(exc)}): every column named "
-                "through it was masked, since PostgreSQL may read such a name as a site-defined function of the "
-                "whole row (fail closed)"
-            )
-            known = frozenset()
-        out[id(table)] = resolved[(written, name)] = frozenset() if known is None else known
-    if over_budget:
-        warnings.append(
-            f"the statement names more than {_ROW_FUNCTION_TABLES} tables whose columns were not yet known (one "
-            "catalog lookup each): the columns named through the others were masked, since PostgreSQL may read "
-            "such a name as a site-defined function of the whole row (fail closed); a repeated call finds them known"
+            current = current.parent
+        if scalar:
+            return False
+        if want in _ROWID_NAMES:
+            return any(c.tainted for s in scope.sources for c in s.columns)
+        if want in _PSEUDO_COLUMNS:
+            return False
+        raise _Refused(
+            f"{_id_text(ident.name)} is not a column of any FROM item (a whole row, a string in double quotes, "
+            "or a name the engine resolves otherwise)"
         )
-    return out
+
+    def _of_source(self, source: _Source, qualifier: exp.Identifier, ident: exp.Identifier) -> bool:
+        hits, made_up = _column_hits(source.columns, ident)
+        if not hits and not made_up and _loose(ident.name) in _ROWID_NAMES:
+            return any(c.tainted for c in source.columns)
+        if not hits and not made_up and _loose(ident.name) in _PSEUDO_COLUMNS:
+            return False
+        if not hits and not made_up:
+            raise _Refused(
+                f"{_id_text(qualifier.name)}.{_id_text(ident.name)} names no column of {_id_text(qualifier.name)} "
+                "(PostgreSQL reads it as a function of the whole row)"
+            )
+        if any(c.name != self._key(ident) for c in hits):
+            raise _Refused(f"the column {_id_text(ident.name)} is spelled otherwise than its source's")
+        return any(c.tainted for c in (*hits, *made_up))
+
+    def _lookup(self, scope: _Scope, qualifier: exp.Identifier) -> _Source:
+        """The FROM item a qualifier names, in ``scope`` or around it. Names
+        are compared in every spelling: one candidate binds; of several, the
+        nearest binds only when it is the only one there and spelled as the
+        engine compares it - anything else is a choice between FROM items
+        that only the engine's rules decide."""
+        want = _loose(qualifier.name)
+        found: list[tuple[_Scope, _Source, exp.Identifier]] = []
+        current: _Scope | None = scope
+        while current is not None:
+            for source in current.sources:
+                for name in source.names:
+                    if _loose(name.name) == want:
+                        found.append((current, source, name))
+                        break
+            current = current.parent
+        if not found:
+            raise _Refused(f"the qualifier {_id_text(qualifier.name)} names no FROM item")
+        if len({id(s) for _sc, s, _n in found}) == 1:
+            return found[0][1]
+        nearest = [f for f in found if f[0] is found[0][0]]
+        exact = self._engine in ("postgres", "oracle", "db2", "clickhouse", "sqlite")
+        name = nearest[0][2]
+        same = self._key(name) == self._key(qualifier) if exact else name.name == qualifier.name
+        if len(nearest) == 1 and same:
+            return nearest[0][1]
+        raise _Refused(
+            f"the qualifier {_id_text(qualifier.name)} may name several FROM items (names that differ only in case, "
+            "or one inside a subquery and one around it): give them distinct aliases"
+        )
+
+    def _aliases(self, scope: _Scope) -> dict[str, list[exp.Alias]]:
+        """The aliases a SELECT defines anywhere in itself: ClickHouse lets a
+        name read one from the SELECT list or WHERE, and MySQL a subquery one
+        from the SELECT list; a bare name that may be one counts its value."""
+        if scope.aliases is None:
+            found: dict[str, list[exp.Alias]] = {}
+            stack: list[exp.Expr] = []
+            for key, value in scope.select.args.items():
+                if key not in ("from_", "joins", "with_"):
+                    stack.extend(v for v in (value if isinstance(value, list) else [value]) if isinstance(v, exp.Expr))
+            while stack:
+                node = stack.pop()
+                if isinstance(node, exp.Subquery | exp.Query):
+                    continue
+                if isinstance(node, exp.Alias) and node.alias:
+                    found.setdefault(_loose(node.alias), []).append(node)
+                stack.extend(node.iter_expressions())
+            scope.aliases = found
+        return scope.aliases
+
+    def _alias_tainted(self, alias: exp.Alias, scope: _Scope) -> bool:
+        known = self._alias_memo.get(id(alias))
+        if known is None:
+            known = self._guarded(id(alias), lambda: self._expr(alias.this, scope))
+            self._alias_memo[id(alias)] = known
+        return known
+
+    def _guarded(self, key: int, work: Callable[[], bool]) -> bool:
+        """``work`` unless it is already running: an alias that reads its
+        own name (ClickHouse f(x) AS x) reads the column there."""
+        if key in self._visiting:
+            return False
+        self._visiting.add(key)
+        try:
+            return work()
+        finally:
+            self._visiting.discard(key)
 
 
-def _output_items(
-    policy: EffectivePolicy, ast: exp.Expression, table_columns: dict[int, frozenset[str]] | None = None
-) -> list[_OutItem] | None:
-    try:
-        view, columns = _engine_view(ast, policy.engine, table_columns)
-        return _OutputTaint(policy.sensitive_patterns, view, policy.engine, columns).root_items()
-    except Exception:  # noqa: BLE001 - an AST the analysis cannot follow is masked, never trusted
-        return None
+def _touches_masked(
+    policy: EffectivePolicy, ast: exp.Expression, base: list[exp.Table], catalog: Mapping[int, tuple[str, ...]]
+) -> bool:
+    """Whether a statement reads a table with a masked column (or one whose
+    columns the catalog does not list, so may have one), or names a masked
+    column at all (a struct field, an attribute)."""
+    patterns = policy.sensitive_patterns
+    for table in base:
+        columns = catalog.get(id(table))
+        if columns is None or any(_sensitive_name(patterns, c) for c in columns):
+            return True
+    for node in ast.walk():
+        if isinstance(node, exp.Column) and _sensitive_name(patterns, node.name):
+            return True
+        if isinstance(node, exp.Dot) and _sensitive_name(patterns, node.expression.name):
+            return True
+    return False
 
 
 def _driver_name(name: str) -> str:
@@ -2829,117 +2421,207 @@ def _driver_name(name: str) -> str:
 _PG_NAME_BYTES = 63
 
 
-def _reported_as(reported: str, alias: str) -> bool:
-    """Whether the driver's column name ``reported`` is the alias the
-    statement wrote: as written, or cut to PostgreSQL's 63 bytes (an alias
-    longer than that is reported cut, and every column was masked)."""
-    if _driver_name(reported) == _driver_name(alias):
+def _reported_as(reported: str, expected: str) -> bool:
+    """Whether the driver's column name ``reported`` is the name the
+    analysis expects there: as written, cut to PostgreSQL's 63 bytes, or
+    qualified by its table (ClickHouse names a star's column b.x where the
+    name repeats), or numbered (SQLite names a repeated one x:1)."""
+    got, want = _driver_name(reported), _driver_name(expected)
+    head, colon, tail = got.rpartition(":")  # SQLite names a repeated subquery column x:1
+    if got == want or got.endswith("." + want) or (colon and head == want and tail.isdigit()):
         return True
-    encoded = alias.encode("utf-8")
-    return len(encoded) > _PG_NAME_BYTES and _driver_name(reported) == _driver_name(
-        encoded[:_PG_NAME_BYTES].decode("utf-8", "ignore")
+    encoded = expected.encode("utf-8")
+    return len(encoded) > _PG_NAME_BYTES and got == _driver_name(encoded[:_PG_NAME_BYTES].decode("utf-8", "ignore"))
+
+
+def _laid_out(plan: list[_Col], columns: list[tuple[str, str]]) -> set[int]:
+    """The positions to mask among the columns the driver reported, or
+    ToolFailure where they are not the ones the analysis proved: another
+    width, or a name it expects elsewhere (a table's hidden or computed
+    columns, a column the engine adds)."""
+    problem = None
+    if len(plan) != len(columns):
+        problem = f"the result has {len(columns)} columns where the analysis expects {len(plan)}"
+    else:
+        for i, (col, (reported, _t)) in enumerate(zip(plan, columns, strict=True)):
+            if col.checked and col.name is not None and not _reported_as(reported, col.name):
+                problem = f"column {i + 1} is reported as {_id_text(reported)}, not {_id_text(col.name)}"
+                break
+    if problem is not None:
+        raise ToolFailure(
+            ErrorCategory.POLICY,
+            f"this statement reads a table with masked columns and {problem}, so masking cannot place them; no "
+            "rows are returned - select the columns explicitly",
+        )
+    return {i for i, col in enumerate(plan) if col.tainted}
+
+
+def _masking_refusal(reason: str) -> ToolFailure:
+    return ToolFailure(
+        ErrorCategory.POLICY,
+        f"this statement reads a table with masked columns, and its shape cannot be checked for them: {reason}. "
+        "Name the columns you need in plain SELECT lists over tables, views, subqueries and CTEs (joins, GROUP BY, "
+        "window functions and UNION are fine)",
     )
 
 
-def _map_positions(items: list[_OutItem], width: int, names: list[str] | None = None) -> set[int] | None:
-    """Tainted indices among the driver's ``width`` columns, or None when the
-    traced output cannot be laid over them. ``names``: the driver's column
-    names; where a run of unknown width takes up the difference, every alias
-    the statement wrote must be reported at the position the layout gives it
-    - a construct the walk counts as one column and the engine as several
-    would otherwise shift each traced position after it onto another column."""
-    runs: list[_OutItem] = []
-    for item in items:
-        if isinstance(item, str) and runs and isinstance(runs[-1], str):
-            runs[-1] = _SPREAD_UNKNOWN if _SPREAD_UNKNOWN in (item, runs[-1]) else _SPREAD_BASE
-        else:
-            runs.append(item)
-    spreads = [r for r in runs if isinstance(r, str)]
-    span = width - (len(runs) - len(spreads))
-    if span < 0 or (not spreads and span != 0):
-        return None
-    if len(spreads) > 1:
-        # several runs of unknown width: exact only when the name heuristics
-        # alone decide every column
-        if _SPREAD_UNKNOWN in spreads or any(r.tainted for r in runs if isinstance(r, _OutCol)):
-            return None
-        return set()
-    hit: set[int] = set()
-    pos = 0
-    for run in runs:
-        if isinstance(run, str):
-            if run == _SPREAD_UNKNOWN:
-                hit.update(range(pos, pos + span))
-            pos += span
-        else:
-            if spreads and names is not None and run.explicit and run.name is not None and (
-                pos >= len(names) or not _reported_as(names[pos], run.name)
-            ):
-                return None
-            if run.tainted:
-                hit.add(pos)
-            pos += 1
-    return hit
+def _listed_spelling(engine: str, written: exp.Identifier, names: Iterable[str], ignores_case: bool) -> list[str]:
+    """The catalog spellings among ``names`` a written name reads: as the
+    engine folds it (PostgreSQL, Oracle, Db2, ClickHouse, SQLite), else -
+    where a collation or a server setting decides - the one spelled exactly
+    so, or the only one in any case."""
+    loose = [n for n in names if _loose(n) == _loose(written.name)]
+    if engine in ("postgres", "oracle", "db2", "clickhouse", "sqlite"):
+        return [n for n in loose if _ident_key(engine, written) == _catalog_key(engine, n)]
+    exact = [n for n in loose if n == written.name]
+    return exact or (loose if ignores_case or len(set(loose)) == 1 else [])
 
 
-def _sensitive_output_positions(policy: EffectivePolicy, ast: exp.Expression, width: int) -> set[int] | None:
-    """Indices of a validated statement's output columns (``width`` of them,
-    as the driver reported) whose values derive from a sensitive column,
-    traced on the AST in the connection's dialect - never from the name the
-    driver reports. None when the output cannot be mapped (fail closed)."""
-    if not policy.sensitive_patterns:
-        return set()
-    items = _output_items(policy, ast)
-    return None if items is None else _map_positions(items, width)
-
-
-def _query_mask_positions(
-    policy: EffectivePolicy,
-    ast: exp.Expression,
-    columns: list[tuple[str, str]],
-    warnings: list[str] | None = None,
-    table_columns: dict[int, frozenset[str]] | None = None,
-) -> set[int]:
-    """The positions to mask in a validated statement's result: the traced
-    ones, or - when the output cannot be mapped - every column whose name the
-    statement does not prove clean (fail closed). A name proves a column clean
-    only when nothing the statement outputs is tainted and no star run is
-    involved: otherwise the driver may report a folded or renamed column under
-    any name, a clean alias's included (SQL Server names FOR JSON output
-    JSON_F52E2B61-..., which a statement can also use as an alias).
-    ``table_columns``: base tables' column names (_row_function_columns)."""
-    if not policy.sensitive_patterns:
-        return set()
-    items = _output_items(policy, ast, table_columns)
-    positions = None if items is None else _map_positions(items, len(columns), [name for name, _t in columns])
-    if positions is not None:
-        return positions
-    clean: set[str] = set()
-    if items is not None and all(isinstance(i, _OutCol) and not i.tainted for i in items):
-        clean = {i.name for i in items if isinstance(i, _OutCol) and i.name}
-    hit = {i for i, (name, _t) in enumerate(columns) if name.lower() not in clean}
-    if hit and warnings is not None:
-        warnings.append(
-            "the result's columns could not all be traced to their source columns; every column the "
-            "statement does not prove clean was masked (fail closed)"
+async def _catalog_columns(
+    app: AppContext, connector: DatabaseConnector, policy: EffectivePolicy, tables: list[exp.Table]
+) -> tuple[dict[int, tuple[str, ...]], dict[int, str]]:
+    """The catalog's columns of each base-table FROM item (by its id), and
+    why those of the others are not known. A bare name is the table the
+    session reads: the first schema it looks bare names up in that holds it
+    (AppContext.name_binding), or on an engine that binds names in its own
+    database the listing's only table of that name. A table the listing
+    lacks (a synonym, an object a policy hides), one that lists no columns
+    (one the login may not read), or one past _MASK_LOOKUPS uncached lookups
+    is not known."""
+    columns: dict[int, tuple[str, ...]] = {}
+    unknown: dict[int, str] = {}
+    if not tables:
+        return columns, unknown
+    engine = policy.engine
+    listing = await app.tables_for(policy, connector)
+    by_name: dict[str, list[Any]] = {}
+    for t in listing:
+        by_name.setdefault(_loose(t.name), []).append(t)
+    binding: NameBinding | None = None
+    binding_read = False
+    done: dict[tuple[str | None, bool, str, bool], tuple[tuple[str, ...] | None, str]] = {}
+    lookups = [0]
+    for table in tables:
+        ident = cast(exp.Identifier, table.this)
+        schema_ident = table.args.get("db") if isinstance(table.args.get("db"), exp.Identifier) else None
+        dummy = (schema_ident.name.upper() if schema_ident else None, ident.name.upper())
+        if not ident.quoted and not (schema_ident and schema_ident.quoted) and dummy in _DUMMY_TABLES.get(engine, {}):
+            columns[id(table)] = _DUMMY_TABLES[engine][dummy]
+            continue
+        if not ident.quoted and ident.name.upper() == "TABLE":
+            # sqlglot reads PostgreSQL's (TABLE t) as a table named TABLE
+            unknown[id(table)] = "(TABLE t) is not checked: write SELECT * FROM t"
+            continue
+        key = (
+            schema_ident.name if schema_ident else None, bool(schema_ident and schema_ident.quoted),
+            ident.name, bool(ident.quoted),
         )
-    return hit
+        if key not in done:
+            if schema_ident is None and not binding_read and engine in ("postgres", "oracle", "db2", "mssql"):
+                binding_read = True
+                with suppress(Exception):
+                    binding = await app.name_binding(policy)
+            done[key] = await _table_columns(app, connector, policy, by_name, schema_ident, ident, binding, lookups)
+        found, reason = done[key]
+        if found is None:
+            unknown[id(table)] = reason
+        else:
+            columns[id(table)] = found
+    return columns, unknown
+
+
+async def _table_columns(
+    app: AppContext,
+    connector: DatabaseConnector,
+    policy: EffectivePolicy,
+    by_name: dict[str, list[Any]],
+    schema_ident: exp.Identifier | None,
+    ident: exp.Identifier,
+    binding: NameBinding | None,
+    lookups: list[int],
+) -> tuple[tuple[str, ...] | None, str]:
+    """The columns of one written table name (_catalog_columns): its listed
+    table's; for a name the listing lacks (a partitioned parent, a foreign
+    table, one newer than the cached listing), what the catalog lists under
+    it where the session looks it up; else, on an engine with synonyms,
+    those of the table its synonym chain ends at."""
+    engine = policy.engine
+    ignores_case = bool(binding and binding.ignores_case)
+    candidates = by_name.get(_loose(ident.name), [])
+    names = set(_listed_spelling(engine, ident, {t.name for t in candidates}, ignores_case))
+    candidates = [t for t in candidates if t.name in names and t.schema]
+    order: list[str | None]
+    if schema_ident is not None:
+        schemas = set(_listed_spelling(engine, schema_ident, {t.schema for t in candidates}, ignores_case))
+        picked = [t for t in candidates if t.schema in schemas]
+        order = [_folded_name(engine, schema_ident)]
+    elif binding is not None:
+        order = list(binding.bare_schemas)
+        if engine == "postgres" and ident.name.startswith("pg_") and "pg_catalog" not in order:
+            order.insert(0, "pg_catalog")
+        picked = []
+        for schema in order:
+            picked = [t for t in candidates if t.schema == schema]
+            if picked or (policy.allowed_schemas and not policy.schema_allowed(schema)):
+                break  # found, or a schema the listing does not show may hold it
+    else:
+        picked, order = candidates, [None]
+    if len(picked) > 1:
+        return None, "several listed tables match it (qualify it with its schema, spelled as the catalog lists it)"
+    if picked:
+        found = await app.columns_of(policy, picked[0].schema, picked[0].name, lookups)
+    else:
+        found = None
+        for schema in order:
+            found = await app.columns_of(policy, schema, _folded_name(engine, ident), lookups)
+            if found is not None:
+                break
+        if found is None and engine in _SYNONYM_ENGINES:
+            written = (order[0] if schema_ident is not None else None, _folded_name(engine, ident))
+            try:
+                chains = await run_meta(app, policy.connection_id, lambda c: c.synonym_chains([written]))
+            except ConnectorError:  # not known: the statement is refused, never masked by guess
+                chains = {}
+            chain = [SynonymTarget(*step) for step in chains.get(written, [])]
+            if chain and chain[-1].elsewhere is None:
+                found = await app.columns_of(policy, chain[-1].schema, chain[-1].name, lookups)
+    if found is None:
+        return None, (
+            "the catalog lists no columns under that name (an object the listing hides or the account may not "
+            "read, a synonym of another database's, or more tables than one statement may look up: run it again)"
+        )
+    return found, ""
+
+
+async def _masking_plan(
+    app: AppContext, connector: DatabaseConnector, policy: EffectivePolicy, ast: exp.Expression
+) -> list[_Col] | None:
+    """The proven output columns of a validated statement that reads a table
+    with masked columns; None for one that reads none (its output names
+    decide alone); a POLICY refusal for a shape the analysis does not prove
+    - before the statement runs."""
+    if not policy.sensitive_patterns:
+        return None
+    targets = await anyio.to_thread.run_sync(_cte_targets, policy.engine, ast)
+    catalog, unknown = await _catalog_columns(app, connector, policy, targets[2])
+    if not await anyio.to_thread.run_sync(_touches_masked, policy, ast, targets[2], catalog):
+        return None
+    proof = _MaskProof(policy.sensitive_patterns, ast, policy.engine, catalog, targets, unknown)
+    try:
+        return await anyio.to_thread.run_sync(proof.output)
+    except _Refused as exc:
+        raise _masking_refusal(str(exc)) from None
 
 
 def _mask_columns(
-    policy: EffectivePolicy,
-    columns: list[tuple[str, str]],
-    sensitive_names: frozenset[str] | None = None,
-    positions: set[int] | None = None,
+    policy: EffectivePolicy, columns: list[tuple[str, str]], positions: set[int] | None = None
 ) -> set[int]:
-    """Indices of columns to mask/omit: the positions traced on the validated
-    statement (see :func:`_query_mask_positions`), plus the output-name
-    heuristics and the guard-derived names that expose a sensitive source
-    column (aliasing a sensitive column does not launder it past policy)."""
-    extra = sensitive_names or frozenset()
+    """Indices of columns to mask/omit: the positions the analysis proved
+    tainted (_MaskProof, _laid_out), plus every column whose reported name a
+    mask pattern matches."""
     hit: set[int] = {i for i in positions or () if 0 <= i < len(columns)}
     for i, (name, _t) in enumerate(columns):
-        if name.lower() in extra or _sensitive_name(policy.sensitive_patterns, name):
+        if _sensitive_name(policy.sensitive_patterns, name):
             hit.add(i)
     return hit
 
@@ -2949,10 +2631,9 @@ def _apply_masking(
     columns: list[tuple[str, str]],
     rows: list[list[Any]],
     state: dict[str, Any],
-    sensitive_names: frozenset[str] | None = None,
     positions: set[int] | None = None,
 ) -> tuple[list[tuple[str, str]], list[list[Any]]]:
-    hit = _mask_columns(policy, columns, sensitive_names, positions)
+    hit = _mask_columns(policy, columns, positions)
     if not hit:
         return columns, rows
     if policy.mask_action == "omit":
@@ -3800,13 +3481,15 @@ def build_server(app: AppContext) -> MCPServer[Any]:
                 plan = {cid: str(sql) for cid in _select_connections(app, connections)}
             if not plan:
                 raise ToolFailure(ErrorCategory.VALIDATION, "no connections selected")
+            _check_statement_sizes(plan.values())
             # each statement gets the named values its own placeholders use
             # (a driver refuses a name its statement does not use); a name
-            # no statement uses is the caller's mistake, refused before any I/O
-            bound = {
-                cid: _statement_parameters(statement, app.resolved[cid].config.type, parameters)
-                for cid, statement in plan.items()
-            }
+            # no statement uses is the caller's mistake, refused before any I/O.
+            # Each distinct text is read once per engine, off the event loop.
+            engines = {cid: app.resolved[cid].config.type for cid in plan}
+            bound = await anyio.to_thread.run_sync(
+                lambda: _bound_parameters({cid: (plan[cid], engines[cid]) for cid in plan}, parameters)
+            )
             if isinstance(parameters, dict):
                 unused = sorted(set(parameters) - {k for b in bound.values() if isinstance(b, dict) for k in b})
                 if unused:
@@ -5363,14 +5046,15 @@ def _literal_beside_sensitive(policy: EffectivePolicy, definition: Any, identifi
     column's DEFAULT literal is harmless), a view or an index as a whole.
     SQLite (and MySQL outside ANSI_QUOTES) also read a double-quoted word as
     a string: there any double-quoted word but the ``identifiers`` (the
-    object's own name and columns) counts as one. Text no reading can
-    tokenize to its end is withheld wherever it names a sensitive word."""
+    object's own name and columns), spelled exactly so, counts as one. Text
+    no reading can tokenize to its end is withheld wherever it names a
+    sensitive word."""
     if not isinstance(definition, str) or not policy.sensitive_patterns:
         return False
     if "'" not in definition and '"' not in definition and "$" not in definition and "--" not in definition \
             and "/*" not in definition and "#" not in definition:
         return False
-    known = {n.lower() for n in identifiers}
+    known = set(identifiers)
     table = bool(_CREATE_TABLE.match(definition))
     for backslash in (False, True):
         for nested in (False, True):
@@ -5381,7 +5065,7 @@ def _literal_beside_sensitive(policy: EffectivePolicy, definition: Any, identifi
                 continue
             for part in _ddl_parts(tokens, table):
                 literal = any(
-                    kind == "lit" or (kind == "dquoted" and value.lower() not in known) for kind, value in part
+                    kind == "lit" or (kind == "dquoted" and value not in known) for kind, value in part
                 )
                 if literal and any(
                     kind in ("ident", "dquoted", "word") and _sensitive(policy, value) for kind, value in part
@@ -5425,96 +5109,37 @@ def _sqlite_view_query(definition: str) -> exp.Query | None:
 
 
 def _sqlite_view_tables(query: exp.Query, schema: str | None) -> set[tuple[str, str]]:
-    """The base tables (or views) a view's query reads, as (schema, name),
-    lower-cased; a bare name in the view's own schema."""
-    out: set[tuple[str, str]] = set()
-    for scope in traverse_scope(query):
-        for source in scope.sources.values():
-            if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
-                out.add(((source.db or schema or "main").lower(), source.name.lower()))
-    return out
-
-
-def _sqlite_scope_names(
-    scope: Scope, schema: str | None, columns_of: Mapping[tuple[str, str], frozenset[str]]
-) -> set[str] | None:
-    """Every name an unqualified column can bind to in ``scope`` alone (its
-    sources' columns, a table's rowid aliases, and the scope's own result
-    aliases, which SQLite also reads in WHERE and ORDER BY); None when one
-    of its sources' columns is not known."""
-    names: set[str] = set()
-    node = scope.expression
-    if isinstance(node, exp.Select):
-        names.update(n.lower() for n in node.named_selects)
-    for source in scope.sources.values():
-        if isinstance(source, exp.Table):
-            known = columns_of.get(((source.db or schema or "main").lower(), source.name.lower()))
-            if known is None:
-                return None
-            names.update(known)
-            names.update(("rowid", "oid", "_rowid_"))
-        elif isinstance(source, Scope):
-            inner = source.expression
-            while isinstance(inner, exp.SetOperation):
-                inner = inner.left
-            if not isinstance(inner, exp.Select) or any(
-                isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
-                for e in inner.expressions
-            ):
-                return None  # a star's names are its sources' (not followed: fail closed)
-            names.update(n.lower() for n in inner.named_selects)
-        else:
-            return None
-    return names
+    """The tables (or views) a view reads in its one FROM clause, as (schema,
+    name), lower-cased (a bare name in the view's own schema): a single
+    SELECT over plain tables and joins, with no subquery, CTE or set
+    operation anywhere - one scope, where SQLite reads a double-quoted word
+    as a name exactly when one of these tables has such a column. Any other
+    shape: none (every double-quoted word in it is then a literal)."""
+    if not isinstance(query, exp.Select) or any(n is not query for n in query.find_all(exp.Query)):
+        return set()
+    from_ = query.args.get("from_")
+    items = ([from_.this] if from_ is not None else []) + [j.this for j in query.args.get("joins") or []]
+    if not all(isinstance(t, exp.Table) and isinstance(t.this, exp.Identifier) for t in items):
+        return set()
+    return {((t.db or schema or "main").lower(), t.name.lower()) for t in items}
 
 
 def _sqlite_quoted_identifiers(
     definition: str, schema: str | None, columns_of: Mapping[tuple[str, str], frozenset[str]]
 ) -> frozenset[str]:
-    """The double-quoted words of a SQLite view's definition that SQLite
-    reads as names: every one but those written as an unqualified column
-    that names no column in scope of its query - SQLite reads such a "x" as
-    the string 'x' (review R6, second pass: "guest" equal to another
-    table's name is still a value). A correlated subquery also sees the
-    enclosing query's names. Text that does not parse, and a scope whose
-    sources' names are not all known, leave every double-quoted word a
-    literal (empty set: fail closed)."""
+    """The double-quoted words of a SQLite view's definition that may be
+    names: a column, spelled exactly as the catalog lists it, of a table the
+    view's one FROM clause reads (_sqlite_view_tables). SQLite reads a
+    double-quoted word that names no column in scope as a string, so every
+    other double-quoted word counts as a literal - which scope binds what is
+    never inferred (review 3, #7: a guess missed HAVING and table-valued
+    function arguments and returned "Sup3rSecret"). A benign view that
+    quotes other words (a table's name, an alias), or whose query has a
+    subquery, beside a masked column is withheld too (fail closed)."""
     query = _sqlite_view_query(definition)
     if query is None:
         return frozenset()
-    try:
-        scopes = traverse_scope(query)
-    except (sqlglot.errors.SqlglotError, RecursionError):
-        return frozenset()
-    names_of: dict[int, set[str] | None] = {}
-
-    def visible(scope: Scope | None) -> Iterator[set[str] | None]:
-        while scope is not None:
-            if id(scope) not in names_of:
-                names_of[id(scope)] = _sqlite_scope_names(scope, schema, columns_of)
-            yield names_of[id(scope)]
-            if scope.scope_type != ScopeType.SUBQUERY:
-                return
-            scope = scope.parent
-
-    values: set[str] = set()
-    for scope in scopes:
-        for column in scope.columns:
-            ident = column.this
-            if not isinstance(ident, exp.Identifier) or not ident.quoted or column.table:
-                continue
-            word = ident.name.lower()
-            bound = False
-            for names in visible(scope):
-                if names is None:
-                    break
-                if word in names:
-                    bound = True
-                    break
-            if not bound:
-                values.add(word)
-    quoted = {i.name.lower() for i in query.find_all(exp.Identifier) if i.quoted}
-    return frozenset(quoted - values)
+    return frozenset().union(*(columns_of.get(t, frozenset()) for t in _sqlite_view_tables(query, schema)))
 
 
 async def _sqlite_view_identifiers(
@@ -5550,7 +5175,7 @@ async def _sqlite_view_identifiers(
         except Exception:  # noqa: BLE001 - the view is then judged without these names (fail closed)
             columns = []
         if columns:
-            columns_of[(schema, table)] = frozenset(str(c.name).lower() for c in columns)
+            columns_of[(schema, table)] = frozenset(str(c.name) for c in columns)
 
     def resolve() -> None:
         for i in todo:
@@ -5609,11 +5234,11 @@ def _scoped_table_detail(
                 }
             columns.append(col)
         detail["columns"] = columns
-    identifiers = [str(detail.get(k) or "") for k in ("schema", "name")]
     if view_identifiers is not None:
-        # a SQLite view: the words its own query's scopes bind (db_list_views's rule)
-        identifiers += [str(detail.get("name") or ""), *view_identifiers]
+        # a SQLite view: its name and its tables' columns (db_list_views's rule)
+        identifiers = [str(detail.get("name") or ""), *view_identifiers]
     else:
+        identifiers = [str(detail.get(k) or "") for k in ("schema", "name")]
         identifiers += [str(c.get("name") or "") for c in detail.get("columns") or () if isinstance(c, dict)]
     if literal_hidden and detail.get("definition") is not None:
         detail["definition"] = None
@@ -5981,6 +5606,43 @@ _OTHER_NAMED_PLACEHOLDERS = re.compile(
 )
 
 
+# db_federated_query's statements together: each is at most _MAX_SQL_BYTES
+# (the guard's limit), and all of them, each distinct text once, this much.
+_FEDERATED_MAX_SQL_CHARS = 4 * _MAX_SQL_BYTES
+
+
+def _check_statement_sizes(statements: Iterable[str]) -> None:
+    """Refuse an oversized statement, or set of them, before anything reads
+    it: the parameter pass lexes every statement before the guard sees one,
+    and a 2 MiB statement of '--' lines held the event loop for 12 s before
+    the guard refused it for its size (review 3, #1)."""
+    distinct = set(statements)
+    for statement in distinct:
+        if len(statement) > _MAX_SQL_BYTES:
+            raise ToolFailure(
+                ErrorCategory.VALIDATION, f"statement exceeds the {_MAX_SQL_BYTES} byte limit ({len(statement)})"
+            )
+    if sum(map(len, distinct)) > _FEDERATED_MAX_SQL_CHARS:
+        raise ToolFailure(
+            ErrorCategory.VALIDATION,
+            f"the statements of one call exceed {_FEDERATED_MAX_SQL_CHARS} bytes together: split the call",
+        )
+
+
+def _bound_parameters(
+    statements: dict[str, tuple[str, str]], parameters: list[Any] | dict[str, Any] | None
+) -> dict[str, list[Any] | dict[str, Any] | None]:
+    """_statement_parameters of each connection's (statement, engine), each
+    distinct pair read once."""
+    seen: dict[tuple[str, str], list[Any] | dict[str, Any] | None] = {}
+    out = {}
+    for cid, pair in statements.items():
+        if pair not in seen:
+            seen[pair] = _statement_parameters(pair[0], pair[1], parameters)
+        out[cid] = seen[pair]
+    return out
+
+
 def _statement_parameters(
     sql: str, engine: str, parameters: list[Any] | dict[str, Any] | None
 ) -> list[Any] | dict[str, Any] | None:
@@ -5989,13 +5651,19 @@ def _statement_parameters(
     literals, quoted names and comments use (None when it uses none); a
     positional list is the statement's whole, as before. One mapping shared
     by statements that use different names failed every statement that did
-    not use them all (review V10-h)."""
+    not use them all (review V10-h). python-oracledb binds names ignoring
+    case (:ID takes {"id": 5}); every other driver compares them exactly
+    (review 3, #15)."""
     if not isinstance(parameters, dict):
         return parameters
     view = code_view(sql, engine)
     used = named_placeholders(view)
     used.update(g for m in _OTHER_NAMED_PLACEHOLDERS.finditer(view) for g in m.groups() if g)
-    picked = {k: v for k, v in parameters.items() if k in used}
+    if engine == "oracle":
+        folded = {u.upper() for u in used}
+        picked = {k: v for k, v in parameters.items() if k.upper() in folded}
+    else:
+        picked = {k: v for k, v in parameters.items() if k in used}
     return picked or None
 
 
@@ -6039,6 +5707,9 @@ async def _guarded_read(
         _check_parameters(parameters)
         connector, policy = _require_engine(app, connection_id)
         validated = await _validated(app, connector, policy, lambda g: g.validate_select(sql))
+        # a statement over masked columns whose shape the analysis does not
+        # prove is refused here, before it runs
+        plan = await _masking_plan(app, connector, policy, validated.ast)
         row_limit = policy.clamp_row_limit(max_rows)
         timeout = policy.clamp_timeout(timeout_seconds)
         ceiling = policy.max_response_bytes
@@ -6056,20 +5727,8 @@ async def _guarded_read(
         outcome = await run_query(
             app, connection_id, spec, f"query on '{connection_id}'", on_start=_sends(audit, st)
         )
-        trace_warnings: list[str] = []
-        table_columns = await _row_function_columns(app, connector, policy, validated.ast, trace_warnings)
-        # both walks are linear in the statement, but a 64 KiB statement must
-        # not hold the event loop, exactly like its validation
-        sensitive, positions = await anyio.to_thread.run_sync(
-            lambda: (
-                _sensitive_output_names(policy, validated.ast),
-                _query_mask_positions(policy, validated.ast, outcome.columns, trace_warnings, table_columns),
-            )
-        )
-        st["warnings"].extend(trace_warnings)
-        columns, rows = _apply_masking(
-            policy, outcome.columns, outcome.rows, st, sensitive_names=sensitive, positions=positions
-        )
+        positions = _laid_out(plan, outcome.columns) if plan is not None else set()
+        columns, rows = _apply_masking(policy, outcome.columns, outcome.rows, st, positions=positions)
         if columns is not outcome.columns:
             # the connector fitted the rows to the ceiling before masking, and
             # '<masked>' can be longer than the value it replaced

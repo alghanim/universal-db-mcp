@@ -1109,7 +1109,9 @@ the residuals).
 - **Engine memory:** ClickHouse server memory is bounded only by the account
   profile's `max_memory_usage`, a documented requirement (owner decision
   2026-09-28; a guard-accepted `repeat(col, 700000)` OOM-killed the fixture
-  container); one row whose `arrayJoin()` or JOIN expansion
+  container; superseded 2026-10-03: the connector now sends a per-query
+  limit, and only `readonly=1` accounts rely on the profile, see the third
+  code review below); one row whose `arrayJoin()` or JOIN expansion
   decodes past the object budget is refused, not truncated (a `LIMIT` in the
   statement is the remedy), and clickhouse-connect 1.8's Variant, Dynamic,
   JSON and geometry readers were not measured one by one. SQLite shapes the
@@ -1529,6 +1531,128 @@ PASSED; the CI job replayed on `linux/amd64` (Debian 12, pwsh) passed ruff,
 mypy, `--check-locks` and pip-audit on every lock, and its unit run (12386
 passed) found one more test that assumed SQLite 3.40 can run FTS under the
 connector's authorizer; it now probes it (`connector_reads_fts`).
+
+**Third code review (2026-10-04).** A third `/code-review` at maximum
+effort, over the second round's fixes (`9c457ec..0ad054b`), confirmed 15
+ranked findings and about 20 more, each reproduced by an independent
+verifier. As in the two reviews before it, most were the previous round's
+fixes opening the next leak, chiefly in the positional masking analysis
+(a ClickHouse CTE aliased or `SEMI`-joined returned SSNs in clear; `(expr).*`
+inside `VALUES`, parenthesized joins with derived tables, SQLite `:1`
+aliases) and in the identifier-folding models; besides those, a quadratic
+lexer pass in `db_federated_query` that held the event loop for seconds
+before the size check, a `NATURAL` join turning MySQL's
+`STATISTICS.EXPRESSION` into an equality oracle, and a review probe that
+OOM-killed the ClickHouse fixture.
+
+**Owner decisions (2026-10-03, binding):** (1) masking refuses what it
+cannot prove: over a table with (or possibly with) a masked column, only
+statement shapes the analysis fully understands run, every other one is
+refused before execution with the construct to avoid, and no special case
+is traced for an exotic shape; (2) on Oracle, Db2 and PostgreSQL a CTE name
+outside ASCII and an unquoted table or schema name outside ASCII are
+refused instead of modelling each engine's case folding (the Unicode
+folding model is deleted; ASCII folding stays exact); (3) ClickHouse gets a
+default per-query memory cap, with `readonly=1` accounts checked by doctor.
+
+What was fixed, by area (regression tests in `tests/unit/test_cr3_*.py`;
+operator-visible behaviour in `docs/tools.md` (Masking), `docs/security.md`,
+`docs/architecture.md`, `docs/driver-matrix.md`, `docs/session-safety.md`,
+`docs/troubleshooting.md`, `docs/claude-code-integration.md`,
+`docs/offline-deployment.md` and `docs/site-upgrade-runbook.md`):
+
+- **Masking, redesigned.** A positive list of proven shapes (plain SELECT
+  lists over tables, views, subqueries and CTEs; inner, outer and cross
+  joins; set operations; recursive CTEs as `anchor UNION recursive branch`)
+  and a `POLICY_VIOLATION` (`... its shape cannot be checked for them:
+  <construct>`) for the rest: `VALUES`, `UNNEST`, `LATERAL`/`APPLY`, `ARRAY
+  JOIN`, `SEMI`/`ANTI`/`ASOF` joins, `PIVOT`, `MATCH_RECOGNIZE`,
+  `SEARCH`/`CYCLE`, `FOR JSON`/`XML`, `(expr).*`, `untuple`, `COLUMNS()`,
+  star modifiers, wrapped or aliased stars, a star over `USING`/`NATURAL`,
+  alias column lists on base tables, unbindable or ambiguous qualifiers,
+  names spelled otherwise than the catalog's, SQLite rename-prone aliases,
+  forward, shadowed or self CTE references, unknown sources and over-deep
+  statements. A post-run layout check refuses a result whose width or names
+  differ. Columns come from per-table catalog lookups (300 s cache, at most
+  64 uncached per statement); a table the catalog lists no columns for is
+  treated as possibly masked; synonyms are followed; PostgreSQL
+  materialized views are listed (`pg_attribute`) and masked exactly;
+  ClickHouse `*` leaves out `MATERIALIZED`/`ALIAS`/`EPHEMERAL` columns
+  (`db_list_columns` and `db_get_table` report `default_kind`); a subquery
+  in an output expression counts every column its clauses read; SQLite
+  `rowid` (and `oid`, `_rowid_`, MySQL `_rowid`) counts as every column of
+  its table, which closes the second review's `INTEGER PRIMARY KEY`
+  residual.
+- **Names.** Non-ASCII CTE names and unquoted non-ASCII table and schema
+  names refused on Oracle, Db2 and PostgreSQL; `cte_key` is one ASCII rule.
+- **Guard.** A `NATURAL` join or ClickHouse `COLUMNS()` in a statement
+  reading a value-column catalog view refused; `x IN 'string'` refused; an
+  engine error over 16 KiB keeps a redacted 4 KiB head (it collapsed to the
+  type name); the comment lexer is linear (`--` lines and nested `/*`).
+- **Federated.** 64 KiB per statement and 256 KiB together, checked before
+  any lexing; Oracle bind names match ignoring case.
+- **ClickHouse memory.** `options.max_memory_usage` (default 2 GiB, at least
+  1 MiB) and `options.memory_limit_from_profile`; the limit is sent with
+  every request where the profile accepts settings; `MEMORY_LIMIT_EXCEEDED`
+  is `LIMIT_EXCEEDED`, a constraint refusal (452) `CONFIG_ERROR`; the
+  session readback includes it; `doctor --connectivity` logs in to
+  ClickHouse and is FATAL for a `readonly=1` profile with no limit of its
+  own, unless acknowledged.
+- **Connectors.** MySQL treats only integer literals and bound integer-like
+  parameters as `GROUP BY`/`ORDER BY` positions (`RAND()`, `NULL`,
+  `COUNT(*)` cut in place again). SQLite cuts cells in pure SQL (no Python
+  function per row, no uncut re-run); its shadow-table prefilter handles
+  doubled quotes, `IN 'table'` and comments in virtual-table definitions;
+  name caches are bounded by characters stored as well as entries.
+- **State files, config, CLI.** macOS audit and cache ACL rules cover
+  delete and attribute rights and inheritable directory entries, accept
+  read-only directory entries, and name one `chmod -N <dir> <files>`
+  remedy; a cache directory reached through a symlink is accepted; a
+  transient `EMFILE` no longer disables the cache; YAML tag conversion
+  errors give line and column without the value; `sudo configure-agents`
+  walks the path component by component with `O_NOFOLLOW` (refusing a
+  user's symlink to another account's file); `dsh` seeds only the config a
+  registration names.
+- **Packaging.** `.deb`: the unwind holder moved to the new package's
+  `postrm abort-upgrade`, so it also covers an unpack that fails after
+  `preinst` passed; `postinst abort-*` leaves a running deferred install
+  alone. MSI: `BuildVenvCA` stops the service and moves the old venv to
+  `venv.previous-<guid>` (refused while something runs from it), with
+  `RollbackBuildVenvCA` and `CommitBuildVenvCA`; an account change grants
+  the new account, switches, then revokes the old one, rotating the token
+  after the switch and clearing the stored password when switching to a
+  gMSA or virtual account; every install sets the default service DACL and
+  SID type `unrestricted`, and an in-place update resets type, error
+  control, dependencies and display name; a service marked for deletion is
+  reported as it is; an Administrators-member account counts only through
+  the registration's Modify grant; a leftover `.gate-backup` stops the
+  gate.
+
+Measured outcome: a live sweep of all three reviews' masking repros on the
+loopback fixtures gave 166 refused, 48 masked and 0 leaks, and the
+everyday-query corpora (49 + 20 + 18 statements) mask exactly, unrefused.
+
+Residuals still open: the MSI behaviours only a Windows host can show
+(moving the venv while a file in it is open or mapped; `sdset`, `depend=`
+and `sidtype` on a service running as a virtual account; clearing the LSA
+secret on a switch to a gMSA or virtual account), with the rest of the MSI
+still never run on Windows; ClickHouse `readonly=1` accounts rely on the
+profile's own limit (doctor checks it, the connector cannot send one);
+masking still does not cover predicate-only use of a masked column
+(`WHERE`, `ORDER BY`, `GROUP BY`, `JOIN`: inference stays possible);
+clickhouse-connect's own regexes can still take seconds on adversarial
+whitespace or comments near the 64 KiB cap; an earlier release's
+`postinst`, run to undo a failed upgrade, may still reinstall that release
+synchronously when its bundle has no OS packages; and on MySQL a deadline
+that fires while a request is still queued behind another on the same
+connection can cancel the request that is running.
+
+**Test status after the third code-review fixes:** `12548 passed, 331 skipped, 1 xfailed`
+(0 failed) for the whole suite on this Mac on 2026-10-04 with
+`UDBMCP_DOCKER_TESTS=1`; `mypy --strict src`, `ruff check src tests scripts` and
+`--check-locks` clean. The skips are the pwsh-executed MSI tests (no pwsh on
+this Mac; they pass in the Linux image), the integration tests that need
+`UDBMCP_TEST_*_HOST`, and single OS-specific cases.
 
 ## 4. Gates not (fully) run (recorded truthfully)
 

@@ -470,16 +470,32 @@ below). After `InstallFiles`, and in this strict order, `msiexec` runs: (1) `Ver
 ADMIN-installed trusted verifier and public key, and refuse an older release
 than the installed one, (2) `BuildVenvCA` — build the venv from the verified
 wheelhouse with `pip --no-index --require-hashes` and `PIP_CONFIG_FILE`
-neutralized, (3) `DoctorSmokeCA` — a `doctor` smoke check, the FIRST
+neutralized (on a repair or upgrade it first stops the service and moves
+the previous venv aside whole, see below), (3) `DoctorSmokeCA` — a `doctor` smoke check, the FIRST
 execution of payload code, strictly after verification passed, and (4)
 `RegisterServiceCA` — `sc.exe` service registration and the installed-release
 record. Any nonzero exit rolls the whole install back, so a failed
 verification can never leave a half-trusted install behind: the rollback twin
 `RollbackRemoveServiceCA` removes the service a first install or an upgrade
 registered (a failed repair keeps the service that was registered before it
-began) and puts back the record this install replaced. After a successful install, repair or upgrade, the commit
-action `CommitReleaseRecordCA` removes the record's rollback copy (it never
-touches the service). Every Python run these actions make as LocalSystem is
+began) and puts back the record this install replaced, and
+`RollbackBuildVenvCA` puts back the venv `BuildVenvCA` moved aside. After a
+successful install, repair or upgrade, the commit actions
+`CommitReleaseRecordCA` and `CommitBuildVenvCA` remove the record's rollback
+copy and the previous venv (they never touch the service).
+
+**The previous venv.** A venv an earlier install built is never deleted in
+place: Windows refuses to delete a file a process has open or mapped, so a
+recursive delete failed part-way and left a gutted venv no rollback could
+restore. `BuildVenvCA` stops the service (it runs from that venv), then
+moves the venv whole to `venv.previous-<guid>` beside it. A move refuses a
+folder a process still runs from (an MCP client a `configure-agents`
+registration started, such as Claude Desktop, or a shell): the install then
+fails with the venv untouched and the service stopped, naming the cause;
+close it and rerun. The marker `venv.moved` names the folder moved aside and
+whether the new venv is complete; a marker an interrupted install left is
+settled first (an incomplete venv is replaced by the one moved aside, a
+complete one keeps its place and the moved one is removed). Every Python run these actions make as LocalSystem is
 isolated (`-I`), `venv.ps1`'s and the service included.
 
 **Nothing about Windows has been run on Windows yet** (see Status below): this
@@ -595,7 +611,9 @@ address or URL. Layout after a successful install:
   the verified wheelhouse (`pip --no-index --require-hashes`,
   `PIP_CONFIG_FILE=NUL`, proxy/index env vars scrubbed, `--isolated`,
   `--only-binary=:all:`); the Windows bundle carries the `pywin32` and
-  `tzdata` wheels its dependencies need on Windows,
+  `tzdata` wheels its dependencies need on Windows. During a repair or
+  upgrade the previous venv sits beside it as `venv.previous-<guid>` until
+  the install commits,
 - `C:\Program Files\UniversalDB MCP\manifest.json` — the installed-release
   record, at that fixed path whatever `INSTALLFOLDER` is. Only while an
   install runs, `manifest.json.previous` (the copy the rollback action
@@ -679,7 +697,17 @@ with failure recovery mirroring the systemd unit (restart after 60000 ms,
 counter reset after 86400 s) and `UDBMCP_CONFIG` +
 `UDBMCP_HTTP_BEARER_TOKEN_FILE` in the service's `Environment` registry
 value. A daemon under the SCM has no stdin client, so HTTP transport is
-forced.
+forced. Every install, a repair included, sets the service's DACL to the
+Windows default for a new service (SYSTEM and Administrators control it,
+interactive and service logons query it; anything granted since, such as
+change-config to Users, is replaced) and its SID type to `unrestricted`. An
+update in place re-applies what `sc.exe create` gives a new service (type
+`own`, error control `normal`, no dependencies, the display name), then
+switches the binPath and account. A service marked for deletion that
+Windows removed once it stopped is created again; one still marked (a
+handle to it is open) fails the install before anything is changed, naming
+the remedy (close services.msc or the tool that holds it, or restart the
+host).
 
 **The account** is resolved in this order: the `UDBMCP_SERVICE_ACCOUNT`
 property (elevated `msiexec` only), the machine-scope
@@ -711,8 +739,16 @@ domain's built-in groups such as Domain Users) or the group `ALL SERVICES`
 (`S-1-5-80-0`). A group an administrator created has the SID form of an
 account and is not told apart, so name an account. To change the account,
 first move the earlier account's files out of `logs\` (its `audit.jsonl` and
-lock) and archive them; its Modify grant on `logs\` and the bearer token are
-replaced automatically.
+lock) and archive them. The change runs grant, switch, revoke: the new
+account is granted its access first, while the account the service is
+registered under keeps its read access and its Modify on `logs\`, and the
+token it reads is kept aside for it while the new account gets a new one;
+`sc.exe config` then switches the service; only then are the earlier
+account's access and its kept token removed. A failure before the switch leaves the service as it was, able to
+start, and takes back what the new account was granted. Switching from a
+password account to a gMSA or virtual account (which take no password) also
+clears the password the Service Control Manager stored for the earlier
+account, by passing through `NT AUTHORITY\LocalService`.
 
 **The bearer token** at `<config dir>\http-token` has its own protected DACL
 (SYSTEM, Administrators, and read for the service account). An existing token
@@ -759,7 +795,9 @@ Features; the release string stays in the file name):
   keeps the account the service is registered under only when `logs\`
   grants it write access, as the install that registered it did (an
   account that is a member of Administrators, such as a gMSA an
-  administrator put there, included); otherwise (an account other than
+  administrator put there, counts only through exactly the Modify grant
+  the registration gives, never through access it holds as an
+  administrator); otherwise (an account other than
   LocalSystem with no such grant, which could only come from the command
   line) it fails, naming the remedy.
 - **Anti-rollback.** `VerifyBundleCA` refuses a bundle older than the
@@ -794,8 +832,10 @@ Features; the release string stays in the file name):
 - **A failed repair** keeps the service registered before it, stopped: on a
   repair `RegisterServiceCA` updates the existing service in place
   (`sc.exe config`) and never deletes it, and the rollback twin deletes only
-  a service a first install or an upgrade registered (`sc.exe create`).
-  Start it again once the cause is fixed, or run the repair again.
+  a service a first install or an upgrade registered (`sc.exe create`). The
+  log says whether it keeps its binPath and account or already runs as the
+  new account, and `RollbackBuildVenvCA` puts the previous venv back. Start
+  it again once the cause is fixed, or run the repair again.
 
 ### Status (honest)
 
@@ -832,7 +872,11 @@ PowerShell 7 on POSIX with the Windows APIs stubbed
 `tests/unit/test_msi_ca_executed_failclosed.py`); real NTFS ACL semantics
 (`MsiLockPermissionsEx`, `Set-Acl` propagation), Windows PowerShell 5.1,
 service start, the msodbcsql MSI interplay and a real major upgrade are
-`not_run`. The delivered gate script `scripts/test_package_msi.ps1` exercises
+`not_run`, and so are the behaviours this release added that only a
+Windows host can show: moving the venv aside while a process holds a file
+in it open or mapped, `sc.exe sdset`/`sidtype`/`depend=` on a service that
+runs as a virtual account, and clearing the stored password (LSA secret)
+when switching to a gMSA or virtual account. The delivered gate script `scripts/test_package_msi.ps1` exercises
 them on a real Windows machine (`msiexec /l*v`, `sc.exe query`, doctor, stdio
 protocol probe, tamper negative, and the checks `programdata_acl`,
 `token_squat_doctor`, `token_squat_refused`, `folder_squat_refused`,
@@ -845,7 +889,9 @@ refused at `CheckFoldersCA` and a squatted `config.yaml` alone at
 blocker) is recorded and the checks after it still run; so do the checks
 after a failing `folder_squat_refused`, `launch_conditions` or
 `repair_keeps_account`, each of which records its failure and goes on
-(only an admin config folder that could not be restored stops the gate).
+(only the admin's config folder sitting aside stops the gate: one that
+could not be restored, or a `.gate-backup` an interrupted run left, found
+before anything is changed; restore it and rerun).
 The gate then exits nonzero. In CI these unit tests run under the
 ubuntu-24.04 runner's
 PowerShell 7 and the suite fails, rather than skips them, when `pwsh` is
@@ -958,18 +1004,25 @@ The installer carries a marker line per format it serves, `4` first, then
 which tests for its own format, with the current trusted tools.
 When dpkg undoes a failed upgrade (`abort-upgrade`, `abort-remove`,
 `abort-deconfigure`), `postinst` starts the service the old `prerm` stopped
-again (when it is enabled) and changes nothing else. If the venv is gone
-(the runbook's package rollback deletes it before installing the older
-package), nothing can run: it writes `failed` to the status file and exits
-1, which leaves the package `unpacked`; `sudo dpkg --configure
-universal-db-mcp` then installs its payload again.
-When this release's `preinst` refuses an upgrade, dpkg runs the installed
-release's `postinst` with `abort-upgrade`, and one from an earlier release
-ignores that and configures again. So the refusing `preinst` leaves a
-short-lived process holding the deferred-install lock until that dpkg run ends,
-then starts the service again when it is enabled: the old `postinst` spawns
-no install worker. It may still re-run its configure synchronously when the
-bundle carries no OS packages. `preinst` (before anything is unpacked) and
+again (when it is enabled) and changes nothing else. While a deferred
+install of the release dpkg records is still running (its worker named in
+the owner file and holding the lock), it leaves that worker alone: the
+status file stays `running`, the worker starts the service itself, and the
+package stays `installed`. Otherwise, if the venv is gone (the runbook's
+package rollback deletes it before installing the older package), nothing
+can run: it writes `failed` to the status file and exits 1, which leaves
+the package `unpacked`; `sudo dpkg --configure universal-db-mcp` then
+installs its payload again.
+When this release's upgrade fails, because its `preinst` refuses or because
+the unpack fails after `preinst` passed (a file conflict, a full disk), dpkg
+runs this package's `postrm` with `abort-upgrade` and then the installed
+release's `postinst` with `abort-upgrade`; one from an earlier release
+ignores that argument and configures again. So the new package's `postrm
+abort-upgrade` (the one script dpkg runs on every path that undoes an
+upgrade) leaves a short-lived process holding the deferred-install lock
+until that dpkg run ends, then starts the service again when it is enabled:
+the old `postinst` spawns no install worker. It may still re-run its
+configure synchronously when the bundle carries no OS packages. `preinst` (before anything is unpacked) and
 `postinst` (before anything is changed) refuse while a deferred install of
 another payload runs (`a deferred install ... is still running`; wait for
 `success` or `failed` in the status file, then install or configure again);

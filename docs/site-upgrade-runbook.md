@@ -470,7 +470,8 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   mandatory. The `.deb` makes that
   check, and the older-release check below, in `preinst`, before dpkg stops
   the service and unpacks anything; if dpkg undoes a failed upgrade,
-  `postinst` starts the service again. A refused upgrade keeps the installed
+  `postinst` starts the service again. A refused or failed upgrade (a
+  `preinst` refusal, or an unpack that fails after it) keeps the installed
   release's `postinst`, which dpkg runs to undo it, from starting a deferred
   install worker (it may still re-run its configure itself when the bundle
   has no OS packages), and `preinst` and `postinst` refuse while a deferred
@@ -601,9 +602,15 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   target `<not permitted>`. To admit a quoted
   namesake as well, list both spellings (`['TRAVEL', 'travel']`).
 - **Masking follows the value, not the column name.** UNIONs, CTE column
-  lists, aliases and whole-row references no longer unmask a sensitive
-  column; a statement the analysis cannot trace has every unproven column
-  masked, with a warning. Mask patterns also match a name's
+  lists, aliases, joins and subqueries no longer unmask a sensitive column.
+  A statement over a table with masked columns whose shape the analysis
+  cannot check is refused before it runs (`POLICY_VIOLATION: ... its shape
+  cannot be checked for them: <construct>`): `VALUES`, `UNNEST`, `LATERAL`,
+  `SEMI`/`ANTI`/`ASOF` joins, `(expr).*`, star modifiers, a star over
+  `USING` or `NATURAL`, a column list on a base table's alias, an ambiguous
+  qualifier, and the other constructs `docs/tools.md` (Masking) lists;
+  select the columns explicitly. So is a statement reading a table whose
+  columns the catalog does not list. Mask patterns also match a name's
   Unicode-normalised form (`ＭＲＮ`, `'MRN '`). A `WHERE`/`ORDER BY`/`GROUP BY`
   on a masked column is still not masked (a documented limitation): use
   column grants or views for secrets.
@@ -630,10 +637,13 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   table, column or alias outside printable ASCII or a quoted name ending in a
   blank (an object whose catalog name is not ASCII cannot be named in a
   statement; `SELECT *` still returns such a column); a Db2 delimited name
-  ending in blanks; an unquoted Oracle name with `ı` or `ſ`; a ClickHouse
+  ending in blanks; an unquoted Oracle name with `ı` or `ſ`; on Oracle, Db2
+  and PostgreSQL a CTE name outside ASCII and an unquoted table or schema
+  name outside ASCII (quote the exact name, or use an ASCII one); a ClickHouse
   quoted identifier containing a backslash; line comments ended by a bare CR;
-  a name after `IN` without parentheses (`x IN t`; a placeholder or constant
-  there, such as ClickHouse `IN {ids:Array(UInt64)}`, is accepted);
+  a name or a string after `IN` without parentheses (`x IN t`, `x IN 't'`;
+  a placeholder or another constant there, such as ClickHouse `IN
+  {ids:Array(UInt64)}`, is accepted);
   ClickHouse `{name:Identifier}` parameters; an `IN` with nothing after it
   or right after `IN`; ClickHouse `IN` over one name however wrapped (`x IN
   ((t AS z))`), the functions that read a table or dictionary (`joinGet`,
@@ -808,8 +818,16 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
 - **SQL Server.** Every query is described first and rolled back explicitly;
   the login should be `db_datareader` plus `SHOWPLAN`, never `db_owner`.
 - **ClickHouse.** Results stream under byte budgets and stop with `KILL
-  QUERY`. The server's own memory is bounded only by the account's profile:
-  set `max_memory_usage` for the MCP account. `db_explain` plans under a
+  QUERY`. Every request now carries `max_memory_usage` (2 GiB by default;
+  `connections.<id>.options.max_memory_usage` in bytes, at least 1 MiB)
+  where the account's profile accepts settings and sets no lower limit; a
+  query over it is `LIMIT_EXCEEDED`, and a profile constraint that refuses
+  the value is `CONFIG_ERROR`. A `readonly=1` profile refuses every
+  setting: there `doctor --connectivity` (which now logs in to ClickHouse to
+  read the profile) is FATAL unless the profile sets `max_memory_usage`
+  (`ALTER USER <user> SETTINGS max_memory_usage = ...` or `ALTER SETTINGS
+  PROFILE ...`) or the connection sets `options.memory_limit_from_profile:
+  true` to acknowledge the account-level limit. `db_explain` plans under a
   1000-row read ceiling, because ClickHouse evaluates subqueries while it
   plans; a plan that would read more is refused as `CAPABILITY_UNSUPPORTED`
   (use `db_query`). A `readonly=1` profile refuses that ceiling, so there

@@ -36,7 +36,7 @@ import pytest
 from test_hardening_2026_09_27_qualified_names import _OCEAN, _call, _call_error, _entries, _refused, _server
 from test_hardening_2026_09_28_final_guard_server import _app_server, _listed_guard
 
-from universal_db_mcp.connectors.base import NameBinding, SynonymTarget, TableSummary
+from universal_db_mcp.connectors.base import ColumnInfo, NameBinding, SynonymTarget, TableSummary
 from universal_db_mcp.connectors.driver_helpers import synonym_chains
 from universal_db_mcp.models.responses import ErrorCategory
 
@@ -307,7 +307,13 @@ def test_without_an_allowlist_a_synonym_still_reads_no_system_schema(
     server, fake = _synonyms(tmp_path, monkeypatch, engine, [], chains)
     text = _call_error(server, "db_query", {"connection_id": "remote", "sql": "SELECT * FROM ocean.r2_sys"})
     assert "AUTHORIZATION_DENIED" in text and "is a system schema" in text, text
-    # no allowlist: another user schema is readable, through a synonym as by name
+    # no allowlist: another user schema is readable, through a synonym as by
+    # name; masking reads the columns of the table its chain ends at
+    listed = fake.list_columns
+    fake.list_columns = lambda schema, table: (
+        [ColumnInfo(_R2[engine], "PAYROLL", "amount", "number")] if (schema, table) == (_R2[engine], "PAYROLL")
+        else listed(schema, table)
+    )
     assert _call(server, "db_query", {"connection_id": "remote", "sql": "SELECT * FROM ocean.r2_other"})
 
 

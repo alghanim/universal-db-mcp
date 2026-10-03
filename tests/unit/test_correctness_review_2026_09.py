@@ -80,14 +80,15 @@ def _ch_connector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server_readon
 def test_h1_fresh_account_gets_our_readonly_and_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     conn, client = _ch_connector(monkeypatch, tmp_path, "0")
     names = [n for n, _v in client.set_calls]
-    assert names == ["readonly", "max_execution_time"]
+    # the memory cap rides along with the session settings (owner decision 2026-10-03)
+    assert names == ["readonly", "max_execution_time", "max_memory_usage"]
     assert "read_only" in conn.session_status["applied"]
 
 
 def test_h1_readonly_2_profile_is_kept_and_reported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """readonly=2 forbids changing readonly but allows other settings."""
     conn, client = _ch_connector(monkeypatch, tmp_path, "2")
-    assert [n for n, _v in client.set_calls] == ["max_execution_time"]
+    assert [n for n, _v in client.set_calls] == ["max_execution_time", "max_memory_usage"]
     assert any("readonly=2" in a for a in conn.session_status["applied"])
     report = conn.session_report({"readonly": "2"})
     assert report["read_only_verified"] is True

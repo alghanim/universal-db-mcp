@@ -128,10 +128,16 @@ the file read-only).
 
 ClickHouse: a truncated or timed-out query is stopped with `KILL QUERY` on its
 pinned `query_id`, which DBAs see in `system.query_log` under the session's
-client name. On a `readonly=1` profile, or one whose constraints refuse them,
-`db_test_connection` lists `per-query result ceilings` under `skipped`; the
-account's profile (`max_memory_usage`) is then the only memory bound on the
-server, as it is for server memory in general.
+client name. Every request carries `max_memory_usage`
+(`options.max_memory_usage`, 2 GiB by default) where the account's profile
+accepts settings and sets no lower limit; `db_test_connection` lists it under
+`applied` and reads it back. On a `readonly=1` profile, or one whose
+constraints refuse them, `db_test_connection` lists `per-query result
+ceilings` under `skipped`, and `max_memory_usage` too unless the profile sets
+one (then `applied`, marked `(server profile)`); the account's profile
+(`max_memory_usage`) is then the only memory bound on the server, and
+`doctor --connectivity` reports it FATAL when the profile sets none, unless
+`options.memory_limit_from_profile: true` acknowledges it.
 
 Statement ceilings are per call: a tool call's own timeout
 (`timeout_seconds`, clamped to `security.hard_query_timeout_seconds`) is what

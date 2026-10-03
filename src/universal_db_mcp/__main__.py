@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
@@ -512,17 +512,20 @@ def _apply_registration(name: str, registry: ModuleType, env: Mapping[str, str],
     return True
 
 
-def _seed_harness_config(env: Mapping[str, str], home: Path) -> tuple[Path | None, str, str | None]:
+def _seed_harness_config(
+    env: Mapping[str, str], home: Path, *, named: bool = False
+) -> tuple[Path | None, str, str | None]:
     """``ensure_per_user_harness_config``, never raising: its ``(seeded path
     or None, note)`` and None, or ``(None, "", why it could not be seeded)``.
     As root it refuses a user's link on the way (and any write may fail):
     that must not end the run with a traceback after the first harness was
-    written."""
+    written. ``named``: an existing registration names the per-user config
+    (:func:`_missing_harness_config`)."""
     from universal_db_mcp.agents.core import ensure_per_user_harness_config
     from universal_db_mcp.errors import ConfigError
 
     try:
-        seeded, note = ensure_per_user_harness_config(env, home)
+        seeded, note = ensure_per_user_harness_config(env, home, named=named)
     except (OSError, ConfigError) as exc:
         return None, "", (
             f"the per-user harness config the registration names could not be seeded ({exc}); "
@@ -532,28 +535,40 @@ def _seed_harness_config(env: Mapping[str, str], home: Path) -> tuple[Path | Non
     return seeded, note, None
 
 
-def _missing_harness_config(env: Mapping[str, str], home: Path) -> Path | None:
-    """The per-user config a registration names when it does not exist yet
-    (what :func:`_seed_harness_config` would create), else None.
+def _missing_harness_config(
+    env: Mapping[str, str], home: Path, configured: Sequence[str]
+) -> tuple[Path, list[str]] | None:
+    """The per-user config the registration of one of the already configured
+    harnesses ``configured`` names, when it does not exist yet (what
+    :func:`_seed_harness_config` with ``named`` creates), and the harnesses
+    whose registration names it; else None.
 
     A seeding that failed after the registration was written (G4) left the
     harness CONFIGURED and the config missing; a re-run must still see that,
-    or it reports "no changes needed" while the server cannot start."""
-    from universal_db_mcp.agents.core import PER_USER_CONFIG_DIR, resolve_harness_config_path
+    or it reports "no changes needed" while the server cannot start. Only the
+    config a registration actually names counts: a dsh row written with
+    ``UDBMCP_CONFIG`` set elsewhere names that config, not the per-user one
+    this run's environment would advertise."""
+    from universal_db_mcp.agents import registry
+    from universal_db_mcp.agents.core import PER_USER_CONFIG_DIR, AgentConfigError
     from universal_db_mcp.errors import ConfigError
 
-    try:
-        advertised = resolve_harness_config_path(env, home, for_harness=True)
-    except ConfigError:
-        return None  # the adapters report a bad override themselves
     per_user = Path(os.path.abspath(home / PER_USER_CONFIG_DIR / "config.yaml"))
-    if advertised != str(per_user):
+    naming: list[str] = []
+    for name in configured:
+        try:
+            named = registry.registered_config_path(name, env, home)
+        except (ConfigError, AgentConfigError, OSError):
+            continue  # the adapters report a bad override or file themselves
+        if named is not None and os.path.abspath(named) == str(per_user):
+            naming.append(name)
+    if not naming:
         return None
     try:
         present = per_user.is_file()
     except OSError:
         present = False
-    return None if present else per_user
+    return None if present else (per_user, naming)
 
 
 def _agent_credentials_notice(env: Mapping[str, str], home: Path) -> str:
@@ -745,15 +760,20 @@ def _configure_agents(args: argparse.Namespace) -> int:
         if any_configured and not (args.yes and not args.dry_run and payload.get("applied")):
             # A registration already in place names a per-user config that a
             # failed seeding left missing: --yes seeds it, as an apply does.
-            missing = _missing_harness_config(env, home)
+            configured_names = [
+                str(h["agent"])
+                for h in harnesses
+                if isinstance(h, dict) and h.get("status") == AgentStatus.CONFIGURED.value
+            ]
+            missing = _missing_harness_config(env, home, configured_names)
             if missing is not None and args.yes and not args.dry_run:
-                seeded, _seed_note, seed_error = _seed_harness_config(env, home)
+                seeded, _seed_note, seed_error = _seed_harness_config(env, home, named=True)
                 payload["config_seeded"] = str(seeded) if seeded else None
                 if seed_error is not None:
                     payload["seed_error"] = seed_error
                     exit_code = 1
             elif missing is not None:
-                payload["config_missing"] = str(missing)
+                payload["config_missing"] = str(missing[0])
         print(json.dumps(payload, indent=2))
         if failed and _failed_closed_is_fatal(args):
             _report_failed_closed(failed)
@@ -879,10 +899,11 @@ def _repair_missing_config(configured: list[str], args: argparse.Namespace, env:
     that failed after the write). Asks as a registration does: --yes or a
     ``y`` on a TTY; a dry run only says so. Returns whether it is still
     missing although the run was to write it."""
-    missing = _missing_harness_config(env, home)
-    if missing is None:
+    found = _missing_harness_config(env, home, configured)
+    if found is None:
         return False
-    who = ", ".join(configured)
+    missing, naming = found
+    who = ", ".join(naming)
     if args.dry_run:
         print(f"\n  note: the config the registration of {who} names, {missing}, does not exist; "
               "a run with --yes (without --dry-run) seeds it")  # fmt: skip
@@ -900,7 +921,7 @@ def _repair_missing_config(configured: list[str], args: argparse.Namespace, env:
         if answer.strip().lower() not in ("y", "yes"):
             print("  skipped (declined)")
             return False
-    seeded, note, problem = _seed_harness_config(env, home)
+    seeded, note, problem = _seed_harness_config(env, home, named=True)
     if seeded is not None:
         print(f"\n  seeded per-user harness config: {seeded} ({note})")
     if problem is not None:

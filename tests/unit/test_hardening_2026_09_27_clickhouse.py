@@ -820,7 +820,8 @@ class _NetworkError(Exception):
     [
         (_ServerError("Code: 47. DB::Exception: Unknown expression identifier `nosuchcol`", code=47), "QUERY_ERROR"),
         # a server error in the middle of the stream (StreamFailureError: text only)
-        (RuntimeError("Code: 241. DB::Exception: Memory limit (for query) exceeded"), "QUERY_ERROR"),
+        # (code 241, MEMORY_LIMIT_EXCEEDED, is LIMIT_EXCEEDED since review round 3: the connection's cap)
+        (RuntimeError("Code: 241. DB::Exception: Memory limit (for query) exceeded"), "LIMIT_EXCEEDED"),
         (_ServerError("Code: 159. DB::Exception: Timeout exceeded: elapsed 5.0 seconds, maximum: 5", 159), "TIMEOUT"),
         (_NetworkError("Error HTTPConnectionPool(host='h', port=8123): Connection refused"), None),
     ],

@@ -2118,10 +2118,12 @@ def test_aliased_sensitive_column_is_masked(app_ctx, demo_policy) -> None:
     values because masking only matched the driver's output column name. The
     guard's AST must taint the alias with its source column's sensitivity."""
     import sqlglot
+    from test_cr_fix_server import _positions
 
     import universal_db_mcp.server as srv
 
     conn = build_connector(app_ctx.resolved["demo_sqlite"], demo_policy)
+    catalog = {"customers": tuple(c.name for c in conn.list_columns(None, "customers"))}
     statements = (
         "SELECT ssn AS code, full_name FROM customers LIMIT 3",
         "SELECT code FROM (SELECT ssn AS code FROM customers) s LIMIT 3",
@@ -2129,11 +2131,11 @@ def test_aliased_sensitive_column_is_masked(app_ctx, demo_policy) -> None:
     )
     for sql in statements:
         out = conn.execute_query(QuerySpec(sql=sql))
-        sensitive = srv._sensitive_output_names(demo_policy, sqlglot.parse_one(sql, read="sqlite"))
+        ast = sqlglot.parse_one(sql, read="sqlite")
+        positions = _positions(demo_policy, ast, out.columns, catalog=catalog)
         state: dict = {"warnings": []}
-        cols, rows = srv._apply_masking(demo_policy, out.columns, out.rows, state, sensitive_names=sensitive)
+        cols, rows = srv._apply_masking(demo_policy, out.columns, out.rows, state, positions=positions)
         assert rows[0][0] == "<masked>", sql
-        assert "code" in sensitive, (sql, sensitive)
         if len(out.columns) > 1:  # the benign column alongside it is untouched
             assert rows[0][1] != "<masked>", sql
 
@@ -4530,15 +4532,15 @@ def test_clickhouse_list_columns_nullable_is_not_inverted(monkeypatch) -> None:
     nullable=True — exactly inverted. Nullable(Nothing) is still nullable."""
     conn = _clickhouse_connector()
     rows = [
-        ("id", "Int64", 0, None),
-        ("name", "Nullable(String)", 0, None),
-        ("weird", "Nullable(Nothing)", 0, None),
-        ("plain", "String", 0, None),
+        ("id", "Int64", 0, None, ""),
+        ("name", "Nullable(String)", 0, None, ""),
+        ("weird", "Nullable(Nothing)", 0, None, ""),
+        ("plain", "String", 0, None, ""),
     ]
 
     class _Meta:
         def query(self, sql: str, parameters: object = None) -> _CHFakeResult:
-            return _CHFakeResult(rows, ["name", "type", "pk", "comment"])
+            return _CHFakeResult(rows, ["name", "type", "pk", "comment", "default_kind"])
 
     conn._meta_client = _Meta()  # type: ignore[attr-defined]
     cols = conn.list_columns("d", "t")
@@ -6793,6 +6795,11 @@ async def test_db_query_envelope_reports_cell_truncation(tmp_path, monkeypatch) 
                 return _Res([["main", "t", "MergeTree", 1]], ["database", "name", "engine", "total_rows"])
             if sql == "SELECT 1":
                 return _Res([["1"]], ["v"])
+            if "FROM system.columns" in sql:  # masking reads the table's columns from the catalog
+                return _Res(
+                    [["big_text", "String", 0, "", ""]],
+                    ["name", "type", "is_in_primary_key", "comment", "default_kind"],
+                )
             return _Res([["x" * 20000]], ["big_text"])
 
         def query_column_block_stream(

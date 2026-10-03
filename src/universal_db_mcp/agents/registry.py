@@ -88,6 +88,19 @@ def build_plan(name: str, env: Any, home: Path) -> Plan:
     return cast(Plan, mod.plan(env, home))
 
 
+def registered_config_path(name: str, env: Any, home: Path) -> str | None:
+    """The config path the CONFIGURED registration of ``name`` names (never
+    writes). A JSON harness is configured only when its entry equals the one
+    this environment would write, so that is the path this environment
+    advertises; dsh counts its row as configured whatever config it names,
+    so its row is read."""
+    from universal_db_mcp.agents.core import resolve_harness_config_path
+
+    if name == "dsh":
+        return cast("str | None", load_adapter(name).registered_config_path(_dsh_home(home)))
+    return resolve_harness_config_path(env, home, for_harness=True)
+
+
 def apply_confirmed(name: str, env: Any, home: Path, confirmed: bool) -> Plan:
     """Normalized ``apply`` for one harness.
 

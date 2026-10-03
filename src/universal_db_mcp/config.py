@@ -152,7 +152,11 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
         "sslmode": str,
     },
     "mysql": {"os_authentication": bool, "unix_socket": str},
-    "clickhouse": {"os_authentication": bool},
+    # max_memory_usage: the per-query memory ceiling (bytes) the connector
+    # sends when the profile allows settings (default 2 GiB);
+    # memory_limit_from_profile: the operator's acknowledgement that a
+    # readonly=1 profile (settings refused) carries the account-level limit.
+    "clickhouse": {"os_authentication": bool, "max_memory_usage": int, "memory_limit_from_profile": bool},
     # thick_mode + lib_dir: Thick mode via an ADMINISTRATOR-SUPPLIED Oracle
     # Instant Client (licensed by Oracle, never shipped here). It is the only
     # client-side way to authenticate an account that carries just the legacy
@@ -181,6 +185,10 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
     "db2": {"authentication": str},
 }
 
+
+# The smallest per-query ClickHouse memory ceiling accepted (1 MiB): below it
+# no statement could run, which is a typo (KiB for MiB), not a policy.
+_CLICKHOUSE_MIN_MEMORY_USAGE = 1024 * 1024
 
 # Characters that are GRAMMAR, not data, in an Oracle connect string. Verified
 # against oracledb 4.0.2's own parser (2026-09-15): a `database` of
@@ -340,8 +348,15 @@ class ConnectionConfig(StrictModel):
         if unknown:
             raise ValueError(f"connections: unknown options for type '{self.type}': {sorted(unknown)}")
         for key, value in self.options.items():
-            if not isinstance(value, allowed[key]):
+            # bool is an int subclass: True must not pass as a number
+            if not isinstance(value, allowed[key]) or (allowed[key] is int and isinstance(value, bool)):
                 raise ValueError(f"connections: option '{key}' for type '{self.type}' must be {allowed[key].__name__}")
+        if self.type == "clickhouse" and "max_memory_usage" in self.options:
+            if self.options["max_memory_usage"] < _CLICKHOUSE_MIN_MEMORY_USAGE:
+                raise ValueError(
+                    "connections: clickhouse options.max_memory_usage is a byte count of at least "
+                    f"{_CLICKHOUSE_MIN_MEMORY_USAGE} (1 MiB); the default is 2 GiB"
+                )
         if self.type in ("postgres", "mysql", "clickhouse") and not (
             self.username_env or self.username_file or self.options.get("os_authentication")
         ):
@@ -941,14 +956,47 @@ def darwin_secret_file_acl_problems(path: Path) -> list[str]:
     ACL cannot be read."""
     if sys.platform != "darwin":
         return []
+    return _darwin_file_grants(path, _DARWIN_ACL_RIGHTS)
+
+
+# A state file (the audit log, its lock and backups, the metadata cache and
+# its sidecars) must also not be deletable, renamable or otherwise alterable
+# by another account: on top of the secret-file rights, delete (of the file
+# itself) and the attribute rights, which change its timestamps and flags.
+_DARWIN_STATE_FILE_ACL_RIGHTS = (
+    *_DARWIN_ACL_RIGHTS,
+    (1 << 4, "delete"),
+    (1 << 8, "writeattr"),
+    (1 << 10, "writeextattr"),
+)
+
+
+def darwin_state_file_acl_problems(path: Path | int) -> list[str]:
+    """What the macOS extended ACL of the state file *path* (a path, or an
+    open descriptor) grants anyone but its owner among the rights that read,
+    change, delete or re-permission it (_DARWIN_STATE_FILE_ACL_RIGHTS). Empty
+    on other platforms and on a filesystem without ACLs; OSError when the ACL
+    cannot be read."""
+    if sys.platform != "darwin":
+        return []
+    return _darwin_file_grants(path, _DARWIN_STATE_FILE_ACL_RIGHTS)
+
+
+def _darwin_file_grants(path: Path | int, rights_table: tuple[tuple[int, str], ...]) -> list[str]:
     import ctypes
 
     libc = _darwin_acl_libc()
+    ctypes.set_errno(0)
+    if isinstance(path, int):
+        libc.acl_get_fd_np.restype = ctypes.c_void_p
+        libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl = libc.acl_get_fd_np(path, _DARWIN_ACL_TYPE_EXTENDED)
+        fd = path
+        return _darwin_acl_grants(libc, acl, lambda: os.fstat(fd).st_uid, rights_table, "a state file")
     libc.acl_get_file.restype = ctypes.c_void_p
     libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
-    ctypes.set_errno(0)
     acl = libc.acl_get_file(os.fsencode(path), _DARWIN_ACL_TYPE_EXTENDED)
-    return _darwin_acl_grants(libc, acl, lambda: os.stat(path).st_uid, _DARWIN_ACL_RIGHTS, str(path))
+    return _darwin_acl_grants(libc, acl, lambda: os.stat(path).st_uid, rights_table, str(path))
 
 
 # Every right an entry can carry on a directory (<sys/kauth.h> KAUTH_VNODE_*,
@@ -968,6 +1016,15 @@ _DARWIN_DIRECTORY_ACL_RIGHTS = (
     (1 << 12, "writesecurity"),
     (1 << 13, "chown"),
 )
+# The directory rights that let another account add, delete or rename the
+# files in a state directory (or the directory itself), or rewrite its ACL or
+# owner (and so grant itself any of those). list, search and the read rights
+# show names and attributes only, as mode 0750/0755 does.
+_DARWIN_STATE_DIRECTORY_REFUSED = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13)
+# <sys/acl.h> acl_flag_t: an entry copied to every file / subdirectory created
+# in the directory, and one that only does that (no effect on the directory).
+_DARWIN_ENTRY_FILE_INHERIT = 1 << 5
+_DARWIN_ENTRY_ONLY_INHERIT = 1 << 8
 
 
 def darwin_directory_acl_problems(fd: int) -> list[str]:
@@ -977,17 +1034,83 @@ def darwin_directory_acl_problems(fd: int) -> list[str]:
     access away ('group:everyone deny delete', which macOS puts on every home
     directory, among them), and the owner's own entry adds nothing. Empty on
     other platforms and on a filesystem without ACLs; OSError when the ACL
-    cannot be read."""
+    cannot be read. The rule for a secrets directory; a state directory has
+    darwin_state_directory_acl_problems."""
     if sys.platform != "darwin":
         return []
+    return [
+        _darwin_entry_problem(entry, _DARWIN_DIRECTORY_ACL_RIGHTS, "")
+        for entry in _darwin_directory_entries(fd)
+        if entry[0] != 0
+    ]
+
+
+def darwin_state_directory_acl_problems(fd: int | Path) -> list[str]:
+    """What the macOS extended ACL of the state directory *fd* (a descriptor,
+    or a path for a directory this process may search but not list; the audit
+    log's or the metadata cache's) lets anyone but its owner do: an allow
+    entry that lets them add, delete or rename files there, or rewrite the
+    directory's ACL or owner; and an inheritable (file_inherit) allow entry
+    that would give them, on every file created there later (each audit
+    rotation creates one), a right darwin_state_file_acl_problems refuses. A
+    read-only entry (list, search, the read rights) is accepted, as mode 0750
+    is. Empty on other platforms and on a filesystem without ACLs; OSError
+    when the ACL cannot be read."""
+    if sys.platform != "darwin":
+        return []
+    file_rights = 0
+    for bit, _name in _DARWIN_STATE_FILE_ACL_RIGHTS:
+        file_rights |= bit
+    problems: list[str] = []
+    for entry in _darwin_directory_entries(fd):
+        rights, flags, _who = entry
+        if rights < 0:
+            problems.append(_darwin_entry_problem(entry, (), ""))
+            continue
+        if not flags & _DARWIN_ENTRY_ONLY_INHERIT and rights & _DARWIN_STATE_DIRECTORY_REFUSED:
+            problems.append(
+                _darwin_entry_problem((rights & _DARWIN_STATE_DIRECTORY_REFUSED, flags, _who),
+                                      _DARWIN_DIRECTORY_ACL_RIGHTS, "")
+            )
+        if flags & _DARWIN_ENTRY_FILE_INHERIT and rights & file_rights:
+            problems.append(
+                _darwin_entry_problem(
+                    (rights & file_rights, flags, _who),
+                    _DARWIN_STATE_FILE_ACL_RIGHTS,
+                    " on every file created in it (an inheritable entry)",
+                )
+            )
+    return problems
+
+
+def _darwin_directory_entries(fd: int | Path) -> list[tuple[int, int, str | None]]:
     import ctypes
 
     libc = _darwin_acl_libc()
+    ctypes.set_errno(0)
+    if isinstance(fd, Path):
+        directory = fd
+        libc.acl_get_file.restype = ctypes.c_void_p
+        libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        acl = libc.acl_get_file(os.fsencode(directory), _DARWIN_ACL_TYPE_EXTENDED)
+        return _darwin_foreign_allow_entries(libc, acl, lambda: os.stat(directory).st_uid, str(directory))
     libc.acl_get_fd_np.restype = ctypes.c_void_p
     libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
-    ctypes.set_errno(0)
     acl = libc.acl_get_fd_np(fd, _DARWIN_ACL_TYPE_EXTENDED)
-    return _darwin_acl_grants(libc, acl, lambda: os.fstat(fd).st_uid, _DARWIN_DIRECTORY_ACL_RIGHTS, "a directory")
+    descriptor = fd
+    return _darwin_foreign_allow_entries(libc, acl, lambda: os.fstat(descriptor).st_uid, "a directory")
+
+
+def _darwin_entry_problem(
+    entry: tuple[int, int, str | None], rights_table: tuple[tuple[int, str], ...], where: str
+) -> str:
+    rights, _flags, who = entry
+    if rights < 0:
+        return "an access control list entry cannot be read"
+    names = ",".join(name for bit, name in rights_table if rights & bit) or f"rights 0x{rights:x}"
+    if who is None:
+        return f"an access control list entry grants {names}{where} to a trustee that cannot be checked"
+    return f"an access control list entry grants {names}{where} to {who}"
 
 
 def _darwin_acl_libc() -> Any:
@@ -998,6 +1121,8 @@ def _darwin_acl_libc() -> Any:
     libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     libc.acl_get_permset.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
     libc.acl_get_perm_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    libc.acl_get_flagset_np.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_flag_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
     libc.acl_get_qualifier.restype = ctypes.c_void_p
     libc.acl_get_qualifier.argtypes = [ctypes.c_void_p]
     libc.mbr_uuid_to_id.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_int)]
@@ -1005,12 +1130,18 @@ def _darwin_acl_libc() -> Any:
     return libc
 
 
-def _darwin_acl_grants(
-    libc: Any, acl: Any, owner_of: Any, rights_table: tuple[tuple[int, str], ...], what: str
-) -> list[str]:
-    """The allow entries of *acl* (from acl_get_file or acl_get_fd_np, just
-    called; freed here) that give anyone but the owner (*owner_of*()) one of
-    the rights in *rights_table*; [] for no ACL (ENOENT) or none possible."""
+# Every permission bit an entry can carry (<sys/acl.h> ACL_READ_DATA ..
+# ACL_CHANGE_OWNER) and the inheritance flags read from it.
+_DARWIN_PERM_BITS = tuple(1 << n for n in range(1, 14))
+_DARWIN_FLAG_BITS = (_DARWIN_ENTRY_FILE_INHERIT, 1 << 6, _DARWIN_ENTRY_ONLY_INHERIT)
+
+
+def _darwin_foreign_allow_entries(libc: Any, acl: Any, owner_of: Any, what: str) -> list[tuple[int, int, str | None]]:
+    """(rights mask, inheritance flags, trustee name) of each allow entry of
+    *acl* (from acl_get_file or acl_get_fd_np, just called; freed here) for
+    anyone but the owner (*owner_of*()), with no trustee name (None) when the
+    trustee cannot be resolved and a rights mask of -1 for an entry that
+    cannot be read; [] for no ACL (ENOENT) or none possible."""
     import ctypes
 
     if not acl:
@@ -1018,22 +1149,33 @@ def _darwin_acl_grants(
         if err in (errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP):  # no ACL, or none possible here
             return []
         raise OSError(err, os.strerror(err), what)
-    problems: list[str] = []
+    entries: list[tuple[int, int, str | None]] = []
     try:
         owner = owner_of()
         entry = ctypes.c_void_p()
         which = _DARWIN_ACL_FIRST_ENTRY
         while libc.acl_get_entry(acl, which, ctypes.byref(entry)) == 0:
             which = _DARWIN_ACL_NEXT_ENTRY
-            tag, permset = ctypes.c_int(), ctypes.c_void_p()
-            if libc.acl_get_tag_type(entry, ctypes.byref(tag)) or libc.acl_get_permset(entry, ctypes.byref(permset)):
-                problems.append("an access control list entry cannot be read")
+            tag, permset, flagset = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_void_p()
+            if (
+                libc.acl_get_tag_type(entry, ctypes.byref(tag))
+                or libc.acl_get_permset(entry, ctypes.byref(permset))
+                or libc.acl_get_flagset_np(entry, ctypes.byref(flagset))
+            ):
+                entries.append((-1, 0, None))
                 continue
             if tag.value != _DARWIN_ACL_EXTENDED_ALLOW:
                 continue
-            rights = ",".join(name for bit, name in rights_table if libc.acl_get_perm_np(permset, bit) == 1)
+            rights = 0
+            for bit in _DARWIN_PERM_BITS:
+                if libc.acl_get_perm_np(permset, bit) == 1:
+                    rights |= bit
             if not rights:
                 continue
+            flags = 0
+            for bit in _DARWIN_FLAG_BITS:
+                if libc.acl_get_flag_np(flagset, bit) == 1:
+                    flags |= bit
             ident, id_type = ctypes.c_uint32(), ctypes.c_int()
             qualifier = libc.acl_get_qualifier(entry)
             unresolved = 1
@@ -1043,13 +1185,29 @@ def _darwin_acl_grants(
                 finally:
                     libc.acl_free(qualifier)
             if unresolved:
-                problems.append(f"an access control list entry grants {rights} to a trustee that cannot be checked")
+                entries.append((rights, flags, None))
             elif id_type.value != _DARWIN_ID_TYPE_UID or ident.value != owner:  # the owner's own entry adds nothing
                 who = _darwin_trustee_name(ident.value, user=id_type.value == _DARWIN_ID_TYPE_UID)
-                problems.append(f"an access control list entry grants {rights} to {who}")
+                entries.append((rights, flags, who))
     finally:
         libc.acl_free(acl)
-    return problems
+    return entries
+
+
+def _darwin_acl_grants(
+    libc: Any, acl: Any, owner_of: Any, rights_table: tuple[tuple[int, str], ...], what: str
+) -> list[str]:
+    """The allow entries of *acl* (from acl_get_file or acl_get_fd_np, just
+    called; freed here) that give anyone but the owner (*owner_of*()) one of
+    the rights in *rights_table*; [] for no ACL (ENOENT) or none possible."""
+    mask = 0
+    for bit, _name in rights_table:
+        mask |= bit
+    return [
+        _darwin_entry_problem((rights if rights < 0 else rights & mask, flags, who), rights_table, "")
+        for rights, flags, who in _darwin_foreign_allow_entries(libc, acl, owner_of, what)
+        if rights < 0 or rights & mask
+    ]
 
 
 def _darwin_trustee_name(ident: int, *, user: bool) -> str:
@@ -1216,6 +1374,22 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
         self._refuse_duplicate_keys(node)
         return super().construct_document(node)
 
+    def construct_object(self, node: yaml.Node, deep: bool = False) -> Any:
+        """A tagged scalar ('!!int Secret') is converted by plain Python, whose
+        error quotes the value: report it as a ConstructorError at the node,
+        naming only the failure's type."""
+        try:
+            return super().construct_object(node, deep=deep)
+        except yaml.YAMLError:
+            raise
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError, IndexError) as exc:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                f"a value could not be read as the type its tag names ({type(exc).__name__})",
+                node.start_mark,
+            ) from None
+
     def _refuse_duplicate_keys(self, root: yaml.Node) -> None:
         stack = [root]
         visited: set[int] = set()
@@ -1257,10 +1431,13 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
 
 def load_yaml_strict(text: str, source: str = "<string>") -> Any:
     """``yaml.safe_load`` that raises ConfigError on invalid YAML and on a
-    mapping key given twice (naming the key and both lines)."""
+    mapping key given twice (naming the key and both lines). Every loader
+    failure is caught, not only YAMLError: a tagged scalar is converted by
+    plain Python ('password: !!int Secret' raises int()'s ValueError, which
+    quotes the value), and each is described without the file's text."""
     try:
         return yaml.load(text, Loader=_UniqueKeySafeLoader)  # noqa: S506 - a SafeLoader subclass
-    except yaml.YAMLError as exc:
+    except Exception as exc:  # noqa: BLE001 - any loader failure, described without content
         raise ConfigError(f"invalid YAML in '{source}': {describe_yaml_error(exc)}") from None
 
 
@@ -1315,7 +1492,11 @@ def describe_yaml_error(exc: BaseException) -> str:
         return f"a character YAML does not accept at character offset {exc.position}"
     if isinstance(exc, yaml.YAMLError):
         return "malformed YAML"
-    return f"the YAML parser failed ({type(exc).__name__})"
+    if isinstance(exc, RecursionError):
+        return "the document nests too deeply"
+    # a tagged value (!!int, !!float, !!bool, !!timestamp) the constructor
+    # could not convert: the exception's own message quotes the value
+    return f"a value could not be read as the type its tag names ({type(exc).__name__})"
 
 
 def describe_decode_error(exc: UnicodeDecodeError) -> str:

@@ -22,7 +22,16 @@ from typing import Any
 
 import pytest
 import sqlglot
-from test_cr_fix_server import _call, _Fake, _fake_server, _final_mask, _no_secret, _on, _server
+from test_cr_fix_server import (
+    _call,
+    _Fake,
+    _fake_server,
+    _final_mask,
+    _masked_or_refused,
+    _on,
+    _refusal,
+    _server,
+)
 
 from universal_db_mcp import server as srv
 from universal_db_mcp.connectors.base import ColumnInfo, QueryOutcome, TableSummary
@@ -149,7 +158,8 @@ def test_v1a_oracle_end_to_end_refuses_the_hidden_table(tmp_path: Path, monkeypa
                   TableSummary("APP", "ΠΕΛΑΤΕΣ", "table", row_estimate=10)],
                  schemas=["HR", "APP"], columns=[ColumnInfo("HR", "EMPLOYEES", "ID", "NUMBER")])
     server = _fake_server(tmp_path, monkeypatch, fake, engine="oracle", allowed=["hr"], system=["information_schema"])
-    with pytest.raises(Exception, match="AUTHORIZATION_DENIED"):
+    # the guard refuses a non-ASCII CTE or unquoted name on Oracle (owner decision, 2026-10-03)
+    with pytest.raises(Exception, match="AUTHORIZATION_DENIED|POLICY_VIOLATION"):
         _call(server, "db_query", {"connection_id": "remote", "sql": sql})
     assert fake.statements == []
 
@@ -165,9 +175,12 @@ class _Rows(_Fake):
 
 
 @pytest.mark.parametrize(("cte", "ref"), [("σ", "ς"), ("ς", "σ"), ("θ", "ϑ"), ("μ", "µ"), ("ᲃ", "с")])
-def test_v1a_oracle_a_cte_bound_by_unicode_upper_case_is_traced(
+def test_v1a_oracle_a_cte_named_outside_ascii_is_refused(
     tmp_path: Path, monkeypatch: Any, cte: str, ref: str
 ) -> None:
+    """Was traced through Oracle's Unicode upper case; a CTE name outside
+    ASCII is now refused before the statement runs (owner decision,
+    2026-10-03)."""
     fake = _Rows(
         [TableSummary("HR", "PEOPLE", "table", row_estimate=10)], schemas=["HR"],
         columns=[ColumnInfo("HR", "PEOPLE", "SSN", "VARCHAR2(20)")],
@@ -176,19 +189,21 @@ def test_v1a_oracle_a_cte_bound_by_unicode_upper_case_is_traced(
     )
     server = _fake_server(tmp_path, monkeypatch, fake, engine="oracle", allowed=["hr"], system=["information_schema"])
     sql = f"WITH {cte} AS (SELECT 'a' AS x FROM DUAL UNION ALL SELECT ssn FROM hr.people) SELECT * FROM {ref}"
-    env = _call(server, "db_query", {"connection_id": "remote", "sql": sql})
-    assert fake.statements, env
-    _no_secret(env["data"])
+    with pytest.raises(Exception, match="POLICY_VIOLATION"):
+        _call(server, "db_query", {"connection_id": "remote", "sql": sql})
+    assert fake.statements == []
 
 
-def test_v6b_the_case_tables_stay_bounded() -> None:
-    """A table shared by every statement remembers at most the code points
-    below its bound, whatever names callers send (review V6-b)."""
-    for table in (srv._NAME_FOLDING["oracle"][0], srv._UNICODE_FOLDING["postgres"][0]):
-        assert isinstance(table, srv._UnicodeCase)
-        "".join(map(chr, range(0x800, 0x30000))).translate(table)
-        assert len(table) <= srv._UNICODE_CASE_CACHED
-    assert "straße_é_ς".translate(srv._NAME_FOLDING["oracle"][0]) == "STRAßE_É_Σ"
+def test_v6b_no_case_table_grows_with_callers_names() -> None:
+    """The case tables are fixed ASCII maps now (no Unicode case model, owner
+    decision 2026-10-03): nothing a caller sends makes them grow (review V6-b)."""
+    assert not hasattr(srv, "_UnicodeCase") and not hasattr(srv, "_UNICODE_FOLDING")
+    for unquoted, _quoted in srv._NAME_FOLDING.values():
+        assert unquoted is not None
+        before = len(unquoted)
+        "".join(map(chr, range(0x800, 0x30000))).translate(unquoted)
+        assert len(unquoted) == before
+    assert "straße_é_ς".translate(srv._NAME_FOLDING["oracle"][0]) == "STRAßE_é_ς"
 
 
 # ------------------- M1 class: composite and table-function output widths
@@ -225,19 +240,29 @@ def test_m1_widths_the_analysis_cannot_prove_never_shift_a_mask(
 @pytest.mark.parametrize(
     ("sql", "columns", "masked"),
     [
-        # a VALUES list's width is its rows': the positions stay exact
-        ("SELECT v.*, upper(c.ssn), c.full_name FROM (VALUES (1, 2)) AS v(a, b), customers c",
-         ["a", "b", "upper", "full_name"], {2}),
-        ("SELECT u.x, upper(c.ssn), c.full_name FROM unnest(ARRAY[1]) WITH ORDINALITY AS u(x), customers c",
-         ["x", "upper", "full_name"], {1}),
-        ("SELECT * FROM unnest(ARRAY[1]) AS u(x)", ["x"], set()),
+        ("SELECT * FROM unnest(ARRAY[1]) AS u(x)", ["x"], set()),  # no table with a masked column
         ("SELECT c.*, 1 AS one FROM customers c", [*CUSTOMERS, "one"], {3}),
     ],
 )
 def test_m1_widths_the_analysis_proves_stay_exact(
     demo_policy: Any, sql: str, columns: list[str], masked: set[int]
 ) -> None:
-    assert _final_mask(_on(demo_policy, "postgres"), sql, columns) == masked
+    catalog = {"customers": tuple(CUSTOMERS)}
+    assert _final_mask(_on(demo_policy, "postgres"), sql, columns, catalog=catalog) == masked
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT v.*, upper(c.ssn), c.full_name FROM (VALUES (1, 2)) AS v(a, b), customers c",
+        "SELECT u.x, upper(c.ssn), c.full_name FROM unnest(ARRAY[1]) WITH ORDINALITY AS u(x), customers c",
+        "SELECT u.*, upper(c.ssn), c.* FROM unnest(ARRAY[1, 2]) AS u(x), customers c",
+    ],
+)
+def test_m1_values_and_unnest_beside_a_masked_table_are_refused(demo_policy: Any, sql: str) -> None:
+    """Their widths were traced (owner decision, 2026-10-03: refused)."""
+    reason = _refusal(_on(demo_policy, "postgres"), sql, {"customers": tuple(CUSTOMERS)})
+    assert reason in ("VALUES", "UNNEST"), reason
 
 
 @pytest.mark.parametrize(
@@ -255,16 +280,7 @@ def test_m1_live_postgres(tmp_path: Path, sql: str) -> None:
 
     server = _pg_live(tmp_path)
     _conn, callsigns = _callsigns(tmp_path)
-    env = _call(server, "db_query", {"connection_id": "pg", "sql": sql})
-    assert env["data"]["rows"], env
-    _no_secret(env["data"], callsigns)
-
-
-def test_m1_unnest_of_scalar_array_literals_keeps_exact_positions(demo_policy: Any) -> None:
-    sql = "SELECT u.*, upper(c.ssn), c.* FROM unnest(ARRAY[1, 2]) AS u(x), customers c"
-    assert _final_mask(_on(demo_policy, "postgres"), sql, ["x", "upper", *CUSTOMERS]) == {1, 5}
-    sql = "SELECT u.*, upper(c.ssn), c.* FROM unnest(ARRAY[1], ARRAY['a']) AS u(x, y), customers c"
-    assert _final_mask(_on(demo_policy, "postgres"), sql, ["x", "y", "upper", *CUSTOMERS]) == {2, 6}
+    _masked_or_refused(server, "pg", sql, callsigns)
 
 
 # --------------------------- S3: MySQL never escapes inside a backtick name
@@ -352,13 +368,12 @@ CREATE VIEW v_plain AS SELECT full_name FROM customers WHERE ssn IS NOT NULL;
 def test_r6_a_double_quoted_password_literal_equal_to_another_tables_name_is_withheld(tmp_path: Path) -> None:
     server, _app = _sqlite_views(tmp_path, _R6_DDL)
     defs = _view_defs(server)
-    for name in ("v_guest", "v_admin", "v_outer"):
+    # a double-quoted word that is no column of a table the view reads is a
+    # literal - a quoted table name or alias too (review 3, #7: fail closed)
+    for name in ("v_guest", "v_admin", "v_outer", "v_named", "v_alias"):
         assert defs[name] is None, (name, defs[name])
         assert _get_def(server, name) is None, name
-    # names in scope stay names: the definitions are shown, by both tools
-    for name in ("v_named", "v_alias", "v_plain"):
-        assert defs[name] is not None, (name, defs)
-        assert _get_def(server, name) == defs[name], name
+    assert defs["v_plain"] is not None and _get_def(server, "v_plain") == defs["v_plain"]
     # 'password' <> '' beside the sensitive name is a literal either way
     assert defs["v_corr"] is None and _get_def(server, "v_corr") is None
 
@@ -384,7 +399,7 @@ def test_r6_db_list_views_never_lists_every_column_of_the_schema(tmp_path: Path)
         defs = _view_defs(server)
     finally:
         mp.undo()
-    assert defs["v_named"] is not None
+    assert defs["v_plain"] is not None
     # one listing per distinct table the quoted definitions read
     assert len(calls) == len(set(calls)) <= 4, calls
 
@@ -415,6 +430,7 @@ def test_m2_a_correlated_qualifier_never_binds_to_an_unused_cte(demo_policy: Any
 @pytest.mark.parametrize(
     ("engine", "sql"),
     [
+        # a subquery's value counts every column its own clauses read
         ("postgres", "WITH w AS (SELECT ssn AS k FROM customers) SELECT (SELECT 1 FROM w x WHERE x.k IS NULL) AS out "
                      "FROM customers c"),
         ("postgres", "WITH w AS (SELECT full_name AS k FROM customers) SELECT w.k AS out FROM w"),
@@ -443,9 +459,7 @@ def test_m2_a_cte_in_a_from_still_binds(demo_policy: Any, engine: str, sql: str)
 )
 def test_p2_aliases_sqlite_renames_end_to_end(tmp_path: Path, sql: str) -> None:
     server, _app = _server(tmp_path)
-    env = _call(server, "db_query", {"connection_id": "shop", "sql": sql})
-    assert env["data"]["rows"], env
-    _no_secret(env["data"])
+    assert _masked_or_refused(server, "shop", sql), "an alias SQLite renames in a subquery is refused"
 
 
 def test_p2_ordinary_sqlite_aliases_stay_exact(demo_policy: Any) -> None:
@@ -653,10 +667,11 @@ def test_readable_filter_of_a_long_listing_runs_off_the_event_loop(demo_policy: 
 def test_a_postgres_alias_cut_to_63_bytes_keeps_the_layout(demo_policy: Any) -> None:
     alias = "a" * 70
     sql = f"SELECT c.*, 1 AS {alias} FROM customers c"
-    masked = _final_mask(_on(demo_policy, "postgres"), sql, [*CUSTOMERS, "a" * 63])
+    catalog = {"customers": tuple(CUSTOMERS)}
+    masked = _final_mask(_on(demo_policy, "postgres"), sql, [*CUSTOMERS, "a" * 63], catalog=catalog)
     assert masked == {3}, masked
-    # a name that is not the alias, cut or not, still fails closed
-    masked = _final_mask(_on(demo_policy, "postgres"), sql, [*CUSTOMERS, "b" * 63])
+    # a name that is not the alias, cut or not, is refused (counted as all masked)
+    masked = _final_mask(_on(demo_policy, "postgres"), sql, [*CUSTOMERS, "b" * 63], catalog=catalog)
     assert masked == set(range(7)), masked
 
 

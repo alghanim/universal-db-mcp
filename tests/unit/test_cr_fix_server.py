@@ -89,15 +89,112 @@ def _no_secret(payload: Any, secrets: tuple[str, ...] = SECRETS) -> None:
         assert secret not in text, (secret, text[:800])
 
 
-def _final_mask(policy: Any, sql: str, columns: list[str], table_columns: Any = None) -> set[int]:
+# The catalog the masking analysis reads base tables' columns from, in
+# these tests: a table not named here has columns the catalog does not list.
+TEST_CATALOG: dict[str, tuple[str, ...]] = {
+    "customers": ("customer_id", "full_name", "email", "ssn"),
+}
+
+
+def _proof(
+    policy: Any, ast: Any, known: Any = None, catalog: dict[str, tuple[str, ...]] | None = None
+) -> list[Any] | str | None:
+    """What masking proves of a validated statement before it runs: its
+    output columns, None where it reads no table with a masked column (the
+    output names decide), or the refusal's reason. ``known`` gives a base
+    table's columns by the id of its FROM item; ``catalog`` by name (default
+    TEST_CATALOG)."""
+    names = TEST_CATALOG if catalog is None else catalog
+    targets = srv._cte_targets(policy.engine, ast)
+    columns: dict[int, tuple[str, ...]] = {}
+    for table in targets[2]:
+        if known is not None and id(table) in known:
+            columns[id(table)] = tuple(known[id(table)])
+        elif table.name.lower() in names:
+            columns[id(table)] = names[table.name.lower()]
+    if not policy.sensitive_patterns or not srv._touches_masked(policy, ast, targets[2], columns):
+        return None
+    try:
+        return srv._MaskProof(policy.sensitive_patterns, ast, policy.engine, columns, targets).output()
+    except srv._Refused as exc:
+        return str(exc)
+
+
+def _positions(
+    policy: Any, ast: Any, columns: list[tuple[str, str]], warnings: Any = None, known: Any = None,
+    catalog: dict[str, tuple[str, ...]] | None = None,
+) -> set[int]:
+    """The positions db_query masks among the driver's ``columns``; a
+    statement it refuses (before it runs, or for the layout it reports)
+    returns nothing at all, counted here as every column masked."""
+    plan = _proof(policy, ast, known, catalog)
+    if isinstance(plan, str):
+        return set(range(len(columns)))
+    if plan is None:
+        return set()
+    try:
+        return srv._laid_out(plan, columns)
+    except ToolFailure:
+        return set(range(len(columns)))
+
+
+def _width_positions(
+    policy: Any, ast: Any, width: int, catalog: dict[str, tuple[str, ...]] | None = None
+) -> set[int] | None:
+    """The tainted positions of a ``width``-column result, None where the
+    statement is refused or reports another width (no name checks)."""
+    plan = _proof(policy, ast, None, catalog)
+    if isinstance(plan, str):
+        return None
+    if plan is None:
+        return set()
+    return {i for i, c in enumerate(plan) if c.tainted} if len(plan) == width else None
+
+
+def _width_mask(
+    policy: Any, ast: Any, width: int, known: Any = None, catalog: dict[str, tuple[str, ...]] | None = None
+) -> set[int]:
+    """The tainted positions of a ``width``-column result whose names the
+    driver reports as expected; every position where the statement is
+    refused or reports another width (nothing is returned then)."""
+    plan = _proof(policy, ast, known, catalog)
+    if isinstance(plan, str) or (plan is not None and len(plan) != width):
+        return set(range(width))
+    return set() if plan is None else {i for i, c in enumerate(plan) if c.tainted}
+
+
+def _final_mask(
+    policy: Any, sql: str, columns: list[str], table_columns: Any = None,
+    catalog: dict[str, tuple[str, ...]] | None = None,
+) -> set[int]:
     """The columns db_query masks for ``sql`` on ``policy``'s engine, given
-    the names the driver reported: the traced positions plus the name
-    heuristics, exactly as the tool combines them."""
+    the names the driver reported: the proven positions plus the name
+    heuristics, exactly as the tool combines them; every column where the
+    statement is refused (nothing is returned)."""
     ast = sqlglot.parse_one(sql, read=sqlglot_dialect(policy.engine))
     cols = [(c, "t") for c in columns]
-    positions = srv._query_mask_positions(policy, ast, cols, [], table_columns)
-    names = srv._sensitive_output_names(policy, ast)
-    return srv._mask_columns(policy, cols, names, positions)
+    positions = _positions(policy, ast, cols, None, table_columns, catalog)
+    return srv._mask_columns(policy, cols, positions)
+
+
+def _masked_or_refused(server: Any, connection: str, sql: str, secrets: tuple[str, ...] = SECRETS) -> str | None:
+    """Run ``sql`` through db_query: the rows it returns hold no secret, or
+    masking refused it before it ran (its reason returned)."""
+    try:
+        env = _call(server, "db_query", {"connection_id": connection, "sql": sql})
+    except Exception as exc:  # noqa: BLE001 - the refusal's text is what is asserted
+        text = str(exc)
+        assert "cannot be checked for them" in text or "masking cannot place them" in text, text
+        return text
+    assert env["data"]["rows"], env
+    _no_secret(env["data"], secrets)
+    return None
+
+
+def _refusal(policy: Any, sql: str, catalog: dict[str, tuple[str, ...]] | None = None) -> str | None:
+    """The reason masking refuses ``sql``, or None where it does not."""
+    plan = _proof(policy, sqlglot.parse_one(sql, read=sqlglot_dialect(policy.engine)), None, catalog)
+    return plan if isinstance(plan, str) else None
 
 
 def _on(policy: Any, engine: str) -> Any:
@@ -196,50 +293,32 @@ def test_m3_a_row_function_over_a_star_mixing_a_table_with_another_run(demo_poli
     sql = "SELECT x.row_text FROM (SELECT * FROM customers, unnest(ARRAY[1]) u) x"
     ast = sqlglot.parse_one(sql, read="postgres")
     known = {id(t): frozenset(CUSTOMERS) for t in ast.find_all(sqlglot.exp.Table) if t.name == "customers"}
-    positions = srv._query_mask_positions(policy, ast, [("row_text", "t")], [], known)
+    positions = _positions(policy, ast, [("row_text", "t")], [], known)
     assert positions == {0}
 
 
-def test_r5_a_decoy_cte_whose_name_postgres_folds_away_leaves_the_table_a_table(
-    demo_policy: Any, tmp_path: Path
-) -> None:
+def test_r5_a_decoy_cte_whose_name_postgres_folds_away_leaves_the_table_a_table(demo_policy: Any) -> None:
     """WITH "CUSTOMERS" ... FROM CUSTOMERS x reads the table customers (the
-    unquoted name folds): its catalog columns are looked up, so x.row_text is
-    known to be no column of it - a function of the whole row."""
+    unquoted name folds). A FROM item spelled like a CTE in another case is
+    refused, not modelled (owner decision, 2026-10-03; was: traced as the
+    table)."""
     policy = _on(demo_policy, "postgres")
     sql = 'WITH "CUSTOMERS" AS (SELECT 1 AS k) SELECT x.row_text FROM CUSTOMERS x'
-    ast = sqlglot.parse_one(sql, read="postgres")
-
-    class _App:
-        row_columns: dict[Any, Any] = {}
-
-        async def tables_for(self, _policy: Any, _connector: Any) -> list[Any]:
-            return [type("T", (), {"schema": "public", "name": "customers"})()]
-
-    async def fake_meta(_app: Any, _cid: str, _fn: Any) -> list[Any]:
-        return [ColumnInfo(name=n, data_type="text", nullable=True) for n in CUSTOMERS]
-
-    original = srv.run_meta
-    srv.run_meta = fake_meta  # type: ignore[assignment]
-    try:
-        warnings: list[str] = []
-        known = asyncio.run(srv._row_function_columns(_App(), None, policy, ast, warnings))  # type: ignore[arg-type]
-    finally:
-        srv.run_meta = original  # type: ignore[assignment]
-    assert known, "the folded FROM item names the table: its columns are read"
-    assert srv._query_mask_positions(policy, ast, [("row_text", "t")], [], known) == {0}
+    reason = _refusal(policy, sql, {"customers": tuple(CUSTOMERS)})
+    assert reason is not None and "spelled otherwise" in reason, reason
 
 
 def test_r4_postgres_folds_only_ascii_letters(demo_policy: Any) -> None:
     """PostgreSQL (UTF-8) folds an unquoted name's ASCII letters only: Ä
     stays Ä, so a column named "Äb" is the unquoted Äb, and a column "äb"
-    is not - x.Äb over a table listing only äb is a function of the row."""
-    assert srv._pg_identifier(sqlglot.exp.Identifier(this="ÄB", quoted=False)) == "Äb"
+    is not - x.Äb over a table listing only äb is a function of the row
+    (refused: no column of that spelling)."""
+    assert srv._col_key("postgres", "ÄB", False) == "Äb"
     policy = _on(demo_policy, "postgres")
     sql = "SELECT x.ÄB FROM customers x"
     ast = sqlglot.parse_one(sql, read="postgres")
     known = {id(t): frozenset([*CUSTOMERS, "äb"]) for t in ast.find_all(sqlglot.exp.Table)}
-    assert srv._query_mask_positions(policy, ast, [("äb", "t")], [], known) == {0}
+    assert _positions(policy, ast, [("äb", "t")], [], known) == {0}
 
 
 # ------------------------------------------------------ P1: PIVOT / UNPIVOT
@@ -277,10 +356,10 @@ def test_p1_a_column_qualified_by_a_pivot_alias_is_never_traced_clean(
     ],
 )
 def test_p2_sqlite_engine_made_names_end_to_end(tmp_path: Path, sql: str) -> None:
+    """Names SQLite makes up for a subquery's columns are refused (owner
+    decision, 2026-10-03): never a leak."""
     server, _app = _server(tmp_path)
-    env = _call(server, "db_query", {"connection_id": "shop", "sql": sql})
-    assert env["data"]["rows"], env
-    _no_secret(env["data"])
+    _masked_or_refused(server, "shop", sql)
 
 
 def test_p2_plain_derived_table_names_stay_readable(tmp_path: Path) -> None:
@@ -403,9 +482,7 @@ def _callsigns(tmp_path: Path) -> tuple[Any, tuple[str, ...]]:
 def test_live_postgres_masking(tmp_path: Path, sql: str) -> None:
     server = _pg_live(tmp_path)
     _conn, callsigns = _callsigns(tmp_path)
-    env = _call(server, "db_query", {"connection_id": "pg", "sql": sql})
-    assert env["data"]["rows"], env
-    _no_secret(env["data"], callsigns)
+    _masked_or_refused(server, "pg", sql, callsigns)
 
 
 # ----------------------------------- S3 / R6: DDL literals beside a name
@@ -473,9 +550,14 @@ def test_s3_sqlite_table_ddl_with_an_apostrophe_in_a_name_end_to_end(tmp_path: P
 
 
 def test_r6_a_sqlite_view_naming_columns_in_double_quotes_is_not_withheld(tmp_path: Path) -> None:
+    """A double-quoted word that is exactly a column of a table the view
+    reads stays a name; any other (a table's quoted name too) counts as a
+    literal (review 3, #7: the view of a benign, fully quoted view may be
+    withheld - fail closed)."""
     server, _app = _server(tmp_path)
     c = sqlite3.connect(tmp_path / "shop.db")
-    c.execute('CREATE VIEW v_named AS SELECT "full_name" FROM "customers" WHERE ssn IS NOT NULL')
+    c.execute('CREATE VIEW v_named AS SELECT "full_name" FROM customers WHERE ssn IS NOT NULL')
+    c.execute('CREATE VIEW v_quoted_table AS SELECT "full_name" FROM "customers" WHERE ssn IS NOT NULL')
     # a double-quoted word that names no column is a string to SQLite: a value
     c.execute('CREATE VIEW v_value AS SELECT full_name FROM customers WHERE ssn <> "999-90-1111"')
     c.commit()
@@ -483,6 +565,7 @@ def test_r6_a_sqlite_view_naming_columns_in_double_quotes_is_not_withheld(tmp_pa
     env = _call(server, "db_list_views", {"connection_id": "shop"})
     views = {v["name"]: v["definition"] for v in env["data"]["views"]}
     assert views["v_named"] is not None and '"full_name"' in views["v_named"], env
+    assert views["v_quoted_table"] is None, env
     assert views["v_value"] is None, env
     _no_secret(env)
 
@@ -627,9 +710,13 @@ def test_s2_an_empty_quoted_qualifier_end_to_end(tmp_path: Path) -> None:
     [
         'WITH "é" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM é',
         'WITH "зарплаты" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM зарплаты',
+        'WITH "É" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM é',
     ],
 )
-def test_m4_oracle_folds_a_non_ascii_name_by_unicode_rules(demo_policy: Any, sql: str) -> None:
+def test_m4_oracle_refuses_a_non_ascii_cte_name(demo_policy: Any, sql: str) -> None:
+    """On Oracle, Db2 and PostgreSQL the guard refuses a CTE name outside
+    ASCII instead of modelling each engine's case folding (owner decision,
+    2026-10-03)."""
     from types import SimpleNamespace
 
     from universal_db_mcp.security.sql_guard import SqlGuard
@@ -638,41 +725,15 @@ def test_m4_oracle_folds_a_non_ascii_name_by_unicode_rules(demo_policy: Any, sql
     listed = srv._LiveResolver([SimpleNamespace(schema="HR", name="EMPLOYEES", kind="table")])
     with pytest.raises(ToolFailure):
         srv._validate_in_scope(SqlGuard("oracle", policy, listed), "oracle", lambda g: g.validate_select(sql))
-    # a CTE the name binds to under every reading is still one
-    ok = 'WITH "É" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM é'
-    srv._validate_in_scope(SqlGuard("oracle", policy, listed), "oracle", lambda g: g.validate_select(ok))
 
 
-def test_m4_folding_is_one_character_for_one(demo_policy: Any) -> None:
-    """Oracle folds é to É and keeps ß (no SS expansion); PostgreSQL and Db2
-    bind a name to a CTE only where the ASCII and the Unicode readings agree."""
-    assert srv._folded_name("oracle", sqlglot.exp.Identifier(this="straße_é", quoted=False)) == "STRAßE_É"
+def test_m4_folding_is_ascii_only(demo_policy: Any) -> None:
+    """The server folds ASCII letters only, as the guard does: a name it
+    would fold otherwise outside ASCII never reaches it on Oracle, Db2 or
+    PostgreSQL."""
+    assert srv._folded_name("oracle", sqlglot.exp.Identifier(this="straße_é", quoted=False)) == "STRAßE_é"
     assert srv._folded_name("oracle", sqlglot.exp.Identifier(this="é", quoted=True)) == "é"
-    for engine, sql in (
-        ("oracle", 'WITH "STRAßE" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM straße'),
-        ("postgres", "WITH straße AS (SELECT 1 AS x) SELECT * FROM straße"),
-        ("db2", "WITH é AS (SELECT 1 AS x FROM SYSIBM.SYSDUMMY1) SELECT * FROM é"),
-    ):
-        ast = sqlglot.parse_one(sql, read=sqlglot_dialect(engine))
-        assert srv._cte_hidden_tables(engine, ast) == [], (engine, sql)
-    for engine, sql in (
-        ("postgres", 'WITH "é" AS (SELECT 1 AS x) SELECT * FROM É'),
-        ("db2", 'WITH "é" AS (SELECT 1 AS x FROM SYSIBM.SYSDUMMY1) SELECT * FROM é'),
-        ("oracle", 'WITH "é" AS (SELECT 1 AS x FROM DUAL) SELECT * FROM é'),
-    ):
-        ast = sqlglot.parse_one(sql, read=sqlglot_dialect(engine))
-        assert [t.name for t in srv._cte_hidden_tables(engine, ast)], (engine, sql)
-
-
-def test_m4_the_taint_walk_does_not_trace_a_binding_the_readings_disagree_on(demo_policy: Any) -> None:
-    """Db2 may fold é to É or keep it: the walk cannot tell the CTE from the
-    table, so nothing of the result is traced as clean."""
-    policy = _on(demo_policy, "db2")
-    sql = 'WITH "é" AS (SELECT 1 AS x FROM SYSIBM.SYSDUMMY1) SELECT * FROM é'
-    assert srv._output_items(policy, sqlglot.parse_one(sql, read="postgres")) is None
-    # PostgreSQL keeps É on UTF-8 (a table) and folds it to é on LATIN1 (the CTE)
-    sql = 'WITH "é" AS (SELECT 1 AS x) SELECT * FROM É'
-    assert srv._output_items(_on(demo_policy, "postgres"), sqlglot.parse_one(sql, read="postgres")) is None
+    assert srv._folded_name("postgres", sqlglot.exp.Identifier(this="ÄB", quoted=False)) == "Äb"
 
 
 # ------------------------------------------- X6: the federated join's keys

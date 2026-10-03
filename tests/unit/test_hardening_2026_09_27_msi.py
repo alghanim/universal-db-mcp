@@ -173,7 +173,7 @@ def test_f15_service_adopts_an_existing_token_only_when_owner_and_acl_are_safe()
 
     body = _main_body(code)
     adopt = body.index("$needToken = $false")
-    decision = body[body.index("if ($null -ne $tokenAttributes) {\n        $problem = ") : adopt]
+    decision = body[body.index("if ($null -ne $tokenAttributes) {\n        $judgedSids = ") : adopt]
     assert "Get-TokenProblem -Path $tokenFile" in decision
     assert "Remove-Item -LiteralPath $tokenFile" in decision, "an untrusted token is replaced, not kept"
     # The old keep-if-non-empty shortcut is gone.
@@ -198,7 +198,11 @@ def test_f15_service_regenerates_a_token_any_other_account_can_read() -> None:
     assert "$tokenSids = @($script:SidSystem, $script:SidAdmins)" in body
     grant = body.index("$tokenSids += $serviceSid")
     assert body.index("$serviceSid = Get-ServiceAccountSid -Account $ServiceAccount") < grant
-    assert "Get-TokenProblem -Path $tokenFile -AllowedSids $tokenSids" in body
+    # judged allowing the account the service is registered under too, when
+    # another one is named (a token it reads is then kept aside, not kept)
+    assert "$problem = Get-TokenProblem -Path $tokenFile -AllowedSids $judgedSids" in body
+    assert "$judgedSids = $tokenSids\n" in body and "if ($previousSid) { $judgedSids += $previousSid }" in body
+    assert "elseif ($previousSid -and (Get-AclProblem -Path $tokenFile -AllowedSids $tokenSids)) {" in body
     assert "Get-AclProblem -Path $Path -AllowedSids $AllowedSids" in _function(code, "Get-TokenProblem")
     assert body.count("Set-ProtectedAcl -Path $tokenFile -Grants $tokenGrants -AllowedSids $tokenSids") == 2
     assert "Get-AclProblem -Path $Path -AllowedSids $AllowedSids" in _function(code, "Set-ProtectedAcl")
@@ -525,7 +529,9 @@ def test_f94_custom_actions_apply_the_same_owned_protected_directory_sddl() -> N
     for path in (VERIFY_PS1, DOCTOR_PS1, SERVICE_PS1):
         code = _code(path)
         assert f"$script:ProtectedDirSddl = '{PROTECTED_DIR_SDDL}'" in code, path.name
-        assert "SetSecurityDescriptorSddlForm($script:ProtectedDirSddl)" in code, path.name
+        # service.ps1 (and doctor.ps1 for logs\) append the ACE that keeps the
+        # registered service account's access (Get-KeptAccessSddl)
+        assert re.search(r"SetSecurityDescriptorSddlForm\(\$script:ProtectedDirSddl[ )+]", code), path.name
         assert f"$script:SidSystem = '{SID_SYSTEM}'" in code and f"$script:SidAdmins = '{SID_ADMINS}'" in code
 
 
@@ -675,15 +681,23 @@ def main(cmd, path, *args):
         return 0
     if cmd == "forget":
         state.pop(path, None)
+    elif cmd == "move":
+        # an entry, and everything below it, keeps its ACL when it moves
+        for key in list(state):
+            if key == path or key.startswith(path + "/"):
+                state[args[0] + key[len(path):]] = state.pop(key)
     elif cmd == "setacl":
         log("Set-Acl " + path + " " + args[0])
-        m = re.fullmatch(r"(?:O:(\w\w))?D:PAI((?:\(A;OICI;FA;;;\w\w\))+)", args[0])
+        m = re.fullmatch(r"(?:O:(\w\w))?D:PAI((?:\(A;OICI;(?:FA|0x1200a9|0x1301bf);;;[\w-]+\))+)", args[0])
         if not m:
             raise SystemExit("Set-Acl stub: unsupported SDDL " + args[0])
         if m.group(1):
             entry["owner"] = ALIASES[m.group(1)]
         entry["protected"] = True
-        entry["rules"] = [[ALIASES[a], "Allow", "FullControl", False] for a in re.findall(r";;;(\w\w)\)", m.group(2))]
+        # FA, and the grants icacls writes as (OI)(CI)RX and (OI)(CI)M
+        masks = {"FA": "FullControl", "0x1200a9": "(OI)(CI)RX", "0x1301bf": "(OI)(CI)M"}
+        entry["rules"] = [[ALIASES.get(sid, sid), "Allow", masks[mask], False]
+                          for mask, sid in re.findall(r";([\w]+);;;([\w-]+)\)", m.group(2))]
         state[path] = entry
         # As on Windows, the inherited ACEs of every described entry below
         # are recomputed from the new DACL, unless it (or a folder between)
@@ -721,6 +735,10 @@ def main(cmd, path, *args):
                 entry["protected"] = True
                 entry["rules"] = [r for r in entry["rules"] if not r[3]]
                 i += 1
+            elif args[i] == "/remove:g":
+                sid = args[i + 1].lstrip("*")
+                entry["rules"] = [r for r in entry["rules"] if not (r[0] == sid and r[1] == "Allow" and not r[3])]
+                i += 2
             elif args[i] in ("/grant:r", "/grant"):
                 replace = args[i] == "/grant:r"
                 i += 1
@@ -827,6 +845,20 @@ function global:Remove-Item {
     }
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Force:$Force -Recurse:$Recurse
     foreach ($path in $LiteralPath) { Invoke-AclStub forget $path }
+}
+
+function global:Move-Item {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$LiteralPath, [Parameter(Mandatory = $true)][string]$Destination)
+    # H_BUSY=<path>: a process runs from that folder, which Windows then
+    # refuses to move
+    if ($env:H_BUSY -and $LiteralPath -eq $env:H_BUSY) {
+        throw [System.IO.IOException]::new(
+            "The process cannot access the file '" + $LiteralPath + "' because it is being used by another process.")
+    }
+    Add-Content -LiteralPath $env:H_CALLS -Value ('Move-Item ' + $LiteralPath + ' -> ' + $Destination)
+    Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination
+    Invoke-AclStub move $LiteralPath $Destination
 }
 
 if ($env:H_ADMIN_MEMBERS) {
@@ -2140,7 +2172,8 @@ def test_r1_walks_judge_an_entrys_own_aces_too() -> None:
         code = _code(path)
         assert "$script:WriteRights = " in code, path.name
         problem = _function(code, "Get-WriteProblem")
-        assert "[string]$WriterSid = $OwnerSid" in problem, path.name
+        assert "[string[]]$WriterSid = $OwnerSid" in problem, path.name
+        assert "($WriterSid -contains $sid)" in problem, path.name
         assert "$rule.IsInherited" in problem and "$script:WriteRights" in problem, path.name
         walk = _function(code, "Get-TreeProblem")
         assert "Get-WriteProblem -Path $entry.FullName -OwnerSid $OwnerSid -WriterSid $below" in walk, path.name
@@ -2652,7 +2685,7 @@ def test_w2_i60_doctor_and_service_share_one_token_rule() -> None:
     rule = _function(service, "Get-TokenProblem")
     owner = rule.index("Get-WriteProblem -Path $Path")
     assert owner < rule.index("Get-AclProblem -Path $Path -AllowedSids $AllowedSids") < rule.index("'is empty'")
-    assert "$problem = Get-TokenProblem -Path $tokenFile -AllowedSids $tokenSids" in _main_body(service)
+    assert "$problem = Get-TokenProblem -Path $tokenFile -AllowedSids $judgedSids" in _main_body(service)
     body = _main_body(doctor)
     # after every refusal, before the first payload run; never an owner change
     walk = body.index("$found = Get-TreeProblem -Directory $configDir")
@@ -3400,14 +3433,18 @@ def test_exec_fu2_an_account_change_nobody_asked_for_is_refused_before_anything_
 @pytest.mark.parametrize("script", ["doctor", "service"])
 def test_exec_fu2_an_account_named_again_still_changes_it(host: _Host, script: str) -> None:
     # An administrator who passes UDBMCP_SERVICE_ACCOUNT (or sets it
-    # machine-wide) changes the account as before: the earlier grant goes.
+    # machine-wide) changes the account as before: the earlier grant goes,
+    # in RegisterServiceCA (here the service is gone, so there is nothing to
+    # switch first). DoctorSmokeCA leaves the account the service is
+    # registered under its grant (cr3 A8-1): it has no rollback twin.
     _installed_as_network_service(host)
     logs = host.cfgdir / "logs"
     run = host.doctor if script == "doctor" else host.service
     code, out, calls = run(None, account="", registered=NETWORK_SERVICE, UDBMCP_SERVICE_ACCOUNT="LocalSystem")
     assert code == 0, out
     assert "keeping" not in out
-    assert all(rule[0] != SID_NETWORK_SERVICE for rule in host.acl(logs)["rules"])
+    granted = [rule for rule in host.acl(logs)["rules"] if rule[0] == SID_NETWORK_SERVICE]
+    assert granted == ([[SID_NETWORK_SERVICE, "Allow", "(OI)(CI)M", False]] if script == "doctor" else []), granted
 
 
 @executed
