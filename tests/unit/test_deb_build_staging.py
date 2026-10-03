@@ -53,6 +53,7 @@ import time
 from pathlib import Path
 
 import pytest
+from helpers_procs import tie
 
 _POSIX = pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell/fcntl semantics; run on linux/macos")
 
@@ -229,10 +230,12 @@ class _LockHolder:
         self.proc = subprocess.Popen(  # noqa: S603 - fixed args, local helper
             [sys.executable, str(holder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
+        self._watchdog = tie(self.proc)  # it loops until released: a killed run must not strand it
 
     def release(self) -> None:
         self.marker.write_text("go\n", encoding="utf-8")
         self.proc.wait(timeout=30)
+        self._watchdog.release()
 
 
 def _run_lib_install(tmp_path: Path, bundle: Path, env_extra: dict[str, str]) -> subprocess.CompletedProcess[str]:

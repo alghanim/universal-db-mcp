@@ -66,6 +66,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from helpers_procs import tie
 
 _POSIX = pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics; run on linux/macos")
 
@@ -431,6 +432,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
     holder_proc = subprocess.Popen(  # noqa: S603 - fixed args, local helper
         [sys.executable, str(holder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+    watchdog = tie(holder_proc)  # it loops until release-dpkg exists: a killed run must not strand it
     try:
         script = _deferred_sandbox_postinst(tmp_path)
         env = dict(os.environ)
@@ -463,6 +465,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
     finally:
         (tmp_path / "release-dpkg").write_text("done\n")
         holder_proc.wait(timeout=30)
+        watchdog.release()
 
     # Worker installed unit + config only after the (stub) installer succeeded.
     assert (tmp_path / "unit_dst").read_text() == "[Unit]\nDescription=u\n"

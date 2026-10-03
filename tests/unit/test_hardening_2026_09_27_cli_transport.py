@@ -101,6 +101,7 @@ from typing import Any
 
 import pytest
 import yaml
+from helpers_procs import tie
 
 from universal_db_mcp import config as config_module
 from universal_db_mcp import wizard
@@ -306,6 +307,7 @@ def listener(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Listener]:
             cwd=work,
             preexec_fn=_limit_fds,  # noqa: PLW1509 - single-threaded test process
         )
+    watchdog = tie(proc)  # a killed test run must not leave the listener running for days
     try:
         deadline = time.monotonic() + 30
         while True:
@@ -327,6 +329,7 @@ def listener(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Listener]:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=10)
+        watchdog.release()
 
 
 # --------------------------------------------------------------------------
