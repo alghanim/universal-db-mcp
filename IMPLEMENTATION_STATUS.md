@@ -1700,6 +1700,10 @@ this Mac; they pass in the Linux image), the integration tests that need
 
 ```bash
 .venv/bin/python -m pytest -o addopts='' -q tests   # the whole suite (§3f records the latest count)
+UDBMCP_LIVE_FIXTURES=1 UDBMCP_DOCKER_TESTS=1 .venv/bin/python -m pytest -o addopts='' -q tests
+    # also the tests against the loopback mock databases (scripts/fixtures/start_mock_dbs.sh;
+    # opt-in, so the package gates' unit run never waits on a paused or absent fixture)
+    # and the real-dpkg container sequences
 .venv/bin/python -m mypy --strict src && .venv/bin/ruff check src tests scripts   # what CI runs
 bash scripts/test_airgap.sh              # Gates A + B (docker, --network none)
 bash scripts/test_airgap_failures.sh     # Gate A negative cases (real exit codes)

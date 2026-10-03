@@ -42,8 +42,9 @@ _STATUS = "/var/log/universal-db-mcp-install.status"
 _VENV_PYTHON = "/opt/universal-db-mcp/venv/bin/python"
 
 # flock(1) as these scripts use it ('flock -n <fd>'): macOS has none.
-_FLOCK_SHIM = """#!/usr/bin/env python3
-import fcntl, sys
+# Started by the interpreter running the tests: PATH below holds only the shims, /usr/bin and /bin,
+# where a Linux image with Python in /usr/local/bin has no python3.
+_FLOCK_SHIM = """import fcntl, sys
 args = [a for a in sys.argv[1:] if a != "-n"]
 try:
     fcntl.flock(int(args[0]), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -62,7 +63,7 @@ time.sleep(120)
 def _shims(tmp_path: Path) -> dict[str, str]:
     shims = tmp_path / "shims"
     shims.mkdir(exist_ok=True)
-    (shims / "flock").write_text(_FLOCK_SHIM, encoding="utf-8")
+    (shims / "flock").write_text(f"#!{sys.executable}\n" + _FLOCK_SHIM, encoding="utf-8")
     (shims / "systemctl").write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path}/systemctl.log"\nexit 0\n', encoding="utf-8")
     (shims / "setsid").write_text(f'#!/bin/sh\necho "setsid $*" >> "{tmp_path}/setsid.log"\nexit 0\n', encoding="utf-8")
     for shim in shims.iterdir():

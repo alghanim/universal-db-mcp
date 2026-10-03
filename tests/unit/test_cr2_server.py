@@ -502,6 +502,8 @@ def _live_three(tmp_path: Path) -> Any:
     from universal_db_mcp.server import AppContext, build_server
 
     secrets = REPO / "out" / "mockdb-secrets"
+    if os.environ.get("UDBMCP_LIVE_FIXTURES") != "1":
+        pytest.skip("live fixture tests are opt-in: set UDBMCP_LIVE_FIXTURES=1 with the loopback fixtures running")
     for port in (5433, 3307, 8124):
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=1):

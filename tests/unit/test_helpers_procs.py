@@ -37,8 +37,15 @@ def _alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    proc = Path(f"/proc/{pid}/stat")
+    if proc.parent.parent.joinpath("self").is_dir():  # Linux: no ps in a slim image
+        try:
+            stat = proc.read_text()
+        except FileNotFoundError:
+            return False
+        return stat[stat.rindex(")") + 2] != "Z"  # a zombie is gone in all but name
     out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)  # noqa: S603, S607
-    return "Z" not in out.stdout  # a zombie is gone in all but name
+    return "Z" not in out.stdout
 
 
 def _until(predicate, timeout: float = 15.0) -> bool:  # type: ignore[no-untyped-def]

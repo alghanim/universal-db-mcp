@@ -426,6 +426,8 @@ def test_p4_search_and_cycle_columns_are_masked(demo_policy: Any, sql: str, colu
 
 def _pg_live(tmp_path: Path) -> Any:
     secret = REPO / "out" / "mockdb-secrets" / "pg.pw"
+    if os.environ.get("UDBMCP_LIVE_FIXTURES") != "1":
+        pytest.skip("live fixture tests are opt-in: set UDBMCP_LIVE_FIXTURES=1 with the loopback fixtures running")
     try:
         with socket.create_connection(("127.0.0.1", 5433), timeout=1):
             pass

@@ -111,6 +111,8 @@ def test_oracle_binds_a_parameter_name_ignoring_case() -> None:
 
 def _oracle_live(tmp_path: Path) -> Any:
     secret = REPO / "out" / "mockdb-secrets" / "oracle.pw"
+    if os.environ.get("UDBMCP_LIVE_FIXTURES") != "1":
+        pytest.skip("live fixture tests are opt-in: set UDBMCP_LIVE_FIXTURES=1 with the loopback fixtures running")
     try:
         with socket.create_connection(("127.0.0.1", 1522), timeout=1):
             pass
@@ -350,6 +352,8 @@ MYSQL_CORPUS: list[tuple[str, set[int]]] = [
 
 
 def _fixture(port: int, secret_name: str) -> Path:
+    if os.environ.get("UDBMCP_LIVE_FIXTURES") != "1":
+        pytest.skip("live fixture tests are opt-in: set UDBMCP_LIVE_FIXTURES=1 with the loopback fixtures running")
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=1):
             pass

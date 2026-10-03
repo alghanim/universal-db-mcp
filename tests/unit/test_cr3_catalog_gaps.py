@@ -296,6 +296,8 @@ def test_a_materialized_view_whose_columns_are_listed_is_masked_not_refused(
 
 
 def _reachable(port: int) -> bool:
+    if os.environ.get("UDBMCP_LIVE_FIXTURES") != "1":
+        return False  # opt-in: the tests that ask skip (UDBMCP_LIVE_FIXTURES=1 runs them)
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=1):
             return True
@@ -323,7 +325,9 @@ def _live_server(tmp_path: Path, engine: str, port: int, database: str, user_env
 def test_live_postgres_materialized_view(tmp_path: Path) -> None:
     secret = REPO / "out" / "mockdb-secrets" / "pg.pw"
     if not _reachable(5433) or not secret.is_file():
-        pytest.skip("the loopback PostgreSQL fixture (127.0.0.1:5433) is not running")
+        pytest.skip(
+            "the loopback PostgreSQL fixture (127.0.0.1:5433) is not running, or UDBMCP_LIVE_FIXTURES=1 is not set"
+        )
     psycopg = pytest.importorskip("psycopg")
     password = secret.read_text(encoding="utf-8").strip()
     schema = f"udbmcp_cr3_mv_{os.getpid()}"
@@ -380,7 +384,9 @@ def test_live_postgres_materialized_view(tmp_path: Path) -> None:
 def test_live_clickhouse_hidden_columns(tmp_path: Path) -> None:
     secret = REPO / "out" / "mockdb-secrets" / "clickhouse.pw"
     if not _reachable(8124) or not secret.is_file():
-        pytest.skip("the loopback ClickHouse fixture (127.0.0.1:8124) is not running")
+        pytest.skip(
+            "the loopback ClickHouse fixture (127.0.0.1:8124) is not running, or UDBMCP_LIVE_FIXTURES=1 is not set"
+        )
     clickhouse_connect = pytest.importorskip("clickhouse_connect")
     password = secret.read_text(encoding="utf-8").strip()
     db = f"udbmcp_cr3_ch_{os.getpid()}"

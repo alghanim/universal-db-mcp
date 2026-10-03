@@ -11,8 +11,8 @@ crash, SIGKILL - closes that end; the watchdog then sees EOF and kills the
 child. A normal teardown calls ``release()``, which writes ``done`` first,
 and the watchdog leaves the child alone. Before killing, the watchdog checks
 the child is still the process it was started for (its start time and
-command line, read with ps), so a recycled pid is never hit. POSIX only;
-elsewhere ``tie`` does nothing.
+command line, from /proc where there is one, else ps), so a recycled pid is
+never hit. POSIX only; elsewhere ``tie`` does nothing.
 """
 
 from __future__ import annotations
@@ -25,6 +25,18 @@ _WATCHDOG = r"""
 import os, signal, subprocess, sys
 pid = sys.argv[1]
 def identity():
+    # Linux: /proc (a slim image has no ps); its start time is field 22 of stat, after the ')' of comm
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read()
+        return stat[stat.rindex(b")") + 2:].split()[19] + b" " + cmdline
+    except FileNotFoundError:
+        if os.path.isdir("/proc/self"):
+            return None  # a /proc system without that pid: it is gone
+    except Exception:
+        return None
     try:
         out = subprocess.run(["ps", "-o", "lstart=,command=", "-p", pid], capture_output=True, text=True, timeout=10)
     except Exception:
