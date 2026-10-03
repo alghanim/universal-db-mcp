@@ -1,5 +1,5 @@
 # Discovery tools: live run through the MCP server against the local fixtures
-date_utc: 2026-10-02T07:24:47Z
+date_utc: 2026-10-03T00:53:06Z
 
 == mock_clickhouse
   catalog: 3 tables; cdr: pk=['started_at', 'caller_msisdn'] cols=9 idx=1 fks=[]
@@ -8,8 +8,8 @@ date_utc: 2026-10-02T07:24:47Z
   profile: sample=500 row_estimate=250000 findings=['low_cardinality', 'low_cardinality', 'low_cardinality', 'low_cardinality', 'sampled']
      call_id [string] null=0.0 distinct=500 maxlen=None min=null top=[]
      started_at [temporal] null=0.0 distinct=500 maxlen=None min="2026-08-01T18:12:16" top=[]
-     duration_sec [numeric] null=0.0 distinct=500 maxlen=None min=64 top=[]
-     caller_msisdn [string] null=0.0 distinct=5 maxlen=12 min="971501000001" top=["971501000003", "971501000004", "971501000001", "9715010...
+     duration_sec [numeric] null=0.0 distinct=500 maxlen=None min=74 top=[]
+     caller_msisdn [string] null=0.0 distinct=5 maxlen=12 min="971501000001" top=["971501000001", "971501000003", "971501000004", "9715010...
   indexes in schema: 3
   review: reviewed=3/3 by_severity={'info': 5} by_code={'low_cardinality': 4, 'sampled': 1} budget_exhausted=False
      info   low_cardinality                  cdr.caller_msisdn: 5 distinct values across 500 sampled rows

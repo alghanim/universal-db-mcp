@@ -1,19 +1,19 @@
 {
   "label": "clickhouse/clickhouse-server:23.8",
   "engine": "clickhouse",
-  "probe_rev": "ec47573",
-  "started_utc": "2026-10-02T22:03:20Z",
+  "probe_rev": "2140348",
+  "started_utc": "2026-10-03T00:58:13Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 131,
+      "ms": 136,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 8,
+      "ms": 7,
       "detail": "23.8.16.16"
     },
     {
@@ -55,7 +55,7 @@
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 4,
+      "ms": 2,
       "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
     },
     {
@@ -67,7 +67,7 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "(sorting key)"
     },
     {
@@ -85,7 +85,7 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "v_orders"
     },
     {
@@ -97,37 +97,37 @@
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "catalog_estimate(system.tables)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 10,
+      "ms": 5,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 10,
+      "ms": 5,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 15,
+      "ms": 8,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 14,
+      "ms": 10,
       "detail": "[['north', 67], ['south', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 5,
+      "ms": 4,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-02T22:03:21Z",
+  "finished_utc": "2026-10-03T00:58:14Z",
   "summary": {
     "passed": 19,
     "failed": []

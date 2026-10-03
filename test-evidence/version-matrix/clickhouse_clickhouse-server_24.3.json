@@ -1,19 +1,19 @@
 {
   "label": "clickhouse/clickhouse-server:24.3",
   "engine": "clickhouse",
-  "probe_rev": "ec47573",
-  "started_utc": "2026-10-02T22:03:41Z",
+  "probe_rev": "2140348",
+  "started_utc": "2026-10-03T00:58:34Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 124,
+      "ms": 132,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "24.3.18.7"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='vm', table='customers', name='email', data_type='S"
     },
     {
@@ -55,7 +55,7 @@
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
     },
     {
@@ -109,25 +109,25 @@
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 9,
+      "ms": 6,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 15,
+      "ms": 13,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 9,
+      "ms": 5,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 6,
+      "ms": 4,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-02T22:03:41Z",
+  "finished_utc": "2026-10-03T00:58:34Z",
   "summary": {
     "passed": 19,
     "failed": []

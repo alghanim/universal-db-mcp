@@ -1,5 +1,5 @@
 # Session safety profile: live read-back through the connectors' health_check
-date_utc: 2026-10-02T07:24:43Z
+date_utc: 2026-10-03T00:53:01Z
 host: native Darwin arm64; fixtures on loopback; policy hard_query_timeout=60.0s, max_response_bytes=1048576
 
 == mock_clickhouse: healthy=True version="26.3.3.20"

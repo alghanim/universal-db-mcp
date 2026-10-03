@@ -1,25 +1,25 @@
 {
   "label": "postgres:17",
   "engine": "postgres",
-  "probe_rev": "ec47573",
-  "started_utc": "2026-10-02T22:01:05Z",
+  "probe_rev": "2140348",
+  "started_utc": "2026-10-03T00:56:02Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 55,
+      "ms": 80,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 9,
+      "ms": 7,
       "detail": "PostgreSQL 17.9 (Debian 17.9-1.pgdg13+1)"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 13,
+      "ms": 5,
       "detail": "vm"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 5,
+      "ms": 3,
       "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
     },
     {
@@ -91,49 +91,49 @@
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 9,
+      "ms": 6,
       "detail": "f_one"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 5,
+      "ms": 2,
       "detail": "catalog_estimate(pg_class.reltuples / pg_stat_user_tables)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 9,
+      "ms": 7,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 12,
+      "ms": 11,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 12,
+      "ms": 8,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 8,
+      "ms": 6,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 11,
+      "ms": 8,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 10,
+      "ms": 6,
       "detail": "['raw']"
     }
   ],
@@ -167,7 +167,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-02T22:01:05Z",
+  "finished_utc": "2026-10-03T00:56:02Z",
   "summary": {
     "passed": 22,
     "failed": []

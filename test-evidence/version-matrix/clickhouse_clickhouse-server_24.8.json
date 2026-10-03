@@ -1,13 +1,13 @@
 {
   "label": "clickhouse/clickhouse-server:24.8",
   "engine": "clickhouse",
-  "probe_rev": "ec47573",
-  "started_utc": "2026-10-02T22:04:01Z",
+  "probe_rev": "2140348",
+  "started_utc": "2026-10-03T00:58:54Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 142,
+      "ms": 138,
       "detail": "seeded"
     },
     {
@@ -19,7 +19,7 @@
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 6,
+      "ms": 5,
       "detail": "vm"
     },
     {
@@ -85,7 +85,7 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "v_orders"
     },
     {
@@ -97,7 +97,7 @@
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "catalog_estimate(system.tables)"
     },
     {
@@ -109,31 +109,31 @@
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 6,
+      "ms": 7,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 15,
+      "ms": 13,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 7,
+      "ms": 14,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 5,
+      "ms": 24,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 4,
+      "ms": 16,
       "detail": "['raw']"
     }
   ],
@@ -159,7 +159,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-02T22:04:01Z",
+  "finished_utc": "2026-10-03T00:58:54Z",
   "summary": {
     "passed": 19,
     "failed": []

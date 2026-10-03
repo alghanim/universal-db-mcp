@@ -1,31 +1,31 @@
 {
   "label": "postgres:16",
   "engine": "postgres",
-  "probe_rev": "ec47573",
-  "started_utc": "2026-10-02T22:00:45Z",
+  "probe_rev": "2140348",
+  "started_utc": "2026-10-03T00:55:42Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 109,
+      "ms": 102,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 14,
+      "ms": 7,
       "detail": "PostgreSQL 16.13 (Debian 16.13-1.pgdg13+"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 10,
+      "ms": 5,
       "detail": "vm"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 2,
+      "ms": 1,
       "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='vm', name='orders', kind='table', row_estimate=None, row_est"
     },
     {
@@ -37,7 +37,7 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 6,
+      "ms": 4,
       "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
     },
     {
@@ -79,31 +79,31 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 3,
+      "ms": 2,
       "detail": "customers"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 1,
+      "ms": 0,
       "detail": "v_orders"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 9,
+      "ms": 7,
       "detail": "f_one"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 3,
+      "ms": 1,
       "detail": "catalog_estimate(pg_class.reltuples / pg_stat_user_tables)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 11,
+      "ms": 7,
       "detail": "300"
     },
     {
@@ -115,25 +115,25 @@
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 11,
+      "ms": 9,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 13,
+      "ms": 7,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 9,
+      "ms": 6,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 7,
+      "ms": 6,
       "detail": "['raw']"
     }
   ],
@@ -167,7 +167,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-10-02T22:00:45Z",
+  "finished_utc": "2026-10-03T00:55:43Z",
   "summary": {
     "passed": 22,
     "failed": []
