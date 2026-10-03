@@ -1520,6 +1520,15 @@ synchronously when its bundle has no OS packages.
 `UDBMCP_DOCKER_TESTS=1` so the container tests (the real dpkg sequences)
 ran too; `mypy --strict src`, `ruff check src tests scripts` and
 `--check-locks` clean.
+Release-level re-checks at 2140348/4c93b02 (2026-10-03): `scripts/live_evidence.py`
+gives the same results as the previous run; the version matrix for the
+engines this round changed passes (PostgreSQL 12-17, MySQL 5.7/8.0/8.4,
+MariaDB 10.6/11.4, ClickHouse 23.8-25.3); `release_usb.sh --demo`: deb gate
+and pkg gate PASSED, stick signature verified; the offline upgrade gate
+PASSED; the CI job replayed on `linux/amd64` (Debian 12, pwsh) passed ruff,
+mypy, `--check-locks` and pip-audit on every lock, and its unit run (12386
+passed) found one more test that assumed SQLite 3.40 can run FTS under the
+connector's authorizer; it now probes it (`connector_reads_fts`).
 
 ## 4. Gates not (fully) run (recorded truthfully)
 

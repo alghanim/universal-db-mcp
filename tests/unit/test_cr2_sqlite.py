@@ -31,6 +31,7 @@ from typing import Any
 
 import pytest
 import sqlglot
+from helpers_sqlite import connector_reads_fts
 
 from universal_db_mcp.config import ConnectionConfig, ResolvedConnection, SecurityConfig, load_resolved
 from universal_db_mcp.connectors import sqlite as sqlite_module
@@ -383,7 +384,8 @@ def test_list_columns_and_a_statement_list_no_catalog(tmp_path: Path, monkeypatc
     conn.list_columns("main", "settings")
     conn.list_columns("main", "posts_stat")
     conn.execute_query(QuerySpec(sql="SELECT * FROM settings JOIN posts_stat ON 1"))
-    conn.execute_query(QuerySpec(sql="SELECT * FROM posts WHERE posts MATCH 'hello'"))
+    if connector_reads_fts():  # SQLite 3.40 refuses every MATCH under the authorizer (helpers_sqlite)
+        conn.execute_query(QuerySpec(sql="SELECT * FROM posts WHERE posts MATCH 'hello'"))
     assert "PRAGMA table_list" not in [s.strip() for s in ran], ran
 
 
