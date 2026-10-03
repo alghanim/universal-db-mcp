@@ -1654,6 +1654,16 @@ connection can cancel the request that is running.
 this Mac; they pass in the Linux image), the integration tests that need
 `UDBMCP_TEST_*_HOST`, and single OS-specific cases.
 
+Release-level re-check after round 3 (2026-10-04): live evidence identical to
+the previous run; the version matrix 26 of 26 at 402c4df; at 5faa37c
+`release_usb.sh --demo` passed the deb gate and the pkg gate (its native unit
+run included) with the stick signature verified, the offline upgrade gate
+passed, and the CI job replayed on `linux/amd64` (Debian 12, pwsh) gave
+`12772 passed, 84 skipped, 1 xfailed` with ruff, mypy, `--check-locks` and
+pip-audit on every lock clean. Tests that use the loopback mock databases now
+run only with `UDBMCP_LIVE_FIXTURES=1` (§6): a TCP probe also succeeds against a
+paused container, and the pkg gate's unit run had waited on one.
+
 ## 4. Gates not (fully) run (recorded truthfully)
 
 - **Gate D (egress observation):** harness provided
