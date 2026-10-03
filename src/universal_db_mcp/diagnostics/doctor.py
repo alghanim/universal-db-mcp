@@ -20,6 +20,7 @@ from universal_db_mcp.config import (
     AppConfig,
     ConnectionConfig,
     ResolvedConnection,
+    darwin_directory_acl_problems,
     darwin_secret_file_acl_problems,
     default_audit_path,
     is_system_config,
@@ -173,6 +174,51 @@ def _failure_detail(exc: BaseException) -> str:
     if isinstance(exc, UnicodeError):
         return "a file it reads is not valid UTF-8 text"
     return str(exc)
+
+
+def _expanded(path: str) -> Path | None:
+    """*path* with a leading ``~`` or ``~user`` expanded, as the SQLite
+    connector opens it; None for a ``~user`` that names no account (pathlib
+    raises RuntimeError there, which no OSError handler catches)."""
+    try:
+        return Path(path).expanduser()
+    except RuntimeError:
+        return None
+
+
+def _state_acl_problems(path: Path) -> list[str]:
+    """What macOS extended ACLs grant other accounts on the state file *path*
+    (the audit log or the metadata cache), its sidecars (lock, rotated
+    backups, SQLite journals) and its directory, whose inheritable entries
+    every new one of them takes."""
+    problems: list[str] = []
+    directory = path.parent
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []  # the path checks above report a directory that cannot be read
+    stem = path.name
+    for name in sorted(names):
+        rest = name[len(stem) :] if name.startswith(stem) else None
+        if rest is None or not (rest == "" or rest in (".lock", "-wal", "-shm", "-journal") or (
+            rest[:1] == "." and rest[1:].isdigit()
+        )):
+            continue
+        member = directory / name
+        if member.is_symlink() or not member.is_file():
+            continue  # the audit checks refuse links; only regular files are read
+        problems += [f"'{member}': {problem}" for problem in _acl_problems(member)]
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return problems
+    try:
+        problems += [f"'{directory}': {problem}" for problem in darwin_directory_acl_problems(fd)]
+    except OSError as exc:
+        problems.append(f"'{directory}': its access control list cannot be read ({exc.strerror or exc})")
+    finally:
+        os.close(fd)
+    return problems
 
 
 def _acl_problems(path: Path) -> list[str]:
@@ -340,6 +386,15 @@ def run_doctor(config_path: str | None, connectivity: bool = False) -> dict[str,
         # Each probe of a configured path reports its own failure; this is the
         # net under them: a report that says where it stopped, not a traceback.
         results.append(_check("doctor", False, f"stopped before every check ran: {_uninspectable(exc)}", fatal=True))
+    except Exception as exc:  # noqa: BLE001 - a diagnostic reports, it never ends in a traceback
+        results.append(
+            _check(
+                "doctor",
+                False,
+                f"stopped before every check ran: {type(exc).__name__}: {_failure_detail(exc)}",
+                fatal=True,
+            )
+        )
     fatal_results = [r for r in results if r["status"] == "fatal"]
     return {
         "healthy": not fatal_results,
@@ -453,8 +508,17 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                                 fatal=True,
                             )
                         )
+                    elif (dbp := _expanded(conn.database)) is None:
+                        results.append(
+                            _check(
+                                f"connection-{name}-file",
+                                False,
+                                f"data file '{conn.database}' starts with a ~user that names no account on this "
+                                "machine, so the connector cannot open it; use an absolute path",
+                                fatal=True,
+                            )
+                        )
                     else:
-                        dbp = Path(conn.database).expanduser()  # as the connector opens it
                         if not dbp.exists():
                             results.append(
                                 _check(f"connection-{name}-file", False, f"data file '{dbp}' not found", fatal=True)
@@ -888,6 +952,27 @@ def _run_checks(results: list[dict[str, Any]], config_path: str | None, connecti
                 results.append(
                     _check("metadata-cache-perms", True, f"'{cp}' absent; directory '{cp.parent}' is private")
                 )
+
+        # macOS: the state files' privacy is read from their mode bits (0600),
+        # which an extended ACL does not show: an inheritable 'everyone allow
+        # read' on the state directory made the audit log (the SQL text) and
+        # its backups readable by every local user, and 'allow write' let them
+        # rewrite the cached object lists the guard trusts.
+        if sys.platform == "darwin":
+            for label, state_path in (
+                ("audit-path-acl", cfg.application.audit_path),
+                ("metadata-cache-acl", cfg.application.metadata_cache_path),
+            ):
+                if state_path and (problems := _state_acl_problems(Path(state_path))):
+                    results.append(
+                        _check(
+                            label,
+                            False,
+                            f"exposed to other local users by an access control list: {'; '.join(problems)}; "
+                            "remove it (chmod -N <path>) from each file and the directory",
+                            fatal=True,
+                        )
+                    )
 
         # HTTP deployment: the bearer token file is the only authentication on
         # the listener; verify it exists, is a non-empty regular file and is

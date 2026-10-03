@@ -84,6 +84,48 @@ administrator; it is deliberately NOT shipped inside any package):
 EOF
 }
 
+# --- what dpkg runs after a refusal here ------------------------------------
+# On an upgrade dpkg has already run the INSTALLED release's prerm, which
+# stopped the service, and a refusal here makes it run the installed
+# release's postinst with abort-upgrade. A postinst from before this release
+# ignores its argument and configures again: for a bundle with OS packages it
+# spawns a deferred install worker that re-installs the installed release
+# (replacing venv.previous, the rollback point) and can still be running when
+# the admin retries this install, so that dpkg records this package while
+# the worker publishes the older code. Every such postinst spawns no worker
+# while $DEFERRED_LOCK is held. So on any nonzero exit under dpkg's upgrade,
+# this preinst takes that lock and hands it to a small detached process
+# (its fd 9 is the one taken here) that holds it until this dpkg run has
+# ended, then starts the service again when it is enabled and not running
+# (what this release's own postinst does for abort-upgrade). A lock already
+# held means an install worker is running: nothing is spawned then. Outside
+# dpkg (no DPKG_MAINTSCRIPT_NAME), or without flock/setsid, nothing is done.
+DEFERRED_LOCK=/run/udbmcp-deferred-install.lock
+PREINST_ACTION="${1:-}"
+UNWIND_HOLDER='i=0
+while kill -0 "$1" 2>/dev/null && [ "$i" -lt 7200 ]; do sleep 0.5; i=$((i + 1)); done
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
+   && systemctl is-enabled --quiet universal-db-mcp 2>/dev/null \
+   && ! systemctl is-active --quiet universal-db-mcp 2>/dev/null; then
+  systemctl start --no-block universal-db-mcp 2>/dev/null || true
+fi'
+hold_the_unwind() {
+    [ "$PREINST_ACTION" = upgrade ] && [ "${DPKG_MAINTSCRIPT_NAME:-}" = preinst ] || return 0
+    command -v flock >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 || return 0
+    exec 9>>"$DEFERRED_LOCK" 2>/dev/null || return 0
+    if flock -n 9; then
+        setsid --fork /bin/bash -c "$UNWIND_HOLDER" udbmcp-unwind-holder "$PPID" </dev/null >/dev/null 2>&1 \
+            && echo "universal-db-mcp preinst: the installed release's postinst is kept from starting an install worker while dpkg undoes this upgrade." >&2
+    fi
+    exec 9>&-
+}
+on_preinst_exit() {
+    local rc=$?
+    [ "$rc" -eq 0 ] || hold_the_unwind || true
+    return "$rc"
+}
+trap on_preinst_exit EXIT
+
 # --- prerequisite 1: the trusted verifier -----------------------------------
 # Installed by the admin with `install -m 644`, so it is executed via
 # python3, not directly: check readability, never the exec bit.
@@ -159,7 +201,9 @@ then re-run this install."
     echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
     exit 1
 fi
-# The installer also carries a format marker ('# udbmcp-installer-format: N');
+# The installer also carries a format marker ('# udbmcp-installer-format: N',
+# one line per format it serves: the current one first, then the earlier ones
+# whose packages it still installs, as in the runbook's package rollback);
 # any pip-running copy without the current number is refused the same way
 # (build-then-switch venvs, --copies interpreters and rollback all depend on it).
 INSTALLER_FORMAT=4
@@ -227,6 +271,36 @@ print(rev.strip() if isinstance(rev, str) and rev.strip().lower() not in ("", "u
 If the downgrade is intended, run:
 
     sudo UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <this .deb>"
+        echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+        exit 1
+    fi
+fi
+
+# --- prerequisite 6: no deferred install is still running ------------------
+# A deferred install worker (see postinst) holds $DEFERRED_LOCK while it
+# installs, from a private copy of the payload it was started for. An unpack
+# now would leave dpkg recording this package while that worker publishes
+# the other release's code and starts the service on it (an earlier
+# package's postinst spawns one when dpkg undoes a refused upgrade). Refused
+# here, before anything is unpacked. A holder that ends within 15 seconds
+# (the one a refused run of this preinst leaves until its dpkg run is over)
+# is waited for.
+if command -v flock >/dev/null 2>&1 && [ -e "$DEFERRED_LOCK" ]; then
+    deferred_free=""
+    for _ in $(seq 1 30); do
+        if (exec 8>>"$DEFERRED_LOCK" && flock -n 8) 2>/dev/null; then
+            deferred_free=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [ -z "$deferred_free" ]; then
+        STATUS_FILE=/var/log/universal-db-mcp-install.status
+        fail "a deferred install started by an earlier configure is still running (status: $(head -c 16 "$STATUS_FILE" 2>/dev/null | tr -cd 'a-z' || true)); nothing was unpacked.
+Installing now would let that worker publish its release's code after dpkg
+records this package. Wait until it has finished, then re-run this install:
+
+    until grep -qxE 'success|failed' $STATUS_FILE; do sleep 5; done; cat $STATUS_FILE"
         echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
         exit 1
     fi

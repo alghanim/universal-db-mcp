@@ -346,6 +346,7 @@ def test_p0_tables_for_filters_by_allowed_schemas() -> None:
     class FakeApp:
         cache = FakeCache()
         schema_names = srv.AppContext.schema_names
+        _tables_for = srv.AppContext._tables_for  # tables_for memoises the listing per call
 
         def __init__(self) -> None:
             self._schema_names: dict[str, object] = {}
@@ -5417,6 +5418,7 @@ async def test_tables_for_survives_metadata_cache_errors(anyio_backend: str) -> 
     class FakeApp:
         cache = ExplodingCache()
         schema_names = srv.AppContext.schema_names
+        _tables_for = srv.AppContext._tables_for  # tables_for memoises the listing per call
 
         def __init__(self) -> None:
             self._schema_names: dict[str, object] = {}

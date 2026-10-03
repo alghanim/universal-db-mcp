@@ -86,10 +86,14 @@ in short:
 - **Deadlines and cancel.** When the deadline fires, or the client cancels
   while the driver call runs, the connector is marked poisoned and discarded
   and its cancel hook fires in a separate thread under a hard budget
-  (SQLite `interrupt()`, PostgreSQL `cancel_safe` with a 1.5 s timeout on
-  libpq 17 or later, Oracle `cancel()`, ClickHouse `KILL QUERY`, MySQL
-  `KILL QUERY` from a second connection, SQL Server `Cursor.cancel()`); a
-  call the hook cancelled gets 0.2 s to return.
+  (SQLite `interrupt()` on every open handle, repeated every 20 ms until
+  they close; PostgreSQL `cancel_safe` with a 1.5 s timeout on libpq 17 or
+  later, and the run stops before its next `FETCH`; Oracle `cancel()`;
+  ClickHouse `KILL QUERY`; MySQL `KILL CONNECTION` from a second
+  connection, which ends the session whatever it is doing; SQL Server
+  `Cursor.cancel()`); a call the hook cancelled gets 0.2 s to return. On
+  MySQL a cancel that comes before the session's id is known is remembered,
+  and the run stops before its first statement.
   Engines without a hook are reported as such, and the query may continue
   server-side until the engine's own statement ceiling stops it. A poisoned
   connection is never reused; requests already waiting on it are refused with
@@ -163,9 +167,14 @@ is read before the cut depends on the engine:
   prepared-statement protocol, which runs nothing). `UNION`, `DISTINCT` and
   `GROUP BY` derived tables materialise before the first row. A statement
   MySQL takes in neither form is refused (`QUERY_ERROR`), as is, on MariaDB,
-  one whose `ORDER BY` the derived table would drop. A `SELECT *` over a join
-  whose columns share a name is spelled out as `table.name` columns instead
-  (MySQL 5.7 and MariaDB take no derived column list). Where the server will
+  one whose `ORDER BY` the derived table would drop. A select list of stars
+  over a join (`*`, or `o.*, c.*`) whose columns share a name is spelled out
+  as `table.name` columns instead (MySQL 5.7 and MariaDB take no derived
+  column list). A column the statement compares, or names by position in
+  `GROUP BY` or `ORDER BY` (`2`, `(2)`, `2 COLLATE x`), is not cut in the
+  select list: the statement runs as a derived table instead, and so does a
+  statement with a term there that names no column (`NULL`, `'2'`, a bound
+  value), which MySQL may read as a position. Where the server will
   not prepare the statement (`1295`, `max_prepared_stmt_count` reached:
   `1461`, a proxy: `1047`), it is not described and runs as written.
 - **SQL Server**: `SET TEXTSIZE` bounds text on query connections; every
@@ -201,11 +210,14 @@ is read before the cut depends on the engine:
   inside SQLite to `max_cell_bytes + 1` by a per-handle function
   (`udbmcp_cut`) in the select list; each query prepares its statement once
   more under `LIMIT 0` first. Left whole: columns the statement compares (in a
-  join condition, `WHERE`, `GROUP BY`, `HAVING` or `ORDER BY`), and every
-  column of a statement that is not one SELECT, uses `DISTINCT` or a bound
-  `LIMIT`, selects `*` over a join, or has a `GROUP BY` or `ORDER BY` term
-  that names no column and is not a plain position (SQLite reads `(2)`,
-  `+2`, `2 COLLATE x` as a position too). A stored text value that is not valid
+  join condition, `WHERE`, `GROUP BY`, `HAVING` or `ORDER BY`, or named by
+  position in `GROUP BY` or `ORDER BY` under any spelling of an integer
+  SQLite reads as one: `2`, `(2)`, `+2`, `0x2`, `-(-2)`, `2 COLLATE x`), and
+  every column of a statement that is not one SELECT, uses `DISTINCT` or a
+  bound `LIMIT`, or selects `*` over a join. A `GROUP BY` or `ORDER BY` term
+  that names no column and is no position (`random()`, `NULL`, a bound
+  parameter, `'2'`, `2.0`) compares no output, and the other columns are
+  still cut. A stored text value that is not valid
   UTF-8 makes the statement run again uncut. Behind that, a process-wide
   `PRAGMA hard_heap_limit` of 32 x `SQLITE_LIMIT_LENGTH` (512 MiB by default),
   shared by every SQLite handle including the metadata cache's and only ever
@@ -231,11 +243,16 @@ is read before the cut depends on the engine:
   JOIN) cannot be narrowed below one input row, so an expansion past the
   budget is refused, not truncated; a `LIMIT` inside the statement returns its
   first rows. The query is stopped with `KILL QUERY` once a limit is reached.
-  The driver sends a statement whose text ends in `LIMIT 0` as a
-  columns-only request it reads whole, outside these budgets: unless it is
-  one SELECT whose own top-level `LIMIT 0` ends it, the connector appends
-  the comment `\n#!''` so it streams like any other (the comment is
-  visible in `system.query_log`); `EXPLAIN` always gets it.
+  The driver sends a statement whose text ends in `LIMIT 0` after binding
+  as a columns-only request it reads whole, outside these budgets. So
+  whenever the word `LIMIT` appears in the statement or in a bound value
+  (`x' LIMIT 0 --` as a value included), the connector appends the comment
+  `\n#!''` and the statement streams like any other (the comment is visible
+  in `system.query_log`); only one SELECT whose own top-level `LIMIT 0`
+  ends it goes without. `EXPLAIN` always gets it. Residual:
+  clickhouse-connect's own regexes over the statement text can still take
+  seconds on adversarial input near the 64 KiB statement cap (long runs of
+  whitespace or unclosed comments).
   Per-query settings only tighten (`max_block_size`, `max_result_rows` with
   `result_overflow_mode='break'`, none on `readonly=1` profiles);
   `max_result_bytes` is never sent. Without the driver seam this relies on,

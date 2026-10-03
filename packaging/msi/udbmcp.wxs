@@ -428,7 +428,9 @@
                                  verification passed — validates the install.
         RegisterServiceCA        AFTER DoctorSmokeCA. service.ps1 registers
                                  the udbmcp service via sc.exe (auto start,
-                                 failure recovery). Only verified,
+                                 failure recovery): sc.exe create, or, for a
+                                 service already registered (a repair),
+                                 sc.exe config in place. Only verified,
                                  doctor-healthy payload is ever registered as
                                  a service. Its last step records the bundle's
                                  manifest.json as the installed release
@@ -449,8 +451,9 @@
                                  first install or an upgrade; a repair,
                                  -Repair "[Installed]", keeps the service:
                                  one was registered before the repair
-                                 began, and the one there now, the same or
-                                 its replacement, runs the restored files),
+                                 began, RegisterServiceCA updates it in
+                                 place and never deletes it, and it runs
+                                 the restored files),
                                  and to
                                  put back the installed-release record
                                  RegisterServiceCA replaced (from the copy

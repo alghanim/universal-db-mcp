@@ -210,7 +210,8 @@ def test_plan_for_malformed_includes_existing_block_and_no_write(tmp_path: Path,
     assert "action=none" in p.summary
     assert p.config_block == ""
     assert "FAIL CLOSED" in p.summary
-    assert "{{{ not yaml" in p.summary  # existing config block surfaced for the operator
+    # Described by line and column, never quoted: the patch holds other servers' rows.
+    assert "{{{ not yaml" not in p.summary and "line 2, column 1" in p.summary
 
 
 def test_plan_for_non_utf8_patch_reports_fail_closed_without_raising(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -186,8 +186,11 @@ does, in order, and what it refuses:
   N, OLDER than release M whose trust tools are installed.`): its tools are
   genuinely signed, and they would put back what later releases fixed. An
   intended downgrade re-runs the printed command with `--allow-downgrade`.
-  A malformed `RELEASE` on the stick is refused always. With nothing
-  recorded yet, any signed stick is accepted.
+  A malformed `RELEASE` on the stick is refused always. A stick of the same
+  release passes only when its trust tools are byte-identical to the
+  installed ones; tools that differ under the same number are refused as
+  another, possibly older, release. With nothing recorded yet, any signed
+  stick is accepted.
 - It copies every `.deb` the signed list names (the package, and the
   `libaio` and `unzip` packages of the Oracle step) into a new root-only
   directory, `/var/cache/udbmcp-trust.new.XXXXXX`, checks those copies
@@ -462,14 +465,22 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   where it checks them again: `dpkg -i` those copies, never the stick's
   files. The package refuses trusted tools that predate this release
   (`OUTDATED copy`; the installer's marker is now
-  `udbmcp-installer-format: 4`): step 1 is mandatory. The `.deb` makes that
+  `udbmcp-installer-format: 4`, and it keeps a `3` line so the previous
+  release's package still installs with it on a rollback): step 1 is
+  mandatory. The `.deb` makes that
   check, and the older-release check below, in `preinst`, before dpkg stops
   the service and unpacks anything; if dpkg undoes a failed upgrade,
-  `postinst` starts the service again. Sticks are ordered: each carries
-  `trust-bootstrap-linux/RELEASE` on its signed list, and the installed
+  `postinst` starts the service again. A refused upgrade keeps the installed
+  release's `postinst`, which dpkg runs to undo it, from starting a deferred
+  install worker (it may still re-run its configure itself when the bundle
+  has no OS packages), and `preinst` and `postinst` refuse while a deferred
+  install of another payload is still running: wait until the status file
+  says `success` or `failed`, then install again. Sticks are ordered: each
+  carries `trust-bootstrap-linux/RELEASE` on its signed list, and the installed
   `bootstrap.sh` records it in `/usr/local/lib/udbmcp-trust/RELEASE` and
-  refuses an older stick (`--allow-downgrade` to mean it); on the first
-  upgrade to this release run it twice, as step 1 says, so the release is
+  refuses an older stick, or one of the same number whose trust tools
+  differ from the installed ones (`--allow-downgrade` to mean it); on the
+  first upgrade to this release run it twice, as step 1 says, so the release is
   recorded.
 - **Installers work on a private copy.** `install_offline.sh`,
   `upgrade_offline.sh` and `load_images_offline.sh` verify the bundle, copy
@@ -507,7 +518,9 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   it (under `sudo` it was skipped silently). On macOS the `.pkg` declares an
   arm64 host (an Intel Mac is refused) and its scripts start over natively
   when the Installer runs them under Rosetta; the verifier judges the
-  hardware architecture.
+  hardware architecture, and refuses an interpreter with no arm64 code (an
+  x86_64-only CPython) for the arm64 profile: use a universal2 or arm64
+  CPython 3.12.
 - **Config that no longer loads.** These stop `serve` at start; run `doctor`
   before restarting:
   - a connection-level `read_only: false` (v1 is read-only);
@@ -595,11 +608,15 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   on a masked column is still not masked (a documented limitation): use
   column grants or views for secrets.
 - **Bound parameters.** On MySQL, ClickHouse and PostgreSQL a placeholder
-  inside a string literal or comment is text, not a parameter, and every
-  `%` other than a placeholder in code arrives as written. A placeholder
-  count or name that does not match the values, or a named value no
-  placeholder uses, is `VALIDATION_ERROR`; queries that relied on a `%s`
-  inside quotes being filled need the placeholder outside them.
+  inside a string literal or comment is text, not a parameter. In a string
+  literal `%%` is still one `%` (`'50%%'`); in a quoted name or comment
+  every `%` arrives as written. A placeholder count or name that does not
+  match the values, a named value no placeholder uses, `%%` outside a
+  string literal (write modulo as `%` or `MOD()`), and a placeholder glued
+  to a name, digit or quote (`%ssn`) are `VALIDATION_ERROR`; queries that
+  relied on a `%s` inside quotes being filled need the placeholder outside
+  them. `db_federated_query` gives each statement only the named values it
+  uses, and refuses a name no statement uses.
 - **Errors.** A statement the engine rejects is now `QUERY_ERROR` (was often
   `CONNECTION_ERROR`); a statement stopped by the engine's time limit is
   `TIMEOUT`. Driver error text has values, quoted fragments and numbers
@@ -628,7 +645,8 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   and hints); SQL Server lock hints in the legacy form without `WITH`
   (`FROM t b (TABLOCKX)`; `NOLOCK`, `READUNCOMMITTED`, `READPAST`, `NOWAIT`
   stay allowed); MySQL `MAX_EXECUTION_TIME`, `SET_VAR` and `RESOURCE_GROUP`
-  optimizer hints (other hint comments, Oracle's `INDEX` or `LEADING`
+  optimizer hints, wherever the word appears in a `/*+ ... */` body (other
+  hint comments, Oracle's `INDEX` or `LEADING`
   included, are accepted and not checked as functions); an empty quoted name
   (`"".ALL_USERS`, `[].syslogins`); a `WITH` after `UNION`,
   `INTERSECT` or `EXCEPT` with more branches after its query (write
@@ -665,7 +683,9 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   the same way. The `information_schema` views that carry other objects'
   definitions (`VIEWS`, `ROUTINES`, `COLUMNS`, `TRIGGERS`,
   `CHECK_CONSTRAINTS`, ...) are refused and unlisted too: describe objects
-  with `db_list_columns` and `db_list_views`. The full lists are in
+  with `db_list_columns` and `db_list_views`. MySQL's
+  `information_schema.STATISTICS` stays readable without its `EXPRESSION`
+  column (a functional index's SQL with its literals). The full lists are in
   `docs/security.md`.
 - **No EXPLAIN ANALYZE, whatever the policy.** With `allow_explain_analyze:
   true`, `EXPLAIN ANALYZE ...` used to pass the guard; it is now
@@ -803,8 +823,9 @@ invisible; these are the ones an operator or an agent notices. `docs/security.md
   10 connects to servers that never answer are parked; beyond that,
   connections to a database server are refused until one returns (SQLite
   connections keep running). A client cancel during a driver call is now
-  handled as a deadline is: the engine's cancel hook fires (ClickHouse and
-  MySQL `KILL QUERY`, PostgreSQL `cancel_safe`, Oracle `cancel()`, SQL
+  handled as a deadline is: the engine's cancel hook fires (ClickHouse
+  `KILL QUERY`, MySQL `KILL CONNECTION`, which ends the session rather
+  than one statement, PostgreSQL `cancel_safe`, Oracle `cancel()`, SQL
   Server `Cursor.cancel()`, SQLite `interrupt()`; Db2 has none), which the
   database's logs may show, and requests already queued on that connection
   are refused with `connection is in an uncertain state after a previous
@@ -937,5 +958,11 @@ cat /var/log/universal-db-mcp-install.status
 sudo python3 -I -c 'import json; print(json.load(open("/opt/universal-db-mcp/manifest.json"))["source_rev"])'; echo "expected to start with: $OLDSHA"
 sudo systemctl restart universal-db-mcp
 ```
+
+If the older package is refused (its `preinst` prints `FAIL`), dpkg undoes
+the install, and with the venv deleted this release's `postinst` writes
+`failed` to the status file and exits 1, which leaves the package
+`unpacked`. Run `sudo dpkg --configure universal-db-mcp` to install this
+release's payload again, resolve the refusal, then retry.
 
 Keep the previous stick until the new release has run for a while.

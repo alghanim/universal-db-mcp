@@ -233,11 +233,15 @@ def test_a5_every_spelling_of_a_position_is_read_as_one(term: str) -> None:
         assert _compared_outputs(tree, ["a", "b"]) == {1}, clause  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("term", ["0x2", "'2'", "2.0", "CAST(2 AS INT)", "NULL", "random()", "(SELECT 2)"])
-def test_a5_a_constant_term_that_may_be_a_position_cuts_nothing(term: str) -> None:
+@pytest.mark.parametrize("term", ["'2'", "2.0", "CAST(2 AS INT)", "NULL", "random()", "(SELECT 2)"])
+def test_a5_a_constant_term_that_is_no_position_compares_no_output(term: str) -> None:
+    """SQLite 3.50, live: only an integer literal is a position (0x2 and
+    -(-2) included, see test_cr2_sqlite); these sort or group by a value,
+    so every output may still be cut (review round 2: ORDER BY random()
+    refused a large table that the cut served)."""
     for clause in ("ORDER BY", "GROUP BY"):
         tree = sqlglot.parse_one(f"SELECT a, b FROM t {clause} {term}", read="sqlite")
-        assert _compared_outputs(tree, ["a", "b"]) == {0, 1}, clause  # type: ignore[arg-type]
+        assert _compared_outputs(tree, ["a", "b"]) == set(), clause  # type: ignore[arg-type]
 
 
 def test_a5_column_terms_still_let_the_other_outputs_be_cut() -> None:
@@ -318,19 +322,15 @@ def test_a7_shadow_tables_cannot_be_read(tmp_path: Path, sql: str) -> None:
     assert "internal table" in str(info.value), str(info.value)
 
 
-def test_a7_shadow_names_without_the_engine_marking_them(tmp_path: Path) -> None:
+def test_a7_shadow_names_without_the_engine_marking_them() -> None:
     """A SQLite build that lacks the module reports its shadow tables as
     plain tables: they are known by name (the virtual table's own name, '_',
-    one of the modules' suffixes)."""
-    rows = [
-        ("main", "docs", "virtual", 3, 0, 0),
-        ("main", "docs_content", "table", 3, 0, 0),
-        ("main", "docs_segdir", "table", 3, 0, 0),
-        ("main", "docs_archive", "table", 3, 0, 0),
-        ("main", "other_content", "table", 3, 0, 0),
-        ("main", "x_y", "shadow", 3, 0, 0),
-    ]
-    assert sqlite_module._shadow_tables(rows) == {"docs_content", "docs_segdir", "x_y"}
+    one of that module's suffixes; see test_cr2_sqlite for the rest)."""
+    lacking: frozenset[str] = frozenset()
+    assert sqlite_module._unmarked_shadow("docs_content", "fts4", lacking)
+    assert sqlite_module._unmarked_shadow("docs_segdir", "fts4", lacking)
+    assert not sqlite_module._unmarked_shadow("docs_archive", "fts4", lacking)
+    assert not sqlite_module._unmarked_shadow("other_content", None, lacking)  # 'other' is no virtual table
 
 
 def test_a7_masked_values_do_not_leak_through_shadow_tables_end_to_end(tmp_path: Path) -> None:

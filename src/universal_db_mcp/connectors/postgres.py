@@ -355,6 +355,8 @@ class PostgresConnector(DatabaseConnector):
         self._exec_lock = threading.Lock()  # serializes queries: cancel slot correctness
         self._exec_state_lock = threading.Lock()  # guards _exec_waiters
         self._exec_waiters = 0  # requests queued on _exec_lock, not yet executing
+        self._in_run = False  # guarded by _exec_state_lock: a query holds _exec_lock and runs
+        self._cancel_requested = False  # guarded by _exec_state_lock: cancel_current reached this run
         self._pool_lock = threading.Lock()
         self._meta_conn: Any = None  # reused metadata connection (probe on checkout)
 
@@ -547,6 +549,11 @@ class PostgresConnector(DatabaseConnector):
         with self._exec_state_lock:
             if self._exec_waiters > 0:
                 return False
+            # Remembered first: a cancel request that reaches the session
+            # while it is idle (after DECLARE, between FETCHes) ends nothing,
+            # and the next FETCH would run the statement; the run checks
+            # this before each (review cr2 V10-d).
+            self._cancel_requested = self._in_run
         target = self._cancel_target
         if target is not None:
             if not _cancel_waits_without_the_gil():
@@ -945,9 +952,13 @@ class PostgresConnector(DatabaseConnector):
             # not suppress cancellation any more.
             with self._exec_state_lock:
                 self._exec_waiters -= 1
+                self._in_run = True
+                self._cancel_requested = False
         try:
             return self._execute(spec)
         finally:
+            with self._exec_state_lock:
+                self._in_run = False
             self._exec_lock.release()
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
@@ -973,6 +984,7 @@ class PostgresConnector(DatabaseConnector):
             conn = self._connect()
         self._cancel_target = conn
         try:
+            self._stop_if_cancelled()
             with translated_driver_errors(phase="execute"):
                 # Server-side (named) cursor: rows stream from the engine and
                 # the row/byte ceilings stop the transfer early. DECLARE plans
@@ -984,6 +996,7 @@ class PostgresConnector(DatabaseConnector):
                     description = list(cur.description or [])
                     cols = [(d[0], self._PG_OID_TYPES.get(d.type_code, "unknown")) for d in description]
                     capped = _pg_capped_select(conn, sql, description, spec.max_cell_bytes)
+                    self._stop_if_cancelled()
                     if capped is None:
                         rows, cell_truncated_cols, truncated = self._stream(cur, cols, spec)
                 if capped is not None:
@@ -1019,6 +1032,7 @@ class PostgresConnector(DatabaseConnector):
         rewrite the server refuses, or a cancel while it is declared, is the
         query's failure, never a reason to run the statement with its values
         uncut."""
+        self._stop_if_cancelled()
         with conn.cursor(name="udbmcp_query") as cur:
             try:
                 cur.execute(bind_text(capped, args, engine="postgres"), args)
@@ -1031,6 +1045,17 @@ class PostgresConnector(DatabaseConnector):
                     ) from exc
                 raise
             return self._stream(cur, cols, spec)
+
+    def _stop_if_cancelled(self) -> None:
+        """End the run before its next statement or FETCH once cancel_current
+        reached it. A cancel request sent in the instant between this check
+        and the FETCH reaching the server can still find the session idle:
+        that one FETCH runs, bounded by statement_timeout, and the check
+        before the next one ends the run."""
+        with self._exec_state_lock:
+            cancelled = self._cancel_requested
+        if cancelled:
+            raise ConnectorError("the query was cancelled at its deadline", category="TIMEOUT")
 
     def _stream(
         self, cur: Any, cols: list[tuple[str, str]], spec: QuerySpec
@@ -1047,6 +1072,7 @@ class PostgresConnector(DatabaseConnector):
         approx_bytes = 0
         truncated = False
         while not truncated:
+            self._stop_if_cancelled()
             batch = cur.fetchmany(next_fetch_size(spec.max_rows, len(rows)))
             if not batch:
                 break

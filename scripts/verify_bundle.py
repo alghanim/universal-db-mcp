@@ -491,17 +491,72 @@ def host_machine() -> str:
     return machine
 
 
+_MACHO_CPU_TYPES = {0x01000007: "x86_64", 0x0100000C: "arm64"}
+_MACHO_MAX_ARCHS = 16
+
+
+def macho_machines(path: Path) -> set[str] | None:
+    """The architectures the Mach-O executable *path* holds code for; None when it is not one (or
+    cannot be read). Reads the header only: a thin image names one CPU, a universal one lists its slices."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8 + 32 * _MACHO_MAX_ARCHS)
+    except OSError:
+        return None
+    if len(head) < 8:
+        return None
+    big = int.from_bytes(head[:4], "big")
+    if big in (0xCAFEBABE, 0xCAFEBABF):  # universal: big-endian fat_arch (or fat_arch_64) entries
+        count, size = int.from_bytes(head[4:8], "big"), 20 if big == 0xCAFEBABE else 32
+        if not 0 < count <= _MACHO_MAX_ARCHS or len(head) < 8 + count * size:
+            return None
+        cpus = (int.from_bytes(head[8 + i * size:12 + i * size], "big") for i in range(count))
+        return {_MACHO_CPU_TYPES.get(cpu, f"cpu {cpu:#x}") for cpu in cpus}
+    if int.from_bytes(head[:4], "little") in (0xFEEDFACE, 0xFEEDFACF):  # thin, little-endian
+        cpu = int.from_bytes(head[4:8], "little")
+        return {_MACHO_CPU_TYPES.get(cpu, f"cpu {cpu:#x}")}
+    return None
+
+
+def interpreter_machines() -> set[str] | None:
+    """The architectures both this interpreter and the base interpreter a venv copies hold code for
+    (None when either cannot be read as a Mach-O executable). pip installs wheels for the architecture
+    the venv's interpreter runs as, which is not the hardware's when that interpreter has no slice for it."""
+    common: set[str] | None = None
+    for exe in {os.path.realpath(p) for p in (sys.executable, getattr(sys, "_base_executable", None)) if p}:
+        machines = macho_machines(Path(exe))
+        if machines is None:
+            return None
+        common = machines if common is None else common & machines
+    return common
+
+
 def host_profile_mismatches(profiles: ModuleType, prof: object) -> list[str]:
     """How this machine differs from the profile *prof*: the registry's check of the running
-    interpreter, with the architecture judged by the hardware (host_machine) under Rosetta 2."""
+    interpreter, with the architecture judged by the hardware (host_machine) under Rosetta 2.
+
+    Under Rosetta 2 the hardware alone is not enough: the venv is built with this interpreter, and
+    pip installs wheels for the architecture it runs as. A universal2 interpreter runs natively once
+    nothing translates it (the service, the .pkg scripts started over natively); one with no slice for
+    the profile's architecture never does, so its wheels could not be installed or loaded."""
     mismatches = list(profiles.profile_host_mismatches(prof))
     machine = host_machine()
     if machine != platform.machine():
         translated = f"machine architecture {platform.machine()} ("
         mismatches = [m for m in mismatches if not m.startswith(translated)]
-        if machine not in getattr(prof, "host_machines", ()):
+        host_machines = set(getattr(prof, "host_machines", ()))
+        if machine not in host_machines:
             target = getattr(prof, "manifest_target", {}).get("arch")
             mismatches.append(f"machine architecture {machine} (target {target})")
+        else:
+            code = interpreter_machines()
+            if code is None or not code & host_machines:
+                has = ", ".join(sorted(code)) if code else "an executable that cannot be read as Mach-O"
+                mismatches.append(
+                    f"interpreter {sys.executable} has no {machine} code ({has}): it runs translated as "
+                    f"{platform.machine()}, and pip would install {platform.machine()} wheels into a venv "
+                    f"built with it; use a universal2 or {machine} CPython 3.12"
+                )
     return mismatches
 
 

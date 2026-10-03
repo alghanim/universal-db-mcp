@@ -102,9 +102,25 @@ unset TMPDIR TEMP TMP
 # dpkg undoes a failed upgrade or removal (the new package's preinst refused,
 # or its unpack was rolled back): this release's files are the installed ones
 # still, and only the service the prerm stopped has to run again. Nothing is
-# verified or installed again.
+# verified or installed again. Unless the venv is gone: the runbook's package
+# rollback deletes it before `dpkg -i` of the older package, so when that
+# package's preinst refuses, nothing can run. That is recorded ('failed' in the
+# status file the runbook waits on) and this script fails, which leaves the
+# package 'unpacked' in dpkg instead of 'installed': `dpkg --configure
+# universal-db-mcp` then installs this release's payload again.
 case "${1:-}" in
   abort-upgrade|abort-remove|abort-deconfigure)
+    ABORT_VENV_PYTHON=/opt/universal-db-mcp/venv/bin/python
+    ABORT_STATUS=/var/log/universal-db-mcp-install.status
+    if [ ! -x "$ABORT_VENV_PYTHON" ]; then
+      abort_status="could not be written"
+      if { echo failed > "$ABORT_STATUS"; } 2>/dev/null; then abort_status="now says 'failed'"; fi
+      echo "FAIL: dpkg's $1 found no venv ($ABORT_VENV_PYTHON is missing): the installed release cannot run," >&2
+      echo "      and $ABORT_STATUS $abort_status. Install this release's payload again with:" >&2
+      echo "        sudo dpkg --configure universal-db-mcp" >&2
+      echo "      or install the intended package with dpkg -i once its refusal (above) is resolved." >&2
+      exit 1
+    fi
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
        && systemctl is-enabled --quiet universal-db-mcp 2>/dev/null; then
       systemctl start universal-db-mcp || echo "WARNING: could not start universal-db-mcp again after dpkg's $1" >&2
@@ -125,6 +141,66 @@ LOG=/var/log/universal-db-mcp-install.log
 STATUS=/var/log/universal-db-mcp-install.status
 UNIT_DROPIN_DIR=/etc/systemd/system/universal-db-mcp.service.d
 UNIT_DROPIN="$UNIT_DROPIN_DIR/deferred-install-guard.conf"
+# A deferred install worker holds DEFERRED_LOCK while it runs and names itself
+# in DEFERRED_OWNER ('<pid> <sha256 of the manifest of the payload it installs>');
+# a worker spawned by an earlier package's postinst names nothing.
+DEFERRED_LOCK=/run/udbmcp-deferred-install.lock
+DEFERRED_OWNER=/run/udbmcp-deferred-install.owner
+
+# $1: a file; prints its sha256 (nothing when it cannot be read)
+manifest_id() {
+  local out
+  out="$(sha256sum -- "$1" 2>/dev/null)" || return 0
+  printf '%s' "${out%% *}"
+}
+
+# >>> one install at a time
+# Whether no deferred install holds the lock. A holder that lets go within 15
+# seconds (the one the preinst of a refused upgrade leaves until its dpkg run
+# is over) is waited for.
+deferred_lock_free() {
+  local _
+  [ -e "$DEFERRED_LOCK" ] || return 0  # no worker ever ran since boot (/run is a tmpfs)
+  for _ in $(seq 1 30); do
+    if (exec 8>>"$DEFERRED_LOCK" && flock -n 8) 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+# $1: the sha256 of the payload's manifest. Succeeds when the running worker
+# installs that same payload; fails for any other worker, including one that
+# names nothing (an earlier package's) and a stale name of an ended one.
+deferred_worker_installs() {
+  local pid id
+  read -r pid id < "$DEFERRED_OWNER" 2>/dev/null || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null && [ "$id" = "$1" ]
+}
+# Refuse (exit 1) while a deferred install of another payload runs: exiting 0
+# here would let dpkg record this package while that worker publishes its own
+# release's code and starts the service on it. $1: this payload's manifest
+# sha256; $2: 'same-ok' when a worker for this very payload may keep running
+# (deferred mode: dpkg --configure -a during a long install).
+refuse_while_another_install_runs() {
+  if deferred_lock_free; then
+    return 0
+  fi
+  if [ "${2:-}" = same-ok ] && deferred_worker_installs "$1"; then
+    echo "WARNING: a deferred install of this same payload is still running;" >&2
+    echo "         not spawning a second worker. Track it: cat $STATUS ; tail -f $LOG" >&2
+    exit 0
+  fi
+  echo "FAIL: a deferred install of ANOTHER payload is still running (an earlier configure, possibly" >&2
+  echo "      spawned by the previous package's postinst when dpkg undid a refused upgrade). Configuring" >&2
+  echo "      now would let dpkg record this package while that worker installs its own release." >&2
+  echo "      Nothing was installed. Wait for it, then configure this package:" >&2
+  echo "        until grep -qxE 'success|failed' $STATUS; do sleep 5; done" >&2
+  echo "        sudo dpkg --configure universal-db-mcp" >&2
+  exit 1
+}
+# <<< one install at a time
 
 # --- step 1: the ADMIN trust dir must already be complete (fail closed) ------
 # The package NEVER bootstraps /usr/local/lib/udbmcp-trust from its own
@@ -342,6 +418,19 @@ if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
   # a missing 'bundle verification PASSED' all abort the configure step — an
   # empty/truncated verifier that exits 0 vacuously proves nothing.
   verify_payload_with_proof
+  # Which payload this is (the verified manifest): the worker names it, and a
+  # worker of another payload still running refuses this configure (exit 1),
+  # one of this payload is left to finish (`dpkg --configure -a` during a long
+  # install). Checked before anything here is changed.
+  PAYLOAD_ID="$(manifest_id "$BUNDLE/manifest.json")"
+  if [ -z "$PAYLOAD_ID" ]; then
+    echo "FAIL: $BUNDLE/manifest.json cannot be read; configure ABORTED (fail closed)." >&2
+    exit 1
+  fi
+  refuse_while_another_install_runs "$PAYLOAD_ID" same-ok
+  # The package version dpkg is configuring now: the worker installs only while
+  # dpkg still records it (empty when dpkg-query cannot tell).
+  EXPECT_VERSION="$(dpkg-query -W -f='${Version}' universal-db-mcp 2>/dev/null || true)"
 
   # Pre-flight everything the worker will need, while a failure can still
   # abort the configure step (fail closed — not discovered in the background).
@@ -388,19 +477,16 @@ DROPIN_EOF
     echo "==> systemctl daemon-reload unavailable (no running systemd?) — skipping"
   echo "==> deferred-install guard installed at $UNIT_DROPIN (service refuses to start until the deferred install records success)"
 
-  # Single flight: never spawn a second worker while one is still running
-  # (e.g. postinst re-run by `dpkg --configure -a` during a long install).
-  if ! (exec 8>/run/udbmcp-deferred-install.lock && flock -n 8); then
-    echo "WARNING: a deferred install from a previous configure is still running;" >&2
-    echo "         not spawning a second worker. Track it: cat $STATUS ; tail -f $LOG" >&2
-    exit 0
-  fi
+  # Single flight: no second worker while one still runs (checked above, before
+  # the guard; refuse_while_another_install_runs).
 
   export UDBMCP_DEB_BUNDLE="$BUNDLE" UDBMCP_DEB_TARGET="$TARGET" \
     UDBMCP_DEB_TRUST_DIR="$TRUST_DIR" UDBMCP_DEB_PUBKEY="$PUBKEY" \
     UDBMCP_DEB_UNIT_SRC="$UNIT_SRC" UDBMCP_DEB_UNIT_DST="$UNIT_DST" \
     UDBMCP_DEB_CONFIG_DIR="$CONFIG_DIR" UDBMCP_DEB_CONFIG="$CONFIG" \
-    UDBMCP_INSTALL_LOG="$LOG" UDBMCP_INSTALL_STATUS="$STATUS"
+    UDBMCP_INSTALL_LOG="$LOG" UDBMCP_INSTALL_STATUS="$STATUS" \
+    UDBMCP_DEB_PAYLOAD_ID="$PAYLOAD_ID" UDBMCP_DEB_EXPECT_VERSION="$EXPECT_VERSION" \
+    UDBMCP_DEB_LOCK="$DEFERRED_LOCK" UDBMCP_DEB_OWNER="$DEFERRED_OWNER"
 
   WORKER_SCRIPT="$(mktemp /var/tmp/udbmcp-postinst-worker.XXXXXX)"
   cat > "$WORKER_SCRIPT" <<'WORKER_EOF'
@@ -434,11 +520,16 @@ CONFIG_DIR="${UDBMCP_DEB_CONFIG_DIR:?}"
 CONFIG="${UDBMCP_DEB_CONFIG:?}"
 LOG="${UDBMCP_INSTALL_LOG:?}"
 STATUS="${UDBMCP_INSTALL_STATUS:?}"
+PAYLOAD_ID="${UDBMCP_DEB_PAYLOAD_ID:?}"
+EXPECT_VERSION="${UDBMCP_DEB_EXPECT_VERSION:-}"
+LOCK="${UDBMCP_DEB_LOCK:?}"
+OWNER="${UDBMCP_DEB_OWNER:?}"
 umask 077
 
 on_exit() {
   rc=$?
   rm -f -- "$0" 2>/dev/null || true
+  if [ "${OWNER_WRITTEN:-}" = 1 ]; then rm -f -- "$OWNER" 2>/dev/null || true; fi
   if [ "$rc" -ne 0 ] && [ "${REPORT_FAILURE:-1}" = "1" ]; then
     echo failed > "$STATUS" 2>/dev/null || true
     echo "==> deferred deb install FAILED (rc=$rc; details above; nothing unverified was executed)"
@@ -450,7 +541,7 @@ exec >>"$LOG" 2>&1
 echo "==> deferred deb install started $(date -u '+%Y-%m-%dT%H:%M:%SZ') (pid $$)"
 
 # --- single flight -----------------------------------------------------------
-exec 9>/run/udbmcp-deferred-install.lock
+exec 9>>"$LOCK"
 if ! flock -n 9; then
   # Another worker owns the install (postinst already warned); do not touch
   # the status file it manages.
@@ -458,7 +549,41 @@ if ! flock -n 9; then
   REPORT_FAILURE=0
   exit 1
 fi
+# Name the payload this worker installs: a later configure of another payload
+# refuses while this one runs, and one of this same payload leaves it be.
+printf '%s %s\n' "$$" "$PAYLOAD_ID" > "$OWNER"
+OWNER_WRITTEN=1
 echo running > "$STATUS"
+
+# $1: a file; prints its sha256 (nothing when it cannot be read)
+manifest_id() {
+  local out
+  out="$(sha256sum -- "$1" 2>/dev/null)" || return 0
+  printf '%s' "${out%% *}"
+}
+# This worker installs only the payload dpkg records. Another dpkg run between
+# the postinst that spawned it and its end (a retried or different package)
+# changes the version dpkg records or the unpacked payload; the worker then
+# stops ('failed', nothing started) rather than publish a release dpkg does
+# not record. $1: when.
+still_what_dpkg_records() {
+  local now
+  if [ -n "$EXPECT_VERSION" ]; then
+    now="$(dpkg-query -W -f='${Version}' universal-db-mcp 2>/dev/null || true)"
+    if [ "$now" != "$EXPECT_VERSION" ]; then
+      echo "FAIL: $1, dpkg records universal-db-mcp ${now:-<nothing>}, but this deferred install is for $EXPECT_VERSION." >&2
+      echo "      Another dpkg run changed the package; this worker stops and starts nothing. Configure the" >&2
+      echo "      package dpkg records: sudo dpkg --configure -a (or install the package again)." >&2
+      return 1
+    fi
+  fi
+  if [ "$(manifest_id "$BUNDLE/manifest.json")" != "$PAYLOAD_ID" ]; then
+    echo "FAIL: $1, the unpacked payload at $BUNDLE is not the one this deferred install was started for." >&2
+    echo "      Another dpkg run replaced it; this worker stops and starts nothing. Configure the package" >&2
+    echo "      dpkg records: sudo dpkg --configure -a (or install the package again)." >&2
+    return 1
+  fi
+}
 
 # --- wait for the outer dpkg to release its locks ----------------------------
 # dpkg uses fcntl record locks (flock(2) would not see them), so probe BOTH
@@ -504,6 +629,7 @@ while [ "$free_runs" -lt 2 ]; do
 done
 sleep 2
 echo "==> dpkg locks are free (waited ${waited}s)"
+still_what_dpkg_records "before the install"
 
 # --- verify + install the unpacked payload via the ONE installer -------------
 # (UDBMCP_ALLOW_DOWNGRADE, when set for dpkg -i, reaches the installer's
@@ -511,6 +637,15 @@ echo "==> dpkg locks are free (waited ${waited}s)"
 echo "==> verifying and installing the bundle payload via $TRUST_DIR/install_offline.sh"
 UDBMCP_RELEASE_PUBKEY="$PUBKEY" \
   bash "$TRUST_DIR/install_offline.sh" "$BUNDLE" "$TARGET"
+still_what_dpkg_records "after the install"
+# What the installer published is the payload this worker was started for
+# (its private copy was taken from $BUNDLE after the check above).
+if [ "$(manifest_id "$TARGET/manifest.json")" != "$PAYLOAD_ID" ]; then
+  echo "FAIL: $TARGET/manifest.json is not the manifest of the payload this deferred install was started for;" >&2
+  echo "      the payload changed during the install. Nothing is started. Configure the package dpkg" >&2
+  echo "      records: sudo dpkg --configure -a (or install the package again)." >&2
+  exit 1
+fi
 
 # --- systemd unit, config, enable: kept in lockstep with the postinst tail ---
 # /etc/systemd/system is an admin-controlled path (not dpkg-managed): install
@@ -784,6 +919,9 @@ echo "==> verifying and installing the bundle payload via $TRUST_DIR/install_off
 # copy, as before. An empty/truncated/no-op verifier that exits 0 vacuously
 # can no longer get unverified payload installed and the service enabled.
 verify_payload_with_proof
+# A deferred install still running (of any payload: this one never spawns
+# one) would publish its release over this install: refused (exit 1).
+refuse_while_another_install_runs "$(manifest_id "$BUNDLE/manifest.json")"
 # Explicit `bash`: the deb-shipped copy is installed 644 in the bundle layout
 # and the trust-dir copy carries the exec bit; invoking via bash makes the
 # call independent of how the bootstrap above (or the admin) installed it.

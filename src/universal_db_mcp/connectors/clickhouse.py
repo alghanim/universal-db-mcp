@@ -126,16 +126,23 @@ _CH_READING_SETTINGS = {
 # The server's own databases (names are case-sensitive: both spellings exist).
 _CH_SYSTEM_DATABASES = ("system", "INFORMATION_SCHEMA", "information_schema")
 # clickhouse-connect sends a statement whose text ends in LIMIT 0 (its own
-# comment regex applied, which keeps '#' comments) as a columns-only FORMAT
-# JSON request, read whole into memory outside the stream budget, the
-# row/byte ceilings and KILL: a UNION whose last branch ends in LIMIT 0, or a
-# '# LIMIT 0' comment, downloaded everything before it (p03L-2). A bound
-# value at the end can be that 0.
-_COLUMNS_ONLY = re.compile(r"LIMIT\s+(?:0|%s|%\(\w+\)s)\s*(?:;\s*)*$", re.IGNORECASE)
+# comment regex applied to the text after binding, which keeps '#' comments
+# and does not know a backslash-escaped quote) as a columns-only FORMAT JSON
+# request, read whole into memory outside the stream budget, the row/byte
+# ceilings and KILL: a UNION whose last branch ends in LIMIT 0, a '# LIMIT 0'
+# comment, or a bound value such as "x' LIMIT 0 --" (sent as 'x\' LIMIT 0
+# --', a comment to the driver) downloaded everything before it (p03L-2,
+# cr2 V6-a). Its regex needs the word LIMIT, matched case-insensitively as
+# Python folds it (LıMıT is LIMIT), somewhere in that text: in the statement
+# or in a bound value. Every such statement gets the probe below, so the
+# branch is never predicted, only prevented.
+_LIMIT_WORD = re.compile("limit", re.IGNORECASE)
 _OWN_LIMIT_0 = re.compile(r"\bLIMIT\s+0[\s;]*$", re.IGNORECASE)
-# A '#!' comment that ends in a quoted string: the server skips it to the end
-# of the text, while the driver's comment regex keeps the string, so the text
-# no longer ends in LIMIT 0 for the driver and streams like any other.
+# A '#!' comment that ends in a quoted string, on a line of its own: the
+# server skips it to the end of that line (the driver's FORMAT clause comes on
+# the next), while the driver's comment regex keeps the string: whatever the
+# driver reads before it (a value's quote, an unclosed '/*'), its reading of
+# the text ends in a quote, never in LIMIT 0, and the statement streams.
 _NO_COLUMNS_PROBE = "\n#!''"
 
 
@@ -230,16 +237,21 @@ def _returns_no_rows(sql: str) -> bool:
     return isinstance(value, exp.Literal) and value.this == "0" and not tree.args.get("offset")
 
 
-def _streamed(sql: str, *, probe_ok: bool) -> str:
-    """``sql`` as the driver must receive it to stream it (_COLUMNS_ONLY):
-    unchanged unless the driver would send a columns-only request for it,
-    and ``probe_ok`` and the statement really returns no rows."""
-    query = _driver_module("clickhouse_connect.driver.query")
-    remove_comments = getattr(query, "remove_sql_comments", None)
-    uncommented = str(remove_comments(sql)) if callable(remove_comments) else sql
-    if not _COLUMNS_ONLY.search(uncommented) or (probe_ok and _returns_no_rows(sql)):
+def _streamed(sql: str, *, probe_ok: bool, params: Any = None) -> str:
+    """``sql`` as the driver must receive it to stream it with ``params``:
+    unchanged when neither the text nor a bound value holds the word LIMIT
+    (_LIMIT_WORD), or ``probe_ok`` and the statement's own top-level LIMIT 0
+    returns no rows; otherwise without its trailing ';' and whitespace, plus
+    the probe. Linear: no regex here can backtrack over a whitespace run or
+    an unclosed comment."""
+    if _LIMIT_WORD.search(sql) is None and (params is None or _LIMIT_WORD.search(repr(params)) is None):
         return sql
-    return re.sub(r"[\s;]*\Z", "", sql) + _NO_COLUMNS_PROBE
+    if probe_ok and _returns_no_rows(sql):
+        return sql
+    end = len(sql)
+    while end and (sql[end - 1] == ";" or sql[end - 1].isspace()):
+        end -= 1
+    return sql[:end] + _NO_COLUMNS_PROBE
 
 
 def _driver_sql(sql: str, params: Any) -> str:
@@ -250,7 +262,7 @@ def _driver_sql(sql: str, params: Any) -> str:
     placeholders that do not match the values (p03L-1)."""
     if params and not _server_bound(sql, params):
         sql = bind_text(sql, params, engine="clickhouse")
-    return _streamed(sql, probe_ok=True)
+    return _streamed(sql, probe_ok=True, params=params)
 
 
 class _StreamBudgetExceeded(Exception):

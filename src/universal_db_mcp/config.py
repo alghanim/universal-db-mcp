@@ -943,9 +943,57 @@ def darwin_secret_file_acl_problems(path: Path) -> list[str]:
         return []
     import ctypes
 
-    libc = ctypes.CDLL(None, use_errno=True)
+    libc = _darwin_acl_libc()
     libc.acl_get_file.restype = ctypes.c_void_p
     libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    ctypes.set_errno(0)
+    acl = libc.acl_get_file(os.fsencode(path), _DARWIN_ACL_TYPE_EXTENDED)
+    return _darwin_acl_grants(libc, acl, lambda: os.stat(path).st_uid, _DARWIN_ACL_RIGHTS, str(path))
+
+
+# Every right an entry can carry on a directory (<sys/kauth.h> KAUTH_VNODE_*,
+# named as chmod(1) names them for a directory).
+_DARWIN_DIRECTORY_ACL_RIGHTS = (
+    (1 << 1, "list"),
+    (1 << 2, "add_file"),
+    (1 << 3, "search"),
+    (1 << 4, "delete"),
+    (1 << 5, "add_subdirectory"),
+    (1 << 6, "delete_child"),
+    (1 << 7, "readattr"),
+    (1 << 8, "writeattr"),
+    (1 << 9, "readextattr"),
+    (1 << 10, "writeextattr"),
+    (1 << 11, "readsecurity"),
+    (1 << 12, "writesecurity"),
+    (1 << 13, "chown"),
+)
+
+
+def darwin_directory_acl_problems(fd: int) -> list[str]:
+    """What the macOS extended ACL of the directory *fd* grants anyone but its
+    owner: each allow entry with any right at all, inheritable ones included
+    (every file created in the directory takes those). Deny entries only take
+    access away ('group:everyone deny delete', which macOS puts on every home
+    directory, among them), and the owner's own entry adds nothing. Empty on
+    other platforms and on a filesystem without ACLs; OSError when the ACL
+    cannot be read."""
+    if sys.platform != "darwin":
+        return []
+    import ctypes
+
+    libc = _darwin_acl_libc()
+    libc.acl_get_fd_np.restype = ctypes.c_void_p
+    libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    ctypes.set_errno(0)
+    acl = libc.acl_get_fd_np(fd, _DARWIN_ACL_TYPE_EXTENDED)
+    return _darwin_acl_grants(libc, acl, lambda: os.fstat(fd).st_uid, _DARWIN_DIRECTORY_ACL_RIGHTS, "a directory")
+
+
+def _darwin_acl_libc() -> Any:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
     libc.acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
     libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     libc.acl_get_permset.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
@@ -954,16 +1002,25 @@ def darwin_secret_file_acl_problems(path: Path) -> list[str]:
     libc.acl_get_qualifier.argtypes = [ctypes.c_void_p]
     libc.mbr_uuid_to_id.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_int)]
     libc.acl_free.argtypes = [ctypes.c_void_p]
-    ctypes.set_errno(0)
-    acl = libc.acl_get_file(os.fsencode(path), _DARWIN_ACL_TYPE_EXTENDED)
+    return libc
+
+
+def _darwin_acl_grants(
+    libc: Any, acl: Any, owner_of: Any, rights_table: tuple[tuple[int, str], ...], what: str
+) -> list[str]:
+    """The allow entries of *acl* (from acl_get_file or acl_get_fd_np, just
+    called; freed here) that give anyone but the owner (*owner_of*()) one of
+    the rights in *rights_table*; [] for no ACL (ENOENT) or none possible."""
+    import ctypes
+
     if not acl:
         err = ctypes.get_errno()
         if err in (errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP):  # no ACL, or none possible here
             return []
-        raise OSError(err, os.strerror(err), str(path))
+        raise OSError(err, os.strerror(err), what)
     problems: list[str] = []
     try:
-        owner = os.stat(path).st_uid
+        owner = owner_of()
         entry = ctypes.c_void_p()
         which = _DARWIN_ACL_FIRST_ENTRY
         while libc.acl_get_entry(acl, which, ctypes.byref(entry)) == 0:
@@ -974,7 +1031,7 @@ def darwin_secret_file_acl_problems(path: Path) -> list[str]:
                 continue
             if tag.value != _DARWIN_ACL_EXTENDED_ALLOW:
                 continue
-            rights = ",".join(name for bit, name in _DARWIN_ACL_RIGHTS if libc.acl_get_perm_np(permset, bit) == 1)
+            rights = ",".join(name for bit, name in rights_table if libc.acl_get_perm_np(permset, bit) == 1)
             if not rights:
                 continue
             ident, id_type = ctypes.c_uint32(), ctypes.c_int()
@@ -1204,7 +1261,69 @@ def load_yaml_strict(text: str, source: str = "<string>") -> Any:
     try:
         return yaml.load(text, Loader=_UniqueKeySafeLoader)  # noqa: S506 - a SafeLoader subclass
     except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid YAML in '{source}': {exc}") from exc
+        raise ConfigError(f"invalid YAML in '{source}': {describe_yaml_error(exc)}") from None
+
+
+# A quoted fragment in a PyYAML message: the file's own text (an alias, anchor,
+# tag or escape character) unless it is a token name ('<block end>') or one
+# of the grammar characters the parser expected. Linear: no nested quantifier.
+_YAML_QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+_YAML_TOKEN_NAME = re.compile(r"'<[a-z ]{1,40}>'")
+_YAML_GRAMMAR = frozenset({"','", "'}'", "']'", "':'", "'-'", "'\\t'"})
+_YAML_MESSAGE_CAP = 200
+
+
+def _content_free(message: str) -> str:
+    """*message* (a PyYAML context or problem) without the file's text: each
+    quoted fragment that is not a token name or a grammar character becomes
+    '…', and the rest from an unbalanced quote on is cut."""
+    message = message[:_YAML_MESSAGE_CAP]
+    out: list[str] = []
+    end = 0
+    for match in [*_YAML_QUOTED.finditer(message), None]:
+        between = message[end : match.start() if match else len(message)]
+        quote = min((i for i in (between.find("'"), between.find('"')) if i >= 0), default=-1)
+        if quote >= 0:
+            out.append(between[:quote].rstrip() + " …")
+            break
+        out.append(between)
+        if match is None:
+            break
+        fragment = match.group(0)
+        out.append(fragment if fragment in _YAML_GRAMMAR or _YAML_TOKEN_NAME.fullmatch(fragment) else "…")
+        end = match.end()
+    return "".join(out)
+
+
+def describe_yaml_error(exc: BaseException) -> str:
+    """Why a YAML document did not parse, by line and column, without its text.
+
+    PyYAML's own message quotes the offending line (about 32 characters on
+    each side of the error) and names aliases, anchors and tags from the
+    document. Harness configs hold other MCP servers' tokens, and a config may
+    inline a secret by mistake, so neither is ever printed: the parser's
+    reason, with every quoted fragment of the file replaced, and where it is.
+    A repeated mapping key keeps its own message (the key and both lines).
+    """
+    if isinstance(exc, _DuplicateKeyError):
+        return str(exc)
+    if isinstance(exc, yaml.MarkedYAMLError):
+        reason = "; ".join(_content_free(part) for part in (exc.context, exc.problem) if part) or "malformed"
+        mark = exc.problem_mark or exc.context_mark
+        return f"{reason} (line {mark.line + 1}, column {mark.column + 1})" if mark is not None else reason
+    if isinstance(exc, yaml.reader.ReaderError):
+        return f"a character YAML does not accept at character offset {exc.position}"
+    if isinstance(exc, yaml.YAMLError):
+        return "malformed YAML"
+    return f"the YAML parser failed ({type(exc).__name__})"
+
+
+def describe_decode_error(exc: UnicodeDecodeError) -> str:
+    """Where a file is not UTF-8, by line: the codec's own message quotes the
+    byte and its offset, and the file may hold a secret."""
+    data = exc.object if isinstance(exc.object, bytes | bytearray) else b""
+    line = data.count(b"\n", 0, exc.start) + 1
+    return f"not valid UTF-8 text (line {line})"
 
 
 # Where auditing goes when the config file leaves application.audit_path unset:

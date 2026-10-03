@@ -223,7 +223,14 @@ def _mysql_compared_outputs(tree: exp.Select, names: list[str]) -> set[int]:
     """Output columns the statement orders, groups or filters by, under
     their output name or position. MySQL resolves such a reference to the
     output column, so cutting it there would order, group or compare by its
-    first max_cell_bytes characters."""
+    first max_cell_bytes characters.
+
+    MySQL reads a GROUP BY or ORDER BY term as a position under parentheses
+    and COLLATE too ((2), ((2)), 2 COLLATE x; live, 9.7: GROUP BY (2) merged
+    the groups of a cut column), and +2 (the parse drops the plus). Any
+    other term that names no column (NULL, '2', a bound value PyMySQL
+    writes into the text as 2, a subquery) may be one: every output is then
+    compared, and none is cut (the derived-table forms run instead)."""
     lowered = [n.lower() for n in names]
     out: set[int] = set()
     for key in ("order", "group", "having"):
@@ -235,8 +242,17 @@ def _mysql_compared_outputs(tree: exp.Select, names: list[str]) -> set[int]:
                 out.update(i for i, n in enumerate(lowered) if n == column.name.lower())
         for item in clause.expressions if key != "having" else []:
             key_expr = item.this if isinstance(item, exp.Ordered) else item
-            if isinstance(key_expr, exp.Literal) and not key_expr.is_string and key_expr.this.isdigit():
+            while isinstance(key_expr, (exp.Paren, exp.Collate)):
+                key_expr = key_expr.this
+            if (
+                isinstance(key_expr, exp.Literal)
+                and not key_expr.is_string
+                and key_expr.this.isascii()
+                and key_expr.this.isdigit()
+            ):
                 out.add(int(key_expr.this) - 1)
+            elif key_expr.find(exp.Column) is None:
+                return set(range(len(names)))
     return out
 
 
@@ -280,24 +296,25 @@ def _mysql_capped_select(
 def _mysql_spelled_star(
     select: SelectList, description: Sequence[Any], tables: Sequence[str] | None, cut: set[int], max_cell_bytes: int
 ) -> str | None:
-    """A ``SELECT *`` over a join with the star spelled out, each column as
-    ``table.name`` (the table or alias the server described it under) and the
-    ones at ``cut`` cut to ``max_cell_bytes + 1``; None where that is not
-    exactly the star. The other rewrites cannot take such a statement when
-    two of its columns share a name: a derived table refuses duplicate names
-    (1060), and only MySQL 8.0 takes the derived column list that renames
-    them (5.7 and MariaDB: 1064; review E4). A star does not rename what it
-    expands, so ``table.name`` is that column, except where a USING or
-    NATURAL join merges a pair of columns into one."""
+    """A select list of stars over a join (``*``, or ``o.*, c.*``) spelled
+    out, each column as ``table.name`` (the table or alias the server
+    described it under) and the ones at ``cut`` cut to ``max_cell_bytes +
+    1``; None where that is not exactly the stars. The other rewrites cannot
+    take such a statement when two of its columns share a name: a derived
+    table refuses duplicate names (1060), and only MySQL 8.0 takes the derived
+    column list that renames them (5.7 and MariaDB: 1064; review E4, cr2
+    V10-e). A star does not rename what it expands and the server describes
+    the columns in the order the stars expand them, so ``table.name`` is that
+    column, except where a USING or NATURAL join merges a pair of columns
+    into one."""
     tree = select.tree
     entries = select.entries
     joins = tree.args.get("joins") or []
     names = [str(d[0]) for d in description]
     if (
         tables is None
-        or entries is None
-        or len(entries) != 1
-        or not isinstance(entries[0].node, exp.Star)
+        or not entries
+        or not all(_is_star_entry(e.node) for e in entries)
         or not joins
         or any(j.args.get("using") or str(j.args.get("method") or "").upper() == "NATURAL" for j in joins)
         or tree.args.get("distinct")
@@ -310,8 +327,12 @@ def _mysql_spelled_star(
     for i, (table, name) in enumerate(zip(tables, names, strict=True)):
         ref = f"{_mysql_quote(table)}.{_mysql_quote(name)}"
         parts.append(f"{f'LEFT({ref}, {keep})' if i in cut else ref} AS {_mysql_quote(name)}")
-    entry = entries[0]
-    return select.sql[: entry.start] + ", ".join(parts) + select.sql[entry.end :]
+    return select.sql[: entries[0].start] + ", ".join(parts) + select.sql[entries[-1].end :]
+
+
+def _is_star_entry(node: exp.Expression) -> bool:
+    """``*`` or ``t.*`` (no alias: MySQL takes none after a star)."""
+    return isinstance(node, exp.Star) or (isinstance(node, exp.Column) and isinstance(node.this, exp.Star))
 
 
 def _mysql_derived_selects(
@@ -392,8 +413,10 @@ class MySQLConnector(DatabaseConnector):
         super().__init__(connection, policy)
         self._module: Any = None
         self._exec_lock = threading.Lock()  # serializes queries
-        self._kill_lock = threading.Lock()  # guards _running_thread
+        self._kill_lock = threading.Lock()  # guards _running_thread, _in_run and _cancel_requested
         self._running_thread: int | None = None  # server thread id of the executing query
+        self._in_run = False  # a query is between its start and its end (execute_query)
+        self._cancel_requested = False  # cancel_current came before the session's id was known
         self._pool_lock = threading.Lock()
         self._meta_conn: Any = None  # reused metadata connection (ping on checkout)
         # the table (or alias) of each column the last LIMIT 0 describe returned, when PyMySQL gave them
@@ -591,22 +614,30 @@ class MySQLConnector(DatabaseConnector):
         return out
 
     def cancel_current(self) -> bool:
-        """Stop the executing query with KILL QUERY <thread id> from a
+        """Stop the executing query with KILL CONNECTION <thread id> from a
         short-lived second connection (PyMySQL has no out-of-band cancel).
-        The server ends the statement, so an abandoned worker stops reading
-        instead of streaming the rest of the result. An account may always
-        kill its own threads."""
+        The server ends the session whatever it is doing, so an abandoned
+        worker stops reading instead of streaming the rest of the result. KILL
+        QUERY ended only a statement in progress: one that found the session
+        between two statements (after the describe probe, before the
+        statement) ended nothing, and the statement then ran to its end
+        (review cr2 V10-d); the executor discards this connection after a
+        deadline anyway. Before the run knows its session's id, the cancel is
+        remembered and the run stops before its first statement. An account
+        may always kill its own threads."""
         with self._kill_lock:
             thread_id = self._running_thread
-        if thread_id is None:
-            return False
+            if self._in_run:
+                self._cancel_requested = True
+            if thread_id is None:
+                return self._in_run
         try:
             kw = self._connect_kwargs()
             del kw["cursorclass"]
             killer = self._module.connect(**kw)
             try:
                 with killer.cursor() as cur:
-                    cur.execute(f"KILL QUERY {int(thread_id)}")
+                    cur.execute(f"KILL CONNECTION {int(thread_id)}")
             finally:
                 killer.close()
             return True
@@ -643,7 +674,7 @@ class MySQLConnector(DatabaseConnector):
                 Limitation(
                     scope="cancel",
                     detail="PyMySQL exposes no out-of-band cancellation; on timeout the "
-                    "query is stopped with KILL QUERY from a short-lived second connection "
+                    "query's session is ended with KILL CONNECTION from a short-lived second connection "
                     "and the connection is discarded.",
                 ),
                 Limitation(scope="explain", detail=f"{EXPLAIN_ANALYZE_UNSUPPORTED}."),
@@ -913,7 +944,14 @@ class MySQLConnector(DatabaseConnector):
 
     def execute_query(self, spec: QuerySpec) -> QueryOutcome:
         with self._exec_lock:
-            return self._execute(spec)
+            with self._kill_lock:
+                self._in_run = True
+                self._cancel_requested = False
+            try:
+                return self._execute(spec)
+            finally:
+                with self._kill_lock:
+                    self._in_run = False
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
         # The guard accepts qmark/named placeholders as opaque markers;
@@ -940,7 +978,15 @@ class MySQLConnector(DatabaseConnector):
         except Exception:  # noqa: BLE001 - no id, nothing to KILL: cancel reports False
             thread_id = None
         with self._kill_lock:
-            self._running_thread = thread_id
+            cancelled = self._cancel_requested
+            if not cancelled:
+                self._running_thread = thread_id
+        if cancelled:  # the deadline fired before the session's id was known: run nothing
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
+            raise ConnectorError("the query was cancelled at its deadline before it started")
         start = time.monotonic()
         truncated = False
         truncation_cause = "row limit"

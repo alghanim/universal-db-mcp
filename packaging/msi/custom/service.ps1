@@ -64,9 +64,12 @@
 # commit action (CommitReleaseRecordCA) removes both once the install
 # succeeded.
 #
-# Idempotency: on upgrade the previous service is stopped and deleted before
-# the new one is created (delete-then-create). On a fresh install the query
-# reports the service absent and creation proceeds directly.
+# Idempotency: a service already registered under the name (a repair; a
+# major upgrade's uninstall of the old product has removed its service) is
+# stopped and updated in place (sc.exe config), never deleted: a failure at
+# any point leaves it registered, and the rollback twin keeps it on a repair
+# (uninstall.ps1 -Repair). On a fresh install the query reports the service
+# absent and it is created (sc.exe create); a failure after that removes it.
 #
 # The service account: -ServiceAccount (UDBMCP_SERVICE_ACCOUNT, which
 # msiexec does not keep between runs), else the account the service is
@@ -139,6 +142,9 @@ $script:ErrServiceNotActive = 1062
 $script:ErrServiceMarkedForDelete = 1072
 
 $script:Created = $false
+# A service was registered under the name when this action began (it is
+# updated in place, and kept whatever fails).
+$script:Existing = $false
 
 function Fail {
     # Hard exit for failures BEFORE the service is created: nothing to clean
@@ -149,8 +155,9 @@ function Fail {
 }
 
 function Abort {
-    # Failure AFTER the service was created: throws so the outer catch can
-    # remove the half-configured service before exiting nonzero.
+    # Failure AFTER the service was registered: throws so the outer catch can
+    # remove a service this action created (one it updated in place is kept)
+    # before exiting nonzero.
     param([string]$Message)
     throw $Message
 }
@@ -224,7 +231,7 @@ function Set-ServiceLogonCredential {
     param([string]$Name, [string]$Account, [string]$Password)
     $svc = Get-CimInstance Win32_Service -Filter ("Name='" + $Name + "'")
     if (-not $svc) {
-        throw ("service '" + $Name + "' not found via Win32_Service after creation")
+        throw ("service '" + $Name + "' not found via Win32_Service after registration")
     }
     $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{
         StartName     = $Account
@@ -511,6 +518,10 @@ function Get-EarlierAccountSid {
     # write access, or $null. Only a logs\ an install made counts: a
     # directory, not a junction or symbolic link, owned by SYSTEM,
     # Administrators or an administrator (the walk refuses any other).
+    # The registration action grants the service account Modify whoever it
+    # is, so $GrantedSid is matched as it is, a member of Administrators (a
+    # gMSA an administrator put there) included. Without it, such an ACE is
+    # an administrator's own, not the mark of an earlier service account.
     param([string]$LogsDir, [string]$ServiceSid, [string]$GrantedSid = '')
     $attributes = Get-EntryAttributes -Path $LogsDir
     if ($null -eq $attributes -or ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
@@ -520,8 +531,11 @@ function Get-EarlierAccountSid {
     foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
         $sid = $rule.IdentityReference.Value
         if ($rule.IsInherited -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-            $sid -eq $ServiceSid -or ($GrantedSid -and $sid -ne $GrantedSid) -or (Test-TrustedOwner -Sid $sid) -or
             -not (Test-AccountSid -Sid $sid)) { continue }
+        if ($GrantedSid) {
+            if ($sid -ne $GrantedSid) { continue }
+        }
+        elseif ($sid -eq $ServiceSid -or (Test-TrustedOwner -Sid $sid)) { continue }
         if ([int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights) -band $script:WriteRights) {
             return $sid
         }
@@ -593,18 +607,21 @@ function Wait-ServiceStopped {
     Fail ("service '" + $Name + "' did not reach STOPPED within " + $TimeoutSeconds + " seconds")
 }
 
-function Remove-ExistingService {
-    # Upgrade path: stop + delete the previous service so create starts from
-    # a clean slate. Tolerates absence (fresh install); fails closed on
-    # anything it cannot resolve.
+function Stop-ExistingService {
+    # Sets $script:Existing when a service is registered under $Name, and
+    # stops it (it is updated in place, never deleted: see the header);
+    # there is none on a fresh install, or an upgrade whose old product took
+    # its service. Fails closed on anything it cannot resolve. (A flag, not a
+    # return value: what this writes would join the value in the pipeline.)
     param([string]$Name)
 
     if (-not (Test-ServiceExists -Name $Name)) {
-        Write-Output ("==> service '" + $Name + "' not present (fresh install)")
+        Write-Output ("==> service '" + $Name + "' not present: it is created")
         return
     }
+    $script:Existing = $true
 
-    Write-Output ("==> existing service '" + $Name + "' found (upgrade): deleting before create")
+    Write-Output ("==> existing service '" + $Name + "' found: stopping it, then updating it in place")
     $r = Invoke-Tool -Tool $script:ScExe -Arguments ("stop " + $Name)
     Write-ToolOutput $r
     if ($r.ExitCode -ne 0 -and
@@ -613,33 +630,12 @@ function Remove-ExistingService {
         Fail ("sc.exe stop " + $Name + " failed with exit code " + $r.ExitCode)
     }
     Wait-ServiceStopped -Name $Name
-
-    $r = Invoke-Tool -Tool $script:ScExe -Arguments ("delete " + $Name)
-    Write-ToolOutput $r
-    if ($r.ExitCode -eq $script:ErrServiceMarkedForDelete) {
-        Fail ("service '" + $Name + "' is already marked for deletion; reboot the host and rerun the install")
-    }
-    if ($r.ExitCode -ne 0 -and $r.ExitCode -ne $script:ErrServiceAbsent) {
-        Fail ("sc.exe delete " + $Name + " failed with exit code " + $r.ExitCode)
-    }
-
-    # A deleted service disappears only once all handles are closed; poll
-    # until the SCM no longer lists it (bounded, then fail closed).
-    $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Date) -lt $deadline) {
-        if (-not (Test-ServiceExists -Name $Name)) {
-            Write-Output ("==> previous service '" + $Name + "' removed")
-            return
-        }
-        Start-Sleep -Seconds 1
-    }
-    Fail ("service '" + $Name + "' still present 60 seconds after sc.exe delete")
 }
 
 function Remove-ServiceBestEffort {
     # Cleanup before a failing exit: the WiX transaction rolls back, but
-    # sc.exe state is not transactional, so a half-configured service is
-    # removed here.
+    # sc.exe state is not transactional, so a half-configured service this
+    # action created is removed here.
     param([string]$Name)
     $r = Invoke-Tool -Tool $script:ScExe -Arguments ("delete " + $Name)
     Write-ToolOutput $r
@@ -824,7 +820,7 @@ try {
         Fail ("refusing '" + $configDir + "': '" + $found.Path + "' in it " + $found.Problem + '. ' + (Get-TreeRemedy $found -Appeared))
     }
 
-    Remove-ExistingService -Name $ServiceName
+    Stop-ExistingService -Name $ServiceName
 
     # --- bearer token (HTTP listener's only authentication) --------------------
     # The service runs --transport http; serve refuses to start without a
@@ -870,7 +866,7 @@ try {
         }
     }
 
-    # --- create ---------------------------------------------------------------
+    # --- create, or update in place ---------------------------------------------
     # Raw command line (CommandLineToArgvW semantics): the binPath value is
     # itself quoted and contains the quoted interpreter path, so its embedded
     # quotes are backslash-escaped.
@@ -880,22 +876,41 @@ try {
     # HTTP transport, exactly like the launchd plist and systemd unit. -I:
     # the service reads no PYTHON* variables, user site or working directory.
     $binPath = '"' + $python + '" -I -m universal_db_mcp serve --transport http'
-    $createArgs = 'create ' + $ServiceName +
-        ' binPath= "' + (ConvertTo-ScArgument $binPath) + '"' +
+    $serviceArgs = ' binPath= "' + (ConvertTo-ScArgument $binPath) + '"' +
         ' start= auto' +
         ' obj= "' + (ConvertTo-ScArgument $ServiceAccount) + '"'
     # The password is deliberately NOT part of this command line: command
     # lines are captured into durable OS audit logs (Event 4688 with
     # include-command-line, Sysmon EID 1). It is written through the Service
-    # Control Manager API below, after the create succeeded.
+    # Control Manager API below, once the service is registered.
 
-    Write-Output ("==> creating service '" + $ServiceName + "' (start= auto, account " + $ServiceAccount + ")")
-    $r = Invoke-Tool -Tool $script:ScExe -Arguments $createArgs
-    Write-ToolOutput $r
-    if ($r.ExitCode -ne 0) {
-        Fail ("sc.exe create " + $ServiceName + " failed with exit code " + $r.ExitCode)
+    if ($script:Existing) {
+        # ChangeServiceConfig keeps the stored password when none is given,
+        # which a managed service or virtual account requires; LocalSystem,
+        # LocalService and NetworkService take an empty one (the earlier
+        # account's is dropped).
+        if ($ServiceAccount -match '^((\.\\)?LocalSystem|NT AUTHORITY\\(SYSTEM|Local ?Service|Network ?Service))$') {
+            $serviceArgs += ' password= ""'
+        }
+        Write-Output ("==> updating service '" + $ServiceName + "' in place (start= auto, account " + $ServiceAccount + ")")
+        $r = Invoke-Tool -Tool $script:ScExe -Arguments ('config ' + $ServiceName + $serviceArgs)
+        Write-ToolOutput $r
+        if ($r.ExitCode -eq $script:ErrServiceMarkedForDelete) {
+            Fail ("service '" + $ServiceName + "' is marked for deletion; reboot the host and rerun the install")
+        }
+        if ($r.ExitCode -ne 0) {
+            Fail ("sc.exe config " + $ServiceName + " failed with exit code " + $r.ExitCode + "; the service is unchanged")
+        }
     }
-    $script:Created = $true
+    else {
+        Write-Output ("==> creating service '" + $ServiceName + "' (start= auto, account " + $ServiceAccount + ")")
+        $r = Invoke-Tool -Tool $script:ScExe -Arguments ('create ' + $ServiceName + $serviceArgs)
+        Write-ToolOutput $r
+        if ($r.ExitCode -ne 0) {
+            Fail ("sc.exe create " + $ServiceName + " failed with exit code " + $r.ExitCode)
+        }
+        $script:Created = $true
+    }
 
     # --- credential (SCM API, never a command line) ---------------------------
     if ($ServicePassword) {
@@ -983,5 +998,9 @@ try {
 }
 catch {
     if ($script:Created) { Remove-ServiceBestEffort -Name $ServiceName }
+    elseif ($script:Existing) {
+        Write-Output ("==> the service '" + $ServiceName + "' was registered before this action, which updates it in" +
+                      ' place and does not remove it (it is stopped)')
+    }
     Fail ("service registration failed: " + $_.Exception.Message)
 }

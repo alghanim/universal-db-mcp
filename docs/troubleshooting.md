@@ -11,6 +11,10 @@ config validity, secret references, secret-file permissions (ACLs on
 Windows), CA files, SQLite data files, the audit path (including a real lock
 probe on its `.lock` sidecar and whether the log or lock is a symlink or hard
 link), the metadata cache path and its permissions (`metadata-cache-perms`),
+on macOS the access control lists of the audit log, its lock and rotated
+backups, the metadata cache with its sidecars, and their directories
+(`audit-path-acl`, `metadata-cache-acl`, fatal when an entry grants another
+account access; remedy `chmod -N <path>`),
 the bearer token, per-connection driver availability and session profile
 (`session-<id>`), the installed release (`installed-release`) and the venv's
 interpreter (`venv-interpreter`). When `application.audit_path` is unset,
@@ -24,7 +28,8 @@ Doctor never stops on a path the current user may not inspect:
 | `connection-<id>-files` fatal with the same text | a CA file, SQLite file, `tns_admin`, `lib_dir` or wallet cannot be inspected; the other checks still run. |
 | `service-bearer-token` warning: `... may be present but is not verifiable by this user ...; run doctor as an administrator to check it` | normal for a non-admin on an MSI host, or a non-root user next to `/etc/universal-db-mcp/http-token`. |
 | `http-bearer-token` fatal: `bearer token file '<path>' cannot be inspected by this user` | a configured `http_bearer_token_file` this user cannot read. |
-| `doctor` fatal: `stopped before every check ran: ...` | another probe failed with an OS error; the JSON report is still printed. |
+| `doctor` fatal: `stopped before every check ran: ...` | another probe failed (an OS error, or anything else); the JSON report is still printed, never a traceback. |
+| `connection-<id>-file` fatal: `data file '<path>' starts with a ~user that names no account on this machine ...` | a SQLite `database` path such as `~nobody/x.db`; `serve` refuses it as `CONNECTION_ERROR` too. Use an absolute path. |
 | Windows, machine-wide config: `audit-path` / `metadata-cache-path` warning ending `unverified: the service account needs write access to '<dir>' ...` | doctor cannot evaluate NTFS ACLs for another account; expected, not an error. |
 | Windows: `'<path>' absent and its directory '<logs>' does not exist: ... repair or reinstall the MSI` | the default audit folder `%ProgramData%\UniversalDB MCP\logs` is missing; a dedicated service account cannot create it. |
 | `session-<id>` warning with `enforce_read_only=false` | on PostgreSQL, MySQL, ClickHouse or SQLite only the SQL guard refuses writes for that connection. |
@@ -70,7 +75,7 @@ are quoted as the driver reports them.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `CONFIG_ERROR: ...` on start | config missing/invalid; unknown fields and duplicate YAML keys rejected | fix YAML; see config.example.yaml |
+| `CONFIG_ERROR: ...` on start | config missing/invalid; unknown fields and duplicate YAML keys rejected. A YAML error gives the parser's reason and the line and column, never the file's text (it may hold a secret); a file that is not UTF-8 is named with the line | fix YAML at that line and column; see config.example.yaml |
 | `CONFIG_ERROR: ... read_only=false is not supported in v1 ...` | a connection sets `read_only: false` (or `security.read_only: false`); v1 is read-only | remove the key; every connection is read-only |
 | `CONFIG_ERROR: connection id '<id>' must be 1-64 chars of [A-Za-z0-9_-], not starting with '-'` | ids starting with `-` or with non-ASCII characters are refused since this release | rename the connection (and its secret files) |
 | `CONFIG_ERROR: application.audit_path is not set and the per-user default cannot be derived (...)` | no usable home directory (none, `HOME` empty or `/`, a drive root, relative) | set `application.audit_path` |
@@ -85,6 +90,9 @@ are quoted as the driver reports them.
 | `POLICY_VIOLATION: '<name>' holds column statistics (histogram buckets, most common values, low and high values) ...` or `... holds stored credentials (password hashes, or the passwords and connection details the database keeps for other servers) ...` | a column-statistics view (MySQL `COLUMN_STATISTICS`, `pg_stats`, Oracle `*_HISTOGRAMS`, Db2 `SYSCAT.COLDIST`, ...) or a credential view (`information_schema.user_mapping_options`, `mysql.user`, `sys.sql_logins`, Oracle `*_DB_LINKS`, ...), refused on every connection whatever is opened. Some of them were `AUTHORIZATION_DENIED` as a closed system schema before | none; the lists are in `docs/security.md` |
 | `POLICY_VIOLATION: '<name>' carries the definitions of every schema's objects (view and routine bodies, trigger statements, check clauses, DEFAULT expressions with their literals) ...` | an `information_schema` definition view (`VIEWS`, `ROUTINES`, `COLUMNS`, `TRIGGERS`, `CHECK_CONSTRAINTS`, ...; per engine in `docs/security.md`), which covers schemas outside the allowlist too | `db_list_columns` and `db_list_views` describe the objects the connection may read; `information_schema.TABLES` and the other names-only views stay readable |
 | `VALIDATION_ERROR: the statement has N placeholder(s) outside string literals, quoted names and comments but M positional value(s) were supplied ...` or `... parameter(s) [...] were supplied but no %(name)s placeholder ... uses them ...` | MySQL, ClickHouse or PostgreSQL: a placeholder inside a literal or comment is text, so the values do not match the placeholders in code | put each placeholder outside quotes (`WHERE name = %s`, not `'%s'`), one value per placeholder |
+| `VALIDATION_ERROR: '%%' outside a string literal is not supported with bound parameters ...` | MySQL, ClickHouse or PostgreSQL with `parameters`: `%%` in code (in a string literal it is one `%`) | write the modulo operator as one `%`, or `MOD()` |
+| `VALIDATION_ERROR: placeholder %s is directly followed by '<c>' ...` | a placeholder glued to a name, digit or quote (`%ssn`), which PostgreSQL's parser and the driver read differently | put a space or an operator after it |
+| `VALIDATION_ERROR: parameter(s) [...] were supplied but no statement's placeholders ... use them` | `db_federated_query`: each statement gets only the named values its placeholders use, and a name none uses is refused | drop the unused name |
 | `QUERY_ERROR: '<name>' is an internal table of a full-text or R*Tree index ...` | SQLite: a shadow table of an FTS or R*Tree index, which holds the indexed values under generic column names | query the index's own (virtual) table |
 | `POLICY_VIOLATION: '<name>' carries each column's low and high values (...): name the columns you need, without those, without * and without a column list after its alias ...` | Oracle `*_TAB_COLUMNS`/`COLS` or Db2 `SYSCAT.COLUMNS` read with `LOW_VALUE`, `HIGH_VALUE`, `HIGH2KEY` or `LOW2KEY`, with `*` (outside `COUNT`) or with a column list after the alias; the sample, profile and metadata tools refuse these views whole. Ending `; a CTE of the name '<name>' does not change this ...`: a CTE named like one of these views | name the columns you need; rename such a CTE |
 | `POLICY_VIOLATION: table <t> is not spelled as the catalog lists it on connection '<id>' (<spelling>): ...` | default-deny on PostgreSQL, Oracle, Db2 or ClickHouse: a quoted name in another case than the catalog's, or an unquoted one the engine folds to another (on SQL Server, a case variant under a case-sensitive collation) | write the spelling the message gives |
@@ -171,10 +179,13 @@ are quoted as the driver reports them.
   change that turns TLS off prints a warning. A relative `tls.ca_file`
   already in the config is offered resolved against the config's directory,
   as the server reads it.
-- On macOS the secrets directory must carry no extended ACL (one inherited
-  as the wizard creates it is removed; one an existing directory carries is
-  refused: `chmod -N <dir>`), since every secret file created in it would
-  inherit it. A `UDBMCP_CONFIG` starting with a `~user` that names no
+- On macOS the secrets directory must carry no extended ACL entry that
+  grants anyone but its owner access, inheritable entries included (one
+  inherited as the wizard creates it is removed; one an existing directory
+  carries is refused: `chmod -N <dir>`), since every secret file created in
+  it would inherit it. Entries that only deny (`group:everyone deny delete`,
+  which macOS puts on home folders) are fine. A `UDBMCP_CONFIG` starting
+  with a `~user` that names no
   account is a `CONFIG_ERROR`.
 - Backups: `<config>.bak.<stamp>` beside the config, created with the
   config's permission bits only (setuid, setgid and sticky are never copied;
@@ -188,9 +199,11 @@ are quoted as the driver reports them.
   is not supported (v1 is read-only)`), and the wizard no longer asks
   "Read-only connection?".
 - As root, secrets are written only when every directory from `/` to the
-  config's directory is root-owned and not group- or other-writable; the
-  `.deb` and `.pkg` system config qualifies, and the service account then
-  owns the secrets (the command to restart the service is printed).
+  config's directory is root-owned and not group- or other-writable (on
+  macOS, with no ACL entry that grants another account access; deny-only
+  entries are fine); the `.deb` and `.pkg` system config qualifies, and the
+  service account then owns the secrets (the command to restart the service
+  is printed).
   Otherwise the run exits 1 naming the directory and suggesting
   `sudo -u <account> udbmcp add-connection ...`.
 

@@ -133,7 +133,45 @@ def cache_file_problems(path: Path, *, owner_uid: int | None) -> list[str]:
                 problems.append(f"'{f}' is owned by uid {st.st_uid}, not uid {owner_uid}")
             if st.st_mode & 0o077:
                 problems.append(f"'{f}' is accessible to group/other ({stat.filemode(st.st_mode)})")
+            problems += _acl_problems(Path(f))
+    if sys.platform == "darwin":
+        problems += _directory_acl_problems(path.parent)
     return problems
+
+
+def _acl_problems(file: Path) -> list[str]:
+    """macOS: what an extended ACL on *file* grants beyond its 0600 mode."""
+    if sys.platform != "darwin":
+        return []
+    from universal_db_mcp.config import darwin_secret_file_acl_problems
+
+    try:
+        granted = darwin_secret_file_acl_problems(file)
+    except OSError as exc:
+        return [f"cannot read the access control list of '{file}': {exc}"]
+    return [f"'{file}' has an access control list that grants others access ({'; '.join(granted)})"] if granted else []
+
+
+def _directory_acl_problems(directory: Path) -> list[str]:
+    """macOS: what an extended ACL on the cache's directory grants anyone but
+    its owner (another account that may add files could plant a sidecar)."""
+    from universal_db_mcp.config import darwin_directory_acl_problems
+
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        return [f"cannot inspect directory '{directory}': {exc}"]
+    try:
+        granted = darwin_directory_acl_problems(fd)
+    except OSError as exc:
+        return [f"cannot read the access control list of directory '{directory}': {exc}"]
+    finally:
+        os.close(fd)
+    if not granted:
+        return []
+    return [f"directory '{directory}' has an access control list that grants others access ({'; '.join(granted)})"]
 
 
 class MetadataCache:

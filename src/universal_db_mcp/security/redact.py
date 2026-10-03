@@ -68,13 +68,11 @@ def redact_text(text: str) -> str:
         (re.compile(r"(?i)\b((?:for\s+)?user(?:name)?|uid|login)\s+(['\"])[^'\"\s;@]+\2"), r"\1 <redacted>"),
         # keyword + bare value after the specific "for user" phrasing.
         (re.compile(r"(?i)\b(for user)\s+[^'\"\s;@]+"), r"\1 <redacted>"),
-        # ClickHouse names the login first: DB::Exception: svc_ro: Authentication
-        # failed (the name may hold spaces and colons, live 26.3).
-        (re.compile(r"(DB::Exception: )[^\n]*?(?=: Authentication failed)"), r"\1<redacted>"),
     ]
     out = text
     for pat, repl in patterns:
         out = pat.sub(repl, out)
+    out = _redact_clickhouse_login(out)
     # Registered SecretMark literals, longest first. Matched as standalone
     # tokens (no adjacent word characters) so a short or generic secret is
     # still scrubbed wherever it appears as a value, without shredding
@@ -90,6 +88,39 @@ def redact_text(text: str) -> str:
     return out
 
 
+# ClickHouse names the login first: DB::Exception: svc_ro: Authentication
+# failed (the name may hold spaces and colons, live 26.3). Scanned with
+# str.find, not a lazy regex: (DB::Exception: )[^\n]*?(?=: Authentication
+# failed) rescanned the rest of the line from every anchor, quadratic on a
+# driver error that echoes a long value (cr2 V7-e/V7-h).
+_CH_LOGIN_ANCHOR = "DB::Exception: "
+_CH_LOGIN_END = ": Authentication failed"
+
+
+def _redact_clickhouse_login(text: str) -> str:
+    """The text between each 'DB::Exception: ' and the first ': Authentication
+    failed' after it on the same line replaced by '<redacted>' (what the
+    regex above did), in one left-to-right pass."""
+    out: list[str] = []
+    last = i = 0
+    eol = -1
+    n = len(text)
+    while (anchor := text.find(_CH_LOGIN_ANCHOR, i)) != -1:
+        start = anchor + len(_CH_LOGIN_ANCHOR)
+        if eol < start:
+            eol = text.find("\n", start)
+            eol = n if eol == -1 else eol
+        end = text.find(_CH_LOGIN_END, start, eol)
+        if end == -1:  # no later anchor on this line has one either
+            i = eol
+            continue
+        out.append(text[last:start])
+        out.append("<redacted>")
+        last = i = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def redact_value(value: Any) -> Any:
     if isinstance(value, SecretMark):
         return "<redacted>"
@@ -102,9 +133,28 @@ def redact_value(value: Any) -> Any:
     return value
 
 
+# scrub_exception shows 500 characters; it redacts at most this many, cut
+# before any pattern runs: a driver error can echo a parameter value of any
+# length, and redaction ran over all of it on the request's thread (V7-h).
+_SCRUB_MAX_CHARS = 16384
+_SCRUB_SHOWN_CHARS = 500
+
+
 def scrub_exception(exc: BaseException) -> str:
     """One-line, redacted representation of an exception for error paths."""
-    return redact_text(f"{type(exc).__name__}: {exc}".replace("\n", " "))[:500]
+    text = f"{type(exc).__name__}: {exc}"
+    if len(text) <= _SCRUB_MAX_CHARS:
+        return redact_text(text.replace("\n", " "))[:_SCRUB_SHOWN_CHARS]
+    # Cut first. A secret or a login cut in two at the boundary is no longer
+    # whole for redaction, and the end of the redacted text is the text just
+    # before the cut, verbatim: that end is dropped, as far back as the
+    # longest registered secret (and a margin), so no part of it is shown.
+    margin = max([256, *(len(s) + 64 for s in _REGISTERED_SECRETS)])
+    redacted = redact_text(text[:_SCRUB_MAX_CHARS].replace("\n", " "))
+    keep = min(_SCRUB_SHOWN_CHARS, len(redacted) - margin)
+    if keep < _SCRUB_SHOWN_CHARS:
+        return redacted[: max(len(type(exc).__name__) + 2, keep)] + " [...]"
+    return redacted[:keep]
 
 
 # Quoted literals in the unrolled form: the old (?:[^']|'')* pushed one

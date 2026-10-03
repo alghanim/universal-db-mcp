@@ -223,7 +223,7 @@ def test_f15_service_refuses_a_squatted_config_before_changing_anything() -> Non
     scan = body.index("$found = Get-TreeProblem -Directory $configDir -SkipNames @('http-token')")
     assert re.match(r"\$found = Get-TreeProblem [^\n]*\n\s*if \(\$found\) \{\s*\n\s*Fail ", body[scan:])
     first_change = min(
-        body.index("Remove-ExistingService -Name $ServiceName"),
+        body.index("Stop-ExistingService -Name $ServiceName"),
         body.index("$r = Invoke-Tool -Tool $script:IcaclsExe"),
         body.index("Set-Acl -LiteralPath $configDir"),
     )
@@ -233,12 +233,12 @@ def test_f15_service_refuses_a_squatted_config_before_changing_anything() -> Non
 
 def test_f15_service_checks_the_token_entry_before_removing_the_old_service() -> None:
     # The fail-closed check on an http-token that is a directory, junction or
-    # symbolic link ran after Remove-ExistingService: on an upgrade the
-    # previous service was already stopped and deleted when the action failed.
+    # symbolic link ran after the old service was stopped and deleted (now:
+    # stopped, to be updated in place), so the action failed without it.
     body = _main_body(_code(SERVICE_PS1))
     entry = body.index("$tokenAttributes = Get-EntryAttributes -Path $tokenFile")
     refuse = body.index("is a directory, junction or symbolic link, not a token file")
-    remove = body.index("Remove-ExistingService -Name $ServiceName")
+    remove = body.index("Stop-ExistingService -Name $ServiceName")
     assert entry < refuse < remove
     assert body.index("$tokenFile = Join-Path $configDir 'http-token'") < entry
 
@@ -351,7 +351,7 @@ def test_f15_gate_has_a_squatted_folder_negative() -> None:
     # the planted config is the shipped template: only its owner is wrong
     assert "Join-Path $BundleDir 'config-templates\\config.template.yaml'" in squat
     # a successful install over a squatted folder or config fails the gate
-    assert re.search(r"-eq 0 -or \$\w+\.ExitCode -eq 3010\) \{\s*\n\s*Stop-Gate 'folder_squat_refused'", squat), (
+    assert re.search(r"-eq 0 -or \$\w+\.ExitCode -eq 3010\) \{\s*\n\s*Stop-Check 'folder_squat_refused'", squat), (
         "an install that adopts a squatted folder or config must fail the gate"
     )
     # the planted folder is removed and the admin's folder restored on every unwind
@@ -1478,7 +1478,7 @@ def test_i61_service_gives_the_service_account_a_writable_logs_folder() -> None:
     create = body.index("New-Item -ItemType Directory -Path $logsDir")
     protect = body.index("Set-Acl -LiteralPath $logsDir -AclObject $security")
     grant = body.index("':(OI)(CI)M'")
-    assert reset < check < create < protect < grant < body.index("Remove-ExistingService -Name $ServiceName")
+    assert reset < check < create < protect < grant < body.index("Stop-ExistingService -Name $ServiceName")
     assert "-Force" not in body[create : body.index("\n", create)]
     # the SID is known before the walks, which accept its files in logs\
     assert body.index("$serviceSid = Get-ServiceAccountSid") < body.index("$found = Get-TreeProblem")
@@ -1582,7 +1582,7 @@ def test_i63_service_walks_the_folder_again_once_its_dacl_is_in_place() -> None:
     assert len(walks) == 2, walks
     grant = body.index("':(OI)(CI)M'")
     assert walks[0] < body.index("Set-Acl -LiteralPath $configDir") < grant < walks[1]
-    assert walks[1] < body.index("Remove-ExistingService -Name $ServiceName")
+    assert walks[1] < body.index("Stop-ExistingService -Name $ServiceName")
     assert re.match(r"\$found = Get-TreeProblem [^\n]*\n\s*if \(\$found\) \{\s*\n\s*Fail ", body[walks[1] :])
     assert "-SkipNames @('http-token')" in body[walks[1] : walks[1] + 120]
 
@@ -3013,7 +3013,7 @@ def test_w2_i61_gate_proves_the_launch_conditions_on_windows() -> None:
     # msiexec's own quoting: "" is a literal quote in a quoted value
     assert "'UDBMCP_SERVICE_ACCOUNT=\"x\"\" -ServiceName \"\"evil\"'" in launch
     assert "'UDBMCP_SERVICE_ACCOUNT=CORP\\'" in launch and "'UDBMCP_ALLOW_DOWNGRADE=yes'" in launch
-    assert "Stop-Gate 'launch_conditions'" in launch and "Add-Check 'launch_conditions' 'passed'" in launch
+    assert "Stop-Check 'launch_conditions'" in launch and "Add-Check 'launch_conditions' 'passed'" in launch
     assert "VerifyBundleCA" in launch, "refused before any custom action runs"
 
 
@@ -3295,7 +3295,7 @@ def test_fu2_doctor_and_service_resolve_the_account_alike() -> None:
         check = body.index("$problem = Get-ImplicitAccountProblem -Account $ServiceAccount")
         assert env < given < kept < default < sid < check < body.index("$found = Get-TreeProblem"), path.name
         # refused before anything on the machine changes
-        for change in ("Set-Acl", "Remove-Item -LiteralPath $tokenFile", "Invoke-Payload", "Remove-ExistingService"):
+        for change in ("Set-Acl", "Remove-Item -LiteralPath $tokenFile", "Invoke-Payload", "Stop-ExistingService"):
             if change in body:
                 assert check < body.index(change), (path.name, change)
     problem = _function(service, "Get-ImplicitAccountProblem")
@@ -3484,7 +3484,8 @@ def test_fu2_venv_runs_the_machine_interpreter_isolated() -> None:
 def test_fu2_gate_proves_a_repair_keeps_the_registered_account() -> None:
     code = _code(GATE_PS1)
     start = code.index("$keepSteps = @(")
-    check = code[start : code.index("Add-Check 'repair_keeps_account' 'passed' \"a repair", start)]
+    check = code[start : code.index("if ($script:Failed -eq 0) {", start)]
+    assert "Add-Check 'repair_keeps_account' 'passed' \"a repair" in check
     # after check 10, and never over a dedicated account (its password)
     assert code.index("Add-Check 'launch_conditions' 'passed' \"") < start
     guard = code[code.rindex("if ($SkipMsiInstall) {", 0, start) : start]

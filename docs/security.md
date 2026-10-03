@@ -73,12 +73,16 @@ reporting only).
   (on Windows with a protected DACL; a pre-created, junctioned or broadly
   readable secrets folder is refused; on macOS an extended ACL the folder
   inherited as it was created is removed, and one an existing folder carries
-  is refused: `chmod -N <dir>`), keeps backups of replaced secret files
+  is refused when an entry grants anyone but its owner access, inheritable
+  entries included: `chmod -N <dir>`; entries that only deny, such as the
+  `group:everyone deny delete` macOS puts on home folders, are kept), keeps
+  backups of replaced secret files
   (`<name>.username.bak.<stamp>`, `<name>.password.bak.<stamp>`; they hold old
   credentials, so remove them once checked), and as root writes secrets only
   when every directory from `/` to the config's directory is root-owned and
-  not group- or other-writable (the `.deb` and `.pkg` system config
-  qualifies); otherwise it refuses and suggests
+  not group- or other-writable, with no macOS ACL entry that grants another
+  account access (the `.deb` and `.pkg` system config qualifies); otherwise
+  it refuses and suggests
   `sudo -u <account> udbmcp add-connection ...`.
 
 ## Configuration rules
@@ -132,7 +136,9 @@ reporting only).
   (`/*+ ... */`) is inert: its body names no object and calls no function
   (Oracle `INDEX`, `LEADING`, `USE_NL`, MySQL `BKA` are accepted), except the
   MySQL hints that change how the statement runs, `MAX_EXECUTION_TIME`,
-  `SET_VAR` and `RESOURCE_GROUP`, which are refused.
+  `SET_VAR` and `RESOURCE_GROUP`, which are refused wherever one of those
+  words appears in a `/*+ ... */` body, in any letter case, however the rest
+  of the body is spelled.
 - EXPLAIN/SHOW/DESCRIBE via dedicated per-dialect policies only; the
   validated statement text is what reaches the engine. `db_explain` never runs
   a statement: ANALYZE asked for with `analyze=true`, or written in a
@@ -149,12 +155,22 @@ reporting only).
   hand the driver exactly the validated statement: only a placeholder in
   code (outside literals, quoted names and comments, as that engine bounds
   them, PostgreSQL `$tag$` quotes and `E'...'` strings and ClickHouse
-  heredocs included) takes a value, and every other `%` reaches the engine
-  as written (`sql_guard.bind_text`, at the driver boundary; the statement
-  the guard and the audit see is plain SQL). A placeholder inside a literal
-  or comment is text. A placeholder count that does not match the values,
-  a `%(name)s` with no value, a named value no placeholder uses, or both
-  styles at once is `VALIDATION_ERROR` before anything runs.
+  heredocs included) takes a value (`sql_guard.bind_text`, at the driver
+  boundary; the statement the guard and the audit see is plain SQL). In a
+  string literal the DBAPI escape `%%` is one `%`, as it always was
+  (`'50%%'`, `DATE_FORMAT(d, '%%Y-%%m')`), and a lone `%` (`LIKE 'a%'`) or
+  a placeholder is text; in a quoted name or a comment every `%` arrives as
+  written. `%%` in code is `VALIDATION_ERROR` (write the modulo operator as
+  one `%`, or `MOD()`), and so is a placeholder glued to a name, a digit or
+  a quote (`%ssn`, `%s1`: PostgreSQL's parser and the driver would read it
+  differently); put a space or an operator after it. A `:name` placeholder
+  straight after an identifier character or a digit is not one (the slice
+  `a[1:n]`), and PostgreSQL `ARRAY[%s]` and `ANY(ARRAY[%s])` take values. A
+  placeholder count that does not match the values, a `%(name)s` with no
+  value, a named value no placeholder uses, or both styles at once is
+  `VALIDATION_ERROR` before anything runs. `db_federated_query` hands each
+  statement only the named values its own placeholders use; a name no
+  statement uses is `VALIDATION_ERROR`.
 - A name after `IN` without parentheses is refused, since ClickHouse and
   SQLite read it as a table (`x IN t`, `x IN db.t`, and any expression there
   holding a name, such as `x IN tuple(t)`); on ClickHouse `IN (<single name>)`
@@ -242,7 +258,8 @@ reporting only).
   (`""`, `[]`, ``` `` ```) as a schema, table or column is refused
   (`"".ALL_USERS`, `[].syslogins` read as a bare name the bare-name rules did
   not see), in statements and in the `object_name` of the metadata tools
-  (`VALIDATION_ERROR`, each part must be a non-empty name).
+  (`VALIDATION_ERROR`, each part must be a non-empty name). On SQLite a bare,
+  unqualified `""` is accepted: SQLite reads it as the empty string.
 - A bare FROM item is taken for a CTE only when the engine binds it to that
   CTE under every case folding it may apply: Oracle upper-cases an unquoted
   name by Unicode's rules, character by character (`WITH "é" ... FROM é`
@@ -678,13 +695,18 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
   column masking hides: it is not readable on any connection;
   db_list_columns and db_list_views describe the objects this connection may
   read`. MySQL `information_schema` `VIEWS`, `ROUTINES`, `COLUMNS`,
-  `TRIGGERS`, `EVENTS`, `CHECK_CONSTRAINTS` and `INNODB_COLUMNS`;
-  PostgreSQL `VIEWS`, `ROUTINES`, `COLUMNS`, `TRIGGERS`,
-  `CHECK_CONSTRAINTS`, `PARAMETERS`, `ATTRIBUTES` and `DOMAINS`; ClickHouse
-  `VIEWS` and `COLUMNS` (either spelling of `information_schema`); SQL
-  Server `VIEWS`, `ROUTINES`, `COLUMNS`, `CHECK_CONSTRAINTS` and `DOMAINS`.
-  The views that hold names only (`TABLES`, `SCHEMATA`,
-  `KEY_COLUMN_USAGE`, ...) stay readable.
+  `TRIGGERS`, `EVENTS`, `CHECK_CONSTRAINTS`, `INNODB_COLUMNS`, and MySQL 9's
+  `LIBRARIES` and `JSON_DUALITY_VIEW_TABLES`; PostgreSQL `VIEWS`,
+  `ROUTINES`, `COLUMNS`, `TRIGGERS`, `CHECK_CONSTRAINTS`, `PARAMETERS`,
+  `ATTRIBUTES` and `DOMAINS`; ClickHouse `VIEWS` and `COLUMNS` (either
+  spelling of `information_schema`); SQL Server `VIEWS`, `ROUTINES`,
+  `ROUTINE_COLUMNS`, `COLUMNS`, `CHECK_CONSTRAINTS` and `DOMAINS`. The views
+  that hold names only (`TABLES`, `SCHEMATA`, `KEY_COLUMN_USAGE`, ...) stay
+  readable. `information_schema.STATISTICS` on MySQL and ClickHouse lists
+  the indexes, and its `EXPRESSION` holds a functional index's SQL with its
+  literals: it is read like the column catalogs above, without that column
+  (naming `EXPRESSION`, `*` outside `COUNT` or a column list after the alias
+  is refused, and the tools that read an object whole refuse it).
 - **Known gap (pending an owner decision).** Under the default
   `[information_schema]`, `db_query` can read the names-only
   `information_schema` views (`TABLES`, `SCHEMATA`, `KEY_COLUMN_USAGE`, ...)
@@ -704,9 +726,16 @@ parenthesised set operation carrying its own `WITH`, stay accepted.
   the database file path. The internal (shadow) tables of FTS3/4/5 and
   R*Tree indexes hold the indexed values under generic column names (`c0`,
   `c1ssn`), where masking by name cannot apply: they are not listed, have no
-  columns or detail, and a statement naming one (as a name, a quoted string
-  or a quoted identifier) is refused (`QUERY_ERROR: '<name>' is an internal
-  table of a full-text or R*Tree index ...`); query the index's own table.
+  columns or detail, and a statement that reads one (a `FROM` or `JOIN`
+  item, as a name, a quoted string or a quoted identifier, in a subquery
+  too, or the table of `x IN table`) is refused (`QUERY_ERROR: '<name>' is
+  an internal table of a full-text or R*Tree index ...`); query the index's
+  own table. A shadow table is one SQLite marks so, or, where the build
+  lacks the virtual table's module, a table named `<virtual table>_<suffix>`
+  with a suffix of that module (an unknown module keeps every such name
+  back). Other tables are ordinary, whatever their names, and a literal,
+  alias or column of a shadow table's name refuses nothing; a statement
+  that cannot be parsed has every word with a `_` checked as a table.
   Residual: a view the database owner creates over a shadow table is an
   ordinary view and readable.
 - `SHOW`/`DESCRIBE` are validated by `db_validate_query` on MySQL and
@@ -747,15 +776,22 @@ Engines with out-of-band cancel report `server_side_cancel` as `supported`
 only where the driver provides it and it is verified: SQLite `interrupt()`,
 PostgreSQL (`cancel_safe`, libpq 17 or later; with an older libpq no cancel is
 sent and the server's `statement_timeout` ends the query), Oracle
-`connection.cancel()`, ClickHouse `KILL QUERY`. MySQL (`KILL QUERY` from a
-second connection) and SQL Server (`Cursor.cancel()`, SQLCancel) are
-`unverified`. Db2 has no cancel; a query's own timeout is its CLI
+`connection.cancel()`, ClickHouse `KILL QUERY`. MySQL (`KILL CONNECTION`
+from a second connection, which ends the query's session whatever it is
+doing, so a cancel that finds it between two statements is not lost) and
+SQL Server (`Cursor.cancel()`, SQLCancel) are `unverified`. A MySQL cancel
+that comes before the session's id is known is remembered and the run stops
+before its first statement; a PostgreSQL run that was cancelled stops
+before its next `FETCH`. Db2 has no cancel; a query's own timeout is its CLI
 `QUERYTIMEOUT`, so the server stops it at that deadline. SQLite's cancel
-also sets a flag that a progress handler (every 1000 virtual-machine steps)
-and every step of the query check, because `interrupt()` reaches only a
-statement already running: a deadline that fires while the statement is
-being described or rewritten stops it before it starts, and a connector once
-cancelled refuses its later calls (the executor discards it). On SQL Server
+interrupts every open handle of the connector, and again every 20 ms until
+they are all closed, because `interrupt()` reaches only a statement already
+running; it also sets a flag that each handle's opening and every step of
+the query check. So a deadline that fires while the statement is being
+described or rewritten stops it before it starts, and a connector once
+cancelled refuses its later calls (the executor discards it); metadata calls
+are interrupted the same way. There is no progress handler: one called into
+Python every few thousand steps of every statement. On SQL Server
 and Oracle a deadline that fires before the statement starts (while it
 connects or is described) stops it before it is sent. On a timeout the
 connection is discarded and the tool output says whether the query may
@@ -928,7 +964,12 @@ by default).
   holding the log open on Windows, `EACCES`, `ENOSPC`) loses no generation
   and is finished by the next record. A log loosened while the server keeps
   it open (`chmod 644`) is set back to 0600 before the next record is
-  appended.
+  appended. On macOS the log and its lock are not written (an audit write
+  failure, so `audit_fail_closed` applies) while an extended ACL entry
+  grants another account access to them (`-rw-------+` with `everyone
+  allow read`); remove it with `chmod -N <path>`. Doctor reports this, for
+  the rotated backups and the
+  directory too, as `audit-path-acl`.
 
 ## Local state files
 
@@ -936,7 +977,9 @@ by default).
   permitted-object set, so the cache file must be owned by the server's user,
   have no group or other bits, not be a symlink or hard link, and sit in a
   directory owned by that user or root with no group or other write bit
-  (sticky directories such as `/tmp` included). Otherwise caching is disabled
+  (sticky directories such as `/tmp` included); on macOS no extended ACL
+  entry on the file, its sidecars or the directory may grant another account
+  access (doctor: `metadata-cache-acl`). Otherwise caching is disabled
   with a stderr line (live catalog reads; nothing fails). Future-dated entries
   are ignored; lists are cached whole or not at all (up to about 500k objects
   or 64 MiB); SQLite errors while running are cache misses; a non-SQLite file

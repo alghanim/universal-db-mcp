@@ -58,6 +58,11 @@ one it recorded at `/usr/local/lib/udbmcp-trust/RELEASE`, or a stick with
 no `RELEASE` once one is recorded (`FAIL: this stick is release N, OLDER
 than release M whose trust tools are installed.`), unless you pass
 `--allow-downgrade`; a malformed `RELEASE` on the stick is refused always.
+An equal `RELEASE` passes only when every trust tool on the stick is
+byte-identical to the installed one (a re-run, or another stick of that
+release); tools that differ under the same number are another release,
+possibly the older one, and are refused the same way (`... its tools differ
+from the installed ones ...`).
 On success it records the stick's release
 (removing the record when the stick names none) and prints it on its
 `release  :` line. Until a release is recorded (`nothing recorded yet`),
@@ -396,9 +401,15 @@ docker compose -f <bundle>/operations/compose.offline.yaml up -d
 
 The loader hands the images to the docker daemon the operator's own `docker`
 command reaches when there is one (a rootless daemon, `DOCKER_HOST` or a
-docker context: the one `docker compose up` uses afterwards, which `sudo`
-would not reach), streaming the root-only verified copy to it; otherwise it
-loads through root's daemon.
+docker context: the one `docker compose up` uses afterwards), streaming the
+root-only verified copy to it; otherwise it loads through root's daemon.
+Under `sudo` (the invocation above) the operator is `SUDO_USER`: their
+`docker` runs as them, with their home (so their current context applies),
+with `DOCKER_HOST` when one is given on the `sudo` line (`sudo
+DOCKER_HOST=... bash .../load_images_offline.sh ...`, since `sudo` drops it
+from the environment), and otherwise with their rootless daemon's socket
+`/run/user/<uid>/docker.sock` when it exists. The loader prints `==> loading
+into <daemon>`.
 
 `pull_policy: never` — an absent image fails locally; no registry contact.
 The compose file sets `ulimits: nofile: 65536` and a bounded `json-file` log
@@ -660,8 +671,9 @@ Verify the driver registration with the 64-bit ODBC Administrator
 
 ### Service management (sc.exe)
 
-`RegisterServiceCA` runs `service.ps1`, which creates an auto-start service
-named `udbmcp` running
+`RegisterServiceCA` runs `service.ps1`, which creates (or, on a repair,
+updates in place with `sc.exe config`, never deleting it) an auto-start
+service named `udbmcp` running
 `"<venv>\Scripts\python.exe" -I -m universal_db_mcp serve --transport http`,
 with failure recovery mirroring the systemd unit (restart after 60000 ms,
 counter reset after 86400 s) and `UDBMCP_CONFIG` +
@@ -745,9 +757,11 @@ Features; the release string stays in the file name):
   template in place of the admin's config). A rebuild of the same bundle may
   replace itself. A repair or upgrade run without `UDBMCP_SERVICE_ACCOUNT`
   keeps the account the service is registered under only when `logs\`
-  grants it write access, as the install that registered it did; otherwise
-  (an account other than LocalSystem with no such grant, which could only
-  come from the command line) it fails, naming the remedy.
+  grants it write access, as the install that registered it did (an
+  account that is a member of Administrators, such as a gMSA an
+  administrator put there, included); otherwise (an account other than
+  LocalSystem with no such grant, which could only come from the command
+  line) it fails, naming the remedy.
 - **Anti-rollback.** `VerifyBundleCA` refuses a bundle older than the
   installed-release record `C:\Program Files\UniversalDB MCP\manifest.json`
   (a fixed path whatever `INSTALLFOLDER` is). The MSI also refuses to install
@@ -777,11 +791,11 @@ Features; the release string stays in the file name):
   and deletes the `udbmcp` service first. `config.yaml` under
   `C:\ProgramData\UniversalDB MCP\` is retained, as the .deb keeps its
   conffile; a later install finds it and keeps it.
-- **A failed repair** keeps the service registered before it (the rollback
-  twin deletes only a service a first install or an upgrade registered).
-  Residual: a repair that fails inside `service.ps1`, between its removal of
-  the existing service and `sc.exe create`, still leaves no service; run a
-  repair again.
+- **A failed repair** keeps the service registered before it, stopped: on a
+  repair `RegisterServiceCA` updates the existing service in place
+  (`sc.exe config`) and never deletes it, and the rollback twin deletes only
+  a service a first install or an upgrade registered (`sc.exe create`).
+  Start it again once the cause is fixed, or run the repair again.
 
 ### Status (honest)
 
@@ -825,9 +839,15 @@ protocol probe, tamper negative, and the checks `programdata_acl`,
 `folder_squat_cleanup_reinstalled`, `installed_manifest_recorded`, which also
 fails when a rollback copy or marker is left beside the record,
 `rollback_refused`, `launch_conditions` and `repair_keeps_account`); none has
-been run. A failing `service_running` check (error 1053 is the known
-blocker) is recorded and the checks after it still run; the gate then exits
-nonzero. In CI these unit tests run under the ubuntu-24.04 runner's
+been run. `folder_squat_refused` expects the squatted config folder to be
+refused at `CheckFoldersCA` and a squatted `config.yaml` alone at
+`DoctorSmokeCA`. A failing `service_running` check (error 1053 is the known
+blocker) is recorded and the checks after it still run; so do the checks
+after a failing `folder_squat_refused`, `launch_conditions` or
+`repair_keeps_account`, each of which records its failure and goes on
+(only an admin config folder that could not be restored stops the gate).
+The gate then exits nonzero. In CI these unit tests run under the
+ubuntu-24.04 runner's
 PowerShell 7 and the suite fails, rather than skips them, when `pwsh` is
 missing; on a host without `pwsh` they still skip. Until both the Windows
 build and that gate have passed, no "passed" or "verified" wording may be
@@ -933,9 +953,29 @@ tools that predate this release, in `preinst`, before the old service is
 stopped and the payload unpacked: an installer without
 `udbmcp-installer-format: 4` or `--force-reinstall`, or a verifier without
 `--installed-manifest` (each an `OUTDATED copy`); refresh them from the stick.
+The installer carries a marker line per format it serves, `4` first, then
+`3`: the runbook's package rollback installs the previous release's package,
+which tests for its own format, with the current trusted tools.
 When dpkg undoes a failed upgrade (`abort-upgrade`, `abort-remove`,
 `abort-deconfigure`), `postinst` starts the service the old `prerm` stopped
-again (when it is enabled) and changes nothing else.
+again (when it is enabled) and changes nothing else. If the venv is gone
+(the runbook's package rollback deletes it before installing the older
+package), nothing can run: it writes `failed` to the status file and exits
+1, which leaves the package `unpacked`; `sudo dpkg --configure
+universal-db-mcp` then installs its payload again.
+When this release's `preinst` refuses an upgrade, dpkg runs the installed
+release's `postinst` with `abort-upgrade`, and one from an earlier release
+ignores that and configures again. So the refusing `preinst` leaves a
+short-lived process holding the deferred-install lock until that dpkg run ends,
+then starts the service again when it is enabled: the old `postinst` spawns
+no install worker. It may still re-run its configure synchronously when the
+bundle carries no OS packages. `preinst` (before anything is unpacked) and
+`postinst` (before anything is changed) refuse while a deferred install of
+another payload runs (`a deferred install ... is still running`; wait for
+`success` or `failed` in the status file, then install or configure again);
+a worker of this same payload is left to finish. The worker itself stops,
+starting nothing, when another dpkg run has changed the package version or
+the unpacked payload since it was spawned.
 On upgrade, root-owned `audit.jsonl*` files in `/var/log/universal-db-mcp`
 (the log, its `.lock`, rotated backups; regular files with one link) are
 handed back to `udbmcp` with mode 0600, and each is printed.
@@ -1083,7 +1123,10 @@ splits the work honestly. The package's Distribution declares the arm64 host
 the scripts natively; should it still run them under Rosetta 2, each script
 starts over as a native arm64 process, and the verifier judges the hardware
 architecture, not the translated process's (a universal2 python started
-under Rosetta reported x86_64 and the arm64 bundle was refused). How the
+under Rosetta reported x86_64 and the arm64 bundle was refused). An
+interpreter with no arm64 code (an x86_64-only CPython, which always runs
+translated and would get x86_64 wheels) is refused for the arm64 profile:
+use a universal2 or arm64 CPython 3.12. How the
 real Installer treats the declaration is confirmed only by a real install:
 
 - **`preinstall`** checks the trust *prerequisites* only (trusted verifier,

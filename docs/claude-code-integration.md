@@ -183,13 +183,18 @@ harness is reported `unknown_state_fail_closed`, with `refusing to write:
   changes no access;
 - under `sudo`, a symlink on the path that a user owns and that points to
   something that user does not own, or a file with several hard links that
-  the owner of its directory does not own: as root such a file is not even
-  read (a dry run printed a root-only file a user had linked in);
+  the owner of its directory does not own, or, in a directory a user owns,
+  a file that user may not read themselves (`... may not read it, and as
+  root this tool does not read it for them`): as root such a file is not
+  even read (a dry run printed a root-only file a user had linked in). The
+  file is opened without following a link and checked again once open;
 - a config another program created after `configure-agents` found it absent
   (re-run to add the registration to it).
 
-A failed-closed harness prints the reason (a parse error names the line and
-column) and, under `details:`, the registration it would add and the
+A failed-closed harness prints the reason (a parse error gives the parser's
+reason with the line and column, a file that is not UTF-8 the line, never the
+file's text or bytes) and, under `details:`, the registration it would add
+and the
 `universal-db` entry the file holds now, never the file's other entries:
 those hold other MCP servers' env values (API tokens), and the output ends
 up in terminals and logs. For `dsh`, only the rows for this server's id are
@@ -241,7 +246,13 @@ did not happen (the adapter refused, raised or crashed), the registration
 was written but the per-user config it names could not be seeded (`FAIL
 CLOSED: the per-user harness config the registration names could not be
 seeded ...`; with `--json` the harness carries `seed_error`), or a write
-needs `--yes` and stdin is not a terminal; `2` for an unknown `--agent`, or when a
+needs `--yes` and stdin is not a terminal. A re-run after a failed seeding
+finds the registration in place and the config it names missing: it offers
+to seed it (`Seed it? [y/N]`; `--yes` seeds it, `--dry-run` only notes it,
+a non-terminal stdin without `--yes` exits 1 with `NOT CONFIRMED`). With
+`--json`, plain detection reports it as `config_missing`, and `--yes` as
+`config_seeded` (or `seed_error`, exit 1); `2` for an unknown `--agent`, or
+when a
 harness failed closed and either `--agent` names it (also with `--dry-run`
 and for plain detection) or `--yes` was given without `--dry-run`. Under
 `--yes` the other writable harnesses are still applied first, and exit `2`

@@ -68,7 +68,9 @@ SQLSTATE/SQLCODE, codes such as `Code: n`, `ORA-nnnnn` or `SQLnnnnN`, bracketed
 driver states (`[xxxxx]`), ODBC wrapper names, `LINE n:`, `argument n` and
 version strings. PostgreSQL XML errors lose their DETAIL. Names you supplied
 (a connection id, an object name) are echoed as their first 64 characters, and
-an error's text is capped at 2000 characters. A connector's own refusal that
+an error's text is capped at 2000 characters. A driver error longer than 16 KiB
+(one that echoes a long bound value) is cut to its first 16 KiB before it is
+redacted, so redaction time stays bounded. A connector's own refusal that
 is not built from a driver error (for example ClickHouse's "more than 8 MiB
 ... even on 1-row blocks") is shown as written, numbers and quoted names
 included, and so is a connector's own diagnostic wrapped like a driver error
@@ -97,7 +99,7 @@ ones). Auth failures: ClickHouse's login is hidden (`DB::Exception:
 | `db_get_relationships` | declared FKs; `include_inferred` adds labeled heuristics (no value sampling). A key into a hidden schema reads `to_table: <not permitted>` with no columns |
 | `db_get_statistics` | catalog estimates with freshness; no COUNT(*) by default |
 | `db_validate_query` | validation without execution + stated limitations; the same refusals the guard gives `db_query` (it runs no statement, so the Oracle bare-`DUAL` session check below is not made). `referenced_objects` names every table the statement reads, as written (a bare `DUAL` is `{schema: null, name: "DUAL"}`; on ClickHouse an `a.b` column that ClickHouse reads as the table `a.b` too). On MySQL and ClickHouse, `SHOW`/`DESCRIBE` verdicts apply the allowlist, qualification, schema-spelling and default-deny rules to the named object, `SHOW TABLES FROM <db>` included (`db_query` still never runs them). The limitations always include `db_explain captures plans without executing the statement: EXPLAIN ANALYZE is not supported`, plus `EXPLAIN ANALYZE is disabled by policy` while `security.allow_explain_analyze` is false, and on MySQL `db_explain returns a TREE or JSON plan only for a statement naming no masked column (MySQL prints the values it reads from const tables into those formats); FORMAT=TRADITIONAL plans are returned for any` |
-| `db_query` | validated, bounded read; masking applied (see Masking). `parameters` values must be JSON scalars (string, number, boolean or null) and their names identifiers; anything else is `VALIDATION_ERROR` before anything runs. On MySQL, ClickHouse and PostgreSQL the text the driver formats is exactly the validated statement: only a placeholder outside string literals, quoted names and comments takes a value, a placeholder inside one is plain text, and every other `%` arrives as written; a placeholder count or name that does not match the values, or a named value no placeholder uses, is `VALIDATION_ERROR` (`docs/security.md`, Query safety). `parameters: []` binds nothing (a `LIKE 'a%'` runs as written). A result cut by the row or byte limit carries `truncated: true` and the warning `result truncated: limits are rows<=N, bytes<=M`. A cell cut to `max_cell_bytes` adds a warning of its own (`... exceeded the N byte cell limit and were truncated`), and on every engine but SQLite it also sets `truncated: true` (with the warning above); on SQLite only the row and byte limits set it |
+| `db_query` | validated, bounded read; masking applied (see Masking). `parameters` values must be JSON scalars (string, number, boolean or null) and their names identifiers; anything else is `VALIDATION_ERROR` before anything runs. On MySQL, ClickHouse and PostgreSQL the text the driver formats is exactly the validated statement: only a placeholder outside string literals, quoted names and comments takes a value, and a placeholder inside one is plain text; in a string literal `%%` is one `%` (DBAPI), in a quoted name or comment every `%` arrives as written. `%%` in code, a placeholder glued to a name, digit or quote (`%ssn`), a placeholder count or name that does not match the values, or a named value no placeholder uses, is `VALIDATION_ERROR` (`docs/security.md`, Query safety). `parameters: []` binds nothing (a `LIKE 'a%'` runs as written). A result cut by the row or byte limit carries `truncated: true` and the warning `result truncated: limits are rows<=N, bytes<=M`. A cell cut to `max_cell_bytes` adds a warning of its own (`... exceeded the N byte cell limit and were truncated`), and on every engine but SQLite it also sets `truncated: true` (with the warning above); on SQLite only the row and byte limits set it |
 | `db_sample_table` | default 20 rows; masking/omission policy applied; an object whose name holds a control character is refused (`VALIDATION_ERROR`), and such columns are skipped with a warning |
 | `db_explain` | non-executing plans only, spelled `EXPLAIN <select>` on every engine: native EXPLAIN on PostgreSQL, MySQL, ClickHouse and SQLite; Oracle through `EXPLAIN PLAN` into the session-private `PLAN_TABLE` (DBMS_XPLAN text plus rows); SQL Server through `SET SHOWPLAN_ALL` on a private connection (needs the SHOWPLAN permission, named when missing); Db2 through `EXPLAIN PLAN` into DBA-provisioned explain tables (session schema or SYSTOOLS; refused with the `SYSINSTALLOBJECTS` instruction when absent; the rows written are read back and deleted again; the account needs INSERT, SELECT and DELETE on the explain tables, and a DELETE that fails is reported as a warning, never hidden). The statement reaches the engine exactly as written (the guard validated that text; Db2 `WITH UR` and `OPTIMIZE FOR n ROWS` survive). `parameters` are refused: a plan is captured for the text as written, so inline the literal values. The plan names every object the engine touches, including the base tables behind a permitted view. On MySQL a TREE or JSON plan of a statement naming a masked column is withheld (see below). Options and ANALYZE: see below |
 | `db_get_query_history` | "Redacted operational history of this server process (fingerprints, not raw SQL); under HTTP it holds every client's calls. Not a substitute for the audit log." The result's note reads `operational history of this server process (under HTTP, every client's calls); raw SQL text is not included` (see the identity note below). It lists every call, the refusals the audit log coalesces included |
@@ -293,7 +295,9 @@ unless it was the only connection named.
   `LOW_VALUE`, `HIGH_VALUE`, `HIGH2KEY` and `LOW2KEY` columns: a statement
   naming one, selecting `*` (outside `COUNT`) or giving the view a column
   list after its alias is refused, and the sample, profile and metadata
-  tools refuse these views whole.
+  tools refuse these views whole. MySQL's `information_schema.STATISTICS`
+  (the index list) is read the same way without its `EXPRESSION` column,
+  which holds a functional index's SQL with its literals.
 - **SQLite.** A statement reads only the tables and views `db_list_tables`
   lists, with or without `default_deny_objects`. `sqlite_schema` and every
   other `sqlite_*` table are refused (`POLICY_VIOLATION`), as are SQLite's
@@ -565,16 +569,33 @@ cut again to `max_response_bytes` after masking. In particular:
   masked when the source may carry a sensitive value.
 - Where a star expands to a run of unknown width, each alias the statement
   wrote must be reported by the driver at the position the trace gives it;
-  otherwise every column not proven clean is masked (a PostgreSQL alias over
-  63 bytes, which the server truncates, included).
+  otherwise every column not proven clean is masked. A PostgreSQL alias over
+  63 bytes is matched as the server reports it, cut to its first 63 bytes.
+- A star the statement wraps or aliases (`(b.*)`, `((b).*)`, PostgreSQL's
+  `b.* AS x`, ClickHouse's `(s.*)`), a parenthesised join's columns, and a
+  table function whose alias list does not prove its width (`WITH
+  ORDINALITY`, `unnest(a, b)`, a composite array) are runs of unknown width,
+  never one column.
+- A CTE is a qualifier's source only where a `FROM` of the scope reads it: a
+  correlated `w.k` binds to the enclosing query's `w`, whatever spare CTE
+  named `w` is in reach.
+- On SQLite, a subquery, derived table or CTE column aliased `true`,
+  `false`, `columnN` or `name:N` (names SQLite may give another column) makes
+  the statement untraceable: every column it does not prove clean is masked.
 - Engines that fold names are traced as they fold (Oracle by Unicode's
   rules), so a CTE decoy in another case does not hide a table.
 
 Definitions (`db_get_table`, `db_list_views`, index definitions) are read
 with a tokenizer, so an apostrophe in a quoted name, a comment or a MySQL
-`\'` escape cannot shift where a literal begins: a definition is withheld
-when any reading the engine may use finds a literal (a comment counts) next
-to a sensitive name.
+`\'` escape cannot shift where a literal begins (a backslash escapes nothing
+inside a MySQL backtick name): a definition is withheld when any reading the
+engine may use finds a literal (a comment counts) next to a sensitive name.
+SQLite reads a double-quoted word that names no column as a string, so in a
+SQLite view's definition a double-quoted word is a name only when it is an
+unqualified column in scope of the view's own query (or a qualified name);
+any other counts as a literal, and so does every one when the query does
+not parse or a table it reads cannot be listed. `db_list_views` and
+`db_get_table` apply the same rule.
 
 PostgreSQL attribute notation (`b.fn` meaning `fn(b)`): a qualified name is
 checked against the base table's catalog columns (one `information_schema`

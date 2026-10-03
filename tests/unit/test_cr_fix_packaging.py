@@ -296,6 +296,8 @@ def _rosetta(monkeypatch: pytest.MonkeyPatch, verifier: Any, translated: bool) -
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(verifier, "_rosetta_translated", lambda: translated)
+    # a universal2 python (python.org's): an x86_64-only one is test_cr2_packaging's V3-n
+    monkeypatch.setattr(verifier, "interpreter_machines", lambda: {"x86_64", "arm64"})
 
 
 def test_m1_the_verifier_judges_the_architecture_by_the_hardware(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -603,6 +605,12 @@ def test_k2_postinst_only_restarts_the_service_when_dpkg_undoes_an_upgrade(tmp_p
     (shims / "systemctl").write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path}/systemctl.log"\nexit 0\n', encoding="utf-8")
     (shims / "systemctl").chmod(0o755)
     env = {**os.environ, "PATH": f"{shims}:/usr/bin:/bin"}
+    venv_python = tmp_path / "opt" / "venv" / "bin" / "python"  # the installed release's venv is in place
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    venv_python.chmod(0o755)
+    block = block.replace("/opt/universal-db-mcp/venv/bin/python", str(venv_python))
+    block = block.replace("/var/log/universal-db-mcp-install.status", str(tmp_path / "status"))
     for action in ("abort-upgrade", "abort-remove", "abort-deconfigure", "configure"):
         script = block.replace("[ -d /run/systemd/system ]", "true") + 'echo "FELL THROUGH"\n'
         proc = subprocess.run(  # noqa: S603 - postinst's own block

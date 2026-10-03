@@ -16,11 +16,12 @@ Safety posture:
 from __future__ import annotations
 
 import math
+import re
 import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -90,41 +91,91 @@ _ALLOWED_PRAGMAS = {
     "data_version",  # read-only; FTS5 reads it on every query
 }
 
-# The internal tables of FTS3/4, FTS5 and R*Tree virtual tables: the virtual
-# table's own name, "_", then one of these. They hold the indexed values
-# under generic column names (c0, c1ssn), past any masking by name.
-_SHADOW_SUFFIXES = frozenset(
-    {"content", "segments", "segdir", "docsize", "stat", "data", "idx", "config", "node", "rowid", "parent"}
+# The internal (shadow) tables of a virtual table are named after it: its
+# own name, "_", then a suffix its module's xShadowName accepts. They hold
+# the indexed values under generic column names (c0, c1ssn), past any
+# masking by name. SQLite marks them itself (PRAGMA table_list type
+# 'shadow') when the build has the module; these suffixes stand in for a
+# module the build lacks.
+_FTS3_SHADOWS = frozenset({"content", "segments", "segdir", "docsize", "stat"})
+_RTREE_SHADOWS = frozenset({"node", "rowid", "parent"})
+_MODULE_SHADOWS: dict[str, frozenset[str]] = {
+    "fts3": _FTS3_SHADOWS,
+    "fts4": _FTS3_SHADOWS,
+    "fts5": frozenset({"content", "data", "idx", "docsize", "config"}),
+    "rtree": _RTREE_SHADOWS,
+    "rtree_i32": _RTREE_SHADOWS,
+    "geopoly": _RTREE_SHADOWS,
+}
+# SQLite stores a virtual table's definition as "CREATE VIRTUAL TABLE "
+# followed by the statement as written from the table's name on (no IF NOT
+# EXISTS, no schema). Each name alternative is an unrolled loop, linear on
+# any input; the match reads at most the first _MODULE_SCAN characters.
+_NAME = r"""(?:"[^"]*(?:""[^"]*)*"|\[[^\]]*\]|`[^`]*(?:``[^`]*)*`|'[^']*(?:''[^']*)*'|[^\s."'`\[(]+)"""
+_VTAB_MODULE = re.compile(
+    rf"CREATE\s+VIRTUAL\s+TABLE\s+(?:{_NAME}\s*\.\s*)?{_NAME}\s+USING\s+({_NAME})", re.IGNORECASE
 )
+_MODULE_SCAN = 4096
 
 
-def _shadow_tables(rows: list[Any]) -> set[str]:
-    """The shadow tables among ``PRAGMA table_list`` rows, lowercased: those
-    SQLite reports as such, and, for a build that lacks the module (which
-    reports them as plain tables), those named after a virtual table."""
-    virtual = {(str(r[0]).lower(), str(r[1]).lower()) for r in rows if r[2] == "virtual"}
-    out: set[str] = set()
-    for schema, name, kind, *_rest in rows:
-        lowered = str(name).lower()
-        owner, _, suffix = lowered.rpartition("_")
-        if kind == "shadow" or (suffix in _SHADOW_SUFFIXES and (str(schema).lower(), owner) in virtual):
-            out.add(lowered)
-    return out
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
-def _shadow_named(sql: str, shadows: set[str]) -> str | None:
-    """A shadow table the statement names, if any. Read from tokens, any
-    kind: SQLite takes a quoted string for a table name where one is
-    expected (FROM 't'), and a comment names nothing. A statement the
-    tokenizer refuses (the guard parsed it already) is read as text."""
-    if not shadows:
+def _fold(name: str) -> str:
+    """A name as SQLite compares names: ASCII letters folded, nothing else."""
+    return name.translate(_ASCII_LOWER)
+
+
+def _module_of(sql: str | None) -> str | None:
+    """The module of a virtual table's stored definition, lowercased; ''
+    for one this cannot read (a comment between its words); None for a
+    definition that is not a virtual table's."""
+    if not sql or not sql[:21].upper().startswith("CREATE VIRTUAL TABLE"):
         return None
+    found = _VTAB_MODULE.match(sql[:_MODULE_SCAN])
+    if found is None:
+        return ""
+    module = found.group(1)
+    if module[0] in "\"[`'":
+        module = module[1:-1]
+    return _fold(module)
+
+
+def _unmarked_shadow(name: str, owner_module: str | None, registered: frozenset[str]) -> bool:
+    """Whether a table SQLite reports as a plain one is the internal table of
+    a virtual table whose module this build lacks: SQLite marks only the
+    shadow tables of a module it has. ``owner_module`` is the module of the
+    virtual table the name points at (the part before its last "_"), None
+    when there is no such virtual table. A module this cannot read or does
+    not know keeps every such table back (fail closed)."""
+    if owner_module is None or owner_module in registered:
+        return False
+    known = _MODULE_SHADOWS.get(owner_module)
+    return known is None or _fold(name).rpartition("_")[2] in known
+
+
+def _table_references(sql: str) -> set[tuple[str | None, str]] | None:
+    """The (schema, name) of every table the statement reads, as SQLite
+    reads a name: a FROM or JOIN item (a quoted string included: FROM 't'),
+    a subquery's, and the table of ``x IN table``. An alias, a column or a
+    literal is no table. None when the statement cannot be parsed."""
     try:
-        words = {t.text.lower() for t in sqlglot.Dialect.get_or_raise("sqlite").tokenize(sql)}
-    except Exception:  # noqa: BLE001 - sqlglot's TokenError, and whatever else a tokenizer raises
-        text = sql.lower()
-        return next((name for name in sorted(shadows) if name in text), None)
-    return next((name for name in sorted(shadows) if name in words), None)
+        trees = sqlglot.parse(sql, read="sqlite")
+    except Exception:  # noqa: BLE001 - sqlglot's ParseError/TokenError, and whatever else a parser raises
+        return None
+    out: set[tuple[str | None, str]] = set()
+    for tree in trees:
+        if tree is None:
+            continue
+        for table in tree.find_all(exp.Table):
+            if table.name:
+                out.add((table.db or None, table.name))
+        for test in tree.find_all(exp.In):
+            field = test.args.get("field")
+            if isinstance(field, (exp.Column, exp.Table)) and field.name:
+                schema = field.table if isinstance(field, exp.Column) else field.db
+                out.add((schema or None, field.name))
+    return out
 
 
 _MIN_VALUE_LENGTH_LIMIT = 16 * 1024 * 1024
@@ -148,10 +199,16 @@ _heap_limit_enforced: bool | None = None  # this SQLite library counts its heap 
 # conversion included (text that is not UTF-8), in these words.
 _CUT_FUNCTION = "udbmcp_cut"
 _CUT_FAILED = "user-defined function raised exception"
-# How many SQLite virtual-machine steps run between two looks at the
-# connector's cancel flag: Connection.interrupt() reaches only a statement
-# already running, and is forgotten once none is.
-_CANCEL_CHECK_STEPS = 1000
+# How often a cancelled connector interrupts its open handles again until
+# they close: Connection.interrupt() reaches only a statement already
+# running, and SQLite forgets it when a statement starts on an idle handle.
+# A progress handler would look at the cancel flag instead, but it calls
+# into Python, and takes the GIL, every few thousand steps of every
+# statement: next to any busy Python thread a statement ran 25-250x slower.
+_REINTERRUPT_SECONDS = 0.02
+# Up to this many virtual tables, a statement whose text contains none of
+# their names followed by "_" is not parsed for the tables it reads.
+_VTAB_PREFILTER = 256
 
 
 def _value_length_limit(max_response_bytes: int) -> int:
@@ -218,9 +275,9 @@ def _compared_outputs(tree: exp.Select, names: list[str]) -> set[int]:
     a column would be compared by its first characters.
 
     SQLite reads a GROUP BY or ORDER BY term as a position under any
-    spelling of an integer: 2, (2), +2, 2 COLLATE x, 0x2. A term that names
-    no column and is not plainly a position may be one: every output is
-    then compared, and none is cut."""
+    spelling of an integer literal (_position). Any other term that names
+    no column (random(), NULL, a bound parameter, '2', 2.0) compares no
+    output: SQLite sorts or groups by its value."""
     named: set[str] = set()
     for key in ("joins", "where", "group", "having", "order"):
         value = tree.args.get(key)
@@ -231,14 +288,32 @@ def _compared_outputs(tree: exp.Select, names: list[str]) -> set[int]:
     for key in ("group", "order"):
         clause = tree.args.get(key)
         for item in clause.expressions if clause is not None else []:
-            term = item.this if isinstance(item, exp.Ordered) else item
-            while isinstance(term, (exp.Paren, exp.Collate)):
-                term = term.this
-            if isinstance(term, exp.Literal) and not term.is_string and term.this.isdigit():
-                out.add(int(term.this) - 1)
-            elif term.find(exp.Column) is None:
-                return set(range(len(names)))
+            position = _position(item.this if isinstance(item, exp.Ordered) else item)
+            if position is not None and 1 <= position <= len(names):
+                out.add(position - 1)
     return out
+
+
+def _position(term: exp.Expression) -> int | None:
+    """The output a GROUP BY or ORDER BY term names by position (1-based),
+    as SQLite reads one (sqlite3ExprIsInteger): an integer literal, decimal
+    or hex, under any parentheses, COLLATE, unary plus (which the parse
+    drops) and unary minus: 2, (2), +2, 0x2, -(-2), 2 COLLATE x. None for
+    any other term; a bound parameter, '2', 2.0 or CAST(2 AS INT) is a value
+    (SQLite 3.50, live)."""
+    sign = 1
+    while isinstance(term, (exp.Paren, exp.Collate, exp.Neg)):
+        if isinstance(term, exp.Neg):
+            sign = -sign
+        term = term.this
+    if isinstance(term, exp.HexString):
+        try:
+            return sign * int(term.this, 16)
+        except ValueError:
+            return None
+    if isinstance(term, exp.Literal) and not term.is_string and term.this.isascii() and term.this.isdigit():
+        return sign * int(term.this)
+    return None
 
 
 def _adapt(value: Any, max_cell_bytes: int) -> tuple[Any, str, bool]:
@@ -281,12 +356,33 @@ class SQLiteConnector(DatabaseConnector):
         # config validation stores the value unresolved, and Path.as_uri()
         # raises ValueError for relative paths, which would crash every later
         # operation as INTERNAL instead of failing fast with a clear message.
-        self._path = Path(path).expanduser().resolve()
+        try:
+            expanded = Path(path).expanduser()
+        except RuntimeError:
+            # pathlib's answer for a ~user that names no account here, or a
+            # bare ~ without a home directory (an INTERNAL_ERROR otherwise).
+            head = str(path).replace("\\", "/").split("/", 1)[0]
+            raise ConnectorError(
+                f"the SQLite database path of connection '{connection.name}' starts with '{head}', which names "
+                "no account on this machine (or one without a home directory); give the full path instead",
+                category=ErrorCategory.CONNECTION,
+            ) from None
+        self._path = expanded.resolve()
         self._conn_lock = threading.Lock()
-        self._current_conn: sqlite3.Connection | None = None
+        # Every open handle, for cancel_current to interrupt; at most one per
+        # call in flight. Changed only under _handles_lock, which a handle's
+        # opening and closing take with the cancel.
+        self._handles: set[sqlite3.Connection] = set()
+        self._handles_lock = threading.Lock()
+        self._reinterrupting = False
         # Set by cancel_current, never cleared: the executor discards a
         # connector it cut off, and every handle and statement here looks.
         self._cancelled = threading.Event()
+        # The main schema's virtual tables (lowercased name -> module) under
+        # the file and schema version they were read at: one entry, replaced
+        # when either changes.
+        self._vtabs: tuple[tuple[int, int, int], dict[str, str]] | None = None
+        self._modules: frozenset[str] | None = None  # the modules this SQLite library has
         self._dbstat_available: bool | None = None  # probed once per connector
         self._heap_cap: int | None = None  # SQLite's heap limit as the last handle read it back
 
@@ -333,16 +429,27 @@ class SQLiteConnector(DatabaseConnector):
             ) from None
 
     @contextmanager
-    def _handle(self) -> Iterator[sqlite3.Connection]:
+    def _handle(self, what: str = "reading the database's schema") -> Iterator[sqlite3.Connection]:
         """A fresh handle for one metadata call, closed when it returns."""
-        with self._heap_refusals("reading the database's schema"), closing(self._open()) as conn:
-            yield conn
+        with self._heap_refusals(what):
+            conn = self._open()
+            try:
+                yield conn
+            finally:
+                self._close(conn)
+
+    def _close(self, conn: sqlite3.Connection) -> None:
+        """Close a handle _open returned, under the lock a cancel interrupts
+        it under: never an interrupt on a handle being closed."""
+        with self._handles_lock:
+            self._handles.discard(conn)
+            conn.close()
 
     def _open(self) -> sqlite3.Connection:
-        """A fresh read-only handle. The caller closes it (contextlib.closing):
-        'with conn' only ends a transaction, and a Connection sits in a
-        reference cycle, so an unclosed one kept its parsed schema, under
-        SQLite's process-wide heap cap, until the cyclic GC ran."""
+        """A fresh read-only handle. The caller closes it with _close: 'with
+        conn' only ends a transaction, and a Connection sits in a reference
+        cycle, so an unclosed one kept its parsed schema, under SQLite's
+        process-wide heap cap, until the cyclic GC ran."""
         self._stop_if_cancelled()  # a connector the executor cut off opens nothing more
         if not self._path.is_file():
             raise FileNotFoundError(
@@ -400,7 +507,11 @@ class SQLiteConnector(DatabaseConnector):
                 conn.execute(f"PRAGMA busy_timeout = {int(lock * 1000)}")
                 self._session_applied(f"busy_timeout={int(lock * 1000)}ms")
             conn.set_authorizer(self._authorizer)
-            conn.set_progress_handler(self._cancelled.is_set, _CANCEL_CHECK_STEPS)
+            with self._handles_lock:
+                # Under the cancel's lock: either the cancel finds this
+                # handle and interrupts it, or this finds the cancel's flag.
+                self._stop_if_cancelled()
+                self._handles.add(conn)
         except BaseException:
             conn.close()
             raise
@@ -471,7 +582,7 @@ class SQLiteConnector(DatabaseConnector):
                 Limitation(
                     scope="metadata",
                     detail="No synonyms or stored routines exist in SQLite. The internal tables of full-text "
-                    "(FTS3/4/5) and R*Tree indexes are not listed and a statement naming one is refused: they "
+                    "(FTS3/4/5) and R*Tree indexes are not listed and a statement reading one is refused: they "
                     "hold the indexed values under generic column names, where masking by name cannot apply.",
                 ),
                 Limitation(
@@ -479,8 +590,8 @@ class SQLiteConnector(DatabaseConnector):
                     detail="SQLite runs inside the server process. Each output value is cut to the cell "
                     "limit inside SQLite, except in a statement that is not one SELECT, uses DISTINCT or a "
                     "bound LIMIT, or selects * over a join, and except a column the statement compares "
-                    "(WHERE, GROUP BY, HAVING, ORDER BY, a join condition), and every column when a GROUP BY "
-                    "or ORDER BY term names no column and is not a plain position. SQLite's heap is capped at "
+                    "(WHERE, GROUP BY, HAVING, ORDER BY, a join condition, a position in GROUP BY or ORDER BY "
+                    "under any spelling of an integer). SQLite's heap is capped at "
                     f"{_HEAP_LIMIT_VALUES}x the longest value a handle accepts "
                     f"({_heap_limit(self.policy.max_response_bytes) >> 20} MiB here). The cap is "
                     "process-wide: every SQLite handle in the server shares it, the metadata cache's "
@@ -527,6 +638,67 @@ class SQLiteConnector(DatabaseConnector):
     def _quote(self, name: str) -> str:
         return '"' + name.replace('"', '""') + '"'
 
+    # ---- the internal tables of virtual tables ------------------------------
+
+    def _virtual_tables(self, conn: sqlite3.Connection) -> dict[str, str]:
+        """The main schema's virtual tables, lowercased name -> module (''
+        for one whose definition this cannot read). Read once per file and
+        schema version: SQLite bumps the version with every schema change,
+        and reading it is one header read."""
+        stat = self._path.stat()
+        key = (stat.st_dev, stat.st_ino, int(conn.execute("PRAGMA schema_version").fetchone()[0]))
+        cached = self._vtabs
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        vtabs: dict[str, str] = {}
+        for name, sql in conn.execute(
+            "SELECT name, sql FROM main.sqlite_schema WHERE type = 'table' AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+        ).fetchall():
+            vtabs[_fold(str(name))] = _module_of(str(sql)) or ""
+        self._vtabs = (key, vtabs)
+        return vtabs
+
+    def _registered_modules(self, conn: sqlite3.Connection) -> frozenset[str]:
+        """The virtual-table modules this SQLite library has. Unreadable: none,
+        so every shadow-like name of a virtual table is kept back."""
+        if self._modules is None:
+            try:
+                self._modules = frozenset(_fold(str(r[0])) for r in conn.execute("PRAGMA module_list").fetchall())
+            except sqlite3.Error:
+                return frozenset()
+        return self._modules
+
+    def _is_shadow(
+        self, conn: sqlite3.Connection, vtabs: dict[str, str], schema: str, name: str, kind: str
+    ) -> bool:
+        """Whether a ``PRAGMA table_list`` row is an internal table of a
+        full-text or R*Tree index: one SQLite marks so, or a plain table
+        named after a virtual table (``vtabs``) whose module this build
+        lacks, with a suffix of that module."""
+        if kind == "shadow":
+            return True
+        if kind != "table" or _fold(schema) != "main":
+            return False
+        module = vtabs.get(_fold(name).rpartition("_")[0])
+        return module is not None and _unmarked_shadow(name, module, self._registered_modules(conn))
+
+    def _shadow_named(self, conn: sqlite3.Connection, schema: str | None, name: str) -> str | None:
+        """The internal table of a full-text or R*Tree index that ``name``
+        (in ``schema``, any when None) names, if any. Costs one header read
+        unless the part of the name before its last "_" is a virtual table:
+        PRAGMA table_list builds the columns of every view and virtual table
+        it meets, so it is asked about such a name only."""
+        owner, sep, _suffix = _fold(name).rpartition("_")
+        if not sep or (schema is not None and _fold(schema) != "main"):
+            return None  # SQLite names a shadow table <virtual table>_<suffix>; temp holds none here
+        vtabs = self._virtual_tables(conn)
+        if owner not in vtabs:
+            return None
+        for row in conn.execute(f"PRAGMA main.table_list({self._quote(name)})").fetchall():  # noqa: S608
+            if self._is_shadow(conn, vtabs, str(row[0]), str(row[1]), str(row[2])):
+                return str(row[1])
+        return None
+
     def list_schemas(self, catalog: str | None, search: str | None) -> list[str]:
         # One attached database (main); read-only mode means temp is empty.
         with self._handle() as conn:
@@ -542,10 +714,12 @@ class SQLiteConnector(DatabaseConnector):
         # The estimates read dbstat, so the handle stays open for the loop.
         with self._handle() as conn:
             rows = conn.execute("PRAGMA table_list").fetchall()
-            shadows = _shadow_tables(rows)
+            vtabs = self._virtual_tables(conn)
             # PRAGMA table_list columns: schema, name, type, ncol, wr, strict
             for schema_name, name, kind, _ncol, _wr, _strict in rows:
-                if schema_name == "temp" or _is_catalog_table(name) or name.lower() in shadows:
+                if schema_name == "temp" or _is_catalog_table(name):
+                    continue
+                if self._is_shadow(conn, vtabs, schema_name, name, kind):
                     continue
                 if schema and schema_name.lower() != schema.lower():
                     continue
@@ -601,12 +775,12 @@ class SQLiteConnector(DatabaseConnector):
     def get_table(self, schema: str | None, name: str) -> dict[str, Any]:
         schema = schema or "main"
         with self._handle() as conn:
-            rows = conn.execute("PRAGMA table_list").fetchall()
+            rows = conn.execute(f"PRAGMA table_list({self._quote(name)})").fetchall()  # noqa: S608
             found = next(
                 (r for r in rows if r[0].lower() == schema.lower() and r[1].lower() == name.lower()),
                 None,
             )
-            if found is None or name.lower() in _shadow_tables(rows):
+            if found is None or self._is_shadow(conn, self._virtual_tables(conn), found[0], found[1], found[2]):
                 raise ObjectNotFound(f"table '{schema}.{name}' not found")
             kind = "view" if found[2] == "view" else "table"
             cols = self.list_columns(schema, name)
@@ -685,7 +859,7 @@ class SQLiteConnector(DatabaseConnector):
     def list_columns(self, schema: str | None, table: str) -> list[ColumnInfo]:
         schema = schema or "main"
         with self._handle() as conn:
-            if table.lower() in _shadow_tables(conn.execute("PRAGMA table_list").fetchall()):
+            if self._shadow_named(conn, schema, table):
                 return []  # an internal table of an index: not a table here
             rows = conn.execute(f"PRAGMA table_info({self._quote(table)})").fetchall()  # noqa: S608
         return [
@@ -787,21 +961,43 @@ class SQLiteConnector(DatabaseConnector):
 
     def cancel_current(self) -> bool:
         """Engine-level cancellation, called from a different thread by the
-        executor on timeout: sqlite3.Connection.interrupt() for the running
-        statement, and a flag every handle's progress handler and every
-        step of a query looks at. interrupt() alone reaches only a statement
-        already running: a deadline that fires while the statement is
-        still being described or rewritten would otherwise be lost and the
-        statement would run unstopped. Always True: whatever this connector
-        runs next stops."""
+        executor on timeout: sqlite3.Connection.interrupt() on every open
+        handle, again every _REINTERRUPT_SECONDS until they are all closed,
+        and a flag every handle opening and every step of a query looks at.
+        interrupt() alone reaches only a statement already running: one
+        that lands while the statement is still being described, rewritten
+        or prepared would be forgotten, and the statement would run
+        unstopped. Always True: whatever this connector runs next stops."""
         self._cancelled.set()
-        conn = self._current_conn
-        if conn is not None:
+        with self._handles_lock:
+            self._interrupt_handles()
+            start = bool(self._handles) and not self._reinterrupting
+            self._reinterrupting = self._reinterrupting or start
+        if start:
+            threading.Thread(
+                target=self._keep_interrupting, name=f"udbmcp-sqlite-cancel-{self.connection.name}", daemon=True
+            ).start()
+        return True
+
+    def _interrupt_handles(self) -> None:
+        """Interrupt every open handle; the caller holds _handles_lock."""
+        for conn in list(self._handles):
             try:
                 conn.interrupt()
             except sqlite3.Error:
-                pass  # closed meanwhile; the flag still stops what follows
-        return True
+                self._handles.discard(conn)  # closed outside _close: nothing runs on it
+
+    def _keep_interrupting(self) -> None:
+        """A cancelled connector's open handles, interrupted until closed:
+        no statement starts on one and runs. Ends with the last of them;
+        the connector opens no more."""
+        while True:
+            time.sleep(_REINTERRUPT_SECONDS)
+            with self._handles_lock:
+                self._interrupt_handles()
+                if not self._handles:
+                    self._reinterrupting = False
+                    return
 
     def _stop_if_cancelled(self) -> None:
         """SQLite's own error for an interrupted statement, once cancelled."""
@@ -817,11 +1013,7 @@ class SQLiteConnector(DatabaseConnector):
 
     def _execute(self, spec: QuerySpec) -> QueryOutcome:
         with translated_driver_errors():
-            conn = self._open()
-        # Registered before anything runs on the handle: a deadline in the
-        # probe or the rewrite below interrupts the probe, and the flag
-        # stops the statement before it starts.
-        self._current_conn = conn
+            conn = self._open()  # interrupted by a cancel from here on (see cancel_current)
         try:
             start = time.monotonic()
             parameters = spec.parameters or ()  # qmark/named params
@@ -846,17 +1038,39 @@ class SQLiteConnector(DatabaseConnector):
                 self._stop_if_cancelled()
                 return self._stream(conn, spec.sql, parameters, spec, start)
         finally:
-            self._current_conn = None
-            conn.close()
+            self._close(conn)
 
-    @staticmethod
-    def _refuse_shadow_tables(conn: sqlite3.Connection, sql: str) -> None:
-        """Refuse a statement that names an internal table of a full-text or
+    def _refuse_shadow_tables(self, conn: sqlite3.Connection, sql: str) -> None:
+        """Refuse a statement that reads an internal table of a full-text or
         R*Tree index: it holds the indexed values under generic names (c0,
         c1ssn), so masking by column name would not apply. The engine's own
         reads of them, for a query on the index, are not affected (the
-        authorizer cannot tell those apart)."""
-        name = _shadow_named(sql, _shadow_tables(conn.execute("PRAGMA table_list").fetchall()))
+        authorizer cannot tell those apart). Only a table the statement
+        reads counts, not a literal, alias or column of that name; a
+        statement that cannot be parsed has every word of its read as one.
+        Nothing to look for, and no parse, without a virtual table whose
+        name, then "_", the statement's text contains."""
+        vtabs = self._virtual_tables(conn)
+        if not vtabs:
+            return
+        lowered = _fold(sql)
+        if len(vtabs) <= _VTAB_PREFILTER and not any(f"{name}_" in lowered for name in vtabs):
+            return
+        references = _table_references(sql)
+        if references is None:
+            try:
+                tokens = sqlglot.Dialect.get_or_raise("sqlite").tokenize(sql)
+            except Exception:  # noqa: BLE001 - sqlglot's TokenError, and whatever else a tokenizer raises
+                raise ConnectorError(
+                    "the statement could not be read to check it reads no internal table of a full-text or "
+                    "R*Tree index",
+                    category=ErrorCategory.QUERY,
+                ) from None
+            references = {(None, t.text) for t in tokens if "_" in t.text}
+        name = next(
+            (hit for schema, table in sorted(references, key=str) if (hit := self._shadow_named(conn, schema, table))),
+            None,
+        )
         if name is not None:
             raise ConnectorError(
                 f"'{name}' is an internal table of a full-text or R*Tree index, which holds the indexed values "
@@ -945,7 +1159,7 @@ class SQLiteConnector(DatabaseConnector):
             raise NotImplementedError(EXPLAIN_ANALYZE_UNSUPPORTED)
         # EXPLAIN QUERY PLAN is non-executing; run it for real and preserve
         # the engine's plan rows verbatim.
-        with self._heap_refusals("planning the statement"), closing(self._open()) as conn:
+        with self._handle("planning the statement") as conn:
             rows = conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall()  # noqa: S608 - validated upstream
         return {
             "engine": "sqlite",

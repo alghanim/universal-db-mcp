@@ -74,9 +74,13 @@
 #      trusted verifier must pass again afterwards.
 #   9. folder_squat_refused: with the admin's C:\ProgramData\UniversalDB MCP
 #      moved aside, a repair (REINSTALL=ALL, so CreateFolders runs as on a
-#      first install) over a folder owned by BUILTIN\Users, and then over a
-#      config.yaml owned by BUILTIN\Users, must FAIL at DoctorSmokeCA; the
-#      folder is restored and the same repair must pass again.
+#      first install) over a folder owned by BUILTIN\Users must FAIL at
+#      CheckFoldersCA, and one over a config.yaml owned by BUILTIN\Users (in
+#      a folder Administrators own) at DoctorSmokeCA; the folder is restored
+#      and the same repair must pass again (folder_squat_cleanup_reinstalled).
+#   Checks 9, 10 and 11 need nothing from each other: a failure in one is
+#   recorded and the next one still runs (only a config folder that cannot
+#   be put back stops the gate), and the gate exits nonzero.
 #  10. launch_conditions: repairs passing UDBMCP_SERVICE_ACCOUNT with a double
 #      quote or a trailing backslash, or UDBMCP_ALLOW_DOWNGRADE=yes, must fail
 #      at LaunchConditions before any custom action runs; the same repair
@@ -217,6 +221,30 @@ function Stop-Gate {
     Save-Evidence -Status 'failed' -InstallExitCode $script:InstallExitCode -MsiUsed $script:MsiUsed -MsiLog $script:MsiLog
     Write-Host "==> msi gate FAILED (fail closed); evidence: $EvidenceDir\results.json"
     exit 1
+}
+
+function Stop-Check {
+    # A failure inside checks 9-11, which need nothing from each other: unlike
+    # Stop-Gate it does not end the gate. It throws to the check's own catch
+    # (Add-CheckFailure), which records it as failed under $Name; the check's
+    # finally blocks still put the machine back, the next check runs, and the
+    # gate still exits nonzero at the end.
+    param([string]$Name, [string]$Detail)
+    $failure = [System.Exception]::new($Detail)
+    $failure.Data['UdbmcpGateCheck'] = $Name
+    throw $failure
+}
+
+function Add-CheckFailure {
+    # Records what stopped one of checks 9-11 ($ErrorRecord): a Stop-Check
+    # under the name it gave, anything else as an unexpected error of $Name.
+    param([string]$Name, $ErrorRecord)
+    $failed = $ErrorRecord.Exception.Data['UdbmcpGateCheck']
+    if ($failed) {
+        Add-Check $failed 'failed' $ErrorRecord.Exception.Message
+    } else {
+        Add-Check $Name 'failed' ('unexpected error: ' + $ErrorRecord.Exception.Message)
+    }
 }
 
 function Save-Evidence {
@@ -1036,73 +1064,98 @@ connections:
     # Any local user can create C:\ProgramData\UniversalDB MCP before the
     # first install, own it, and leave a config.yaml in it that names files
     # LocalSystem then reads and writes (token file, audit log, databases);
-    # NeverOverwrite keeps such a config. The MSI's folder DACL names no
-    # owner, so CreateFolders leaves a squatted folder owned by its creator,
-    # and DoctorSmokeCA refuses a folder or config.yaml that SYSTEM or
-    # Administrators do not own. Exercised the way a first install meets it:
-    # REINSTALL=ALL reinstalls every component, so CreateFolders applies the
-    # folder permission again. The admin's folder is moved aside (never
-    # uninstalled: uninstall deletes config.yaml) and a planted one owned by
-    # BUILTIN\Users takes its place:
-    #   folder - the folder itself (msiexec installs config.yaml into it);
-    #   config - config.yaml only (the shipped template, so its owner is the
-    #            only thing wrong with it).
-    # Each install must FAIL at DoctorSmokeCA, the first action that reads
-    # the folder. The planted folder is then removed, the admin's folder
-    # restored, and the same repair must pass, proving the squat was the
-    # only cause.
+    # NeverOverwrite keeps such a config. Two actions refuse it, each the
+    # first to read what it refuses: CheckFoldersCA (before CreateFolders,
+    # which would apply the folder's DACL through it) a folder no
+    # administrator owns, and DoctorSmokeCA (the first action that reads the
+    # config) a config.yaml SYSTEM or Administrators do not own. Exercised
+    # the way a first install meets it: REINSTALL=ALL reinstalls every
+    # component, so CreateFolders applies the folder permission again. The
+    # admin's folder is moved aside (never uninstalled: uninstall deletes
+    # config.yaml) and a planted one takes its place:
+    #   folder - the folder itself, owned by BUILTIN\Users (msiexec installs
+    #            config.yaml into it): must fail at CheckFoldersCA;
+    #   config - config.yaml only, owned by BUILTIN\Users, in a folder
+    #            Administrators own (the shipped template, so its owner is
+    #            the only thing wrong with it): must fail at DoctorSmokeCA.
+    # Each case runs and is judged on its own. The planted folder is then
+    # removed, the admin's folder restored, and the same repair must pass,
+    # proving the squat was the only cause. Checks 9, 10 and 11 record a
+    # failure (Stop-Check) and the gate goes on with the next one; only a
+    # folder that cannot be put back stops the gate.
     if ($SkipMsiInstall) {
         Add-Check 'folder_squat_refused' 'passed' 'skipped (-SkipMsiInstall); needs msiexec runs against the MSI'
     } else {
-        # A running service can hold the venv and files in the folder open.
-        (Invoke-Native { & $scExe stop $ServiceName 2>&1 }) | Out-Null
-        for ($i = 0; $i -lt 30; $i++) {
-            $stateLine = ((Invoke-Native { & $scExe query $ServiceName 2>&1 }) | ForEach-Object { "$_" } |
-                Where-Object { $_ -match '^\s*STATE' } | Select-Object -First 1)
-            if (-not $stateLine -or $stateLine -match 'STOPPED') { break }
-            Start-Sleep -Seconds 2
-        }
         $SquatBackup = $ProgramDataDir + '.gate-backup'
         $SquatBackupName = Split-Path -Leaf $SquatBackup
         $ProgramDataName = Split-Path -Leaf $ProgramDataDir
-        if (Test-Path -LiteralPath $SquatBackup) {
-            Stop-Gate 'folder_squat_refused' "$SquatBackup already exists (an interrupted gate run?); restore it to $ProgramDataDir or remove it, then rerun the gate"
-        }
         $SquatTemplate = Join-Path $BundleDir 'config-templates\config.template.yaml'
+        $SquatCases = @(
+            @{ Name = 'folder'; Action = 'CheckFoldersCA' },
+            @{ Name = 'config'; Action = 'DoctorSmokeCA' }
+        )
         $SquatMoved = $false
         $squatLogs = @()
+        $squatFailures = @()
         try {
+            # A running service can hold the venv and files in the folder open.
+            (Invoke-Native { & $scExe stop $ServiceName 2>&1 }) | Out-Null
+            for ($i = 0; $i -lt 30; $i++) {
+                $stateLine = ((Invoke-Native { & $scExe query $ServiceName 2>&1 }) | ForEach-Object { "$_" } |
+                    Where-Object { $_ -match '^\s*STATE' } | Select-Object -First 1)
+                if (-not $stateLine -or $stateLine -match 'STOPPED') { break }
+                Start-Sleep -Seconds 2
+            }
+            if (Test-Path -LiteralPath $SquatBackup) {
+                Stop-Check 'folder_squat_refused' "$SquatBackup already exists (an interrupted gate run?); restore it to $ProgramDataDir or remove it, then rerun the gate"
+            }
             Rename-Item -LiteralPath $ProgramDataDir -NewName $SquatBackupName
             $SquatMoved = $true
-            foreach ($squat in @('folder', 'config')) {
-                New-Item -ItemType Directory -Path $ProgramDataDir | Out-Null
-                $squatTarget = $ProgramDataDir
-                if ($squat -eq 'config') {
-                    $squatTarget = Join-Path $ProgramDataDir 'config.yaml'
-                    Copy-Item -LiteralPath $SquatTemplate -Destination $squatTarget
-                    Invoke-Native { & $IcaclsExe $ProgramDataDir /setowner *S-1-5-32-544 2>&1 } | Out-Null
+            foreach ($case in $SquatCases) {
+                $squat = $case.Name
+                try {
+                    New-Item -ItemType Directory -Path $ProgramDataDir | Out-Null
+                    $squatTarget = $ProgramDataDir
+                    if ($squat -eq 'config') {
+                        $squatTarget = Join-Path $ProgramDataDir 'config.yaml'
+                        Copy-Item -LiteralPath $SquatTemplate -Destination $squatTarget
+                        Invoke-Native { & $IcaclsExe $ProgramDataDir /setowner *S-1-5-32-544 2>&1 } | Out-Null
+                    }
+                    Invoke-Native { & $IcaclsExe $squatTarget /setowner *S-1-5-32-545 2>&1 } | Out-Null
+                    $plantedOwner = (Get-Acl -LiteralPath $squatTarget).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+                    if ($plantedOwner -ne 'S-1-5-32-545') {
+                        Stop-Check 'folder_squat_refused' "could not plant the squatted $squat ($squatTarget is owned by $plantedOwner)"
+                    }
+                    $squatMsiLog = Join-Path $LogDir "msi-install-squatted-$squat.log"
+                    $squatLogs += $squatMsiLog
+                    $squatArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus /qn /norestart /l*v `"$squatMsiLog`""
+                    $squatProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $squatArgStr -Wait -PassThru
+                    if ($squatProc.ExitCode -eq 0 -or $squatProc.ExitCode -eq 3010) {
+                        Stop-Check 'folder_squat_refused' "msiexec exited $($squatProc.ExitCode) with the $squat owned by BUILTIN\Users ($squatTarget): the install adopted a squatted config (log: $squatMsiLog)"
+                    }
+                    $squatMsiText = (Get-Content -LiteralPath $squatMsiLog -Raw -ErrorAction SilentlyContinue)
+                    if ($null -eq $squatMsiText) { $squatMsiText = '' }
+                    # A failing exe custom action is logged as "CustomAction <Id>
+                    # returned actual error code <n>" and in Error 1722 as
+                    # "Action <Id>, location: ...".
+                    $refusedAt = 'CustomAction ' + $case.Action + ' returned actual error code|Action ' + $case.Action + ', location:'
+                    if ($squatMsiText -notmatch $refusedAt) {
+                        Stop-Check 'folder_squat_refused' "msiexec exited $($squatProc.ExitCode) with the $squat owned by BUILTIN\Users, but not at $($case.Action), the first action that reads it: the refusal is unproven (log: $squatMsiLog)"
+                    }
+                } catch {
+                    $squatFailures += ($squat + ': ' + $_.Exception.Message)
+                } finally {
+                    if (Test-Path -LiteralPath $ProgramDataDir) {
+                        Remove-Item -LiteralPath $ProgramDataDir -Recurse -Force -ErrorAction SilentlyContinue
+                    }
                 }
-                Invoke-Native { & $IcaclsExe $squatTarget /setowner *S-1-5-32-545 2>&1 } | Out-Null
-                $plantedOwner = (Get-Acl -LiteralPath $squatTarget).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-                if ($plantedOwner -ne 'S-1-5-32-545') {
-                    Stop-Gate 'folder_squat_refused' "could not plant the squatted $squat ($squatTarget is owned by $plantedOwner)"
-                }
-                $squatMsiLog = Join-Path $LogDir "msi-install-squatted-$squat.log"
-                $squatLogs += $squatMsiLog
-                $squatArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus /qn /norestart /l*v `"$squatMsiLog`""
-                $squatProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $squatArgStr -Wait -PassThru
-                if ($squatProc.ExitCode -eq 0 -or $squatProc.ExitCode -eq 3010) {
-                    Stop-Gate 'folder_squat_refused' "msiexec exited $($squatProc.ExitCode) with the $squat owned by BUILTIN\Users ($squatTarget): the install adopted a squatted config (log: $squatMsiLog)"
-                }
-                $squatMsiText = (Get-Content -LiteralPath $squatMsiLog -Raw -ErrorAction SilentlyContinue)
-                # A failing exe custom action is logged as "CustomAction <Id>
-                # returned actual error code <n>" and in Error 1722 as
-                # "Action <Id>, location: ...".
-                if ($squatMsiText -notmatch 'CustomAction DoctorSmokeCA returned actual error code|Action DoctorSmokeCA, location:') {
-                    Stop-Gate 'folder_squat_refused' "msiexec exited $($squatProc.ExitCode) with the $squat owned by BUILTIN\Users, but not at DoctorSmokeCA, the first action that reads the folder: the refusal is unproven (log: $squatMsiLog)"
-                }
-                Remove-Item -LiteralPath $ProgramDataDir -Recurse -Force
             }
+            if ($squatFailures.Count -gt 0) {
+                Stop-Check 'folder_squat_refused' ($squatFailures -join '; ')
+            }
+            Add-Check 'folder_squat_refused' 'passed' "msiexec REINSTALL=ALL failed at CheckFoldersCA with the config folder owned by BUILTIN\Users, and at DoctorSmokeCA with config.yaml alone owned by BUILTIN\Users; neither was adopted (logs: $($squatLogs -join ', '))"
+        } catch {
+            Add-CheckFailure 'folder_squat_refused' $_
         } finally {
             # Never leave a planted folder behind, and put the admin's folder
             # back, on every unwind (Stop-Gate's exit included).
@@ -1115,20 +1168,28 @@ connections:
                 }
             }
         }
-        Add-Check 'folder_squat_refused' 'passed' "msiexec REINSTALL=ALL failed at DoctorSmokeCA with the config folder, and then config.yaml alone, owned by BUILTIN\Users; neither was adopted (logs: $($squatLogs -join ', '))"
 
-        if (Test-Path -LiteralPath $SquatBackup) {
+        if (-not $SquatMoved) {
+            Add-Check 'folder_squat_cleanup_reinstalled' 'not_run' "the admin's $ProgramDataDir was never moved aside, so there is nothing to restore and reinstall (see folder_squat_refused)"
+        } elseif (Test-Path -LiteralPath $SquatBackup) {
+            # The one failure that stops the gate: the admin's folder is not
+            # back, and the repairs below would install a template in its place.
             Stop-Gate 'folder_squat_cleanup_reinstalled' "could not restore $ProgramDataDir from $SquatBackup; move it back by hand"
+        } else {
+            try {
+                # The same repair on the restored folder must pass. It
+                # re-registers the service stopped, as check 3c does.
+                $restoreMsiLog = Join-Path $LogDir 'msi-install-squat-restored.log'
+                $restoreArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus /qn /norestart /l*v `"$restoreMsiLog`""
+                $restoreProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $restoreArgStr -Wait -PassThru
+                if ($restoreProc.ExitCode -ne 0 -and $restoreProc.ExitCode -ne 3010) {
+                    Stop-Check 'folder_squat_cleanup_reinstalled' "msiexec REINSTALL=ALL exited $($restoreProc.ExitCode) on the restored $ProgramDataDir, so the squat negative above is inconclusive; repair the install (log: $restoreMsiLog)"
+                }
+                Add-Check 'folder_squat_cleanup_reinstalled' 'passed' "admin's $ProgramDataDir restored; the same msiexec REINSTALL=ALL exited $($restoreProc.ExitCode) (the squat was the only cause; log: $restoreMsiLog)"
+            } catch {
+                Add-CheckFailure 'folder_squat_cleanup_reinstalled' $_
+            }
         }
-        # The same repair on the restored folder must pass. It re-registers
-        # the service stopped, as check 3c does.
-        $restoreMsiLog = Join-Path $LogDir 'msi-install-squat-restored.log'
-        $restoreArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus /qn /norestart /l*v `"$restoreMsiLog`""
-        $restoreProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $restoreArgStr -Wait -PassThru
-        if ($restoreProc.ExitCode -ne 0 -and $restoreProc.ExitCode -ne 3010) {
-            Stop-Gate 'folder_squat_cleanup_reinstalled' "msiexec REINSTALL=ALL exited $($restoreProc.ExitCode) on the restored $ProgramDataDir, so the squat negative above is inconclusive; repair the install (log: $restoreMsiLog)"
-        }
-        Add-Check 'folder_squat_cleanup_reinstalled' 'passed' "admin's $ProgramDataDir restored; the same msiexec REINSTALL=ALL exited $($restoreProc.ExitCode) (the squat was the only cause; log: $restoreMsiLog)"
     }
 
     # ------------------------------ 10. launch conditions (who passes what)
@@ -1137,50 +1198,67 @@ connections:
     # (MSIUSEREALADMINDETECTION=1 and AdminUser) and refuses an account that
     # would break out of its quotes on the custom actions' command lines.
     # Each repair below must fail at LaunchConditions: the Launch message in
-    # the log and no custom action run. The same repair passing
-    # UDBMCP_SERVICE_ACCOUNT from this elevated administrator must pass
-    # (AdminUser is set for a real administrator); it runs only when the
-    # install registered LocalSystem, so no account changes. A standard
-    # user's repair is not exercised (it needs a second, non-admin account).
+    # the log and no custom action run (CheckFoldersCA is the first). The
+    # same repair passing UDBMCP_SERVICE_ACCOUNT from this elevated
+    # administrator must pass (AdminUser is set for a real administrator);
+    # it runs only when the install registered LocalSystem, so no account
+    # changes. A standard user's repair is not exercised (it needs a second,
+    # non-admin account). Every case runs and is judged on its own.
     if ($SkipMsiInstall) {
         Add-Check 'launch_conditions' 'passed' 'skipped (-SkipMsiInstall); needs msiexec runs against the MSI'
     } else {
-        $accountMessage = 'UDBMCP_SERVICE_ACCOUNT may not contain a double quote or end with a backslash.'
-        # msiexec's own quoting: "" is a literal quote inside a quoted value
-        $LaunchCases = @(
-            @{ Name = 'account-quote'; Property = 'UDBMCP_SERVICE_ACCOUNT="x"" -ServiceName ""evil"'; Message = $accountMessage },
-            @{ Name = 'account-backslash'; Property = 'UDBMCP_SERVICE_ACCOUNT=CORP\'; Message = $accountMessage },
-            @{ Name = 'downgrade-value'; Property = 'UDBMCP_ALLOW_DOWNGRADE=yes'; Message = 'UDBMCP_ALLOW_DOWNGRADE may only be 1' }
-        )
-        $launchLogs = @()
-        foreach ($case in $LaunchCases) {
-            $launchLog = Join-Path $LogDir ('msi-launch-' + $case.Name + '.log')
-            $launchLogs += $launchLog
-            $launchArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus " + $case.Property + " /qn /norestart /l*v `"$launchLog`""
-            $launchProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $launchArgStr -Wait -PassThru
-            $launchText = (Get-Content -LiteralPath $launchLog -Raw -ErrorAction SilentlyContinue)
-            if ($null -eq $launchText) { $launchText = '' }
-            if ($launchProc.ExitCode -eq 0 -or $launchProc.ExitCode -eq 3010) {
-                Stop-Gate 'launch_conditions' "msiexec exited $($launchProc.ExitCode) with $($case.Property): the Launch condition did not refuse it (log: $launchLog)"
+        try {
+            $accountMessage = 'UDBMCP_SERVICE_ACCOUNT may not contain a double quote or end with a backslash.'
+            # msiexec's own quoting: "" is a literal quote inside a quoted value
+            $LaunchCases = @(
+                @{ Name = 'account-quote'; Property = 'UDBMCP_SERVICE_ACCOUNT="x"" -ServiceName ""evil"'; Message = $accountMessage },
+                @{ Name = 'account-backslash'; Property = 'UDBMCP_SERVICE_ACCOUNT=CORP\'; Message = $accountMessage },
+                @{ Name = 'downgrade-value'; Property = 'UDBMCP_ALLOW_DOWNGRADE=yes'; Message = 'UDBMCP_ALLOW_DOWNGRADE may only be 1' }
+            )
+            $launchLogs = @()
+            $launchFailures = @()
+            foreach ($case in $LaunchCases) {
+                try {
+                    $launchLog = Join-Path $LogDir ('msi-launch-' + $case.Name + '.log')
+                    $launchLogs += $launchLog
+                    $launchArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus " + $case.Property + " /qn /norestart /l*v `"$launchLog`""
+                    $launchProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $launchArgStr -Wait -PassThru
+                    $launchText = (Get-Content -LiteralPath $launchLog -Raw -ErrorAction SilentlyContinue)
+                    if ($null -eq $launchText) { $launchText = '' }
+                    if ($launchProc.ExitCode -eq 0 -or $launchProc.ExitCode -eq 3010) {
+                        Stop-Check 'launch_conditions' "msiexec exited $($launchProc.ExitCode) with $($case.Property): the Launch condition did not refuse it (log: $launchLog)"
+                    }
+                    if ($launchText -notmatch [regex]::Escape($case.Message)) {
+                        Stop-Check 'launch_conditions' "msiexec exited $($launchProc.ExitCode) with $($case.Property), but not with the Launch message '$($case.Message)' (log: $launchLog)"
+                    }
+                    if ($launchText -match 'CheckFoldersCA|VerifyBundleCA') {
+                        Stop-Check 'launch_conditions' "msiexec refused $($case.Property) only after a custom action ran (log: $launchLog)"
+                    }
+                } catch {
+                    $launchFailures += ($case.Name + ': ' + $_.Exception.Message)
+                }
             }
-            if ($launchText -notmatch [regex]::Escape($case.Message)) {
-                Stop-Gate 'launch_conditions' "msiexec exited $($launchProc.ExitCode) with $($case.Property), but not with the Launch message '$($case.Message)' (log: $launchLog)"
+            $adminDetail = 'not run: the install registered a dedicated account (a repair would need its password)'
+            if (-not $installedService -or $installedService.StartName -match '^(\.\\)?LocalSystem$') {
+                try {
+                    $adminLog = Join-Path $LogDir 'msi-launch-admin-account.log'
+                    $adminArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus UDBMCP_SERVICE_ACCOUNT=LocalSystem /qn /norestart /l*v `"$adminLog`""
+                    $adminProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $adminArgStr -Wait -PassThru
+                    if ($adminProc.ExitCode -ne 0 -and $adminProc.ExitCode -ne 3010) {
+                        Stop-Check 'launch_conditions' "msiexec exited $($adminProc.ExitCode) with UDBMCP_SERVICE_ACCOUNT=LocalSystem from this elevated administrator: AdminUser is not set for a real administrator (log: $adminLog)"
+                    }
+                    $adminDetail = "an elevated administrator's UDBMCP_SERVICE_ACCOUNT=LocalSystem passed (log: $adminLog)"
+                } catch {
+                    $launchFailures += ('admin-account: ' + $_.Exception.Message)
+                }
             }
-            if ($launchText -match 'VerifyBundleCA') {
-                Stop-Gate 'launch_conditions' "msiexec refused $($case.Property) only after a custom action ran (log: $launchLog)"
+            if ($launchFailures.Count -gt 0) {
+                Stop-Check 'launch_conditions' ($launchFailures -join '; ')
             }
+            Add-Check 'launch_conditions' 'passed' "a quote or trailing backslash in UDBMCP_SERVICE_ACCOUNT and UDBMCP_ALLOW_DOWNGRADE=yes were refused at LaunchConditions, before any custom action (logs: $($launchLogs -join ', ')); $adminDetail"
+        } catch {
+            Add-CheckFailure 'launch_conditions' $_
         }
-        $adminDetail = 'not run: the install registered a dedicated account (a repair would need its password)'
-        if (-not $installedService -or $installedService.StartName -match '^(\.\\)?LocalSystem$') {
-            $adminLog = Join-Path $LogDir 'msi-launch-admin-account.log'
-            $adminArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus UDBMCP_SERVICE_ACCOUNT=LocalSystem /qn /norestart /l*v `"$adminLog`""
-            $adminProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $adminArgStr -Wait -PassThru
-            if ($adminProc.ExitCode -ne 0 -and $adminProc.ExitCode -ne 3010) {
-                Stop-Gate 'launch_conditions' "msiexec exited $($adminProc.ExitCode) with UDBMCP_SERVICE_ACCOUNT=LocalSystem from this elevated administrator: AdminUser is not set for a real administrator (log: $adminLog)"
-            }
-            $adminDetail = "an elevated administrator's UDBMCP_SERVICE_ACCOUNT=LocalSystem passed (log: $adminLog)"
-        }
-        Add-Check 'launch_conditions' 'passed' "a quote or trailing backslash in UDBMCP_SERVICE_ACCOUNT and UDBMCP_ALLOW_DOWNGRADE=yes were refused at LaunchConditions, before any custom action (logs: $($launchLogs -join ', ')); $adminDetail"
     }
 
     # ------------------ 11. a repair keeps the registered service account
@@ -1214,12 +1292,12 @@ connections:
                 $keepArgStr = "/i `"$MsiPath`" REINSTALL=ALL REINSTALLMODE=omus " + $step.Property + " /qn /norestart /l*v `"$keepLog`""
                 $keepProc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $keepArgStr -Wait -PassThru
                 if ($keepProc.ExitCode -ne 0 -and $keepProc.ExitCode -ne 3010) {
-                    Stop-Gate 'repair_keeps_account' "msiexec REINSTALL=ALL $($step.Property) exited $($keepProc.ExitCode) (log: $keepLog)"
+                    Stop-Check 'repair_keeps_account' "msiexec REINSTALL=ALL $($step.Property) exited $($keepProc.ExitCode) (log: $keepLog)"
                 }
                 $keepRestored = ($step.Name -eq 'localsystem')
                 $startName = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").StartName
                 if ($startName -notmatch $step.Expect) {
-                    Stop-Gate 'repair_keeps_account' "after msiexec REINSTALL=ALL $($step.Property) the service runs as '$startName' (log: $keepLog)"
+                    Stop-Check 'repair_keeps_account' "after msiexec REINSTALL=ALL $($step.Property) the service runs as '$startName' (log: $keepLog)"
                 }
                 if ($step.Name -eq 'unnamed') {
                     # NetworkService kept its Modify on logs\ and its read
@@ -1228,11 +1306,14 @@ connections:
                         $grants = @((Get-Acl -LiteralPath $kept).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
                             Where-Object { $_.IdentityReference.Value -eq 'S-1-5-20' })
                         if ($grants.Count -eq 0) {
-                            Stop-Gate 'repair_keeps_account' "a repair without UDBMCP_SERVICE_ACCOUNT kept NetworkService, but $kept no longer grants it access (log: $keepLog)"
+                            Stop-Check 'repair_keeps_account' "a repair without UDBMCP_SERVICE_ACCOUNT kept NetworkService, but $kept no longer grants it access (log: $keepLog)"
                         }
                     }
                 }
             }
+            Add-Check 'repair_keeps_account' 'passed' "a repair without UDBMCP_SERVICE_ACCOUNT kept NetworkService, its Modify on logs\ and its read access to the token; a repair naming LocalSystem restored the install (logs: $($keepLogs -join ', '))"
+        } catch {
+            Add-CheckFailure 'repair_keeps_account' $_
         } finally {
             # Never leave the service switched to NetworkService, Stop-Gate's
             # exit included.
@@ -1242,7 +1323,6 @@ connections:
                 Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $keepRestoreArgs -Wait | Out-Null
             }
         }
-        Add-Check 'repair_keeps_account' 'passed' "a repair without UDBMCP_SERVICE_ACCOUNT kept NetworkService, its Modify on logs\ and its read access to the token; a repair naming LocalSystem restored the install (logs: $($keepLogs -join ', '))"
     }
 
     # ------------------------------------------------------------------ done

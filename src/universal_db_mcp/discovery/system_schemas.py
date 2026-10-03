@@ -10,6 +10,7 @@ allowed_schemas) names it.
 
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
 
@@ -78,9 +79,23 @@ def loose_name(name: str) -> str:
     more spellings than an engine reads, never fewer. SQL Server's collations
     fold more than this, which is why the guard admits only printable ASCII
     names there."""
+    return _loose_cached(name) if len(name) <= _CACHED_NAME_CHARS else _loose(name)
+
+
+def _loose(name: str) -> str:
     decomposed = unicodedata.normalize("NFKD", name)
     unmarked = "".join(ch for ch in decomposed if not unicodedata.category(ch).startswith("M"))
     return unmarked.upper().lower().strip()
+
+
+# loose_name and is_session_sql_view run for every object of every catalog
+# page and every name of every statement: their answers are kept for names
+# up to an engine's identifier length (128: Oracle, SQL Server, Db2), in
+# caches bounded in entries, so a long or hostile name is computed, never
+# kept, and the memory stays bounded (a few tens of MiB at worst).
+_CACHED_NAME_CHARS = 128
+_CACHE_ENTRIES = 32768
+_loose_cached = functools.lru_cache(maxsize=_CACHE_ENTRIES)(_loose)
 
 
 def is_listed_system_schema(engine: str, schema: str) -> bool:
@@ -391,17 +406,32 @@ CREDENTIAL_VIEWS: dict[str, re.Pattern[str]] = {
 # hold names only (TABLES, SCHEMATA, KEY_COLUMN_USAGE, ...) stay readable,
 # and db_list_columns and db_list_views describe the allowlisted objects.
 # Not listed: information_schema.PARTITIONS (a partition's bounds, the
-# documented residual beside COLUMN_VALUE_COLUMNS).
+# documented residual beside COLUMN_VALUE_COLUMNS). STATISTICS, whose
+# EXPRESSION holds a functional key part's SQL (MySQL) and is the index list
+# agents read, refuses only that column (COLUMN_VALUE_COLUMNS).
+#
+# Swept by column name (definition, expression, default, clause, body,
+# condition, statement, value, text, source; review cr2, 2026-10-03) on
+# MySQL 9.7, PostgreSQL 17, ClickHouse 26.3 and SQL Server 2022 live, and
+# MySQL 8.0 / MariaDB from their documentation: what is left out holds names,
+# server-wide reference data (character sets, spatial reference systems,
+# SQL_IMPLEMENTATION_INFO), sequence bounds, comments, or the caller's own
+# session (OPTIMIZER_TRACE); other sessions' statements and full-text words
+# are SESSION_SQL_VIEWS.
 DEFINITION_VIEWS: dict[str, re.Pattern[str]] = {
-    # INNODB_COLUMNS.DEFAULT_VALUE: the default of a column added instantly
+    # INNODB_COLUMNS.DEFAULT_VALUE: the default of a column added instantly; MySQL 9's
+    # LIBRARIES.LIBRARY_DEFINITION (a JavaScript library's source) and
+    # JSON_DUALITY_VIEW_TABLES.WHERE_CLAUSE (a duality view's filter with its literals)
     "mysql": re.compile(
-        r"information_schema\.(?:views|routines|columns|triggers|events|check_constraints|innodb_columns)"
+        r"information_schema\.(?:views|routines|columns|triggers|events|check_constraints|innodb_columns"
+        r"|libraries|json_duality_view_tables)"
     ),
     "postgres": re.compile(
         r"information_schema\.(?:views|routines|columns|triggers|check_constraints|parameters|attributes|domains)"
     ),
     "clickhouse": re.compile(r"information_schema\.(?:views|columns)"),
-    "mssql": re.compile(r"information_schema\.(?:views|routines|columns|check_constraints|domains)"),
+    # ROUTINE_COLUMNS.COLUMN_DEFAULT: a table-valued function's result columns' defaults
+    "mssql": re.compile(r"information_schema\.(?:views|routines|routine_columns|columns|check_constraints|domains)"),
 }
 
 # Catalog views that describe every column and carry its lowest and highest
@@ -422,7 +452,14 @@ DEFINITION_VIEWS: dict[str, re.Pattern[str]] = {
 # pg_class.relpartbound, SQL Server's sys.partition_range_values, and
 # ClickHouse's system.parts and the views of the same parts (partition,
 # min_date, max_date, min_time, max_time).
+#
+# The same holds for a catalog view whose other columns are names: MySQL's
+# (and, empty today, ClickHouse's) information_schema.STATISTICS lists the
+# indexes, and its EXPRESSION carries a functional key part's SQL with its
+# literals ((`password` = 'hunter2'), of any schema; live, MySQL 9.7).
 COLUMN_VALUE_COLUMNS: dict[str, tuple[re.Pattern[str], frozenset[str]]] = {
+    "mysql": (re.compile(r"information_schema\.statistics"), frozenset({"expression"})),
+    "clickhouse": (re.compile(r"information_schema\.statistics"), frozenset({"expression"})),
     "oracle": (
         re.compile(
             _ORACLE_DICTIONARY
@@ -478,6 +515,12 @@ def is_session_sql_view(engine: str, schema: str | None, name: str) -> bool:
     DEFINITION_VIEWS, in any spelling loose_name folds to one: a view that
     hands back values masking hides, or credentials, refused to every tool
     and left out of every listing."""
+    if len(name) <= _CACHED_NAME_CHARS and (schema is None or len(schema) <= _CACHED_NAME_CHARS):
+        return _session_sql_view_cached(engine, schema, name)
+    return _session_sql_view(engine, schema, name)
+
+
+def _session_sql_view(engine: str, schema: str | None, name: str) -> bool:
     pattern = SESSION_SQL_VIEWS.get(engine)
     matched = pattern is not None and pattern.fullmatch(_shown(schema, name)) is not None
     return (
@@ -486,6 +529,9 @@ def is_session_sql_view(engine: str, schema: str | None, name: str) -> bool:
         or is_credential_view(engine, schema, name)
         or is_definition_view(engine, schema, name)
     )
+
+
+_session_sql_view_cached = functools.lru_cache(maxsize=_CACHE_ENTRIES)(_session_sql_view)
 
 
 def is_system_object(engine: str, schema: str | None, table: str) -> bool:

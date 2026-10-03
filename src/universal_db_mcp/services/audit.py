@@ -712,6 +712,19 @@ def _open_state_file(path: Path, flags: int) -> int:
             os.fchmod(fd, 0o600)
             if created:
                 _give_to_directory_owner(fd, path.parent)
+        if sys.platform == "darwin":
+            # 0600 says nothing about an extended ACL: '-rw-------+' with
+            # 'everyone allow read' is readable by every local user
+            from universal_db_mcp.config import darwin_secret_file_acl_problems
+
+            granted = darwin_secret_file_acl_problems(path)
+            if granted:
+                raise OSError(
+                    errno.EACCES,
+                    f"refused: its access control list grants others access ({'; '.join(granted)}); "
+                    f"remove it with chmod -N",
+                    str(path),
+                )
     except OSError:
         os.close(fd)
         raise

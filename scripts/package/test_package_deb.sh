@@ -494,25 +494,49 @@ else
   rec payload_layout failed "payload incomplete; missing:$MISSING"
 fi
 
-# Files under $1 that hold key material: a PEM block, its armour line
-# (-----BEGIN ... KEY-----, or ... KEY BLOCK-----) followed by a base64 body,
-# also inside a string literal where the line breaks are written \n. Not the
-# armour text alone: the shipped verify_bundle.py names 'BEGIN PUBLIC KEY' in
-# its PEM parser, and a package without any key must still pass. Every file is
-# read, text or not; a failure to read one is reported as a hit (fail closed).
+# Files under $1 that hold key material: an armour line (BEGIN ... KEY, or
+# ... KEY BLOCK, dashes optional) followed by a key body, in any layout a key
+# can be written down in: a PEM file, a single line, string literals joined
+# or concatenated, a JSON line array, printf arguments, '# ' comments, XML
+# entities or written \n between the lines. A body is base64 text after the
+# armour, before its END line (or within 4 KiB): a run of 20 or more base64
+# characters that mixes upper case, lower case and digits, or, up to an END
+# line, 40 such characters in pieces of 4 or more. Not the armour text alone:
+# the shipped verify_bundle.py names 'BEGIN PUBLIC KEY' in its PEM parser, and
+# a package without any key must still pass. Every file is read, text or not;
+# a failure to read one is reported as a hit (fail closed). Every pattern is
+# bounded or linear, and each armour's window is at most 4 KiB.
 pem_key_files() {
   python3 -I -S - "$1" <<'PYEOF'
 import os
 import re
 import sys
 
-ARMOUR = re.compile(
-    rb"-----BEGIN [A-Z0-9 ]*KEY(?: BLOCK)?-----"
-    rb"(?:\\[rn]|[ \t\r\n])+"  # the line break, or a written \n
-    rb"(?:[A-Za-z-]+: [^\r\n\\]*(?:\\[rn]|[\r\n])+)*"  # RFC 1421 headers (Proc-Type: ...)
-    rb"(?:\\[rn]|[ \t\r\n])*"
-    rb"[A-Za-z0-9+/]{16}"
-)
+ARMOUR = re.compile(rb"-{0,5}BEGIN [A-Z0-9 ]{0,40}?KEY(?: BLOCK)?-{0,5}")
+END = re.compile(rb"-{0,5}END [A-Z0-9 ]{0,40}?KEY(?: BLOCK)?")
+RUN = re.compile(rb"[A-Za-z0-9+/]+")
+WINDOW = 4096
+
+
+def mixed(text):
+    return re.search(rb"[A-Z]", text) and re.search(rb"[a-z]", text) and re.search(rb"[0-9]", text)
+
+
+def holds_key(data):
+    for armour in ARMOUR.finditer(data):
+        window = data[armour.end():armour.end() + WINDOW]
+        end = END.search(window)
+        if end:
+            window = window[:end.start()]
+        runs = RUN.findall(window)
+        if any(len(run) >= 20 and mixed(run) for run in runs):
+            return True
+        pieces = b"".join(run for run in runs if len(run) >= 4)
+        if end and len(pieces) >= 40 and mixed(pieces):
+            return True
+    return False
+
+
 for top, dirs, files in os.walk(sys.argv[1]):
     dirs.sort()
     for name in sorted(files):
@@ -525,7 +549,7 @@ for top, dirs, files in os.walk(sys.argv[1]):
         except OSError as exc:
             print(f"{path} (unreadable: {exc.strerror})")
             continue
-        if ARMOUR.search(data):
+        if holds_key(data):
             print(path)
 PYEOF
 }

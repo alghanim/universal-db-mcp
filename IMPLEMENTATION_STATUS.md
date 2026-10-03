@@ -1417,8 +1417,7 @@ By area (operator-visible behaviour in `docs/security.md`, `docs/tools.md`,
   not the verifier's PEM parser (it failed every run, so `release_usb.sh`
   aborted).
 
-Still open after the review: a repair that fails inside `service.ps1`
-between `Remove-ExistingService` and `sc.exe create` loses the service; an
+Still open after the review: an
 Oracle Thin connect to a listener that never answers (F37); ClickHouse
 server memory is bounded only by the account profile; the `.pkg`
 `hostArchitectures` and native re-run need a real `sudo installer` on Apple
@@ -1441,6 +1440,86 @@ pin 2.15.1; `--check-locks` and pip-audit over every lock are clean.
 `scripts/live_evidence.py` re-run on 2026-10-02 gives the recorded results
 (the SQL Server driver diagnostic now names the driver instead of
 `<redacted>`).
+
+**Second code review (2026-10-03).** A second `/code-review` at maximum
+effort, over the fixes commit (33a8477) and its follow-ups, confirmed 15
+ranked findings and about 25 more. Among them: a security regression in the Oracle CTE fold (the
+guard folded CTE names by Unicode upper case while the server's masking
+backstop still compared `str.lower()`, so `WITH σ AS (... SELECT ssn ...)
+SELECT * FROM ς` returned SSNs in clear; both now use one `cte_key`); a
+regression of `'%%'` semantics (bound parameters made the DBAPI escape two
+`%`, so `'50%%' = %s` compared differently); quadratic regexes (ClickHouse
+login redaction and the `LIMIT 0` probe, live stalls of seconds from one
+`db_query`); and a SQLite progress handler that slowed every statement next
+to busy Python threads 25-250x. All are fixed, with regression tests in
+`tests/unit/test_cr2_*.py`; operator-visible behaviour is in
+`docs/security.md`, `docs/tools.md`, `docs/architecture.md`,
+`docs/troubleshooting.md`, `docs/claude-code-integration.md`,
+`docs/offline-deployment.md` and `docs/site-upgrade-runbook.md`:
+
+- **Bound parameters.** `%%` in a string literal is one `%` again; `%%` in
+  code and placeholders glued to a name, digit or quote are
+  `VALIDATION_ERROR`; `a[1:n]` is no `:name` placeholder; PostgreSQL
+  `ARRAY[%s]` binds again; `db_federated_query` hands each statement only
+  the names it uses.
+- **Guard and catalog views.** MySQL `STATISTICS.EXPRESSION`, `LIBRARIES`,
+  `JSON_DUALITY_VIEW_TABLES` and SQL Server `ROUTINE_COLUMNS` refused;
+  MySQL session hints refused however the hint body is spelled; SQLite
+  `""` accepted again; name caches bounded.
+- **Masking.** Wrapped or aliased stars, parenthesised joins and table
+  functions of unproven width are runs of unknown width; spare CTEs are no
+  qualifier sources; SQLite renamed aliases fail closed; SQLite view
+  definitions judged by the view's own scopes (`db_list_views` and
+  `db_get_table` agree, without listing every column of the schema); MySQL
+  backtick names take no backslash escapes; PostgreSQL 63-byte alias cut
+  accepted.
+- **Connectors.** MySQL cancels with `KILL CONNECTION` and remembers an
+  early cancel; PostgreSQL stops before the next `FETCH`; SQLite interrupts
+  every handle until closed, with no progress handler, hides only real
+  shadow tables and refuses a statement only when it reads one; SQLite and
+  MySQL keep an output named by position in `GROUP BY`/`ORDER BY` whole
+  under any spelling of the integer, and SQLite cuts the other outputs
+  again under `random()`, `NULL` or a constant there; MySQL 5.7/MariaDB
+  `o.*, c.*` over a join cut in place; metadata calls stay fast on
+  thousands of SQLite tables;
+  ClickHouse streams whenever `LIMIT` is in the text or a bound value;
+  error text capped at 16 KiB before redaction.
+- **Config, CLI, doctor.** YAML and decode errors carry no file content;
+  macOS ACLs refused only when they grant access (wizard, root walk), and
+  on the audit log, its lock and the metadata cache; doctor gains
+  `audit-path-acl` and `metadata-cache-acl` and never ends in a traceback;
+  `configure-agents` seeds a missing per-user config on a re-run; as root
+  it reads no harness config the home owner may not read.
+- **Packaging.** A refused `.deb` upgrade keeps the old `postinst` from
+  spawning a worker, `preinst`/`postinst` refuse while another deferred
+  install runs, `abort-*` without a venv records `failed`; the installer
+  carries format lines 4 and 3 (package rollback works again); `bootstrap.sh`
+  refuses an equal `RELEASE` whose tools differ; the verifier refuses an
+  x86_64-only interpreter for the arm64 profile; the image loader under
+  `sudo` loads into `SUDO_USER`'s daemon. MSI: `RegisterServiceCA` updates
+  an existing service in place and never deletes it (the repair window is
+  closed); an Administrators-member gMSA is kept; gate checks
+  `folder_squat_refused`, `launch_conditions` and `repair_keeps_account`
+  record and go on.
+
+Residuals still open: clickhouse-connect's own regexes can still take
+seconds on 60 KiB of adversarial whitespace or comments; on MySQL a
+deadline that fires while a request is still queued behind another on the
+same connection can cancel the request that is running (PostgreSQL guards
+this, MySQL does not yet); MariaDB's `*_VARIABLES` views (not
+verified live); on SQLite, `rowid` (or `oid`, `_rowid_`) returns the value
+of a sensitive `INTEGER PRIMARY KEY` it aliases unmasked; on PostgreSQL a
+cancel that lands just before a `FETCH` lets that one `FETCH` run, bounded
+by `statement_timeout`; ClickHouse over-masks a clean `b.tariff` in some
+statements (fails safe); and an earlier release's `postinst`, which dpkg
+runs to undo a refused upgrade, may still reinstall that release
+synchronously when its bundle has no OS packages.
+
+**Test status after the second code-review fixes:** `12185 passed, 288 skipped, 1 xfailed`
+(0 failed) for the whole suite on this Mac on 2026-10-03, run with
+`UDBMCP_DOCKER_TESTS=1` so the container tests (the real dpkg sequences)
+ran too; `mypy --strict src`, `ruff check src tests scripts` and
+`--check-locks` clean.
 
 ## 4. Gates not (fully) run (recorded truthfully)
 

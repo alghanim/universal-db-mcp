@@ -1384,19 +1384,27 @@ def test_f08_sqlite_fetches_within_the_row_budget(tmp_path: Path, monkeypatch: p
     real_open = SQLiteConnector._open
 
     class _Cur:
-        def __init__(self, cur: sqlite3.Cursor) -> None:
+        """Counts the fetches of the statement's own result only; a catalog
+        read (PRAGMA schema_version) is not the result."""
+
+        def __init__(self, cur: sqlite3.Cursor, counted: bool) -> None:
             self._cur = cur
+            self._counted = counted
             self.description = cur.description
 
         def fetchmany(self, n: int) -> list[Any]:
-            sizes.append(n)
+            if self._counted:
+                sizes.append(n)
             return self._cur.fetchmany(n)
 
         def fetchone(self) -> Any:
-            sizes.append(1)
+            if self._counted:
+                sizes.append(1)
             return self._cur.fetchone()
 
-        def fetchall(self) -> list[Any]:  # the catalog read (PRAGMA table_list), not the result
+        def fetchall(self) -> list[Any]:
+            if self._counted:
+                sizes.append(-1)  # the whole result: fails the bounds below
             return self._cur.fetchall()
 
     class _Conn:
@@ -1404,7 +1412,7 @@ def test_f08_sqlite_fetches_within_the_row_budget(tmp_path: Path, monkeypatch: p
             self._real = real
 
         def execute(self, sql: str, params: Any = ()) -> _Cur:
-            return _Cur(self._real.execute(sql, params))
+            return _Cur(self._real.execute(sql, params), counted="FROM t" in sql and "LIMIT 0" not in sql)
 
         def create_function(self, *args: Any, **kwargs: Any) -> None:
             self._real.create_function(*args, **kwargs)
@@ -1418,7 +1426,7 @@ def test_f08_sqlite_fetches_within_the_row_budget(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(SQLiteConnector, "_open", lambda self: _Conn(real_open(self)))
     out = conn.execute_query(QuerySpec(sql="SELECT n FROM t ORDER BY n", max_rows=1))
     assert out.truncated and out.rows == [[0]]
-    assert sizes and max(sizes) <= 2, sizes
+    assert sizes and max(sizes) <= 2 and min(sizes) >= 1, sizes
     assert sum(sizes) <= 2, "rows past the one that proves truncation are never fetched"
 
 
@@ -2138,7 +2146,7 @@ def test_f08_mysql_cancel_kills_the_running_query(tmp_path: Path, monkeypatch: p
         state.blocked.set()
         worker.join(5)
     kills = [(s, p) for s, p in state.statements if s.startswith("KILL")]
-    assert kills == [("KILL QUERY 4242", None)]
+    assert kills == [("KILL CONNECTION 4242", None)]
     assert len(fake.conns) == 2 and "close" in state.log, "the KILL travels on its own short-lived connection"
     assert fake.kwargs[1]["user"] == "ro" and fake.kwargs[1]["password"] == "pw"
     assert not errors, errors

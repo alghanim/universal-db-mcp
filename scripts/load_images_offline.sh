@@ -332,16 +332,52 @@ echo "==> staging a private copy of the verified bundle (closes the verify-then-
 STAGING="$(private_copy "$BUNDLE" "$STAGING_DIR" "No image was loaded.")" || exit 1
 verify_with_proof "$STAGING"
 
-# Which docker daemon gets the images: the one the operator's own docker
-# command reaches when there is one (a rootless daemon, DOCKER_HOST or a docker
-# context: the one `docker compose up` uses afterwards, and which sudo, whose
-# env_reset drops DOCKER_HOST, never reaches), else root's through sudo. The
-# private copy is root's alone either way: root reads it and the operator's
-# docker reads the stream, so what is loaded is still the verified copy.
-DOCKER_AS=""
-if [ -n "$sudo_ok" ] && ! docker info >/dev/null 2>&1; then
-  DOCKER_AS="$sudo_ok"
+# >>> which docker daemon gets the images
+# The one the operator's own docker command reaches when there is one (a
+# rootless daemon, DOCKER_HOST or a docker context: the one `docker compose up`
+# uses afterwards), else root's. The private copy is root's alone either way:
+# root reads it and the operator's docker reads the stream (STREAM=1), so
+# what is loaded is still the verified copy.
+#   - run unprivileged: the operator's docker is this shell's;
+#   - run as root through sudo (the documented invocation): the operator is
+#     SUDO_USER, whose environment sudo's env_reset dropped. Their docker
+#     client runs as them, with their home (so their current docker context
+#     applies), and with DOCKER_HOST when one was given on the sudo line;
+#     with neither, their rootless daemon's socket (/run/user/<uid>/docker.sock,
+#     where dockerd-rootless puts it) when it exists. Only a SUDO_USER that is
+#     not root and whose uid is SUDO_UID counts;
+#   - run as root otherwise, or when the operator's docker reaches no daemon:
+#     root's.
+DOCKER=(docker)
+STREAM=""
+DOCKER_FOR="root's docker daemon"
+if [ -n "$sudo_ok" ]; then
+  if docker info >/dev/null 2>&1; then
+    STREAM=1
+    DOCKER_FOR="the docker daemon $(id -un 2>/dev/null || echo this account)'s docker reaches"
+  else
+    DOCKER=(sudo docker)
+  fi
+elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && [[ "${SUDO_UID:-}" =~ ^[1-9][0-9]{0,9}$ ]] \
+     && [ "$(id -u "$SUDO_USER" 2>/dev/null)" = "$SUDO_UID" ] && command -v sudo >/dev/null 2>&1; then
+  operator=(sudo -n -u "$SUDO_USER" -H -- env)
+  if [ -n "${DOCKER_HOST:-}" ]; then
+    operator+=("DOCKER_HOST=$DOCKER_HOST")
+  else
+    context="$("${operator[@]}" docker context show 2>/dev/null || true)"
+    rootless_sock="/run/user/$SUDO_UID/docker.sock"
+    if { [ -z "$context" ] || [ "$context" = default ]; } && [ -S "$rootless_sock" ]; then
+      operator+=("DOCKER_HOST=unix://$rootless_sock")
+    fi
+  fi
+  if "${operator[@]}" docker info >/dev/null 2>&1; then
+    DOCKER=("${operator[@]}" docker)
+    STREAM=1
+    DOCKER_FOR="the docker daemon $SUDO_USER's docker reaches"
+  fi
 fi
+echo "==> loading into $DOCKER_FOR"
+# <<< which docker daemon gets the images
 load_one() {
   local tar="$1" expect="$2"
   if ! $sudo_ok test -f "$tar"; then
@@ -349,13 +385,14 @@ load_one() {
     exit 1
   fi
   echo "==> loading $(basename "$tar")"
-  if [ -n "$sudo_ok" ] && [ -z "$DOCKER_AS" ]; then
-    $sudo_ok cat -- "$tar" | docker load
+  # docker load through the chosen client: from root's stream of the verified copy, or with -i
+  if [ -n "$STREAM" ]; then
+    $sudo_ok cat -- "$tar" | "${DOCKER[@]}" load
   else
-    $DOCKER_AS docker load -i "$tar"
+    "${DOCKER[@]}" load -i "$tar"
   fi
   if [ -n "$expect" ]; then
-    $DOCKER_AS docker image inspect "$expect" > /dev/null 2>&1 || {
+    "${DOCKER[@]}" image inspect "$expect" > /dev/null 2>&1 || {
       echo "FAIL: image '$expect' not present after load (identity mismatch)" >&2
       exit 1
     }

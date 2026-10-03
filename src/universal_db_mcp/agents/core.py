@@ -886,6 +886,65 @@ def refuse_foreign_read(path: Path) -> None:
         )
 
 
+def read_config_bytes(path: Path) -> bytes:
+    """``path``'s bytes; as root, only a file the owner of its directory may
+    read themselves (``OSError`` otherwise).
+
+    Without root this is ``path.read_bytes()``. As root (``sudo
+    configure-agents``) the checks of :func:`refuse_foreign_read` run first,
+    then the file is opened by its resolved path without following a link
+    swapped in since, and what was opened is checked on the descriptor: it
+    must be the file the checks saw, and, in a directory a user owns, either
+    that user's or one its permission bits let that user read. A hard link
+    the user made to a root-only file whose original name was later replaced
+    by a rename has one link left and passed the link count check.
+    """
+    if sys.platform == "win32" or os.geteuid() != 0:
+        return path.read_bytes()
+    refuse_foreign_read(path)
+    real = os.path.realpath(path)
+    seen = os.stat(real)
+    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != (seen.st_dev, seen.st_ino):
+            raise OSError(f"{real} was replaced while it was being read; re-run")
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{real} is not a regular file")
+        directory = os.stat(os.path.dirname(real))
+        owner = directory.st_uid
+        if owner != 0 and st.st_uid != owner and not _bits_allow(st, owner, directory.st_gid, 4):
+            raise PermissionError(
+                f"{real} belongs to uid {st.st_uid} and the owner of its directory (uid {owner}) may not "
+                "read it, and as root this tool does not read it for them; run configure-agents as that "
+                "user (without sudo), or give them the file (chown)"
+            )
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_config_text(path: Path) -> str:
+    """:func:`read_config_bytes` decoded as UTF-8 (``UnicodeDecodeError``), with
+    universal newlines as ``Path.read_text`` reads them."""
+    return read_config_bytes(path).decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def describe_read_error(exc: BaseException) -> str:
+    """What a fail-closed report says about a config that could not be read:
+    for one that is not UTF-8, the line, never the byte or its offset (the
+    codec's message quotes both, and harness configs hold other servers'
+    tokens)."""
+    if isinstance(exc, UnicodeDecodeError):
+        from universal_db_mcp.config import describe_decode_error
+
+        return describe_decode_error(exc)
+    return str(exc)
+
+
 def _refuse_regrouping(real: Path, st: os.stat_result) -> None:
     """Without root, raise when the replace would give ``real`` (``st``: its
     stat) another group, where its mode gives that group other access than
@@ -1245,12 +1304,11 @@ def load_json_or_fail_closed(path: Path) -> tuple[dict[str, Any] | None, str | N
     file a user's link leads to is not read at all (:func:`refuse_foreign_read`).
     """
     try:
-        refuse_foreign_read(path)
-        raw = path.read_text(encoding="utf-8")
+        raw = read_config_text(path)
     except FileNotFoundError:
         return None, f"{path} does not exist"
     except (OSError, UnicodeDecodeError) as exc:
-        return None, f"{path} could not be read: {exc}"
+        return None, f"{path} could not be read: {describe_read_error(exc)}"
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -1313,12 +1371,11 @@ def load_yaml_or_fail_closed(path: Path) -> tuple[Any | None, str | None]:
     sequences, e.g. the dsh patch layer).
     """
     try:
-        refuse_foreign_read(path)
-        raw = path.read_text(encoding="utf-8")
+        raw = read_config_text(path)
     except FileNotFoundError:
         return None, f"{path} does not exist"
     except (OSError, UnicodeDecodeError) as exc:
-        return None, f"{path} could not be read: {exc}"
+        return None, f"{path} could not be read: {describe_read_error(exc)}"
     try:
         import yaml
     except ImportError as exc:  # pragma: no cover — PyYAML is a hard dependency
@@ -1326,7 +1383,9 @@ def load_yaml_or_fail_closed(path: Path) -> tuple[Any | None, str | None]:
     try:
         data = yaml.safe_load(raw)
     except Exception as exc:
-        return None, f"{path} is not valid YAML: {exc}"
+        from universal_db_mcp.config import describe_yaml_error
+
+        return None, f"{path} is not valid YAML: {describe_yaml_error(exc)}"
     return data, None
 
 
@@ -1463,23 +1522,36 @@ def _mode_bits_allow_read(path: Path, uid: int, home_gid: int) -> bool:
     """Whether ``uid`` may, by the permission bits, search every directory
     above ``path`` and read it, a regular file. Its groups come from the user
     database (``home_gid`` alone when ``uid`` has no entry there)."""
-    import pwd
-
-    try:
-        user = pwd.getpwuid(uid)
-        groups = set(os.getgrouplist(user.pw_name, user.pw_gid))
-    except (KeyError, OSError):
-        groups = {home_gid}
+    groups = _user_groups(uid, home_gid)
     real = Path(os.path.realpath(path))
     try:
         for node, want in ((real, 4), *((parent, 1) for parent in real.parents)):
-            st = node.stat()
-            shift = 6 if st.st_uid == uid else 3 if st.st_gid in groups else 0
-            if ((st.st_mode >> shift) & want) != want:
+            if not _bits_allow(node.stat(), uid, home_gid, want, groups):
                 return False
         return stat.S_ISREG(real.stat().st_mode)
     except OSError:
         return False
+
+
+def _user_groups(uid: int, fallback_gid: int) -> set[int]:
+    """``uid``'s groups from the user database (``fallback_gid`` alone when
+    it has no entry there)."""
+    import pwd
+
+    try:
+        user = pwd.getpwuid(uid)
+        return set(os.getgrouplist(user.pw_name, user.pw_gid))
+    except (KeyError, OSError):
+        return {fallback_gid}
+
+
+def _bits_allow(st: os.stat_result, uid: int, fallback_gid: int, want: int, groups: set[int] | None = None) -> bool:
+    """Whether the permission bits of ``st`` give ``uid`` the access ``want``
+    (4 read, 1 search), as the owner, a group member or everyone else."""
+    if groups is None:
+        groups = _user_groups(uid, fallback_gid)
+    shift = 6 if st.st_uid == uid else 3 if st.st_gid in groups else 0
+    return ((st.st_mode >> shift) & want) == want
 
 
 def _windows_token_is_elevated() -> bool:

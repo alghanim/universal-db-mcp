@@ -341,12 +341,35 @@ if [ -e "$RELEASE_DST" ] || [ -L "$RELEASE_DST" ]; then
     echo "WARNING: $RELEASE_DST cannot be read as a release number; release order NOT checked (--allow-downgrade)"
   }
 fi
+# RELEASE holds the release_seq only, which defaults to a commit timestamp:
+# a rebase can give two releases the same one, so an equal number orders
+# nothing. It passes for the same release only: every trust tool on the stick
+# byte-identical to the installed one (a re-run of the same stick, or another
+# stick of that release). Tools that differ under the same number are another
+# release, which may be the older one, and are refused like a downgrade.
+same_trust_tools() {
+  local tool
+  for tool in bootstrap.sh verify_bundle.py profiles.py install_offline.sh lib/os_packages.sh; do
+    cmp -s -- "$SRC/$tool" "$TRUST_DIR/$tool" || return 1
+  done
+}
 if [ -z "$INSTALLED_RELEASE" ]; then
   echo "==> release order: stick release ${STICK_RELEASE:-none}, nothing recorded yet"
 else
   RELEASE_ORDER="stick release ${STICK_RELEASE:-none}, installed release $INSTALLED_RELEASE"
-  if [ -n "$STICK_RELEASE" ] && [ "$STICK_RELEASE" -ge "$INSTALLED_RELEASE" ]; then
+  if [ -n "$STICK_RELEASE" ] && [ "$STICK_RELEASE" -gt "$INSTALLED_RELEASE" ]; then
     echo "==> release order: $RELEASE_ORDER (not a downgrade)"
+  elif [ -n "$STICK_RELEASE" ] && [ "$STICK_RELEASE" -eq "$INSTALLED_RELEASE" ] && same_trust_tools; then
+    echo "==> release order: $RELEASE_ORDER (the same release)"
+  elif [ -n "$STICK_RELEASE" ] && [ "$STICK_RELEASE" -eq "$INSTALLED_RELEASE" ]; then
+    if [ "$ALLOW_DOWNGRADE" -ne 1 ]; then
+      echo "FAIL: this stick is release $STICK_RELEASE, the release whose trust tools are installed, but its tools differ" >&2
+      echo "      from the installed ones: it is another release with the same number, which may be the older one." >&2
+      echo "      If you mean to install this stick's tools, re-run with: $RERUN --allow-downgrade" >&2
+      echo "      Nothing was installed." >&2
+      exit 1
+    fi
+    echo "WARNING: another release with the installed release number allowed by --allow-downgrade: $RELEASE_ORDER"
   elif [ "$ALLOW_DOWNGRADE" -eq 1 ]; then
     echo "WARNING: DOWNGRADE allowed by --allow-downgrade: $RELEASE_ORDER"
   else

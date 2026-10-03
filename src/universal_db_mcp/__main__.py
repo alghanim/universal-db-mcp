@@ -526,10 +526,34 @@ def _seed_harness_config(env: Mapping[str, str], home: Path) -> tuple[Path | Non
     except (OSError, ConfigError) as exc:
         return None, "", (
             f"the per-user harness config the registration names could not be seeded ({exc}); "
-            "the harness cannot start the server until it exists: fix that, then re-run (or create it "
-            "with `udbmcp add-connection`)"
+            "the harness cannot start the server until it exists: fix that, then re-run configure-agents "
+            "with --yes, which seeds it (or create it with `udbmcp add-connection`)"
         )
     return seeded, note, None
+
+
+def _missing_harness_config(env: Mapping[str, str], home: Path) -> Path | None:
+    """The per-user config a registration names when it does not exist yet
+    (what :func:`_seed_harness_config` would create), else None.
+
+    A seeding that failed after the registration was written (G4) left the
+    harness CONFIGURED and the config missing; a re-run must still see that,
+    or it reports "no changes needed" while the server cannot start."""
+    from universal_db_mcp.agents.core import PER_USER_CONFIG_DIR, resolve_harness_config_path
+    from universal_db_mcp.errors import ConfigError
+
+    try:
+        advertised = resolve_harness_config_path(env, home, for_harness=True)
+    except ConfigError:
+        return None  # the adapters report a bad override themselves
+    per_user = Path(os.path.abspath(home / PER_USER_CONFIG_DIR / "config.yaml"))
+    if advertised != str(per_user):
+        return None
+    try:
+        present = per_user.is_file()
+    except OSError:
+        present = False
+    return None if present else per_user
 
 
 def _agent_credentials_notice(env: Mapping[str, str], home: Path) -> str:
@@ -715,6 +739,21 @@ def _configure_agents(args: argparse.Namespace) -> int:
                     )
                     exit_code = 1
             payload["applied"] = applied
+        any_configured = any(
+            isinstance(h, dict) and h.get("status") == AgentStatus.CONFIGURED.value for h in harnesses
+        )
+        if any_configured and not (args.yes and not args.dry_run and payload.get("applied")):
+            # A registration already in place names a per-user config that a
+            # failed seeding left missing: --yes seeds it, as an apply does.
+            missing = _missing_harness_config(env, home)
+            if missing is not None and args.yes and not args.dry_run:
+                seeded, _seed_note, seed_error = _seed_harness_config(env, home)
+                payload["config_seeded"] = str(seeded) if seeded else None
+                if seed_error is not None:
+                    payload["seed_error"] = seed_error
+                    exit_code = 1
+            elif missing is not None:
+                payload["config_missing"] = str(missing)
         print(json.dumps(payload, indent=2))
         if failed and _failed_closed_is_fatal(args):
             _report_failed_closed(failed)
@@ -742,6 +781,8 @@ def _configure_agents(args: argparse.Namespace) -> int:
     # Phase 2: print the exact plan per actionable harness and ask.
     pending: list[str] = []
     not_written: list[str] = []  # confirmed, but the adapter refused, raised or crashed
+    configured: list[str] = []  # registered before this run
+    applying = False  # an apply seeds the config itself
     for name in names:
         if detected.get(name) is None:
             continue
@@ -760,6 +801,7 @@ def _configure_agents(args: argparse.Namespace) -> int:
             continue
         if planned.status is AgentStatus.CONFIGURED:
             print(f"\n== {name} ==\n  {planned.summary}")
+            configured.append(name)
             continue
 
         print(f"\n== {name} ==")
@@ -789,6 +831,7 @@ def _configure_agents(args: argparse.Namespace) -> int:
             continue
 
         if args.yes:
+            applying = True
             if not _apply_registration(name, registry, env, home):
                 not_written.append(name)
             continue
@@ -803,10 +846,13 @@ def _configure_agents(args: argparse.Namespace) -> int:
         except EOFError:
             answer = ""
         if answer.strip().lower() in ("y", "yes"):
+            applying = True
             if not _apply_registration(name, registry, env, home):
                 not_written.append(name)
         else:
             print("  skipped (declined)")
+
+    unseeded = bool(configured) and not applying and _repair_missing_config(configured, args, env, home)
 
     if pending:
         print(
@@ -824,7 +870,43 @@ def _configure_agents(args: argparse.Namespace) -> int:
     if failed and _failed_closed_is_fatal(args):
         _report_failed_closed(failed)
         return 2
-    return 1 if pending or not_written else 0
+    return 1 if pending or not_written or unseeded else 0
+
+
+def _repair_missing_config(configured: list[str], args: argparse.Namespace, env: Mapping[str, str], home: Path) -> bool:
+    """Seed the per-user config that the registration of the already
+    configured harnesses ``configured`` names, when it is missing (a seeding
+    that failed after the write). Asks as a registration does: --yes or a
+    ``y`` on a TTY; a dry run only says so. Returns whether it is still
+    missing although the run was to write it."""
+    missing = _missing_harness_config(env, home)
+    if missing is None:
+        return False
+    who = ", ".join(configured)
+    if args.dry_run:
+        print(f"\n  note: the config the registration of {who} names, {missing}, does not exist; "
+              "a run with --yes (without --dry-run) seeds it")  # fmt: skip
+        return False
+    if not args.yes:
+        prompt = f"\n  The config the registration of {who} names, {missing}, does not exist. Seed it? [y/N] "
+        if not sys.stdin.isatty():
+            print(f"\n  NOT CONFIRMED: {missing}, which the registration of {who} names, does not exist; "
+                  "re-run with --yes to seed it")  # fmt: skip
+            return True
+        try:
+            answer = input(prompt)
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("  skipped (declined)")
+            return False
+    seeded, note, problem = _seed_harness_config(env, home)
+    if seeded is not None:
+        print(f"\n  seeded per-user harness config: {seeded} ({note})")
+    if problem is not None:
+        print(f"\n  -> FAIL CLOSED: {problem}")
+        return True
+    return False
 
 
 def _failed_closed_is_fatal(args: argparse.Namespace) -> bool:

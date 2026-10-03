@@ -67,9 +67,11 @@ from universal_db_mcp.agents.core import (
     absolute_override,
     atomic_write_text,
     backup_path,
+    describe_read_error,
     ensure_replaceable,
     isolation_advice,
-    refuse_foreign_read,
+    read_config_bytes,
+    read_config_text,
     require_isolated_import,
     resolve_harness_config_path,
     starts_without_isolation,
@@ -263,8 +265,7 @@ def _holds_legacy_row(patch: Path) -> bool:
     file that mixes them, is not upgraded).
     """
     try:
-        refuse_foreign_read(patch)
-        text = patch.read_bytes().decode("utf-8")
+        text = read_config_bytes(patch).decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return False
     legacy, _current = _registration_rows()
@@ -281,21 +282,22 @@ def _load_patch(patch: Path) -> tuple[Any, str | None]:
 
     Never raises: any read/parse/shape problem becomes a reason string so the
     caller can fail closed. As root, a file a user's link leads to is not read
-    (``core.refuse_foreign_read``).
+    (``core.read_config_bytes``). The reason never quotes the file: the
+    patch holds other servers' rows and their tokens (a YAML error is given
+    by line and column, a decode error by line).
     """
     try:
-        refuse_foreign_read(patch)
-        text = patch.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        return None, f"unreadable (not valid UTF-8): {exc}"
-    except OSError as exc:
-        return None, f"unreadable: {exc}"
+        text = read_config_text(patch)
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"unreadable: {describe_read_error(exc)}"
     try:
         import yaml
 
         data = yaml.safe_load(text)
     except Exception as exc:  # yaml.YAMLError and any unexpected parser issue
-        return None, f"malformed YAML: {exc}"
+        from universal_db_mcp.config import describe_yaml_error
+
+        return None, f"malformed YAML: {describe_yaml_error(exc)}"
     if data is None:  # empty file: an empty patch sequence
         return [], None
     return data, None
@@ -655,16 +657,15 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
     backup: Path | None = None
     if patch.exists():
         try:
-            refuse_foreign_read(patch)
-            # Not read_text: universal newlines would write every CRLF back as LF.
-            original = patch.read_bytes().decode("utf-8")
+            # Not read_config_text: universal newlines would write every CRLF back as LF.
+            original = read_config_bytes(patch).decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             # TOCTOU guard: the file changed/unreadable between detect() and
             # here. Fail closed; nothing has been written or backed up yet.
             return ApplyResult(
                 AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
                 False, None,
-                f"FAIL CLOSED: could not read {patch} ({exc}); nothing written",
+                f"FAIL CLOSED: could not read {patch} ({describe_read_error(exc)}); nothing written",
             )
         try:
             ensure_replaceable(patch)  # refused before the backup, so none is left behind
@@ -713,10 +714,14 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
             raise ValueError("a registration row in the merged patch file still starts the server without -I")
     except Exception as exc:
         # Verification runs BEFORE the write, so patch still holds the
-        # original bytes; nothing to roll back, just fail closed.
+        # original bytes; nothing to roll back, just fail closed. A parse
+        # error is described, never quoted (the payload holds the other rows).
+        from universal_db_mcp.config import describe_yaml_error
+
+        why = describe_yaml_error(exc) if isinstance(exc, yaml.YAMLError) else str(exc)
         return ApplyResult(
             AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED, False, backup,
-            f"FAIL CLOSED: merged patch failed verification ({exc}); original content restored",
+            f"FAIL CLOSED: merged patch failed verification ({why}); original content restored",
         )
 
     try:

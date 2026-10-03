@@ -1915,7 +1915,7 @@ def test_f54_after_verifying_the_copy_the_loader_reads_only_the_staging_director
     )
     first_verify = code.index('verify_with_proof "$BUNDLE"')
     copy_verify = code.index('verify_with_proof "$STAGING"')
-    first_load = code.index("docker load")
+    first_load = code.index('"${DOCKER[@]}" load')  # the chosen daemon's client (V3-c)
     assert first_verify < copy_verify
     staged = code[first_verify:copy_verify]
     assert 'mktemp -d "$STAGING_BASE/udbmcp-images.XXXXXX"' in staged

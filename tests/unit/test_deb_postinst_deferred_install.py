@@ -350,6 +350,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
     bundle = tmp_path / "bundle"
     (bundle / "os-packages").mkdir(parents=True)
     (bundle / "os-packages" / "dummy_1.0_amd64.deb").write_bytes(b"deb")
+    (bundle / "manifest.json").write_text('{"release_seq": 5}\n', encoding="utf-8")  # every verified bundle has one
     (bundle / "config-templates").mkdir()
     (bundle / "config-templates" / "config.yaml").write_text("# template\n", encoding="utf-8")
     (bundle / "operations").mkdir()
@@ -396,6 +397,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
         "        fh.close()\n"
         "PY\n"
         'mkdir -p "$2"\n'
+        'cp "$1/manifest.json" "$2/manifest.json"\n'  # the real installer publishes the verified manifest
         f'touch "{tmp_path}/install-marker"\n',
         encoding="utf-8",
     )
@@ -510,6 +512,7 @@ def test_worker_failure_leaves_guard_block_service_and_no_enable(tmp_path: Path)
     bundle = tmp_path / "bundle"
     (bundle / "os-packages").mkdir(parents=True)
     (bundle / "os-packages" / "dummy_1.0_amd64.deb").write_bytes(b"deb")
+    (bundle / "manifest.json").write_text('{"release_seq": 5}\n', encoding="utf-8")  # every verified bundle has one
     (bundle / "config-templates").mkdir()
     (bundle / "config-templates" / "config.yaml").write_text("# template\n", encoding="utf-8")
     (bundle / "operations").mkdir()

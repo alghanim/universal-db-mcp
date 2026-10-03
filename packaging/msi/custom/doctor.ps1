@@ -352,6 +352,10 @@ function Get-EarlierAccountSid {
     # write access, or $null. Only a logs\ an install made counts: a
     # directory, not a junction or symbolic link, owned by SYSTEM,
     # Administrators or an administrator (the walk refuses any other).
+    # The registration action grants the service account Modify whoever it
+    # is, so $GrantedSid is matched as it is, a member of Administrators (a
+    # gMSA an administrator put there) included. Without it, such an ACE is
+    # an administrator's own, not the mark of an earlier service account.
     param([string]$LogsDir, [string]$ServiceSid, [string]$GrantedSid = '')
     $attributes = Get-EntryAttributes -Path $LogsDir
     if ($null -eq $attributes -or ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
@@ -361,8 +365,11 @@ function Get-EarlierAccountSid {
     foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
         $sid = $rule.IdentityReference.Value
         if ($rule.IsInherited -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-            $sid -eq $ServiceSid -or ($GrantedSid -and $sid -ne $GrantedSid) -or (Test-TrustedOwner -Sid $sid) -or
             -not (Test-AccountSid -Sid $sid)) { continue }
+        if ($GrantedSid) {
+            if ($sid -ne $GrantedSid) { continue }
+        }
+        elseif ($sid -eq $ServiceSid -or (Test-TrustedOwner -Sid $sid)) { continue }
         if ([int64]([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights) -band $script:WriteRights) {
             return $sid
         }

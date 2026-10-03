@@ -98,8 +98,9 @@ security:
   # pg_authid, mysql.user, sys.sql_logins, database links, ...) and
   # information_schema's views of other objects' definitions (VIEWS,
   # ROUTINES, COLUMNS, TRIGGERS, CHECK_CONSTRAINTS, ...) stay refused
-  # whatever this lists, and Oracle's *_TAB_COLUMNS and Db2's SYSCAT.COLUMNS
-  # are readable only without their low and high value columns.
+  # whatever this lists, Oracle's *_TAB_COLUMNS and Db2's SYSCAT.COLUMNS
+  # are readable only without their low and high value columns, and MySQL's
+  # information_schema.STATISTICS only without EXPRESSION.
   # Lists: docs/security.md.
   allowed_system_schemas: [information_schema]
   sample_limit: 20

@@ -18,7 +18,7 @@ accounts. Design:
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -79,6 +79,13 @@ _ALLOWED_TABLE_HINTS = frozenset({"NOLOCK", "READUNCOMMITTED", "READPAST", "NOWA
 # max_execution_time), any hint-updatable session variable, the resource
 # group. Every other hint body is inert (SqlGuard._check_hint).
 _SESSION_HINTS = frozenset({"max_execution_time", "set_var", "resource_group"})
+# The same names anywhere in a /*+ ... */ body, however sqlglot reads the
+# body (one it cannot parse stays a raw string, and the walk saw no call in
+# it: review cr2 V7-a, live). Matched with Python's case folding, which
+# reads the long s and dotless i as s and i, as loose_name does.
+_SESSION_HINT_WORD = re.compile(
+    r"(?<![A-Za-z0-9_$])(?:" + "|".join(sorted(_SESSION_HINTS)) + r")(?![A-Za-z0-9_$])", re.IGNORECASE
+)
 # Db2 sequence expressions: sqlglot's postgres reader cannot parse them (so
 # they are refused anyway); this names the refusal and survives a parser
 # that learns them.
@@ -156,10 +163,17 @@ _PLACEHOLDER_OK = re.compile(r"^[%?$:@][0-9a-zA-Z_]*$")
 # ``%(name)s``. The lookahead keeps ``%s`` from matching the start of a
 # longer identifier-like token; ``%(name)s`` is fully delimited already.
 _PYFORMAT_NAMED_RE = re.compile(r"%\([A-Za-z_][A-Za-z0-9_$]*\)s")
-_PYFORMAT_POS_RE = re.compile(r"%s(?![0-9a-zA-Z_$\"'`\]])")
+_PYFORMAT_POS_RE = re.compile(r"%s(?![0-9a-zA-Z_$\"'`])")
+# Every ``%s`` a %-formatting driver fills, whatever follows it.
+_PYFORMAT_ANY_POS_RE = re.compile(r"%s")
+# What a placeholder must not be glued to: an identifier character or a
+# quote would make one token of it for some readers and two for others.
+_GLUED = re.compile(r"[0-9a-zA-Z_$\"'`\u0080-\U0010ffff]")
 # SQLAlchemy-style named placeholders ``:name``. The lookarounds keep
-# PostgreSQL's ``::`` cast operator (and ``x :`` chains) out of the match.
-_NAMED_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_$]*)(?!:)")
+# PostgreSQL's ``::`` cast operator (and ``x :`` chains) out of the match,
+# and a ':' straight after an identifier character or a digit is an array
+# slice's (a[1:n], a[lo:hi]), as SQLAlchemy's own text() reads it.
+_NAMED_RE = re.compile(r"(?<![:\w$]):([A-Za-z_][A-Za-z0-9_$]*)(?!:)")
 _QMARK_RE = re.compile(r"\?")
 
 
@@ -171,6 +185,7 @@ class _Lexing:
     guard's own masking uses: every quote kind, brackets included."""
 
     quotes: str = "'\"`["
+    strings: str = "'"  # quote characters that open a string literal; the others open a quoted name
     backslash_quotes: str = ""  # quote characters whose body takes \ escapes
     hash_comments: bool = False  # '#' opens a line comment
     dash_needs_space: bool = False  # MySQL: '--' is a comment only before whitespace or a control character
@@ -192,7 +207,7 @@ _IDENT_CHAR = re.compile(r"[A-Za-z0-9_$\u0080-\U0010ffff]")
 # the connector pins) reads \ only in E'...', nests block comments, ends a
 # line comment at CR or LF, and has $tag$ dollar quotes.
 _ENGINE_LEXING: dict[str, _Lexing] = {
-    "mysql": _Lexing(quotes="'\"`", backslash_quotes="'\"", hash_comments=True, dash_needs_space=True),
+    "mysql": _Lexing(quotes="'\"`", strings="'\"", backslash_quotes="'\"", hash_comments=True, dash_needs_space=True),
     "clickhouse": _Lexing(
         quotes="'\"`",
         backslash_quotes="'\"`",
@@ -233,6 +248,63 @@ def _block_comment_end(sql: str, i: int, *, nested: bool) -> int:
     return k
 
 
+def _spans(sql: str, lex: _Lexing) -> Iterator[tuple[str, int, int]]:
+    """``sql`` cut into ``(kind, start, end)`` spans as ``lex`` bounds its
+    literals: ``code`` (a maximal run between the others), ``string`` (a
+    string literal, a $tag$ quote), ``name`` (a quoted identifier) and
+    ``comment``. An unterminated span runs to the end of the text."""
+    i = 0
+    n = len(sql)
+    code_start = 0
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1 : i + 2]
+        follower = sql[i + 2 : i + 3]
+        dollar = (
+            lex.dollar_tag.match(sql, i)
+            if ch == "$" and lex.dollar_tag is not None and not _follows_identifier(sql, i)
+            else None
+        )
+        if (ch == "-" and nxt == "-" and not (lex.dash_needs_space and follower > " " and follower != "\x7f")) or (
+            ch == "#" and lex.hash_comments
+        ):
+            ends = [k for k in (sql.find(e, i) for e in lex.line_ends) if k != -1]
+            kind, j = "comment", (min(ends) + 1 if ends else n)
+        elif ch == "/" and nxt == "*":
+            kind, j = "comment", _block_comment_end(sql, i, nested=lex.nested_comments)
+        elif dollar is not None:
+            close = sql.find(dollar.group(), dollar.end())
+            kind, j = "string", (n if close == -1 else close + len(dollar.group()))
+        elif ch in lex.quotes:
+            quote = "]" if ch == "[" else ch
+            backslash = ch in lex.backslash_quotes or (
+                ch == "'" and lex.e_strings and i > 0 and sql[i - 1] in "eE" and not _follows_identifier(sql, i - 1)
+            )
+            j = i + 1
+            while j < n:
+                c = sql[j]
+                if backslash and c == "\\":
+                    j += 2
+                    continue
+                if c == quote:
+                    if sql[j + 1 : j + 2] == quote:  # doubled quote escape
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            kind, j = ("string" if ch in lex.strings else "name"), min(j, n)
+        else:
+            i += 1
+            continue
+        if code_start < i:
+            yield "code", code_start, i
+        yield kind, i, j
+        i = code_start = j
+    if code_start < n:
+        yield "code", code_start, n
+
+
 def _rewrite_code_segments(
     sql: str,
     transform: Callable[[str], str],
@@ -258,76 +330,14 @@ def _rewrite_code_segments(
     lex = lexing or _Lexing(backslash_quotes="'\"`[" if backslash_escapes else "")
     out: list[str] = []
     view: list[str] = []
-    buf: list[str] = []
-    i = 0
-    n = len(sql)
-
-    def flush() -> None:
-        if buf:
-            out.append(transform("".join(buf)))
-            view.append("".join(buf))
-            buf.clear()
-
-    def blank(span: str) -> None:
-        out.append(span)
-        view.append(" " * len(span))
-
-    while i < n:
-        ch = sql[i]
-        nxt = sql[i + 1 : i + 2]
-        follower = sql[i + 2 : i + 3]
-        dollar = (
-            lex.dollar_tag.match(sql, i)
-            if ch == "$" and lex.dollar_tag is not None and not _follows_identifier(sql, i)
-            else None
-        )
-        if (ch == "-" and nxt == "-" and not (lex.dash_needs_space and follower > " " and follower != "\x7f")) or (
-            ch == "#" and lex.hash_comments
-        ):
-            flush()
-            ends = [k for k in (sql.find(e, i) for e in lex.line_ends) if k != -1]
-            j = min(ends) + 1 if ends else n
-            blank(sql[i:j])
-            i = j
-        elif ch == "/" and nxt == "*":
-            flush()
-            j = _block_comment_end(sql, i, nested=lex.nested_comments)
-            blank(sql[i:j])
-            i = j
-        elif dollar is not None:
-            flush()
-            close = sql.find(dollar.group(), dollar.end())
-            j = n if close == -1 else close + len(dollar.group())
-            blank(sql[i:j])
-            i = j
-        elif ch in lex.quotes:
-            quote = "]" if ch == "[" else ch
-            backslash = ch in lex.backslash_quotes or (
-                ch == "'" and lex.e_strings and i > 0 and sql[i - 1] in "eE" and not _follows_identifier(sql, i - 1)
-            )
-            flush()
-            start = i
-            i += 1
-            while i < n:
-                c = sql[i]
-                if backslash and c == "\\":
-                    i += 2
-                    continue
-                if c == quote:
-                    if sql[i + 1 : i + 2] == quote:  # doubled quote escape
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
-            i = min(i, n)
-            span = sql[start:i]
-            out.append(span)  # literals pass through untouched ...
-            view.append(" " * len(span))  # ... and are invisible to detection
-        else:
-            buf.append(ch)
-            i += 1
-    flush()
+    for kind, start, end in _spans(sql, lex):
+        span = sql[start:end]
+        if kind == "code":
+            out.append(transform(span))
+            view.append(span)
+        else:  # literals and comments pass through untouched and are invisible to detection
+            out.append(span)
+            view.append(" " * len(span))
     return "".join(out), "".join(view)
 
 
@@ -429,6 +439,14 @@ def translate_paramstyle(
     return sql, parameters
 
 
+def named_placeholders(view: str) -> set[str]:
+    """The names of the ``:name`` placeholders in ``view``, a code view
+    (code_view's output: literals, quoted names and comments blanked), read
+    as translate_paramstyle reads them (an array slice's a[1:n] is no
+    placeholder)."""
+    return {m.group(1) for m in _NAMED_RE.finditer(view)}
+
+
 def code_view(sql: str, engine: str) -> str:
     """``sql`` with its string literals, quoted identifiers and comments
     blanked to spaces as ``engine`` bounds them (same length)."""
@@ -444,33 +462,62 @@ def bind_text(sql: str, parameters: Any, *, engine: str) -> str:
     string literal or a comment too, after the guard has validated the text:
     a value in a literal closed it and became SQL. Here only the placeholders
     in code (as ``engine`` bounds its literals, quoted identifiers and
-    comments) stay placeholders; every other '%' is doubled, so the driver
-    formats it back to itself and the statement it sends is the validated
-    one with values at those placeholders only. The placeholders must match
-    the values: as many ``%s`` as positional values, every ``%(name)s``
-    supplied and every name used, never both styles. ``parameters`` None: nothing is formatted.
+    comments) stay placeholders. The DBAPI escape ``%%`` in a string literal
+    stays, so the driver sends one '%' there as it always did ('50%%',
+    DATE_FORMAT(d, '%%Y-%%m')); every other '%' is doubled, so the driver
+    formats it back to itself: a lone '%' (LIKE 'a%'), a placeholder inside
+    a literal or a comment, and every '%' of a quoted name, which stays the
+    name the guard authorized. Refused, because the guard and the engine
+    could read them differently: ``%%`` in code (the guard does not parse it
+    as the modulo operator; where it parses at all, it reads a placeholder
+    after it that the engine would not see), and a placeholder glued to an
+    identifier character or a quote (``%sx``: PostgreSQL's parser reads a
+    placeholder and an alias there, the driver fills the placeholder).
+    The placeholders must match the values: as many ``%s`` as positional
+    values, every ``%(name)s`` supplied and every name used, never both
+    styles. ``parameters`` None: nothing is formatted.
     """
     if parameters is None:
         return sql
-    _, view = _rewrite_code_segments(sql, lambda seg: seg, lexing=_ENGINE_LEXING[engine])
     out: list[str] = []
     positional = 0
     names: set[str] = set()
-    i = 0
-    while (j := sql.find("%", i)) != -1:
-        out.append(sql[i:j])
-        found = (_PYFORMAT_NAMED_RE.match(sql, j) or _PYFORMAT_POS_RE.match(sql, j)) if view[j] == "%" else None
-        if found is None:
-            out.append("%%")
-            i = j + 1
+    for kind, start, end in _spans(sql, _ENGINE_LEXING[engine]):
+        if kind in ("name", "comment"):
+            out.append(sql[start:end].replace("%", "%%"))
             continue
-        if found.group().startswith("%("):
-            names.add(found.group()[2:-2])
-        else:
-            positional += 1
-        out.append(found.group())
-        i = found.end()
-    out.append(sql[i:])
+        i = start
+        while (j := sql.find("%", i, end)) != -1:
+            out.append(sql[i:j])
+            pair = sql.startswith("%%", j)
+            if kind == "string":
+                out.append("%%")
+                i = j + (2 if pair else 1)
+                continue
+            if pair:
+                raise ToolFailure(
+                    ErrorCategory.VALIDATION,
+                    "'%%' outside a string literal is not supported with bound parameters: write the "
+                    "modulo operator as a single '%' (or MOD()); in a string literal '%%' is one '%'",
+                )
+            found = _PYFORMAT_NAMED_RE.match(sql, j) or _PYFORMAT_ANY_POS_RE.match(sql, j)
+            if found is None:
+                out.append("%%")
+                i = j + 1
+                continue
+            if _GLUED.match(sql, found.end()):
+                raise ToolFailure(
+                    ErrorCategory.VALIDATION,
+                    f"placeholder {found.group()} is directly followed by "
+                    f"{sql[found.end()]!r}: put a space or an operator after it",
+                )
+            if found.group().startswith("%("):
+                names.add(found.group()[2:-2])
+            else:
+                positional += 1
+            out.append(found.group())
+            i = found.end()
+        out.append(sql[i:end])
     if isinstance(parameters, dict):
         if positional:
             raise ToolFailure(
@@ -624,6 +671,25 @@ _CTE_FOLDS: dict[str, tuple[Callable[[str], str], ...]] = {
     "db2": (_charwise(str.upper), lambda n: n.translate(_ASCII_UPPER)),
     "postgres": (_charwise(str.lower), lambda n: n.translate(_ASCII_LOWER)),
 }
+
+def cte_key(engine: str, name: exp.Identifier | str) -> tuple[str, ...]:
+    """What a CTE's name, or a bare FROM item's, is compared as on
+    ``engine``: on an engine that folds unquoted names (_CTE_FOLDS), the
+    name under each folding it may apply (a quoted name as written), so a
+    FROM item is taken for a CTE only when it is that CTE under every one.
+    Oracle upper-cases by Unicode's rules: FROM é reads table É, which the
+    CTE "é" does not cover (review M4); PostgreSQL folds ASCII only, or by
+    the locale in a single-byte encoding. Elsewhere, case-insensitively as
+    before (ClickHouse's own binding is _clickhouse_cte_refs). The one
+    source of truth for the guard and the server's masking."""
+    text = name.name if isinstance(name, exp.Identifier) else name
+    folds = _CTE_FOLDS.get(engine)
+    if folds is None:
+        return (text.lower(),)
+    if isinstance(name, exp.Identifier) and name.quoted:
+        return tuple(text for _ in folds)
+    return tuple(fold(text) for fold in folds)
+
 
 # Engine names from config -> sqlglot dialect names. sqlglot has no 'mssql'
 # (its T-SQL dialect is 'tsql') and no DB2 dialect; DB2 statements are parsed
@@ -1539,6 +1605,13 @@ class SqlGuard:
                     "SET STATEMENT ... FOR is not permitted: it overrides session variables "
                     "(transaction_read_only, max_statement_time) for the statement"
                 )
+            for kind, start, end in _spans(stripped, _ENGINE_LEXING["mysql"]):
+                hint = _SESSION_HINT_WORD.search(stripped, start, end) if kind == "comment" else None
+                if hint is not None and stripped.startswith("/*+", start):
+                    raise _deny(
+                        f"optimizer hint '{hint.group().upper()}' is not permitted: it lifts the statement's time "
+                        f"limit or changes session variables or its resource group for the statement"
+                    )
         if self._engine == "db2":
             if _DB2_SEQUENCE.search(stripped):
                 raise _deny("sequence expressions (NEXT VALUE FOR ...) are not permitted: they advance the sequence")
@@ -1718,21 +1791,8 @@ class SqlGuard:
         return refs
 
     def _cte_key(self, name: exp.Identifier | str) -> tuple[str, ...]:
-        """What a CTE's name, or a bare FROM item's, is compared as: on an
-        engine that folds unquoted names (_CTE_FOLDS), the name under each
-        folding it may apply (a quoted name as written), so a FROM item is
-        taken for a CTE only when it is that CTE under every one. Oracle
-        upper-cases by Unicode's rules: FROM é reads table É, which the CTE
-        "é" does not cover (review M4); PostgreSQL folds ASCII only, or by
-        the locale in a single-byte encoding. Elsewhere, case-insensitively
-        as before (ClickHouse's own binding is _clickhouse_cte_refs)."""
-        text = name.name if isinstance(name, exp.Identifier) else name
-        folds = _CTE_FOLDS.get(self._engine)
-        if folds is None:
-            return (text.lower(),)
-        if isinstance(name, exp.Identifier) and name.quoted:
-            return tuple(text for _ in folds)
-        return tuple(fold(text) for fold in folds)
+        """cte_key under this guard's engine."""
+        return cte_key(self._engine, name)
 
     def _check_hint(self, hint: exp.Hint) -> None:
         """An optimizer hint's body is inert: the engine reads its names as
@@ -1852,7 +1912,7 @@ class SqlGuard:
             return
         shown = f"{schema}.{name}" if schema else name
         raise _deny(
-            f"'{shown}' carries each column's low and high values "
+            f"'{shown}' carries each column's low and high values or an index expression's SQL with its literals "
             f"({', '.join(sorted(c.upper() for c in carried))}), which would hand back values column masking "
             f"hides: name the columns you need, without those, without * and without a column list after its "
             f"alias (which renames them by position)"
@@ -1981,7 +2041,16 @@ class SqlGuard:
         name with a letter Oracle upper-cases to ASCII (v$ſql is V$SQL); an
         empty quoted qualifier or name."""
         name = ident.name
-        if ident.quoted and not name and isinstance(ident.parent, (exp.Table, exp.Column, exp.Dot)):
+        sqlite_string = (
+            # SQLite reads a bare "" as the empty string (or a column named
+            # "", which it allows): a value, not a qualifier (review cr2 V1-e)
+            self._engine == "sqlite"
+            and isinstance(ident.parent, exp.Column)
+            and ident.arg_key == "this"
+            and not any(ident.parent.args.get(k) for k in ("table", "db", "catalog"))
+        )
+        qualifier_like = isinstance(ident.parent, (exp.Table, exp.Column, exp.Dot))
+        if ident.quoted and not name and not sqlite_string and qualifier_like:
             # "".ALL_USERS, [].syslogins: no engine takes a zero-length
             # delimited name, and the checks here read it as no qualifier at
             # all, a bare name the bare-name rules did not see (review S2)

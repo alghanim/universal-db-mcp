@@ -99,10 +99,12 @@ def test_p03l7_bare_percent_with_parameters_is_text() -> None:
 
 
 def test_s1_sent_text_is_the_validated_one_byte_for_byte() -> None:
-    """Everything but the real placeholders arrives as written: '%%', a
-    '%(name)s' in a quoted name, an odd '%d'."""
+    """Everything but the real placeholders arrives as written: a
+    '%(name)s' in a quoted name, an odd '%d'; the DBAPI escape '%%' in a
+    string literal is one '%', as the driver always sent it (cr2 SW-1)."""
     sql = "SELECT '100%%' AS `p%(q)s`, 'x%d' AS y, %s AS z FROM t WHERE s LIKE '%s%'"
-    assert _pymysql_sent(bind_text(sql, [7], engine="mysql"), [7]) == sql.replace("%s AS z", "7 AS z")
+    expected = sql.replace("%s AS z", "7 AS z").replace("'100%%'", "'100%'")
+    assert _pymysql_sent(bind_text(sql, [7], engine="mysql"), [7]) == expected
 
 
 def test_s1_mysql_backtick_takes_no_backslash_escape() -> None:

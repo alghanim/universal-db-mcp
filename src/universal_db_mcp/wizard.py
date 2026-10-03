@@ -51,7 +51,9 @@ from universal_db_mcp.config import (
     AppConfig,
     ConnectionConfig,
     ResolvedConnection,
+    darwin_directory_acl_problems,
     darwin_secret_file_acl_problems,
+    describe_yaml_error,
     load_config,
 )
 from universal_db_mcp.connectors.registry import build_connector
@@ -283,11 +285,11 @@ _ACL_TYPE_EXTENDED = 0x00000100
 
 
 def _has_extended_acl(fd: int) -> bool:
-    """Whether the directory *fd* carries a macOS extended ACL. Its entries do
-    not show in the mode bits ('everyone allow add_file,delete_child' leaves
-    a directory at 0755), so any one is refused, as the pkg's own trust check
-    does (find -acl). On Linux a POSIX ACL's mask shows in the group bits,
-    which _only_root_can_change reads."""
+    """Whether the directory *fd* carries a macOS extended ACL at all (see
+    _acl_grants for the ones that are refused). Its entries do not show in
+    the mode bits ('everyone allow add_file,delete_child' leaves a directory
+    at 0755). On Linux a POSIX ACL's mask shows in the group bits, which
+    _only_root_can_change reads."""
     if sys.platform != "darwin":
         return False
     import ctypes
@@ -305,6 +307,21 @@ def _has_extended_acl(fd: int) -> bool:
     if err != errno.ENOENT:  # ENOENT: no ACL
         raise OSError(err, f"cannot read the access control list of a directory: {os.strerror(err)}")
     return False
+
+
+def _acl_grants(fd: int) -> list[str]:
+    """What the macOS extended ACL of the directory *fd* grants anyone but its
+    owner (config.darwin_directory_acl_problems: every allow entry of another
+    trustee, inheritable ones included). Deny entries only take access away:
+    'group:everyone deny delete', which macOS puts on every home directory
+    and an older release's secrets directory could inherit, is no reason to
+    refuse it. An ACL that cannot be read is refused as one."""
+    if not _has_extended_acl(fd):
+        return []
+    try:
+        return darwin_directory_acl_problems(fd)
+    except OSError as exc:
+        return [f"its access control list cannot be read ({exc.strerror or exc})"]
 
 
 # links followed on the way to a directory (the kernel's own limit, MAXSYMLINKS)
@@ -326,11 +343,11 @@ def _open_root_only_directory(directory: Path) -> int:
     try:
         while True:
             st = os.fstat(stack[-1])
-            acl = _has_extended_acl(stack[-1])
+            acl = _acl_grants(stack[-1])
             if acl or not _only_root_can_change(st):
                 where = "/" + "/".join(names)
                 why = (
-                    "carries an access control list (ls -led shows it)"
+                    f"carries an access control list (ls -led shows it): {'; '.join(acl)}"
                     if acl
                     else f"belongs to uid {st.st_uid} with mode {stat.filemode(st.st_mode)}"
                 )
@@ -429,6 +446,8 @@ def _prepare_secrets_dir(sdir: Path, owner: tuple[int, int] | None, parent_fd: i
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         fd = os.open(sdir.name, flags, dir_fd=parent_fd) if parent_fd is not None else os.open(sdir, flags)
     except OSError as exc:  # ELOOP (a symlink) or ENOTDIR
+        if exc.errno not in (errno.ELOOP, errno.ENOTDIR):
+            raise WizardError(f"{sdir} cannot be opened ({exc.strerror or exc}); no secret was written") from exc
         raise WizardError(linked) from exc
     try:
         os.fchmod(fd, 0o700)
@@ -442,15 +461,19 @@ def _prepare_secrets_dir(sdir: Path, owner: tuple[int, int] | None, parent_fd: i
 
 
 def _refuse_extended_acl(fd: int, sdir: Path, *, created: bool) -> None:
-    """Keep the macOS secrets directory *fd* free of an extended ACL, which
-    the 0700 mode does not show and which every secret file created in it
-    inherits ('everyone allow read,file_inherit' made each one readable by
-    all). One the directory inherited from the config directory as it was
-    created is removed; one an existing directory carries is refused
-    (WizardError), the operator's to remove. On Linux a POSIX ACL's mask is
-    the group bits, which the 0700 mode clears."""
+    """Keep the macOS secrets directory *fd* free of an extended ACL entry
+    that grants anyone but its owner access (_acl_grants), which the 0700
+    mode does not show and which every secret file created in it inherits
+    ('everyone allow read,file_inherit' made each one readable by all). The
+    ACL a new directory inherited from the config directory as it was created
+    is removed; an existing directory's is refused (WizardError) when it
+    grants such access, the operator's to remove, and kept when it only
+    denies. On Linux a POSIX ACL's mask is the group bits, which the 0700
+    mode clears."""
     if not _has_extended_acl(fd):
         return
+    if not created and not (grants := _acl_grants(fd)):
+        return  # deny entries (and the owner's own) only
     if created:
         import ctypes
 
@@ -463,11 +486,12 @@ def _refuse_extended_acl(fd: int, sdir: Path, *, created: bool) -> None:
         if empty:
             libc.acl_set_fd_np(fd, empty, _ACL_TYPE_EXTENDED)
             libc.acl_free(empty)
-        if not _has_extended_acl(fd):
+        if not (grants := _acl_grants(fd)):
             return
     raise WizardError(
         f"{sdir} carries an access control list (ls -led shows it) that can let other accounts read the "
-        f"secret files created in it; no secret was written there: remove it (chmod -N {sdir}) and re-run"
+        f"secret files created in it ({'; '.join(grants)}); no secret was written there: remove it "
+        f"(chmod -N {sdir}) and re-run"
     )
 
 
@@ -994,7 +1018,7 @@ def plan_merge(config_path: Path, name: str, connection: ConnectionConfig, *, re
     try:
         data = yaml.safe_load("".join(body))
     except yaml.YAMLError as exc:
-        raise WizardError(f"config is not valid YAML; refusing to edit ({exc})") from exc
+        raise WizardError(f"config is not valid YAML; refusing to edit ({describe_yaml_error(exc)})") from None
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -1298,9 +1322,11 @@ def _config_relative(cfg_path: Path, value: Any) -> str | None:
     """A path value of the config as a prompt default: a relative one as the
     server resolves it, against the config file's directory (config.py's
     _resolve_relative_paths), never the wizard's working directory, which
-    _absolute would anchor it at."""
+    _absolute would anchor it at. The loader does not expand '~', so neither
+    does this: '~/certs/ca.pem' is offered as the file the server opens, under
+    the config's directory."""
     default = _default(value)
-    if default is None or os.path.isabs(os.path.expanduser(default)):
+    if default is None or os.path.isabs(default):
         return default
     return str(Path(os.path.abspath(cfg_path)).parent / default)
 
@@ -1400,7 +1426,8 @@ def collect_answers_interactive(
         while tls_enabled:
             ca_default = _config_relative(cfg_path, existing_tls.get("ca_file"))
             tls_ca_file = _ask("CA certificate file (absolute path)", ca_default)
-            if tls_ca_file and Path(tls_ca_file).is_file():
+            # checked as it is written: '~' expanded, relative to here (_absolute)
+            if tls_ca_file and Path(_absolute(tls_ca_file) or "").is_file():
                 break
             print("  that file does not exist; TLS verification needs the CA certificate")
             if not _ask_bool("Try another path?", True):
