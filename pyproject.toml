@@ -25,6 +25,12 @@ dependencies = [
     "cryptography>=50",
 ]
 
+[project.urls]
+Homepage = "https://github.com/alghanim/universal-db-mcp"
+Repository = "https://github.com/alghanim/universal-db-mcp"
+Issues = "https://github.com/alghanim/universal-db-mcp/issues"
+Security = "https://github.com/alghanim/universal-db-mcp/security/policy"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=9",

@@ -443,7 +443,10 @@ def test_the_ledger_records_the_2026_09_28_owner_decisions_as_the_tree_has_them(
     assert "`/var/lib/universal-db-mcp/release.json`" in decisions
     # the maintainer identity carries no address; Debian's required one is reserved and non-routable
     project = _project()
-    assert project["authors"] == [{"name": "universal-db-mcp maintainers"}] and "urls" not in project
+    assert project["authors"] == [{"name": "universal-db-mcp maintainers"}]
+    assert set(project["urls"].values()) <= {
+        f"https://github.com/alghanim/universal-db-mcp{tail}" for tail in ("", "/issues", "/security/policy")
+    }
     control = "Maintainer: universal-db-mcp maintainers <maintainers@universal-db-mcp.invalid>"
     assert control in _read(ROOT / "packaging" / "deb" / "control")
     assert control in _read(ROOT / "scripts" / "package" / "build_deb.sh")

@@ -1316,20 +1316,22 @@ the residuals).
 
 **Owner actions:**
 
-- Git history and authorship (F62): placeholder author on every commit,
-  earlier internal branding in history; decide squash or rewrite before any
-  public push. The packages already name `universal-db-mcp maintainers`
+- Git history and authorship (F62): done 2026-10-08, before the first
+  push to GitHub. History rewritten: one named author on every commit, the
+  earlier internal-brand landing page commit dropped, and region-specific
+  sample values replaced. The GitLab copy (`gitlab` remote) still holds the
+  old history. The packages name `universal-db-mcp maintainers`
   (`pyproject.toml`, `packaging/deb/control`, `build_deb.sh`, the MSI's
   Manufacturer).
 - Generate a production Ed25519 release key offline, rotate the site to it
   with `bootstrap.sh --rotate-key` after an out-of-band fingerprint check,
   and retire the demo-signed artifacts (F55); sign the `.pkg` once a
   Developer ID identity exists.
-- Create the GitHub repository, enable GitHub private vulnerability
-  reporting (and secret scanning) on it (`SECURITY.md` points reporters
-  there), and add the repository URL where it is left out today:
-  `[project.urls]` in `pyproject.toml` and the site's `git clone
-  <repository-url>` line (the site derives its links on `*.github.io` only).
+- GitHub repository: `https://github.com/alghanim/universal-db-mcp`
+  (public), named in `[project.urls]`; the Pages workflow fills the site's
+  repository and site URLs. Check that private vulnerability reporting and
+  secret scanning are on (`SECURITY.md` points reporters there), and enable
+  GitHub Pages (source: GitHub Actions) for the landing page.
 - Run `uv sync --locked --all-extras` on the dev `.venv` while no test run
   is in flight: it has uvicorn 0.52.4 and no PyNaCl, where `uv.lock` pins
   0.53.0 and 1.6.2.

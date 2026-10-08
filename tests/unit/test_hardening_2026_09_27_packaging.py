@@ -4417,11 +4417,15 @@ MAINTAINER = "universal-db-mcp maintainers"
 DEB_MAINTAINER = f"Maintainer: {MAINTAINER} <maintainers@universal-db-mcp.invalid>"
 
 
-def test_f62_the_python_package_names_the_maintainers_and_no_address_or_repository() -> None:
+def test_f62_the_python_package_names_the_maintainers_no_address_and_the_public_repository() -> None:
     project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
     assert project["authors"] == [{"name": MAINTAINER}]
     assert "maintainers" not in project  # the same identity, stated once
-    assert "urls" not in project, "no repository URL until the public repository exists"
+    # the public repository is the one contact point; SECURITY.md sends reports to its private reporting
+    repo = "https://github.com/alghanim/universal-db-mcp"
+    assert project["urls"] == {
+        "Homepage": repo, "Repository": repo, "Issues": f"{repo}/issues", "Security": f"{repo}/security/policy",
+    }
 
 
 def test_f62_both_deb_control_sources_name_the_same_maintainer() -> None:
