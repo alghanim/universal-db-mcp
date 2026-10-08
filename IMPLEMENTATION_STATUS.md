@@ -1257,10 +1257,17 @@ the residuals).
   `launch_conditions`, `repair_keeps_account`) has not run. Windows
   secret-ACL and wizard DACL behaviour is verified only against mocked
   pywin32.
-- **GitHub Actions:** neither the CI workflow nor the job-scoped Pages
-  workflow has run on GitHub; the workflows pass `actionlint` and CI's
-  install was replayed locally in Ubuntu 24.04 and Debian containers. On
-  2026-09-29 the whole `checks` job (`uv sync --locked --all-extras`, the
+- **GitHub Actions:** the CI workflow first ran on GitHub on 2026-10-08
+  (pull request #1, ubuntu-24.04). The first run failed 3 of 12,770 tests,
+  all host leaks a slim local image could not show: the runner's
+  `XDG_CONFIG_HOME` won over the tests' fake `HOME` (every such test now
+  clears it), and its `/usr/bin/dotnet` satisfied the MSI Phase 0 gate
+  tests' `/usr/bin:/bin` PATH (now a directory of links without `dotnet`
+  and `wix`). The next run was green: every step, including the
+  `GITHUB_ACTIONS`-only pip and pwsh probes, 12,769 passed, 85 skipped, 1
+  xfailed. The job-scoped Pages workflow has not run (Pages is not enabled
+  yet). Before that, the workflows passed `actionlint` and CI's install was
+  replayed locally in Ubuntu 24.04 and Debian containers. On 2026-09-29 the whole `checks` job (`uv sync --locked --all-extras`, the
   hashed pip install, `pytest tests/unit`, ruff, `mypy --strict src`,
   `--check-locks`, pip-audit over every lock) was replayed as a non-root
   user in a `linux/amd64` Debian 12 container with pwsh 7.4.6, so the MSI
@@ -1271,8 +1278,8 @@ the residuals).
   makes an internal `UPDATE sqlite_master` check that the connector's
   read-only authorizer denies, so row estimates are None there by design;
   3.45 on Ubuntu 24.04 is not affected; `tests/unit/helpers_sqlite.py`).
-  Unconfirmed: the `GITHUB_ACTIONS`-only pip and pwsh probes, a result for
-  every push to `main`, and Dependabot's pickup of the `/.github` pip entry.
+  Unconfirmed: a result for a push to `main`, and Dependabot's pickup of
+  the `/.github` pip entry.
 - **Apple signing:** the `.pkg` is unsigned (no Developer ID identity). The
   convergence wave's postinstall steps (the newsyslog rule removed,
   `/Library/Logs/universal-db-mcp` provisioned, the app assembled in

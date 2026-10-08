@@ -184,8 +184,8 @@ the same way.
 
 ## Verification
 
-- **Tests:** over 12,000 unit tests on macOS, and the same suite in a
-  `linux/amd64` replay of the CI job; ruff and `mypy --strict` clean.
+- **Tests:** over 12,000 unit tests, run by GitHub Actions CI on
+  ubuntu-24.04 and locally on macOS; ruff and `mypy --strict` clean.
   `IMPLEMENTATION_STATUS.md` (section 3f) records the latest counts.
 - **Real databases:** the version matrix above, and
   `scripts/live_evidence.py` against the mock databases of
@@ -195,8 +195,8 @@ the same way.
 - **Supply chain:** pinned, hash-checked locks for every platform, checked
   with pip-audit.
 
-Not yet verified anywhere: the MSI on a real Windows host, a real macOS
-Installer run of the `.pkg`, and a hosted CI run (see below).
+Not yet verified anywhere: the MSI on a real Windows host and a real macOS
+Installer run of the `.pkg`.
 
 ## Development
 
@@ -217,9 +217,8 @@ database; the real-`dpkg` container sequences run only with
 **CI.** `.github/workflows/ci.yml` is a GitHub Actions workflow (ubuntu-24.04,
 CPython 3.12): the unit suite (including the MSI custom-action tests under
 `pwsh`), ruff, `mypy --strict`, `prepare_offline_bundle.py --check-locks`, and
-pip-audit over every lock. Actions are pinned to commit SHAs. It runs once the
-repository is on GitHub; until then the same job has only been replayed
-locally in a container. `tests/unit/test_hardening_2026_09_27_ci_hygiene.py`
+pip-audit over every lock. Actions are pinned to commit SHAs. It runs on
+every pull request and every push to `main`. `tests/unit/test_hardening_2026_09_27_ci_hygiene.py`
 guards the CI setup itself (pinned actions, pytest options, no skips or hooks
 hidden in conftests or helpers, no compiled or symlinked files in the tree);
 it is a tripwire, not a sandbox, so changes to conftests, test helpers and CI
