@@ -64,6 +64,7 @@ def _private_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("USERPROFILE", str(home))
     return home
 
@@ -3063,6 +3064,7 @@ def test_i36_a_home_that_is_the_root_or_relative_asks_for_an_explicit_audit_path
     created at the filesystem root as root); a relative HOME made it follow
     each stdio client's working directory."""
     monkeypatch.setenv("HOME", home)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ConfigError, match="set application.audit_path") as info:
         load_config(_yaml(tmp_path, "application:\n  transport: stdio\n"))

@@ -104,6 +104,7 @@ def test_v2e_configure_agents_dry_run_never_prints_a_malformed_dsh_patch(
     monkeypatch.setattr(dsh, "default_dsh_home", lambda: h.target.parent, raising=False)
     monkeypatch.setenv("DSH_HOME", str(h.target.parent))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     for key, value in hard.ENV.items():
         monkeypatch.setenv(key, value)
 
@@ -175,6 +176,7 @@ def test_v2f_a_non_utf8_harness_config_never_shows_a_byte_or_offset(
 
 def test_v2a_doctor_reports_an_unknown_tilde_user_sqlite_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
         f"application: {{audit_path: {tmp_path}/audit.jsonl}}\n"
@@ -207,6 +209,7 @@ def test_v2a_the_cli_doctor_prints_json_for_an_unknown_tilde_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
         f"application: {{audit_path: {tmp_path}/audit.jsonl}}\n"
@@ -275,6 +278,7 @@ def test_v2b_add_connection_writes_secrets_into_a_deny_only_secrets_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     cfg_dir = tmp_path / "cfg"
     (cfg_dir / "secrets").mkdir(parents=True, mode=0o700)
     _chmod_acl(cfg_dir / "secrets", "group:everyone deny delete")
@@ -321,6 +325,7 @@ def _per_user_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
     (home / ".cursor").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     monkeypatch.setenv("UDBMCP_VENV_PYTHON", hard.FAKE_PYTHON)
@@ -494,6 +499,7 @@ def test_v2j_a_tilde_ca_file_is_offered_and_checked_as_the_server_resolves_it(
     ca = home / "certs" / "ca.pem"
     ca.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     cfg_dir = tmp_path / "cfg"
     cfg_dir.mkdir()
     cfg = cfg_dir / "config.yaml"

@@ -150,6 +150,7 @@ def test_json_apply_reports_seeded_config(
     fake_home.mkdir()
     (fake_home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     monkeypatch.setattr(
         agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-such-etc" / "config.yaml"
@@ -184,6 +185,7 @@ def test_bare_doctor_resolves_the_per_user_config(
         "application:\n  transport: stdio\n", encoding="utf-8"
     )
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     monkeypatch.setattr(
         agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-such-etc" / "config.yaml"

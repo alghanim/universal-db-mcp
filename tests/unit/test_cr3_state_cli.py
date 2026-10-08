@@ -359,6 +359,7 @@ def _dsh_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (home / ".dsh").mkdir(parents=True)
     (home / ".dsh" / "settings.yaml").write_text("")  # a dsh home
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     monkeypatch.setenv("UDBMCP_VENV_PYTHON", hard.FAKE_PYTHON)

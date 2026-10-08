@@ -123,6 +123,7 @@ def test_g1_configure_agents_dry_run_never_prints_another_servers_token(
     for key, value in hard.ENV.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
 
     assert main(["configure-agents", "--dry-run", "--agent", "cursor"]) == 2
     out = capsys.readouterr().out
@@ -185,6 +186,7 @@ def test_g3_dsh_with_an_unregistrable_override_fails_closed_at_detection(
     (home / ".dsh").mkdir(parents=True)
     (home / ".dsh" / "settings.yaml").write_text("x: 1\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("UDBMCP_CONFIG", "missing/rel.yaml")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dsh, "_resolve_python", lambda: hard.FAKE_PYTHON)
@@ -217,6 +219,7 @@ def test_g4_a_seeding_failure_after_a_write_does_not_abort_the_run(
     for key, value in hard.ENV.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
 
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise PermissionError("~/.universal-db-mcp is a symlink to /etc, which its owner does not own")
@@ -307,6 +310,7 @@ def test_g6_unknown_tilde_user_in_udbmcp_config_is_a_config_error(
 
     monkeypatch.setenv("UDBMCP_CONFIG", "~nosuchuser_zz/config.yaml")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     rc = main(["add-connection", "--json", "--name", "x", "--engine", "sqlite", "--database", str(tmp_path / "x.db")])
     err = capsys.readouterr().err
     assert rc == 1 and "CONFIG_ERROR" in err and "~nosuchuser_zz" in err

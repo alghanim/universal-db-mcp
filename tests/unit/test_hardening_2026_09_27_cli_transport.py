@@ -1412,6 +1412,7 @@ def site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Site:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     d = tmp_path / "site"
     secrets_dir = d / "secrets"
@@ -2389,6 +2390,7 @@ def test_f52_paths_given_relative_to_the_cwd_are_stored_absolute(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     work = tmp_path / "work"
     elsewhere = tmp_path / "elsewhere"
     work.mkdir()
@@ -2609,6 +2611,7 @@ def test_f81_add_connection_says_that_agents_can_read_the_secrets(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     monkeypatch.setattr(agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-system-config.yaml")
     ca = tmp_path / "ca.pem"
@@ -2647,6 +2650,7 @@ def cursor_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     monkeypatch.setattr(agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-system-config.yaml")
     return home

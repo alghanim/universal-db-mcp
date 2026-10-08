@@ -2525,6 +2525,7 @@ def test_f56_a_hostile_index_or_pip_setting_cannot_get_a_wheel_into_a_signed_bun
     monkeypatch.setenv("PIP_CONFIG_FILE", str(tmp_path / "pip.conf"))
     monkeypatch.setenv("PIP_INDEX_URL", evil_index)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))  # pip's http cache stays in tmp_path
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
 
     def build(out: Path, index_url: str) -> None:
         monkeypatch.setattr(sys, "argv", [
@@ -4554,6 +4555,7 @@ def test_f61_the_offline_bundle_carries_the_license_and_notice(
         builder, "build_app_wheel", lambda workdir, index_url: _wheel(workdir / "dist", "universal_db_mcp", "0.1.0")
     )
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setattr(sys, "argv", [
         "prepare_offline_bundle.py", "--profile", WINDOWS_PROFILE, "--connectors", "core",
         "--out", str(tmp_path / "out"), "--signing-key", str(priv), "--source-rev", "abc1234", "--release-seq", "1",

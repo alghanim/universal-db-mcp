@@ -44,6 +44,7 @@ def test_json_detection_is_read_only_and_well_formed(
     fake_home.mkdir()
     (fake_home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     # Isolate from the TEST HOST: the adapter (correctly) probes absolute
     # system app paths, and this Mac may really have Claude.app installed.
@@ -75,6 +76,7 @@ def test_json_without_yes_never_writes_even_for_single_agent(
     fake_home.mkdir()
     (fake_home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
 
     rc = main(["configure-agents", "--json", "--agent", "claude-code"])
@@ -90,6 +92,7 @@ def test_json_yes_applies_only_selected_agent_and_reports(
     fake_home.mkdir()
     (fake_home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
 
     rc = main(["configure-agents", "--json", "--agent", "claude-code", "--yes"])
@@ -113,6 +116,7 @@ def test_json_apply_skips_non_writable_harnesses(
     fake_home = tmp_path / "home"
     fake_home.mkdir()  # NOTHING installed
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     # Host isolation for the absolute system-app probe (see the detection test).
     monkeypatch.setattr(
@@ -245,6 +249,7 @@ def test_json_dry_run_notice_never_pollutes_stdout(
     fake_home.mkdir()
     (fake_home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
 
     rc = main(["configure-agents", "--json", "--dry-run", "--yes"])
@@ -264,6 +269,7 @@ def test_json_apply_counts_returned_fail_closed_plan_as_failure(
     fake_home.mkdir()
     (fake_home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
 
     from universal_db_mcp.agents import registry

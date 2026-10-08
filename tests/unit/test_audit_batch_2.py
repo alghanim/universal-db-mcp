@@ -306,6 +306,7 @@ def _fake_home_with_claude_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     home.mkdir()
     (home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     monkeypatch.setattr(agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-such-etc" / "config.yaml")

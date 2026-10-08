@@ -193,6 +193,7 @@ def fake_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("UDBMCP_CONFIG", FAKE_CONFIG)
     monkeypatch.setenv("UDBMCP_VENV_PYTHON", FAKE_PYTHON)
     monkeypatch.chdir(tmp_path)

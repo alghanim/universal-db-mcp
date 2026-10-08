@@ -701,6 +701,7 @@ def test_f48_cli_prints_the_backup_when_a_write_fails(
     target.write_text(json.dumps({"mcpServers": {"other": _SECRET_SERVER}}), encoding="utf-8")
     original = target.read_bytes()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     for variable, value in ENV.items():
         monkeypatch.setenv(variable, value)
@@ -836,6 +837,7 @@ def test_f58_configure_agents_json_refuses_and_keeps_stdout_pure(
     home = tmp_path / "home"
     (home / ".cursor").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UDBMCP_CONFIG", "examples/sqlite-demo/config.yaml")
@@ -1321,6 +1323,7 @@ def test_f48_configure_agents_json_lists_the_backup_of_a_successful_write(
     target.parent.mkdir(parents=True)
     target.write_text(json.dumps({"mcpServers": {"other": _SECRET_SERVER}}), encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     for variable, value in ENV.items():
         monkeypatch.setenv(variable, value)
@@ -1914,6 +1917,7 @@ def test_f58_configure_agents_reports_no_adapter_error_when_nothing_is_installed
 ) -> None:
     _unregistrable_env(tmp_path, monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
 
     assert main(["configure-agents"]) == 0
     out = capsys.readouterr().out
@@ -2464,6 +2468,7 @@ def test_i51_read_only_config_is_not_writable_in_json_or_dry_run(
     target.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
     target.chmod(0o444)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     for variable, value in ENV.items():
         monkeypatch.setenv(variable, value)
 
