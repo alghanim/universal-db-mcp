@@ -39,7 +39,7 @@ jobs:
     # tests run the real .ps1 scripts under its pwsh, and in CI the suite fails
     # rather than let them skip when there is none.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,9 +62,10 @@ jobs:
           uv pip install --python .venv/bin/python --require-hashes -r .github/ci-pip-requirements.txt
 
       # A step timeout fails this step and the checks below still run; reaching
-      # the job timeout would cancel them all.
+      # the job timeout would cancel them all. The suite takes 13-15 minutes on
+      # a hosted runner (2026-10-08), and runner speed varies by about half.
       - name: Unit tests
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: .venv/bin/python -m pytest tests/unit
 
       # The checks below run even when an earlier one failed, so every result shows.
