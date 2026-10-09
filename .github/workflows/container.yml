@@ -1,0 +1,133 @@
+# Publishes the container image to GitHub Packages
+# (ghcr.io/<owner>/universal-db-mcp) for each published release, and on
+# demand for an existing release tag. The image is built only from that
+# release's own signed Linux bundle: the bundle is downloaded from the
+# release, and its signed SHA256SUMS and its own signature are checked
+# against the release key whose fingerprint SECURITY.md publishes at the
+# release tag, before anything is built. It is container mode's image
+# (packaging/Dockerfile): the bundle's wheels, installed by hash, on the
+# Ubuntu 24.04 + CPython 3.12 baseline, running as the udbmcp user. It
+# carries no ODBC stack, so SQL Server connections need an image extended
+# with Microsoft's driver (docs/offline-deployment.md). A build-provenance
+# attestation for the pushed digest is stored with the image.
+#
+# This job's token may push packages and request the OIDC token the
+# attestation needs; the CI hygiene test allows that here only, on release
+# and manual runs, never on a push or a pull request.
+name: Container image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release tag to build, v<major>.<minor>.<patch>"
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      # Passed to scripts through the environment, never spliced into them.
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Check the release tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: '$TAG'" >&2; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ env.TAG }}
+
+      - name: Download the release's Linux bundle and its verification files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" \
+            --pattern 'universal-db-mcp-*-linux-x86_64-*.tar.gz' --pattern release.pub.pem \
+            --pattern SHA256SUMS --pattern SHA256SUMS.sig
+
+      - name: Verify the bundle against the published release key
+        run: |
+          set -euo pipefail
+          release="$RUNNER_TEMP/release"
+          published="$(python3 - <<'PY'
+          import re
+          text = open("SECURITY.md", encoding="utf-8").read()
+          section = text.split("## Release signing key", 1)[1].split("\n## ", 1)[0] if "## Release signing key" in text else ""
+          found = re.findall(r"^([0-9a-f]{64})$", section, re.M)
+          print(found[0] if len(found) == 1 else "")
+          PY
+          )"
+          [ -n "$published" ] || { echo "SECURITY.md publishes no release key fingerprint" >&2; exit 1; }
+          key="$(openssl pkey -pubin -in "$release/release.pub.pem" -outform DER | sha256sum | awk '{print $1}')"
+          [ "$key" = "$published" ] || { echo "release.pub.pem ($key) is not the published key ($published)" >&2; exit 1; }
+          python3 scripts/verify_bundle.py --verify-file "$release/SHA256SUMS" \
+            --signature "$release/SHA256SUMS.sig" --pubkey "$release/release.pub.pem"
+          tarball="$(cd "$release" && ls universal-db-mcp-*-linux-x86_64-*.tar.gz)"
+          (cd "$release" && grep -E "  (\./)?${tarball//./\\.}\$" SHA256SUMS | sha256sum -c -)
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xzf "$release/$tarball" -C "$RUNNER_TEMP/bundle"
+          bundle="$RUNNER_TEMP/bundle/${tarball%.tar.gz}"
+          python3 scripts/verify_bundle.py --bundle "$bundle" --pubkey "$release/release.pub.pem" --no-installed-manifest
+          echo "BUNDLE=$bundle" >> "$GITHUB_ENV"
+
+      # The digest-pinned Ubuntu 24.04 + CPython 3.12 base container mode uses.
+      - name: Build the baseline image
+        run: bash scripts/prepare_baseline_image.sh
+
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          base="$(docker image inspect --format '{{index .RepoDigests 0}}' ubuntu:24.04)"
+          docker build --platform linux/amd64 -f packaging/Dockerfile \
+            --label "org.opencontainers.image.title=universal-db-mcp" \
+            --label "org.opencontainers.image.description=Read-only MCP server for databases, built from the signed release bundle" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$version" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            --label "org.opencontainers.image.base.name=$base" \
+            -t "$image:$version" "$BUNDLE"
+          docker run --rm "$image:$version" version
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Push the image
+        id: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          # 'latest' follows stable releases only, never a pre-release.
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)" = false ]; then
+            docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")"
+          echo "digest=${digest#*@}" >> "$GITHUB_OUTPUT"
+          docker logout ghcr.io
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

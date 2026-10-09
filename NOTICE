@@ -5,3 +5,10 @@ This product includes software developed by third parties, distributed under
 their own licenses. The offline bundle lists those components in
 sbom/cyclonedx.json, and each wheel in its wheelhouse/ carries its license
 files.
+
+The ibm_db wheel (the Db2 connector) contains IBM Data Server Driver for ODBC
+and CLI redistributables, which IBM licenses for distribution as part of an
+application such as this one. They are distributed unmodified, with IBM's
+license and notice files (clidriver/license/ inside the wheel), which govern
+them. Db2 and IBM are trademarks of International Business Machines
+Corporation, used here only to name the database and its driver.

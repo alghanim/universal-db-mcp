@@ -1040,9 +1040,13 @@ def main() -> None:
     (out / "licenses" / "README.md").write_text(
         "# Licenses\n\nLICENSE and NOTICE are universal-db-mcp's own (Apache-2.0). "
         "The third-party wheels are listed in sbom/cyclonedx.json and each carries "
-        "its own license files. Vendor driver "
-        "licenses (IBM, Microsoft, Oracle) are NOT included; administrators "
-        "must hold the required entitlements.\n"
+        "its own license files. The ibm_db wheel contains IBM Data Server Driver "
+        "for ODBC and CLI redistributables with IBM's license and notice files "
+        "(clidriver/license/ inside the wheel), which govern them. Microsoft's "
+        "ODBC driver, when this bundle ships it, is under Microsoft's EULA, "
+        "accepted at install; Oracle's Instant Client is never included. "
+        "Administrators hold any other entitlements a database needs (e.g. Db2 "
+        "Connect for z/OS or IBM i).\n"
     )
 
     # 6. manifest ----------------------------------------------------------------

@@ -2363,8 +2363,22 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
         assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", ref), f"{name}: {ref} is not pinned to a commit SHA"
 
 
-def test_workflow_tokens_are_read_only_unless_a_job_needs_more() -> None:
-    for name, wf in _workflows().items():
+# The container publish (container.yml's image job) pushes to GitHub Packages
+# and stores a provenance attestation, so its token may write exactly these,
+# on a published release or a manual run only (never code from a push or a
+# pull request), with no action but the reviewed checkout and attestation
+# commits: every step of a job gets its token.
+_CONTAINER_JOB = ("container.yml", "image")
+_CONTAINER_WRITES = frozenset({"packages", "id-token", "attestations"})
+_CONTAINER_TRIGGERS = frozenset({"release", "workflow_dispatch"})
+_CONTAINER_ACTIONS = frozenset({
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
+})
+
+
+def _assert_tokens_are_read_only_unless_a_job_needs_more(workflows: dict[str, dict[str, Any]]) -> None:
+    for name, wf in workflows.items():
         top = wf.get("permissions")
         assert isinstance(top, dict), f"{name}: set workflow-level permissions explicitly (read-only or {{}})"
         assert all(v in ("read", "none") for v in top.values()), f"{name}: workflow-level write {top}"
@@ -2372,13 +2386,51 @@ def test_workflow_tokens_are_read_only_unless_a_job_needs_more() -> None:
             perms = job.get("permissions", {})
             assert isinstance(perms, dict), f"{name}:{job_name}: {perms}"
             writes = {k for k, v in perms.items() if v == "write"}
-            # Only the Pages deploy may write, only what deploy-pages needs, and
-            # in a job that runs deploy-pages alone: every step of a job gets
-            # its token, and the OIDC token request.
-            if writes:
-                assert writes <= {"pages", "id-token"}, f"{name}:{job_name}: {writes}"
-                steps = [str(s.get("uses", s.get("run", ""))) for s in job.get("steps", [])]
-                assert len(steps) == 1 and steps[0].startswith("actions/deploy-pages@"), f"{name}:{job_name}: {steps}"
+            if not writes:
+                continue
+            if (name, job_name) == _CONTAINER_JOB:
+                assert writes == _CONTAINER_WRITES, f"{name}:{job_name}: {writes}"
+                assert set(_triggers(wf)) <= _CONTAINER_TRIGGERS, f"{name}: runs on {sorted(_triggers(wf))}"
+                actions = {str(s["uses"]) for s in job.get("steps", []) if "uses" in s}
+                assert actions <= _CONTAINER_ACTIONS, f"{name}:{job_name}: {sorted(actions - _CONTAINER_ACTIONS)}"
+                continue
+            # Otherwise only the Pages deploy may write, only what deploy-pages
+            # needs, and in a job that runs deploy-pages alone: every step of
+            # a job gets its token, and the OIDC token request.
+            assert writes <= {"pages", "id-token"}, f"{name}:{job_name}: {writes}"
+            steps = [str(s.get("uses", s.get("run", ""))) for s in job.get("steps", [])]
+            assert len(steps) == 1 and steps[0].startswith("actions/deploy-pages@"), f"{name}:{job_name}: {steps}"
+
+
+def test_workflow_tokens_are_read_only_unless_a_job_needs_more() -> None:
+    _assert_tokens_are_read_only_unless_a_job_needs_more(_workflows())
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        # code from a push or a pull request with the package-writing token
+        ("  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request:\n"),
+        ("  workflow_dispatch:\n", "  workflow_dispatch:\n  push:\n"),
+        # a write it does not need, or a write moved to the whole workflow
+        ("      attestations: write\n", "      attestations: write\n      contents: write\n"),
+        ("permissions: {}\n", "permissions:\n  packages: write\n"),
+        # an action other than the reviewed commits
+        ("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
+         "actions/attest-build-provenance@" + "0" * 40),
+        ("      - name: Check the release tag\n", "      - uses: docker/login-action@" + "1" * 40 + "\n"
+         "      - name: Check the release tag\n"),
+    ],
+)
+def test_the_container_job_cannot_widen_its_token(old: str, new: str) -> None:
+    workflows = _workflows()
+    _assert_tokens_are_read_only_unless_a_job_needs_more(workflows)
+    text = (WORKFLOWS / "container.yml").read_text(encoding="utf-8")
+    assert old in text
+    with pytest.raises(AssertionError):
+        _assert_tokens_are_read_only_unless_a_job_needs_more(
+            {**workflows, "container.yml": _load_yaml(text.replace(old, new, 1))}
+        )
 
 
 def test_checkouts_do_not_leave_the_token_in_the_git_config() -> None:
