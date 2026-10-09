@@ -2370,15 +2370,27 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
 # these, on a published release or a manual run only (never code from a push
 # or a pull request), with no action but the reviewed commits listed: every
 # step of a job gets its token.
+# Scorecard (scorecard.yml) publishes its results with an OIDC token and
+# uploads them to code scanning: on a push to main, a schedule or by hand.
 _CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-_RELEASE_WRITERS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
+_RELEASE_TRIGGERS = frozenset({"release", "workflow_dispatch"})
+_WRITER_JOBS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str], frozenset[str]]] = {
     ("container.yml", "image"): (
         frozenset({"packages", "id-token", "attestations"}),
         frozenset({_CHECKOUT_ACTION, "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"}),
+        _RELEASE_TRIGGERS,
     ),
-    ("container.yml", "registry"): (frozenset({"id-token"}), frozenset({_CHECKOUT_ACTION})),
+    ("container.yml", "registry"): (frozenset({"id-token"}), frozenset({_CHECKOUT_ACTION}), _RELEASE_TRIGGERS),
+    ("scorecard.yml", "analysis"): (
+        frozenset({"security-events", "id-token"}),
+        frozenset({
+            _CHECKOUT_ACTION,
+            "ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc",
+            "github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d",
+        }),
+        frozenset({"push", "schedule", "branch_protection_rule", "workflow_dispatch"}),
+    ),
 }
-_RELEASE_TRIGGERS = frozenset({"release", "workflow_dispatch"})
 
 
 def _assert_tokens_are_read_only_unless_a_job_needs_more(workflows: dict[str, dict[str, Any]]) -> None:
@@ -2392,10 +2404,13 @@ def _assert_tokens_are_read_only_unless_a_job_needs_more(workflows: dict[str, di
             writes = {k for k, v in perms.items() if v == "write"}
             if not writes:
                 continue
-            if (name, job_name) in _RELEASE_WRITERS:
-                allowed_writes, allowed_actions = _RELEASE_WRITERS[(name, job_name)]
+            if (name, job_name) in _WRITER_JOBS:
+                allowed_writes, allowed_actions, allowed_triggers = _WRITER_JOBS[(name, job_name)]
                 assert writes == allowed_writes, f"{name}:{job_name}: {writes}"
-                assert set(_triggers(wf)) <= _RELEASE_TRIGGERS, f"{name}: runs on {sorted(_triggers(wf))}"
+                triggers = _triggers(wf)
+                assert set(triggers) <= allowed_triggers, f"{name}: runs on {sorted(triggers)}"
+                if "push" in triggers:  # code that is on main, never a branch or a tag
+                    assert triggers["push"] == {"branches": ["main"]}, f"{name}: push {triggers['push']}"
                 actions = {str(s["uses"]) for s in job.get("steps", []) if "uses" in s}
                 assert actions <= allowed_actions, f"{name}:{job_name}: {sorted(actions - allowed_actions)}"
                 continue
@@ -2440,6 +2455,29 @@ def test_the_container_job_cannot_widen_its_token(old: str, new: str) -> None:
     with pytest.raises(AssertionError):
         _assert_tokens_are_read_only_unless_a_job_needs_more(
             {**workflows, "container.yml": _load_yaml(text.replace(old, new, 1))}
+        )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request:\n"),
+        ("    branches: [main]\n", "    branches: ['**']\n"),
+        ("      id-token: write\n", "      id-token: write\n      contents: write\n"),
+        (
+            "      - uses: ossf/scorecard-action@",
+            "      - uses: actions/setup-python@" + "3" * 40 + "\n      - uses: ossf/scorecard-action@",
+        ),
+    ],
+)
+def test_the_scorecard_job_cannot_widen_its_token(old: str, new: str) -> None:
+    workflows = _workflows()
+    _assert_tokens_are_read_only_unless_a_job_needs_more(workflows)
+    text = (WORKFLOWS / "scorecard.yml").read_text(encoding="utf-8")
+    assert old in text
+    with pytest.raises(AssertionError):
+        _assert_tokens_are_read_only_unless_a_job_needs_more(
+            {**workflows, "scorecard.yml": _load_yaml(text.replace(old, new, 1))}
         )
 
 
