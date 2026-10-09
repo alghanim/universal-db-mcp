@@ -52,6 +52,22 @@ Microsoft (`docs/offline-deployment.md`). The flag is allowed with
 closure, and refused if a closure is staged anyway. A site's own stick can
 keep the driver.
 
+**Publishing a GitHub release.** After `release_usb.sh` has built `HEAD`
+with the release key and `UDBMCP_WITHOUT_MSSQL_DRIVER=1`,
+`scripts/package/publish_github_release.sh` (same `UDBMCP_RELEASE_KEY` and
+`UDBMCP_PUBKEY`) assembles the public set in `dist/release-v<version>/`: the
+`.deb`, the `.pkg`, the Linux and macOS bundles and the Linux trust
+bootstrap as `.tar.gz`, the public key and its fingerprint, and a signed
+`SHA256SUMS`. It never takes the stick's Oracle Instant Client. It refuses a
+key other than the one `SECURITY.md` publishes, bundles built from another
+commit, a Linux bundle that still carries Microsoft's driver, and a build
+whose `.deb` or `.pkg` gate did not pass. It then checks the set the way a
+user would (the key, the signed list, every file, both bundles unpacked, no
+demo signature, no Microsoft driver in the `.deb`). With `--publish
+<notes.md>` it also creates the tag and the release (a pre-release unless
+`--stable`) once CI has passed for `HEAD`, then downloads the published
+files and checks them again.
+
 **Residual trust:** the lock hashes are whatever the index advertises when
 the locks are refreshed, so an upstream release that is already compromised
 at that moment would be locked too: review the lock diff before committing
