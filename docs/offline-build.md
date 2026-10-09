@@ -148,7 +148,8 @@ openssl pkey -in udbmcp-release.pem -pubout -out udbmcp-release.pub.pem
 #    UDBMCP_RELEASE_KEY is unset (a stale signature would not verify).
 UDBMCP_RELEASE_KEY=udbmcp-release.pem bash scripts/prepare_baseline_image.sh
 
-# 4. container-mode application image (optional mode)
+# 4. container-mode application image (optional mode), on the digest-pinned
+#    Ubuntu 24.04 that packaging/Dockerfile names (BASE_IMAGE)
 docker build --platform linux/amd64 -t udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312 \
   -f packaging/Dockerfile out/bundle/universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312
 docker save udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312 \

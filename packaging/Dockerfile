@@ -1,7 +1,16 @@
 # Container mode: application image built on the staging machine and
 # exported as an archive (docker save). The target loads it locally with
 # docker load; no registry access at any point on the target.
-FROM udbmcp-baseline:ubuntu24.04-cp312
+#
+# The base is Ubuntu 24.04 pinned by digest, with the CPython 3.12 packages
+# the platform baseline (scripts/prepare_baseline_image.sh) installs, so the
+# image never depends on a locally built tag no registry can vouch for.
+ARG BASE_IMAGE=ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ${BASE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-venv python3.12-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3
 
 # Application wheels are copied from the offline bundle wheelhouse only.
 COPY wheelhouse/ /opt/udbmcp/wheelhouse/

@@ -101,7 +101,9 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          base="$(docker image inspect --format '{{index .RepoDigests 0}}' ubuntu:24.04)"
+          # The Dockerfile's digest-pinned base (older tags built on the local baseline).
+          base="$(sed -n 's/^ARG BASE_IMAGE=//p' packaging/Dockerfile)"
+          [ -n "$base" ] || base="$(docker image inspect --format '{{index .RepoDigests 0}}' ubuntu:24.04)"
           docker build --platform linux/amd64 -f packaging/Dockerfile \
             --label "org.opencontainers.image.title=universal-db-mcp" \
             --label "org.opencontainers.image.description=Read-only MCP server for databases, built from the signed release bundle" \

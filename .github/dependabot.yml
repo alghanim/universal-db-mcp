@@ -98,6 +98,13 @@ updates:
     schedule:
       interval: "monthly"
 
+  # The digest-pinned Ubuntu base in packaging/Dockerfile: a pinned base also
+  # freezes its OS packages, so new digests are proposed like everything else.
+  - package-ecosystem: "docker"
+    directory: "/packaging"
+    schedule:
+      interval: "monthly"
+
   # The commit-SHA pins in .github/workflows, with their version comments.
   - package-ecosystem: "github-actions"
     directory: "/"
