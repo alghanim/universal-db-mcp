@@ -2327,6 +2327,45 @@ def test_dependabot_tracks_the_python_dependencies_and_the_action_pins() -> None
     assert {"pip", "github-actions"} <= ecosystems
 
 
+def test_dependabot_skips_every_release_past_a_pyproject_cap() -> None:
+    """A capped dependency moves past its cap by review: a weekly bump past it
+    fails the lock check, or (the uv ecosystem) widens the cap itself."""
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    extras = project["optional-dependencies"].values()
+    requirements = [*project["dependencies"], *(r for extra in extras for r in extra)]
+    caps: dict[str, Version] = {}
+    for text in requirements:
+        requirement = Requirement(text)
+        for spec in requirement.specifier:
+            if spec.operator == "<":
+                bound = Version(spec.version)
+            elif spec.operator == "~=":
+                release = Version(spec.version).release[:-1]
+                bound = Version(".".join(map(str, (*release[:-1], release[-1] + 1))))
+            else:
+                continue
+            name = canonicalize_name(requirement.name)
+            caps[name] = min(bound, caps.get(name, bound))
+    assert {"uvicorn", "h11", "sqlglot", "clickhouse-connect"} <= caps.keys()
+    config = yaml.safe_load((REPO / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
+    locked = {("uv", "/"), ("pip", "/requirements")}
+    python = [u for u in config["updates"] if (u["package-ecosystem"], u["directory"]) in locked]
+    assert len(python) == 2
+    for update in python:
+        ignored: dict[str, Version] = {}
+        for rule in update.get("ignore", []):
+            for versions in rule["versions"]:
+                assert versions.startswith(">="), rule
+                ignored[canonicalize_name(rule["dependency-name"])] = Version(versions[2:])
+        for name, bound in caps.items():
+            where = update["directory"]
+            assert name in ignored and ignored[name] <= bound, f"{where}: {name} >= {bound} is not ignored"
+
+
 def test_scripts_ruff_config_extends_the_project_config_with_file_scoped_ignores() -> None:
     text = (REPO / "scripts" / "ruff.toml").read_text(encoding="utf-8")
     config = tomllib.loads(text)

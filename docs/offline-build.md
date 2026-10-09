@@ -31,7 +31,12 @@ listener subclasses uvicorn's h11 protocol), clickhouse-connect 1.8.x (the
 stream budget uses one of its seams), sqlglot 30.18.x (the guard is tested on
 it), with floors `cryptography>=50` and, in the `mysql` extra,
 `PyMySQL[ed25519,rsa]>=1.2.0` and `PyNaCl>=1.6.2`. The Windows bundle also
-ships the `pywin32` and `tzdata` wheels its dependencies need there.
+ships the `pywin32` and `tzdata` wheels its dependencies need there. ibm-db
+stays on 3.2.x: 3.3.0 ships only `manylinux_2_34` Linux wheels, so the Linux
+profile (resolved for `manylinux2014`, glibc 2.17) cannot lock it, and taking
+it would raise the bundle's glibc floor to 2.34. `.github/dependabot.yml`
+skips every release past these caps (and ibm-db 3.3); its grouped runtime
+pull requests stay red until the locks are refreshed as above.
 
 **Residual trust:** the lock hashes are whatever the index advertises when
 the locks are refreshed, so an upstream release that is already compromised
