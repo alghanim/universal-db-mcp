@@ -25,6 +25,10 @@
 #   UDBMCP_RELEASE_KEY   signing key PEM (required unless --demo)
 #   UDBMCP_PUBKEY        matching public key (required unless --demo)
 #   UDBMCP_ORACLE_CLIENT folder with the Instant Client files (default: out/oracle-client)
+#   UDBMCP_WITHOUT_MSSQL_DRIVER=1  build the Linux bundle (and so the .deb) without
+#                        Microsoft's ODBC Driver 18 and its unixODBC closure, for a release
+#                        that must not redistribute it (a public one); the manifest declares
+#                        the driver administrator_supplied. A site's own stick keeps it.
 # The public key's fingerprint (sha256 of the DER encoding, what the site's
 # bootstrap.sh prints) is printed and written to RELEASE-KEY-FINGERPRINT.txt
 # on the stick so the operator can compare it out-of-band.
@@ -139,9 +143,15 @@ echo "=== release build at $SHA7 $(date -u +%FT%TZ)"
 # The release_seq of a bundle, which orders the trust tools on the stick too.
 bundle_seq() { "$PY" -c "import json,glob; m=glob.glob('$1/universal-db-mcp-*/manifest.json'); s=json.load(open(m[0])).get('release_seq') if m else None; print(s if type(s) is int and s >= 0 else '')" 2>/dev/null; }
 bundle_rev() { "$PY" -c "import json,glob; m=glob.glob('$1/universal-db-mcp-*/manifest.json'); d=json.load(open(m[0])) if m else {}; print(d.get('source_rev', '') if type(d.get('release_seq')) is int else '')" 2>/dev/null; }
-if [ "$(bundle_rev out/bundle)" = "$SHA" ]; then echo "=== linux bundle already built at $SHA7 (reused)"; else
-  rm -rf out/bundle; echo "=== linux bundle (signed, source_rev=$SHA7)"
-  "$PY" scripts/prepare_offline_bundle.py --out out/bundle --source-rev "$SHA" --signing-key "$KEY"; fi
+# Whether a bundle ships OS packages (the Microsoft driver closure): a bundle
+# built the other way round is never reused.
+bundle_os() { "$PY" -c "import json,glob; m=glob.glob('$1/universal-db-mcp-*/manifest.json'); d=json.load(open(m[0])) if m else {}; print('yes' if d.get('os_packages') else 'no')" 2>/dev/null; }
+DRIVER_FLAG=""; WANT_OS="yes"
+if [ "${UDBMCP_WITHOUT_MSSQL_DRIVER:-}" = 1 ]; then DRIVER_FLAG="--without-mssql-driver"; WANT_OS="no"; fi
+if [ "$(bundle_rev out/bundle)" = "$SHA" ] && [ "$(bundle_os out/bundle)" = "$WANT_OS" ]; then echo "=== linux bundle already built at $SHA7 (reused)"; else
+  rm -rf out/bundle; echo "=== linux bundle (signed, source_rev=$SHA7${DRIVER_FLAG:+, without the Microsoft ODBC driver})"
+  # shellcheck disable=SC2086 # DRIVER_FLAG is one flag or nothing
+  "$PY" scripts/prepare_offline_bundle.py --out out/bundle --source-rev "$SHA" --signing-key "$KEY" $DRIVER_FLAG; fi
 if [ "$(bundle_rev out/bundle-macos)" = "$SHA" ]; then echo "=== macos bundle already built at $SHA7 (reused)"; else
   rm -rf out/bundle-macos; echo "=== macos bundle (signed, source_rev=$SHA7)"
   "$PY" scripts/prepare_offline_bundle.py --profile macos-arm64-cp312 --out out/bundle-macos --source-rev "$SHA" --signing-key "$KEY"; fi

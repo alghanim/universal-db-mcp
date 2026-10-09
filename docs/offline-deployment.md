@@ -229,6 +229,19 @@ Microsoft ODBC driver EULA. The bundle merely carries the package; the
 acceptance decision belongs to the administrator and is recorded at install
 time.
 
+**Bundles without the driver (public releases).** The Linux bundle and
+`.deb` published on GitHub are built with `--without-mssql-driver`
+(`docs/offline-build.md`): Microsoft's driver is not redistributed, so they
+carry no OS packages, and the manifest lists the driver as an
+administrator-supplied prerequisite. On a host that will use SQL Server
+connections, install `msodbcsql18` (it brings the unixODBC packages with it)
+from Microsoft's package repository, or carry its `.deb` files in from a
+machine that can reach it, accepting the EULA (`ACCEPT_EULA=Y`); Microsoft's
+"Install the Microsoft ODBC driver for SQL Server (Linux)" page has the
+commands. Install it on the host, never into the bundle: the bundle is
+signed, and the verifier refuses any `.deb` its manifest does not declare.
+`doctor` names the driver when it is missing.
+
 After install, `doctor` reports driver presence explicitly: it checks for
 the installed ODBC Driver 18 and names it in its output, so a missing or
 mismatched driver is reported as the specific failing artifact rather than

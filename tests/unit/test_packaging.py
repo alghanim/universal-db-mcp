@@ -180,6 +180,29 @@ def test_os_package_closure_warns_loudly_without_signing_key(
         assert "administrator_supplied" in err
 
 
+def test_without_mssql_driver_lets_a_signed_build_ship_no_closure(capsys: pytest.CaptureFixture[str]) -> None:
+    # --without-mssql-driver: a public release must not redistribute Microsoft's
+    # driver. Shipping no OS packages at all is the case the verifier exempts,
+    # so a signed build may make that choice, and says so.
+    prof = PROFILES[LINUX]
+    assert pob.check_os_package_closure(["core", "mssql"], [], prof, "key.pem", without_driver=True) is False
+    err = capsys.readouterr().err
+    assert "--without-mssql-driver" in err and "administrator_supplied" in err
+    # a closure staged anyway contradicts the choice
+    for closure in ([{"package": "unixodbc"}], [{"package": "unixodbc"}, {"package": "msodbcsql18"}]):
+        with pytest.raises(SystemExit, match="--without-mssql-driver"):
+            pob.check_os_package_closure(["core", "mssql"], closure, prof, "key.pem", without_driver=True)
+    # without the choice, the same empty closure is still refused for a signed build
+    with pytest.raises(SystemExit, match="signed"):
+        pob.check_os_package_closure(["core", "mssql"], [], prof, "key.pem")
+
+
+def test_without_mssql_driver_is_a_builder_option() -> None:
+    args = pob.build_arg_parser().parse_args(["--out", "b", "--without-mssql-driver"])
+    assert args.without_mssql_driver is True
+    assert pob.build_arg_parser().parse_args(["--out", "b"]).without_mssql_driver is False
+
+
 def test_os_package_closure_passes_when_msodbcsql18_is_vendored() -> None:
     prof = PROFILES[LINUX]
     assert pob.check_os_package_closure(

@@ -208,6 +208,8 @@ def check_os_package_closure(
     os_packages: list[dict[str, object]],
     profile: Profile,
     signing_key: str | None,
+    *,
+    without_driver: bool = False,
 ) -> bool:
     """Fail loud (signed) or warn loudly (unsigned) on an incomplete .deb closure.
 
@@ -227,6 +229,12 @@ def check_os_package_closure(
        the mirror of check_signing_conflict's "a signed release can never ship
        a knowingly incomplete wheelhouse". Unsigned builds keep the documented
        administrator_supplied fallback, but loudly, never silently.
+
+    3. ``without_driver`` (--without-mssql-driver) is the recorded choice to
+       ship no closure at all, so that a public release does not redistribute
+       Microsoft's driver: the verifier exempts a bundle that declares no
+       os_packages, and the manifest names the driver administrator_supplied.
+       Signed builds may make it; a closure staged anyway is refused.
 
     Returns True when the vendored closure includes the mssql ODBC driver.
     """
@@ -252,6 +260,13 @@ def check_os_package_closure(
               file=sys.stderr)
     if "mssql" not in connectors or not profile.os_packages_staging:
         return driver_vendored
+    if without_driver:
+        if os_packages:
+            raise SystemExit("--without-mssql-driver was given, but an OS-package closure was staged into the bundle")
+        print(f"NOTE: --without-mssql-driver: profile '{profile.name}' ships no OS packages; the Microsoft "
+              "ODBC driver is declared administrator_supplied (installed from Microsoft at the site)",
+              file=sys.stderr)
+        return False
     if driver_vendored:
         return True
     state = (
@@ -652,6 +667,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="record missing connector wheels in the manifest and continue "
                          "instead of failing; refused together with --signing-key")
     ap.add_argument("--signing-key", default=None, help="PEM file with an Ed25519 private key (staging only)")
+    ap.add_argument("--without-mssql-driver", action="store_true",
+                    help="leave the Microsoft ODBC Driver 18 and its unixODBC .deb closure out of the bundle, "
+                         "for a release that must not redistribute Microsoft's driver (a public one). The "
+                         "manifest declares the driver administrator_supplied, which the verifier accepts; a "
+                         "SQL Server site installs it from Microsoft. Allowed with --signing-key: it is a "
+                         "recorded choice, not an incomplete closure.")
     ap.add_argument("--source-rev", default=os.environ.get("UDBMCP_SOURCE_REV") or None,
                     help="source revision recorded in manifest.json. Default: git HEAD of "
                          "this repository (UDBMCP_SOURCE_REV as an environment override); "
@@ -985,10 +1006,10 @@ def main() -> None:
     #     Microsoft ODBC Driver 18) when mssql is selected, so install targets
     #     never need apt, a vendor repository, or any network access.
     os_packages: list[dict[str, object]] = []
-    if "mssql" in connectors and profile.os_packages_staging:
+    if "mssql" in connectors and profile.os_packages_staging and not args.without_mssql_driver:
         os_packages = stage_os_packages(out, PROJECT / profile.os_packages_staging)
     mssql_driver_vendored = check_os_package_closure(
-        connectors, os_packages, profile, args.signing_key,
+        connectors, os_packages, profile, args.signing_key, without_driver=args.without_mssql_driver,
     )
     if mssql_driver_vendored and os_packages:
         (out / "os-packages" / "README.md").write_text(
@@ -1003,9 +1024,15 @@ def main() -> None:
         )
     else:
         (out / "os-packages" / "README.md").write_text(
-            "# OS packages\n\nPlace administrator-acquired OS packages here "
-            "(e.g. Microsoft ODBC driver .deb files, after EULA acceptance). "
-            "The application never adds vendor repositories on targets.\n"
+            "# OS packages\n\nThis bundle ships no OS packages. The SQL Server "
+            "connector needs Microsoft ODBC Driver 18 for SQL Server (and, on "
+            "Linux, the unixODBC packages it depends on) on the target: install "
+            "it the platform's way and accept Microsoft's EULA (Ubuntu: Microsoft's "
+            "package repository, or its .deb files carried in; macOS: Homebrew's "
+            "microsoft/mssql-release tap), as docs/offline-deployment.md describes. "
+            "Do not add files to this directory: the bundle is signed, and the "
+            "verifier refuses any .deb that manifest.json does not declare. The "
+            "application never adds vendor repositories on targets.\n"
         )
     # universal-db-mcp's own license (Apache-2.0) and the NOTICE it requires
     for name in ("LICENSE", "NOTICE"):
@@ -1026,6 +1053,11 @@ def main() -> None:
         admin_supplied["mssql_odbc_driver"] = (
             f"Microsoft ODBC Driver 18 for SQL Server ({profile.odbc_driver_package}) + EULA acceptance"
         )
+        if args.without_mssql_driver and profile.os_packages_staging:
+            admin_supplied["mssql_odbc_driver"] += (
+                ": not redistributed in this bundle; install it, with the unixODBC packages it"
+                " depends on, from Microsoft's package repository (docs/offline-deployment.md)"
+            )
     build_backend = parse_lock(BUILD_LOCK.read_text(encoding="utf-8"))
     manifest = {
         "release": "0.1.0",
