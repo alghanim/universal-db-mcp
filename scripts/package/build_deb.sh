@@ -37,6 +37,10 @@
 #                          (postinst copies this to /etc/systemd/system/, so
 #                          the unit stays a non-dpkg-managed, admin-controlled
 #                          path — see packaging/deb/postinst step 3)
+#        usr/share/doc/universal-db-mcp/{copyright,NOTICE}
+#                        — the machine-readable (DEP-5) copyright statement
+#                          (Apache-2.0; the bundled third-party packages keep
+#                          their own licenses) and the repository's NOTICE
 #
 #      Deliberately NOT in the payload (not a dpkg path; see the staging
 #      code below for why):
@@ -210,6 +214,8 @@ print(source_rev)
 print(os_name)
 print(str(target.get("arch", "")))
 print(build_stamp)
+seq = m.get("release_seq")
+print(seq if type(seq) is int and seq >= 0 else "")
 PYEOF
 if [ "$_fields_ok" -ne 1 ]; then
     rm -f "$FIELDS_TMP"
@@ -221,6 +227,7 @@ SOURCE_REV="$(sed -n '2p' "$FIELDS_TMP")"
 TARGET_OS="$(sed -n '3p' "$FIELDS_TMP")"
 TARGET_ARCH="$(sed -n '4p' "$FIELDS_TMP")"
 BUILD_STAMP="$(sed -n '5p' "$FIELDS_TMP")"
+RELEASE_SEQ="$(sed -n '6p' "$FIELDS_TMP")"
 rm -f "$FIELDS_TMP"
 
 case "$TARGET_ARCH" in
@@ -319,11 +326,13 @@ echo "==> verifying bundle via trusted-channel verifier: $TRUSTED/verify_bundle.
 # --allow-platform-mismatch is the documented STAGING-side mode (the staging
 # host is often macOS while the bundle targets ubuntu-24.04): it skips only
 # the local python-version check, never a signature check. The install
-# target re-verifies WITHOUT this flag in postinst.
+# target re-verifies WITHOUT this flag in postinst. --no-installed-manifest:
+# a release installed on this build machine never decides the build.
 python3 "$TRUSTED/verify_bundle.py" \
     --bundle "$BUNDLE" \
     --pubkey "$PUBKEY" \
     --allow-platform-mismatch \
+    --no-installed-manifest \
     || die "bundle verification FAILED against $BUNDLE — refusing to package unverified payload"
 
 # ---------------------------------------------------------------------------
@@ -390,6 +399,57 @@ UNIT_SRC="$PROJECT_ROOT/packaging/systemd/universal-db-mcp.service"
 cp "$UNIT_SRC" "$PKG_SHARE/systemd/universal-db-mcp.service"
 chmod 0644 "$PKG_SHARE/systemd/universal-db-mcp.service"
 
+# License: Debian policy puts it at /usr/share/doc/<package>/copyright, and
+# Apache-2.0 section 4(d) has the NOTICE file travel with it. Policy 12.5
+# wants the copyright statement in that file itself, so it is written in the
+# machine-readable format (DEP-5): the statement, then the Apache-2.0 grant
+# pointing at /usr/share/common-licenses/Apache-2.0 (base-files), where Debian
+# keeps the license text; lintian refuses a full copy here. The third-party
+# wheels and OS packages in the bundle are not Apache-2.0: a later Files
+# paragraph (the last match wins) says so and where their licenses are. The
+# unmodified LICENSE travels in the bundle's licenses/ beside NOTICE.
+DOC_DIR="$DEBROOT/usr/share/doc/universal-db-mcp"
+for _doc in LICENSE NOTICE; do
+    [ -s "$PROJECT_ROOT/$_doc" ] || die "$_doc missing from $PROJECT_ROOT (the .deb states Apache-2.0 in /usr/share/doc/universal-db-mcp/copyright and ships NOTICE beside it; the bundle carries LICENSE)"
+done
+mkdir -p "$DOC_DIR"
+{
+    printf '%s\n' \
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/" \
+        "Upstream-Name: universal-db-mcp" \
+        "" \
+        "Files: *" \
+        "Copyright: 2026 the universal-db-mcp authors" \
+        "License: Apache-2.0" \
+        "" \
+        "Files: usr/share/universal-db-mcp/bundle/wheelhouse/* usr/share/universal-db-mcp/bundle/os-packages/*" \
+        "Copyright: the authors of each package" \
+        "License: other" \
+        " The third-party Python wheels and OS packages the offline bundle carries" \
+        " are not part of universal-db-mcp: each keeps its own license (MIT, BSD," \
+        " LGPL and others), in the license files inside each wheel's .dist-info" \
+        " and each .deb's /usr/share/doc. The bundle's sbom/cyclonedx.json lists" \
+        " them all." \
+        "" \
+        "License: Apache-2.0" \
+        ' Licensed under the Apache License, Version 2.0 (the "License");' \
+        " you may not use this file except in compliance with the License." \
+        " You may obtain a copy of the License at" \
+        " ." \
+        "     http://www.apache.org/licenses/LICENSE-2.0" \
+        " ." \
+        " Unless required by applicable law or agreed to in writing, software" \
+        ' distributed under the License is distributed on an "AS IS" BASIS,' \
+        " WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied." \
+        " See the License for the specific language governing permissions and" \
+        " limitations under the License." \
+        " ." \
+        " On Debian systems, the complete text of the Apache License, Version 2.0" \
+        ' can be found in "/usr/share/common-licenses/Apache-2.0".'
+} > "$DOC_DIR/copyright"
+chmod 0644 "$DOC_DIR/copyright"
+install -m 0644 "$PROJECT_ROOT/NOTICE" "$DOC_DIR/NOTICE"
+
 # Default config: staged as a dpkg conffile from the verified bundle's
 # config-templates/ copy (checked to exist below) and registered via
 # packaging/deb/conffiles in the gate below. Mode 0644 is preserved by
@@ -411,6 +471,22 @@ for script in preinst postinst prerm postrm; do
     cp "$MAINT_DIR/$script" "$DEBROOT/DEBIAN/$script"
     chmod 0755 "$DEBROOT/DEBIAN/$script"
 done
+# The payload's release_seq and source revision go into the preinst: it
+# refuses an OLDER release (or another release with the installed one's
+# release_seq) before dpkg unpacks it over the newer payload. Both come from
+# the signed manifest; source_rev was checked above to hold dpkg-version
+# characters only, and release_seq digits only.
+case "$RELEASE_SEQ" in
+    "" | *[!0-9]*) RELEASE_SEQ="" ;;
+esac
+for _field in PAYLOAD_RELEASE_SEQ PAYLOAD_SOURCE_REV; do
+    [ "$(grep -cx "${_field}=\"\"" "$DEBROOT/DEBIAN/preinst")" = 1 ] \
+        || die "packaging/deb/preinst must hold exactly one ${_field}=\"\" line for the payload's value"
+done
+sed -e "s/^PAYLOAD_RELEASE_SEQ=\"\"\$/PAYLOAD_RELEASE_SEQ=\"$RELEASE_SEQ\"/" \
+    -e "s/^PAYLOAD_SOURCE_REV=\"\"\$/PAYLOAD_SOURCE_REV=\"$SOURCE_REV\"/" \
+    "$MAINT_DIR/preinst" > "$DEBROOT/DEBIAN/preinst"
+chmod 0755 "$DEBROOT/DEBIAN/preinst"
 # --- conffiles gate (fail-loud) ---------------------------------------------
 # packaging/deb/conffiles is a REQUIRED plan Phase 4 input: it registers
 # /etc/universal-db-mcp/config.yaml as a dpkg conffile (the file is staged
@@ -515,7 +591,7 @@ Priority: optional
 Architecture: $DEB_ARCH
 Depends: python3 (>= 3.12~), python3-venv, libc6 (>= 2.36)
 Recommends: systemd
-Maintainer: Universal DB MCP Release Engineering <release@udbmcp.invalid>
+Maintainer: universal-db-mcp maintainers <maintainers@universal-db-mcp.invalid>
 Description: Universal Database MCP server (read-only, air-gapped)
  MCP server exposing read-only, policy-checked SQL access to relational
  databases, installed from the signed offline bundle. Nothing in this

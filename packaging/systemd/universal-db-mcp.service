@@ -22,6 +22,10 @@ Environment=UDBMCP_HTTP_BEARER_TOKEN_FILE=/etc/universal-db-mcp/http-token
 ExecStart=/opt/universal-db-mcp/venv/bin/python -m universal_db_mcp serve --transport http
 Restart=on-failure
 RestartSec=5
+# Every connection holds a descriptor, and the default soft limit (1024) is
+# low for a shared daemon. The server also closes connections that send no
+# complete request head within its header deadline.
+LimitNOFILE=65536
 
 # Hardening: read-only FS except explicit writable state; no privileges.
 NoNewPrivileges=true

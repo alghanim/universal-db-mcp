@@ -66,6 +66,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from helpers_procs import tie
 
 _POSIX = pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics; run on linux/macos")
 
@@ -350,6 +351,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
     bundle = tmp_path / "bundle"
     (bundle / "os-packages").mkdir(parents=True)
     (bundle / "os-packages" / "dummy_1.0_amd64.deb").write_bytes(b"deb")
+    (bundle / "manifest.json").write_text('{"release_seq": 5}\n', encoding="utf-8")  # every verified bundle has one
     (bundle / "config-templates").mkdir()
     (bundle / "config-templates" / "config.yaml").write_text("# template\n", encoding="utf-8")
     (bundle / "operations").mkdir()
@@ -396,6 +398,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
         "        fh.close()\n"
         "PY\n"
         'mkdir -p "$2"\n'
+        'cp "$1/manifest.json" "$2/manifest.json"\n'  # the real installer publishes the verified manifest
         f'touch "{tmp_path}/install-marker"\n',
         encoding="utf-8",
     )
@@ -429,6 +432,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
     holder_proc = subprocess.Popen(  # noqa: S603 - fixed args, local helper
         [sys.executable, str(holder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+    watchdog = tie(holder_proc)  # it loops until release-dpkg exists: a killed run must not strand it
     try:
         script = _deferred_sandbox_postinst(tmp_path)
         env = dict(os.environ)
@@ -461,6 +465,7 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
     finally:
         (tmp_path / "release-dpkg").write_text("done\n")
         holder_proc.wait(timeout=30)
+        watchdog.release()
 
     # Worker installed unit + config only after the (stub) installer succeeded.
     assert (tmp_path / "unit_dst").read_text() == "[Unit]\nDescription=u\n"
@@ -471,8 +476,14 @@ def test_deferred_flow_functional_verifies_then_installs_after_dpkg_locks_releas
     assert (trust / "profiles.py").read_text() == "# admin-installed profiles.py\n"
     assert (trust / "verify_bundle.py").read_text().startswith("import pathlib")
     assert (trust / "install_offline.sh").read_text().startswith("#!/bin/bash")
-    # The worker cleaned up its own script copy.
-    leftovers = list((tmp_path / "tmp").glob("udbmcp-postinst-worker.*"))
+    # The worker cleaned up its own script copy. It deletes itself in its EXIT
+    # trap, after writing 'success' and running the (shimmed) systemctl calls,
+    # so give it a moment to finish instead of racing it.
+    for _ in range(100):
+        leftovers = list((tmp_path / "tmp").glob("udbmcp-postinst-worker.*"))
+        if not leftovers:
+            break
+        time_sleep(0.1)
     assert leftovers == [], "worker script must delete itself"
 
 
@@ -504,6 +515,7 @@ def test_worker_failure_leaves_guard_block_service_and_no_enable(tmp_path: Path)
     bundle = tmp_path / "bundle"
     (bundle / "os-packages").mkdir(parents=True)
     (bundle / "os-packages" / "dummy_1.0_amd64.deb").write_bytes(b"deb")
+    (bundle / "manifest.json").write_text('{"release_seq": 5}\n', encoding="utf-8")  # every verified bundle has one
     (bundle / "config-templates").mkdir()
     (bundle / "config-templates" / "config.yaml").write_text("# template\n", encoding="utf-8")
     (bundle / "operations").mkdir()
@@ -591,3 +603,83 @@ def time_sleep(seconds: float) -> None:
     import time
 
     time.sleep(seconds)
+
+
+# ----------------------------- CGR#84: audit files an older release left owned by root
+
+
+def _as_this_account(script: Path) -> str:
+    """The repair's root-owned predicate and service account pointed at the test account: a
+    non-root test cannot create root-owned files, so the files the test account owns stand in."""
+    import pwd
+
+    me = pwd.getpwuid(os.getuid()).pw_name
+    text = script.read_text(encoding="utf-8")
+    assert text.count("\nROOT = 0\n") == 1 and text.count('"$LOG_DIR" udbmcp') == 1
+    text = text.replace("\nROOT = 0\n", f"\nROOT = {os.getuid()}\n")
+    text = text.replace('"$LOG_DIR" udbmcp', f'"$LOG_DIR" {me}').replace("id udbmcp ", f"id {me} ")
+    script.write_text(text, encoding="utf-8")
+    return me
+
+
+@_POSIX
+def test_upgrade_hands_root_owned_audit_files_back_to_the_service_account(tmp_path: Path) -> None:
+    """A root site check of an older release could leave audit.jsonl, its .lock sidecar or a
+    rotated backup owned by root; the service then fails every audited call (audit_fail_closed).
+    The postinst hands back only regular, single-link audit files: the service account owns the
+    directory, so a symlink or a second link to another file is never chowned."""
+    bundle = tmp_path / "bundle"
+    (bundle / "config-templates").mkdir(parents=True)
+    (bundle / "config-templates" / "config.yaml").write_text("# template\n", encoding="utf-8")
+    trust = tmp_path / "trust_dir"
+    (trust / "lib").mkdir(parents=True)
+    (trust / "verify_bundle.py").write_text("print('bundle verification PASSED')\n", encoding="utf-8")
+    (trust / "install_offline.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    (trust / "profiles.py").write_text("# profiles\n", encoding="utf-8")
+    (trust / "lib" / "os_packages.sh").write_text("# lib\n", encoding="utf-8")
+    (tmp_path / "unit_src").write_text("[Unit]\n", encoding="utf-8")
+    (tmp_path / "pubkey").write_text("key\n", encoding="utf-8")
+    logs = tmp_path / "log_dir"
+    logs.mkdir()
+    for name in ("audit.jsonl", "audit.jsonl.lock", "audit.jsonl.1", "server.log"):
+        (logs / name).write_text("x\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("not an audit file\n", encoding="utf-8")
+    os.link(elsewhere, logs / "audit.jsonl.2")  # a second link to another file
+    (logs / "audit.jsonl.3").symlink_to(elsewhere)
+    (logs / "audit.jsonl.4").mkdir()
+    (logs / "audit.jsonl.1").chmod(0o444)  # read-only for its owner, but the writer opens it read-write
+    # a link to a file only root may change (/etc/sudoers): root's, with one link, so only
+    # O_NOFOLLOW keeps the repair from handing it to the account that made the link
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text("root ALL=(ALL) ALL\n", encoding="utf-8")
+    sudoers.chmod(0o440)
+    (logs / "audit.jsonl.9").symlink_to(sudoers)
+    _make_shims(tmp_path)
+    script = _deferred_sandbox_postinst(tmp_path)
+    me = _as_this_account(script)
+    env = {**os.environ, "PATH": f"{tmp_path / 'shims'}{os.pathsep}{os.environ.get('PATH', '')}"}
+    proc = subprocess.run(  # noqa: S603 - sandboxed copy of a repo script
+        ["/bin/bash", str(script)], capture_output=True, text=True, timeout=120, env=env, check=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    handed = re.findall(rf"^==> {re.escape(str(logs))}/(\S+) was owned by root; handed back to {me}$",
+                        proc.stdout, flags=re.MULTILINE)
+    assert handed == ["audit.jsonl", "audit.jsonl.1", "audit.jsonl.lock"], proc.stdout
+    assert (logs / "audit.jsonl.1").stat().st_mode & 0o777 == 0o600  # the audit writer's own mode
+    assert sudoers.stat().st_mode & 0o777 == 0o440 and sudoers.stat().st_nlink == 1
+    # the repair runs before the installer and the service start
+    assert proc.stdout.index("handed back") < proc.stdout.index("postinst complete")
+
+
+@_POSIX
+def test_audit_ownership_repair_is_skipped_before_the_service_account_exists(tmp_path: Path) -> None:
+    """A first install has neither the account nor the log directory: nothing to hand back."""
+    code = _executable_lines(_read_postinst())
+    repair = code.index('python3 -I -S - "$LOG_DIR" udbmcp')
+    guard = code.rindex('if [ -d "$LOG_DIR" ] && id udbmcp >/dev/null 2>&1; then', 0, repair)
+    assert code[guard:repair].count("\n") == 1, "the guard must open the block the repair runs in"
+    # best effort: a failed repair warns, it never aborts the configure step
+    assert code[repair:].split("\n", 1)[0].endswith(
+        '|| echo "WARNING: could not hand root-owned audit files in $LOG_DIR back to the service account" >&2'
+    )

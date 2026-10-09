@@ -116,7 +116,9 @@ def test_powershell_path_is_resolved_by_an_immediate_action_before_the_first_def
     value = setter.get("Value") or ""
     assert "[System64Folder]" in value and "WindowsPowerShell\\v1.0\\powershell.exe" in value
     entry = sequence_entry(root, "SetPowerShellExe")
-    assert entry.get("Before") == "VerifyBundleCA"
+    # before InstallInitialize, so before every deferred action, the
+    # uninstall's RemoveServiceCA (at RemoveFiles) included
+    assert entry.get("Before") == "InstallInitialize"
 
 
 def test_setpowershellexe_entry_is_unconditional():
@@ -167,9 +169,9 @@ def test_verify_action_pins_trust_dir_to_an_acl_protected_location():
     cmd = ca.get("ExeCommand") or ""
     assert "TRUST_DIR=[ProgramFiles64Folder]udbmcp-trust" in cmd, (
         "VerifyBundleCA must pass TRUST_DIR pointing into the admin-write-only "
-        "Program Files tree; falling back to verify.ps1's C:\\ProgramData "
-        "default lets a non-admin squat the trust directory and replace the "
-        "verifier the gate executes as LocalSystem"
+        "Program Files tree; falling back to verify.ps1's machine-scope "
+        "UDBMCP_TRUST_DIR lets a C:\\ProgramData path a non-admin squatted "
+        "supply the verifier the gate executes as LocalSystem"
     )
     # The authored CustomActionData must never root the trust dir (or any
     # other trust input) in world-squattable ProgramData.

@@ -1,25 +1,25 @@
 {
   "label": "postgres:16",
   "engine": "postgres",
-  "probe_rev": "c820896",
-  "started_utc": "2026-09-16T20:33:51Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:44:36Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 82,
+      "ms": 106,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 8,
+      "ms": 9,
       "detail": "PostgreSQL 16.13 (Debian 16.13-1.pgdg13+"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 4,
+      "ms": 6,
       "detail": "vm"
     },
     {
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 3,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
+      "ms": 5,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='integer', nullable=False, default=None, comment=None, ordinal=1, default_kind=None), ColumnInfo(schema='vm', table='customers', name='"
     },
     {
       "check": "list_columns_count",
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "[IndexInfo(name='ix_orders_customer', columns=['customer_id'], unique=False, definition='CREATE INDEX ix_orders_customer ON vm.orders USING btree (customer_id)', primary=False, kind='btree', schema='v"
     },
     {
@@ -91,7 +91,7 @@
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 5,
+      "ms": 7,
       "detail": "f_one"
     },
     {
@@ -103,37 +103,37 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 5,
+      "ms": 8,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 6,
+      "ms": 18,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 6,
+      "ms": 9,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 6,
+      "ms": 11,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 6,
+      "ms": 10,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 4,
+      "ms": 6,
       "detail": "['raw']"
     }
   ],
@@ -147,6 +147,8 @@
     "read_only_requested": true,
     "server_read_only_available": true,
     "applied": [
+      "standard_conforming_strings=on",
+      "client_encoding=UTF8",
       "read_only",
       "statement_timeout=60000ms",
       "lock_timeout=5000ms"
@@ -159,11 +161,13 @@
       "statement_timeout": "1min",
       "lock_timeout": "5s",
       "application_name": "udbmcp:vm",
-      "isolation": "read committed"
+      "isolation": "read committed",
+      "standard_conforming_strings": "on",
+      "client_encoding": "UTF8"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:33:51Z",
+  "finished_utc": "2026-10-03T14:44:36Z",
   "summary": {
     "passed": 22,
     "failed": []

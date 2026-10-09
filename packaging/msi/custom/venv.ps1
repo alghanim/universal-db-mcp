@@ -31,6 +31,9 @@
 # Invocation contract (set up by udbmcp.wxs / test_package_msi.ps1):
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<...>\venv.ps1"
 #   [deferred, impersonate=no (runs as SYSTEM), Return="check"]
+#   The same script is the rollback twin (RollbackBuildVenvCA, -Rollback,
+#   Execute="rollback") and the commit action (CommitBuildVenvCA, -Commit,
+#   Execute="commit", Return="ignore"); see "The previous venv" below.
 #   Optional environment overrides (defaults below match the udbmcp.wxs
 #   directory tree under ProgramFiles64Folder\UniversalDB MCP):
 #     UDBMCP_BUNDLE_DIR  signed bundle directory (contains wheelhouse/,
@@ -43,6 +46,24 @@
 #                        local non-admin can point at their own interpreter;
 #                        see Find-Cpython312 below)
 #
+# The previous venv: a repair or upgrade finds the venv an earlier install
+# built, and the service (and any MCP client a configure-agents registration
+# started) may be running from it. It is never deleted in place: Windows
+# refuses to delete a file a process has open or mapped, so a recursive
+# delete failed part-way and left a gutted venv that no rollback restores
+# (it is not an MSI file). Instead the service is stopped, the venv is
+# moved aside whole to <venv>.previous-<id> (a move refuses a folder a
+# process still runs from; the install then fails with the venv untouched),
+# and the new one is built in its place. The marker <venv>.moved names the
+# folder moved aside and whether the new venv is complete ("building",
+# "built"). Until the install commits, that folder is kept: a failure in
+# this action puts it back at once, and the rollback twin (RollbackBuildVenvCA,
+# run when this or any later action fails) puts it back too. The commit
+# action (CommitBuildVenvCA) removes it and the marker once the install has
+# succeeded. A marker an interrupted install left is settled first, before
+# anything here can fail: "building" puts its folder back (the venv in
+# place is incomplete), "built" drops it (the venv in place is complete).
+#
 # Logging: this script has no UI; every message is a structured console write
 # (stdout for progress, stderr for failures) that msiexec captures verbatim
 # into the /l*v MSI log. Format mirrors the shell installers:
@@ -53,7 +74,14 @@
 param(
     [string]$BundleDir,
     [string]$VenvDir,
-    [string]$PythonExe
+    [string]$PythonExe,
+    # The service that runs from the venv: stopped before the venv is moved
+    # aside (see "The previous venv" above).
+    [string]$ServiceName = 'udbmcp',
+    # The rollback twin: put back the venv this install moved aside.
+    [switch]$Rollback,
+    # The commit action: remove the venv this install moved aside.
+    [switch]$Commit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,11 +99,157 @@ function Write-Detail {
     [Console]::Out.WriteLine("    $Message")
 }
 
+# Exit codes of sc.exe: ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE.
+$script:ErrServiceAbsent = 1060
+$script:ErrServiceNotActive = 1062
+# The venv this run moved aside (full path), until the install is settled.
+$script:Aside = $null
+
 function Fail {
     param([string]$Message)
     [Console]::Error.WriteLine("FAIL: $Message")
+    if ($script:Aside) {
+        $aside = $script:Aside
+        $script:Aside = $null
+        Restore-PreviousVenv -Aside $aside
+    }
     [Console]::Error.WriteLine("      The installation has been aborted; nothing was started.")
     exit 1
+}
+
+function Get-MarkerPath {
+    return ($VenvDir + '.moved')
+}
+
+function Read-Marker {
+    # The marker's folder (full path) and state, or $null when there is no
+    # marker. A marker naming anything but a <venv>.previous-<id> folder
+    # beside the venv is refused (fail closed: nothing is moved for it).
+    $marker = Get-MarkerPath
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { return $null }
+    $lines = @(Get-Content -LiteralPath $marker)
+    $leaf = ''
+    $state = ''
+    if ($lines.Count -ge 1) { $leaf = [string]$lines[0] }
+    if ($lines.Count -ge 2) { $state = [string]$lines[1] }
+    $prefix = [regex]::Escape((Split-Path -Leaf $VenvDir) + '.previous-')
+    if ($leaf -notmatch ('^' + $prefix + '[0-9a-f]{32}$')) {
+        throw ("the marker '" + $marker + "' names '" + $leaf + "', not a venv this action moved aside; inspect it")
+    }
+    return [pscustomobject]@{ Path = (Join-Path (Split-Path -Parent $VenvDir) $leaf); State = $state }
+}
+
+function Write-Marker {
+    param([string]$Aside, [string]$State)
+    Set-Content -LiteralPath (Get-MarkerPath) -Value @((Split-Path -Leaf $Aside), $State) -Encoding ascii
+}
+
+function Remove-Marker {
+    $marker = Get-MarkerPath
+    if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
+}
+
+function Restore-PreviousVenv {
+    # Puts the venv moved aside to $Aside back in place of whatever stands at
+    # $VenvDir (the new venv, complete or not). The marker is set to
+    # "building" first, so a restore that cannot finish leaves the moved
+    # venv for the next install to put back, never to drop. Reports, never
+    # throws: it runs on the way out of a failure.
+    param([string]$Aside)
+    try {
+        if (-not (Test-Path -LiteralPath $Aside -PathType Container)) {
+            [Console]::Error.WriteLine("      the previous venv '" + $Aside + "' is gone; nothing to put back")
+            Remove-Marker
+            return
+        }
+        Write-Marker -Aside $Aside -State 'building'
+        if (Test-Path -LiteralPath $VenvDir) {
+            Remove-Item -LiteralPath $VenvDir -Recurse -Force
+        }
+        Move-Item -LiteralPath $Aside -Destination $VenvDir
+        Remove-Marker
+        [Console]::Error.WriteLine("      the previous venv is back at '" + $VenvDir + "'")
+    }
+    catch {
+        [Console]::Error.WriteLine("      could not put the previous venv '" + $Aside + "' back at '" + $VenvDir + "': " +
+                                   $_.Exception.Message + "; the next install puts it back (marker " + (Get-MarkerPath) + ")")
+    }
+}
+
+function Invoke-Tool {
+    # Runs a tool with a fully controlled raw command line and returns the
+    # exit code plus captured output (sc.exe output is small, so synchronous
+    # ReadToEnd is safe).
+    param([string]$Tool, [string]$Arguments)
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Tool
+        $psi.Arguments = $Arguments
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        return [pscustomobject]@{ ExitCode = $proc.ExitCode; StdOut = $stdout; StdErr = $stderr }
+    }
+    catch {
+        Fail ("could not start '" + $Tool + "': " + $_.Exception.Message)
+    }
+}
+
+function Stop-VenvService {
+    # Stops the service $Name when it is registered and not stopped: it runs
+    # from the venv about to be moved aside. Fails closed on anything it
+    # cannot resolve, before the venv is touched.
+    param([string]$Name)
+    $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+    $r = Invoke-Tool -Tool $sc -Arguments ('query ' + $Name)
+    if ($r.ExitCode -eq $script:ErrServiceAbsent) { return }
+    if ($r.ExitCode -ne 0) {
+        Fail ("sc.exe query " + $Name + " failed with exit code " + $r.ExitCode + "; the venv is unchanged")
+    }
+    if ($r.StdOut -match 'STOPPED') { return }
+    Write-Detail ("stopping service '" + $Name + "' (it runs from this venv)")
+    $r = Invoke-Tool -Tool $sc -Arguments ('stop ' + $Name)
+    if ($r.ExitCode -ne 0 -and $r.ExitCode -ne $script:ErrServiceNotActive -and $r.ExitCode -ne $script:ErrServiceAbsent) {
+        Fail ("sc.exe stop " + $Name + " failed with exit code " + $r.ExitCode + "; the venv is unchanged")
+    }
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        $r = Invoke-Tool -Tool $sc -Arguments ('query ' + $Name)
+        if ($r.ExitCode -eq $script:ErrServiceAbsent -or ($r.ExitCode -eq 0 -and $r.StdOut -match 'STOPPED')) { return }
+        Start-Sleep -Seconds 1
+    }
+    Fail ("service '" + $Name + "' did not reach STOPPED within 60 seconds; the venv is unchanged")
+}
+
+function Resolve-InterruptedInstall {
+    # Settles a marker an earlier install left (it was interrupted, or ran
+    # with rollback disabled, so neither its twin nor its commit ran); see
+    # "The previous venv" in the header. Runs before anything here can fail,
+    # so the twin never finds that marker.
+    $found = Read-Marker
+    if (-not $found) { return }
+    if ($found.State -eq 'building' -and (Test-Path -LiteralPath $found.Path -PathType Container)) {
+        Write-Detail ("an interrupted install left an incomplete venv; putting back '" + $found.Path + "'")
+        if (Test-Path -LiteralPath $VenvDir) { Remove-Item -LiteralPath $VenvDir -Recurse -Force }
+        Move-Item -LiteralPath $found.Path -Destination $VenvDir
+        Remove-Marker
+        return
+    }
+    Remove-Marker
+    if (Test-Path -LiteralPath $found.Path) {
+        Write-Detail ("removing '" + $found.Path + "', which an earlier install moved aside")
+        try {
+            Remove-Item -LiteralPath $found.Path -Recurse -Force
+        }
+        catch {
+            Write-Detail ("could not remove it (" + $_.Exception.Message + "); remove it once nothing runs from it")
+        }
+    }
 }
 
 function Get-EnvValue {
@@ -162,6 +336,43 @@ try {
     $Wheelhouse = Join-Path $BundleDir 'wheelhouse'
     $Lock       = Join-Path $BundleDir 'requirements\runtime.lock'
 
+    # --- the rollback twin and the commit action (see the header) -------------
+    # Neither builds anything, and neither fails: the install is being rolled
+    # back, or it has committed.
+    if ($Rollback) {
+        try {
+            $found = Read-Marker
+            if (-not $found) {
+                Write-Detail ('this install moved no venv aside: ' + $VenvDir + ' is left as it is')
+            }
+            else {
+                Restore-PreviousVenv -Aside $found.Path
+            }
+        }
+        catch {
+            Write-Detail ('WARNING: ' + $_.Exception.Message)
+        }
+        exit 0
+    }
+    if ($Commit) {
+        try {
+            $found = Read-Marker
+            if ($found) {
+                Remove-Marker
+                if (Test-Path -LiteralPath $found.Path) {
+                    Remove-Item -LiteralPath $found.Path -Recurse -Force
+                }
+                Write-Detail ('the install committed: removed the previous venv ' + $found.Path)
+            }
+        }
+        catch {
+            Write-Detail ('WARNING: could not remove the previous venv (' + $_.Exception.Message +
+                          '); remove it once nothing runs from it')
+        }
+        exit 0
+    }
+    Resolve-InterruptedInstall
+
     Write-Step 'resolving inputs'
     Write-Detail "bundle_dir=$BundleDir"
     Write-Detail "wheelhouse=$Wheelhouse"
@@ -198,8 +409,11 @@ try {
     Write-Detail "python=$py"
     # Native invocation: EAP is relaxed inside Invoke-Native, so a stray
     # interpreter stderr line cannot escalate; the exit code alone decides.
+    # -I, as for every LocalSystem python run of the MSI (here and in the
+    # venv's pip below): no PYTHON* variables, no user site and no working
+    # directory on sys.path.
     $verExit = Invoke-Native -FilePath $py -ArgumentList @(
-        '-c', 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)')
+        '-I', '-c', 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)')
     if ($verExit -ne 0) {
         Fail "CPython 3.12.x is required (the wheelhouse is built for cp312); found: $py"
     }
@@ -229,16 +443,33 @@ try {
 
     # --- step 4: (re)create the venv ------------------------------------------
     # A venv from a previous install (upgrade/re-install, where MSI does not
-    # remove custom-action-created files) is removed so the result always
-    # reflects exactly the freshly verified wheelhouse, never a stale mix.
+    # remove custom-action-created files) is replaced, so the result always
+    # reflects exactly the freshly verified wheelhouse, never a stale mix. It
+    # is moved aside whole, never deleted in place, and kept until the
+    # install commits (see "The previous venv" in the header).
     Write-Step "creating virtual environment at $VenvDir"
-    if (Test-Path -LiteralPath $VenvDir -PathType Container) {
-        Write-Detail 'removing stale venv from a previous install'
-        Remove-Item -LiteralPath $VenvDir -Recurse -Force
+    if (Test-Path -LiteralPath $VenvDir) {
+        if (-not (Test-Path -LiteralPath $VenvDir -PathType Container)) {
+            Fail "'$VenvDir' is not a directory; inspect it, then remove it and rerun the install"
+        }
+        Stop-VenvService -Name $ServiceName
+        $aside = $VenvDir + '.previous-' + [guid]::NewGuid().ToString('N')
+        Write-Detail "moving the previous venv aside to $aside (kept until the install commits)"
+        try {
+            Move-Item -LiteralPath $VenvDir -Destination $aside
+        }
+        catch {
+            Fail ("could not move the previous venv '" + $VenvDir + "' aside (" + $_.Exception.Message + '): a process' +
+                  ' still runs from it (an MCP client a configure-agents registration started, such as Claude' +
+                  ' Desktop, or a shell). Close it and rerun the install; the venv is unchanged, and the service' +
+                  " '" + $ServiceName + "', if registered, is stopped")
+        }
+        $script:Aside = $aside
+        Write-Marker -Aside $aside -State 'building'
     }
     # Native invocation: EAP is relaxed inside Invoke-Native and the exit code
     # alone decides (fail closed on nonzero, exactly as before).
-    $venvExit = Invoke-Native -FilePath $py -ArgumentList @('-m', 'venv', $VenvDir)
+    $venvExit = Invoke-Native -FilePath $py -ArgumentList @('-I', '-m', 'venv', $VenvDir)
     if ($venvExit -ne 0) {
         Fail "could not create the virtual environment at $VenvDir (python -m venv exited $venvExit)"
     }
@@ -264,7 +495,7 @@ try {
     # the wheelhouse only, --only-binary=:all:, pinned by the signed lock.
     $previousEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & $VenvPython -m pip --isolated --disable-pip-version-check install `
+    & $VenvPython -I -m pip --isolated --disable-pip-version-check install `
         '--no-index' `
         '--no-cache-dir' `
         "--find-links=$Wheelhouse" `
@@ -275,6 +506,14 @@ try {
     $ErrorActionPreference = $previousEap
     if ($pipExit -ne 0) {
         Fail "wheelhouse install failed (pip exited $pipExit); install from the verified bundle did not complete"
+    }
+
+    # Complete: an interrupted install's marker now drops the venv moved
+    # aside instead of putting it back. Until the install commits, the
+    # rollback twin still puts it back.
+    if ($script:Aside) {
+        Write-Marker -Aside $script:Aside -State 'built'
+        $script:Aside = $null
     }
 
     Write-Step 'venv ready'

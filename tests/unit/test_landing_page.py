@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from universal_db_mcp.config import ConnectionConfig, SecurityConfig, load_resolved
+from universal_db_mcp.connectors import clickhouse
 from universal_db_mcp.errors import ToolFailure
 from universal_db_mcp.security.policy import EffectivePolicy
 from universal_db_mcp.security.sql_guard import SqlGuard
@@ -61,14 +62,14 @@ def test_the_version_matrix_figures_match_the_evidence() -> None:
     assert "26 of 26 images pass" in PAGE and 'data-count="26" data-suffix="/26"' in PAGE
 
 
-def _guard(engine: str) -> SqlGuard:
+def _guard(engine: str, **security: Any) -> SqlGuard:
     # the policy the page states under the panel: connection 'warehouse', schema allowlist 'sales'
     body: dict[str, Any] = {"type": engine, "database": "d", "username_env": "U", "allowed_schemas": ["sales"]}
     if engine != "sqlite":
         body["host"] = "h"
     cfg = ConnectionConfig.model_validate(body)
     policy = EffectivePolicy.build(
-        SecurityConfig(default_deny_objects=False), type("R", (), {"config": cfg, "name": "warehouse"})()
+        SecurityConfig(default_deny_objects=False, **security), type("R", (), {"config": cfg, "name": "warehouse"})()
     )
     return SqlGuard(engine, policy, None)
 
@@ -89,6 +90,43 @@ def test_the_panel_covers_one_allowed_read_and_the_attacks() -> None:
     assert sum(1 for c in CASES if c["allowed"]) == 1
     assert len(CASES) == 12 and "Twelve ways" in PAGE
     assert 'connection <code>warehouse</code>, schema allowlist <code>sales</code>' in PAGE
+
+
+def test_the_plan_card_holds_explain_analyze_is_refused_whatever_the_config() -> None:
+    card = re.search(r"Query plans on every engine, never executed</h3>(.*?)</p>", PAGE, re.S)
+    assert card is not None
+    assert "EXPLAIN ANALYZE is refused whatever the configuration says" in card.group(1)
+    for allow in (False, True):
+        with pytest.raises(ToolFailure):
+            _guard("postgres", allow_explain_analyze=allow).validate_explain(
+                "EXPLAIN ANALYZE SELECT id FROM sales.customers"
+            )
+    # ClickHouse evaluates subqueries while it plans; the card names the ceiling on that
+    assert f"{clickhouse._EXPLAIN_MAX_ROWS_TO_READ:,}-row" in card.group(1)
+
+
+@pytest.mark.parametrize(
+    ("engine", "opened", "sql"),
+    [
+        ("postgres", "pg_catalog", "SELECT query FROM pg_catalog.pg_stat_activity"),
+        ("mysql", "information_schema", "SELECT info FROM information_schema.PROCESSLIST"),
+        ("mssql", "sys", "SELECT * FROM sys.dm_exec_requests"),
+        ("oracle", "SYS", "SELECT sql_text FROM SYS.V_$SQL"),
+        ("oracle", "SYS", "SELECT sql_text FROM SYS.UNIFIED_AUDIT_TRAIL"),
+    ],
+    ids=["pg_stat_activity", "processlist", "dm_exec_requests", "v$sql", "unified_audit_trail"],
+)
+def test_the_masking_answer_holds_other_sessions_sql_is_refused_on_every_connection(
+    engine: str, opened: str, sql: str
+) -> None:
+    faq = re.search(
+        r"<summary>Does masking stop an agent from learning a sensitive value\?</summary><p>(.*?)</p>", PAGE
+    )
+    assert faq is not None and "show other sessions' SQL" in faq.group(1)
+    # refused even where the administrator opened the system schema that holds the view
+    with pytest.raises(ToolFailure) as refused:
+        _guard(engine, allowed_system_schemas=[opened]).validate_select(sql)
+    assert str(refused.value).startswith("POLICY_VIOLATION: ") and "other sessions' SQL" in str(refused.value)
 
 
 def test_the_headline_claim_holds_there_is_no_write_mode() -> None:

@@ -23,7 +23,11 @@ test_pkg_postinstall_functional_failclosed.py do:
   unprivileged (no root, no real install). ``python3`` is a TRIPWIRE: since the
   interpreter-selection fix, postinstall must never PATH-search python3, so
   any PYTHON3 log line fails the positive control. The verifier runs under the
-  ``python312-sandbox`` shim (the rewritten preinstall-approved candidate).
+  ``python312-sandbox`` shim (the rewritten preinstall-approved candidate);
+- ``FIND`` (the stat of the root-ownership check on the interpreter) is mocked
+  to report every path as root's alone, since the shim belongs to the test
+  account; the check itself is exercised in
+  test_hardening_2026_09_27_packaging.py (F53).
 
 Coverage split vs the sibling file (test_pkg_postinstall_functional_failclosed,
 committed with the feature): that file owns the four refusal cases plus the
@@ -66,8 +70,10 @@ POSTINSTALL = PROJECT / "packaging" / "pkg" / "postinstall"
 # 'bundle verification PASSED' line are fatal - the rule every other call site
 # already enforced.
 _FATAL_VERIFY_BRANCH = re.compile(
-    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY" >"\$VERIFY_OUT" 2>&1 \|\| VRC=\$\?'
-    r'[\s\S]{0,400}?fail "bundle verification FAILED'
+    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY" "\$\{ROLLBACK_ARGS\[@\]\}" '
+    r'>"\$VERIFY_OUT" 2>&1 \|\| VRC=\$\?'
+    # the refused-downgrade branch (its own message, same exit) sits between the call and this one
+    r'[\s\S]{0,700}?fail "bundle verification FAILED'
 )
 _VERIFY_PROOF_REQUIRED = re.compile(
     r"grep -q 'bundle verification PASSED'[\s\S]{0,400}?fail \"trusted verifier exited 0"
@@ -88,10 +94,9 @@ _PATH_REWRITES = [
     # PATH: the sandbox shim dir must win over /usr/bin, where the REAL dscl /
     # launchctl / install live — otherwise the positive control would touch the
     # host's directory service (or fail on its root-only ownership flags).
-    (
-        r'^PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"$',
-        'PATH="{shim}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"',
-    ),
+    (r'^PATH="/usr/bin:/bin:/usr/sbin:/sbin"$', 'PATH="{shim}:/usr/bin:/bin:/usr/sbin:/sbin"'),
+    # stat mocked: the sandbox interpreter shim counts as root-owned
+    (r'^FIND="/usr/bin/find"$', 'FIND="{find_root_owned}"'),
     # The interpreter candidates are absolute paths with no env override: point
     # both at the sandbox PY shim (the venv/pip/smoke steps run through it).
     (
@@ -105,9 +110,11 @@ _PATH_REWRITES = [
         r'^APP_DIR="/Applications/Configure UniversalDB MCP\.app"$',
         'APP_DIR="{app_dir}"',
     ),
-    # The best-effort newsyslog rotation install must land inside the sandbox,
-    # not the real /etc/newsyslog.d.
+    # The removal of an earlier release's newsyslog rule must act inside the
+    # sandbox, not the real /etc/newsyslog.d.
     (r'^NEWSYSLOG_DST="/etc/newsyslog\.d/udbmcp\.conf"$', 'NEWSYSLOG_DST="{newsyslog}"'),
+    # launchd's output files for the daemon: the sandbox, not /Library/Logs.
+    (r'^LAUNCHD_LOG_DIR="/Library/Logs/universal-db-mcp"$', 'LAUNCHD_LOG_DIR="{launchd_log}"'),
 ]
 
 
@@ -118,6 +125,11 @@ def _require_script() -> str:
 
 def _make_executable(path: Path) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _launchd_log_dir(tmp_path: Path) -> Path:
+    """The sandbox's /Library/Logs/universal-db-mcp."""
+    return tmp_path / "Library-Logs" / "universal-db-mcp"
 
 
 def _sandbox_postinstall(tmp_path: Path) -> Path:
@@ -133,7 +145,10 @@ def _sandbox_postinstall(tmp_path: Path) -> Path:
         "pyshim": str(tmp_path / "shim-bin" / "python312-sandbox"),
         "app_dir": str(tmp_path / "applications" / "Configure UniversalDB MCP.app"),
         "newsyslog": str(tmp_path / "etc" / "newsyslog.d" / "udbmcp.conf"),
+        "find_root_owned": str(tmp_path / "find-root-owned"),
+        "launchd_log": str(_launchd_log_dir(tmp_path)),
     }
+    _write_shim(tmp_path, "find-root-owned", "#!/bin/sh\nexit 0\n")  # every path is root's alone
     for pattern, replacement in _PATH_REWRITES:
         new_text, n = re.subn(pattern, replacement.format(**dirs), text, flags=re.MULTILINE)
         assert n == 1, f"path-rewrite pattern matched {n} times (expected 1): {pattern}"
@@ -155,7 +170,8 @@ def _build_shims(tmp_path: Path) -> Path:
     """PATH shims so the sandbox never touches the host: dscl/launchctl/install
     log and simulate; python3 is a tripwire (postinstall must never PATH-search
     it — any PYTHON3 log line fails the executed tests); python312-sandbox is
-    the rewritten preinstall-approved candidate: it emulates the CPython 3.12
+    the rewritten preinstall-approved candidate: it logs its arguments (so the
+    -I that every root-side python gets is visible), emulates the CPython 3.12
     prerequisite checks and `python -m venv` (skipping options such as
     --copies), is the venv python, and executes the trusted verifier stub via
     UDBMCP_SANDBOX_PYTHON."""
@@ -187,6 +203,8 @@ def _build_shims(tmp_path: Path) -> Path:
         "# VERIFIER STUB (postinstall runs the verifier under this interpreter,\n"
         "# never a PATH-searched python3) by delegating to the real backend.\n"
         'printf \'PY %s\\n\' "$*" >> "' + str(actions) + '"\n'
+        'if [ "$1" = "-I" ]; then shift; fi   # isolated mode: logged above\n'
+        'if [ "$1" = "-S" ]; then shift; fi   # no site.py: logged above\n'
         'if [ "$1" = "-c" ]; then exit 0; fi   # version/ensurepip checks pass\n'
         'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
         "  shift 2\n"
@@ -394,7 +412,7 @@ def test_executed_tampered_payload_aborts_before_provisioning(tmp_path: Path) ->
     assert "SIGNATURE MISMATCH" in out, "the sandbox verifier's complaint must be surfaced"
     actions = _actions(tmp_path)
     assert not any(
-        ln.startswith(("DSCL", "LAUNCHCTL", "VENV-PY", "PY -m venv", "INSTALL")) for ln in actions
+        ln.startswith(("DSCL", "LAUNCHCTL", "VENV-PY", "PY -I -S -m venv", "INSTALL")) for ln in actions
     ), f"nothing may be provisioned after a failed verification:\n{actions}"
     # interpreter-selection fix: even the verifier must not run via a
     # PATH-searched python3 (the PYTHON3 shim is a tripwire)
@@ -598,12 +616,12 @@ def test_executed_passing_verification_reaches_provisioning(tmp_path: Path) -> N
     )
     # doctor-hook fix: the venv python must be a real copy, not a symlink
     # (doctor resolves sys.executable and would escape a symlinked venv).
-    assert "PY -m venv --copies" in joined, (
+    assert "PY -I -S -m venv --copies" in joined, (
         f"venv must be created with --copies so doctor finds $PREFIX/manifest.json:\n{joined}"
     )
     # provisioning happened, in order, strictly AFTER verification passed:
-    assert "PY -m venv" in joined, f"venv creation expected:\n{joined}"
-    pip_lines = [ln for ln in actions if ln.startswith("VENV-PY -m pip")]
+    assert "PY -I -S -m venv" in joined, f"venv creation expected:\n{joined}"
+    pip_lines = [ln for ln in actions if ln.startswith("VENV-PY -I -m pip")]
     assert pip_lines, f"hashed offline pip install expected:\n{joined}"
     pip_line = pip_lines[0]
     for flag in ("--no-index", "--require-hashes", "--no-cache-dir", "--only-binary=:all:"):
@@ -614,7 +632,7 @@ def test_executed_passing_verification_reaches_provisioning(tmp_path: Path) -> N
     assert "-r" in pip_line and "runtime.lock" in pip_line, (
         f"pip must install exactly the runtime.lock resolution:\n{pip_line}"
     )
-    assert any("universal_db_mcp version" in ln for ln in actions if ln.startswith("VENV-PY")), (
+    assert any(ln.startswith("VENV-PY -I -m universal_db_mcp version") for ln in actions), (
         f"smoke check expected after the install:\n{joined}"
     )
     assert any("DSCL" in ln and "-create" in ln and "/Users/_udbmcp" in ln for ln in actions), (
@@ -629,9 +647,9 @@ def test_executed_passing_verification_reaches_provisioning(tmp_path: Path) -> N
     )
     # the verifier ran BEFORE any provisioning shim: it logs through the
     # python312-sandbox shim (the validated candidate), executing the stub.
-    first_provision = next(i for i, ln in enumerate(actions) if ln.startswith(("PY -m venv", "DSCL", "INSTALL")))
+    first_provision = next(i for i, ln in enumerate(actions) if ln.startswith(("PY -I -S -m venv", "DSCL", "INSTALL")))
     verifier_calls = [
-        i for i, ln in enumerate(actions) if ln.startswith("PY ") and "verify_bundle.py" in ln
+        i for i, ln in enumerate(actions) if ln.startswith("PY -I -S ") and "verify_bundle.py" in ln
     ]
     assert verifier_calls and verifier_calls[0] < first_provision, (
         f"verify-then-provision order broken:\n{joined}"

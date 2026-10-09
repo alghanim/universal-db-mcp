@@ -84,7 +84,8 @@ def test_federated_query_per_connection_statements_and_one_failure(server: Any) 
     assert data["merged"]["rows"] == [["crm", "N1", "north"]]
     with pytest.raises(Exception, match="either sql"):
         _call(server, "db_federated_query", {})
-    with pytest.raises(Exception, match="unknown connections"):
+    # the same error every tool gives for an id that is not configured
+    with pytest.raises(Exception, match="AUTHORIZATION_DENIED: connection 'ghost' is not available"):
         _call(server, "db_federated_query", {"sql": "SELECT 1", "connections": ["ghost"]})
 
 

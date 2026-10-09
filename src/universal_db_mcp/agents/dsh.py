@@ -26,15 +26,27 @@ Shared-core contract (``universal_db_mcp.agents.core``):
 Security posture (hard rules):
 - No secrets are ever written: the registration row contains only the venv
   python launch command, the ``UDBMCP_CONFIG`` path and ``failOnStartupError``.
-- A timestamped ``.bak`` of the patch file is written before the first
-  modification of an existing file (nothing to back up when creating it).
+- A timestamped, private ``.bak`` of the patch file is written before the
+  first modification of an existing file (nothing to back up when creating
+  it), and every write replaces the file atomically (a failed write leaves
+  it as it was).
 - ``apply(confirmed=False)`` never writes; the CLI layer owns the interactive
   y/n prompt and passes explicit confirmation through.
-- Malformed or unrecognized harness state fails closed: the existing config
-  block is reported (via :func:`plan` / :class:`ApplyResult`) and nothing is
-  written.
+- Malformed or unrecognized harness state fails closed: the reason and the
+  rows for our id are reported (via :func:`plan` / :class:`ApplyResult`),
+  never the other rows (they may hold other servers' secrets), and nothing
+  is written.
 - Re-runs are idempotent: an existing registration (matched by id, regardless
-  of its env keys) is reported as already-configured, never duplicated.
+  of its env keys) is reported as already-configured, never duplicated. The
+  exception is a registration whose launch still runs ``-m universal_db_mcp``
+  without ``-I``: the exact row an earlier release wrote for THIS install
+  (same command and config) is upgraded in place, behind the same backup and
+  confirmation, and any other such row fails closed. More than one row with
+  our id (a duplicate) also fails closed, and so does a patch file the write
+  would replace or create but may not (read-only, another user's,
+  hard-linked, with an access control list the replace would change, in a
+  read-only directory, or as root behind a user's symlink:
+  ``core.ensure_replaceable``).
 """
 
 from __future__ import annotations
@@ -49,10 +61,23 @@ from pathlib import Path
 from typing import Any
 
 from universal_db_mcp.agents.core import (
+    SERVER_ARGS,
     AgentStatus,
     Plan,
+    absolute_override,
+    atomic_write_text,
     backup_path,
+    describe_read_error,
+    ensure_replaceable,
+    isolation_advice,
+    read_config_bytes,
+    read_config_text,
+    require_isolated_import,
     resolve_harness_config_path,
+    starts_without_isolation,
+    unisolated_launches_note,
+    unreplaceable_reason,
+    write_private_backup,
 )
 
 AGENT_NAME = "dsh"
@@ -84,6 +109,13 @@ _NEW_FILE_HEADER = (
 # characters, spaces. Anything else is emitted double-quoted (JSON-compatible).
 _PLAIN_SCALAR_SAFE = re.compile(r"[A-Za-z0-9_@/.\- ]+")
 
+# The launch args (core.SERVER_ARGS: ``-I`` keeps the harness's working
+# directory off sys.path). Kept literal in the template below; a unit test
+# pins it to _registration_entry().
+_ARGS_LINE = "        args: ['-I', '-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']\n"
+# What releases before ``-I`` wrote; recognized only to upgrade that row.
+_LEGACY_ARGS_LINE = "        args: ['-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']\n"
+
 _REGISTRATION_BLOCK_TEMPLATE = (
     "# Universal Database MCP server (air-gapped local build), registered by\n"
     "# 'universal_db_mcp configure-agents'. Its 29 tools appear to the model as\n"
@@ -95,11 +127,12 @@ _REGISTRATION_BLOCK_TEMPLATE = (
     "        serverName: udb\n"
     "        transport: stdio\n"
     "        command: {command}\n"
-    "        args: ['-m', 'universal_db_mcp', 'serve', '--transport', 'stdio']\n"
-    "        env:\n"
+    + _ARGS_LINE
+    + "        env:\n"
     "          UDBMCP_CONFIG: {config_path}\n"
     "        failOnStartupError: true\n"
 )
+_ROW_START = "- insert:\n"
 
 
 @dataclass(frozen=True)
@@ -120,12 +153,18 @@ class ApplyResult:
 
 
 def _resolve_python() -> str:
-    """Absolute path to the python that runs this package (venv preferred)."""
+    """Absolute path to the python that runs this package (venv preferred).
+
+    Refused (``CONFIG_ERROR``) when that python cannot import the package in
+    the registered ``-I`` mode (e.g. a ``pip install --user``).
+    """
+    python = sys.executable
     if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
         exe = Path(sys.prefix) / ("python.exe" if sys.platform == "win32" else "bin/python")
         if exe.is_file():
-            return str(exe)
-    return sys.executable
+            python = str(exe)
+    require_isolated_import(python)
+    return python
 
 
 def _resolve_config_path() -> str:
@@ -133,11 +172,13 @@ def _resolve_config_path() -> str:
 
     Order: explicit ``$UDBMCP_CONFIG``; otherwise a config file at the root of
     this checkout (editable install), preferring a real ``config.yaml`` over
-    the bundled examples.
+    the bundled examples. A relative ``$UDBMCP_CONFIG`` is made absolute (or
+    refused when it names no file): dsh spawns the server from whichever
+    project is open.
     """
     from_env = os.environ.get("UDBMCP_CONFIG")
     if from_env:
-        return from_env
+        return absolute_override(from_env, "UDBMCP_CONFIG")
     # Editable-install dev case: a real config at the checkout root wins.
     root = Path(__file__).resolve().parents[3]
     for candidate in ("config.yaml", "config.mockdbs.yaml"):
@@ -148,7 +189,7 @@ def _resolve_config_path() -> str:
     # them right after connecting - seen live 2026-09-14), else the per-user
     # config that `configure-agents` seeds on apply. config.example.yaml is
     # no longer advertised: it is a documentation artifact, not runnable.
-    return resolve_harness_config_path({}, Path.home())
+    return resolve_harness_config_path({}, Path.home(), for_harness=True)
 
 
 def _yaml_scalar(value: str) -> str:
@@ -172,7 +213,7 @@ def _registration_entry() -> dict[str, Any]:
             "serverName": SERVER_NAME,
             "transport": "stdio",
             "command": _resolve_python(),
-            "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+            "args": list(SERVER_ARGS),
             "env": {"UDBMCP_CONFIG": _resolve_config_path()},
             "failOnStartupError": True,
         },
@@ -193,6 +234,44 @@ def _registration_block() -> str:
     )
 
 
+def _registration_rows() -> tuple[str, str]:
+    """``(legacy, current)`` registration rows, without the comment header.
+
+    ``legacy`` is byte-for-byte the row a release before ``-I`` wrote for
+    THIS install (same command and config path); the header is left out
+    because its tool count changed between releases.
+    """
+    block = _registration_block()
+    current = block[block.index(_ROW_START) :]
+    return current.replace(_ARGS_LINE, _LEGACY_ARGS_LINE), current
+
+
+def _line_ending(text: str) -> str:
+    """``text``'s line ending: CRLF when its first line ends with one, else LF."""
+    first = text.find("\n")
+    return "\r\n" if first > 0 and text[first - 1] == "\r" else "\n"
+
+
+def _count_rows(text: str, row: str) -> int:
+    """Occurrences of ``row`` starting at a line boundary in ``text``, adjacent ones included."""
+    return len(re.findall("(?m)^" + re.escape(row), text))
+
+
+def _holds_legacy_row(patch: Path) -> bool:
+    """True when ``patch`` holds exactly one pre-``-I`` row for this install.
+
+    Matched as :func:`apply` replaces it: in the raw text, with the line
+    ending of the file's first line (a row whose line endings differ, in a
+    file that mixes them, is not upgraded).
+    """
+    try:
+        text = read_config_bytes(patch).decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    legacy, _current = _registration_rows()
+    return _count_rows(text, legacy.replace("\n", _line_ending(text))) == 1
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed YAML loading (dsh configs are YAML, not JSON).
 # ---------------------------------------------------------------------------
@@ -202,27 +281,46 @@ def _load_patch(patch: Path) -> tuple[Any, str | None]:
     """Parse ``cordis.patch.yml``; return ``(data, None)`` or ``(None, reason)``.
 
     Never raises: any read/parse/shape problem becomes a reason string so the
-    caller can fail closed.
+    caller can fail closed. As root, a file a user's link leads to is not read
+    (``core.read_config_bytes``). The reason never quotes the file: the
+    patch holds other servers' rows and their tokens (a YAML error is given
+    by line and column, a decode error by line).
     """
     try:
-        text = patch.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        return None, f"unreadable (not valid UTF-8): {exc}"
-    except OSError as exc:
-        return None, f"unreadable: {exc}"
+        text = read_config_text(patch)
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"unreadable: {describe_read_error(exc)}"
     try:
         import yaml
 
         data = yaml.safe_load(text)
     except Exception as exc:  # yaml.YAMLError and any unexpected parser issue
-        return None, f"malformed YAML: {exc}"
+        from universal_db_mcp.config import describe_yaml_error
+
+        return None, f"malformed YAML: {describe_yaml_error(exc)}"
     if data is None:  # empty file: an empty patch sequence
         return [], None
     return data, None
 
 
+def _names_our_id(entries: Any) -> bool:
+    """True when an ``insert`` value, list or single mapping, holds our id."""
+    items = entries if isinstance(entries, list) else [entries]
+    return any(isinstance(e, dict) and e.get("id") == REGISTRATION_ID for e in items)
+
+
+class _UnparsedMerge(ValueError):
+    """The merged patch file did not parse; the message describes why
+    without quoting it."""
+
+
 def _scan_rows(data: Any) -> tuple[bool, bool, str | None]:
-    """Scan patch rows. Returns ``(registered, broken_override, reason)``."""
+    """Scan patch rows. Returns ``(registered, broken, reason)``.
+
+    ``broken`` marks a row a clean insert must not be added beside: an
+    override-form row for our id, or an ``insert`` block that is not a list
+    of mappings yet names our id (dsh may read it as a registration too).
+    """
     if not isinstance(data, list):
         return False, False, f"expected a YAML sequence at top level, found {type(data).__name__}"
     registered = False
@@ -230,12 +328,20 @@ def _scan_rows(data: Any) -> tuple[bool, bool, str | None]:
     reason: str | None = None
     for index, row in enumerate(data):
         if not isinstance(row, dict):
-            reason = f"row {index} is not a mapping"
+            if not broken:
+                reason = f"row {index} is not a mapping"
             continue
         if "insert" in row:
             entries = row["insert"]
             if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
-                reason = f"row {index} has a malformed 'insert' block"
+                if _names_our_id(entries):
+                    broken = True
+                    reason = (
+                        f"row {index} has an 'insert' block that is not a list of mappings but names id "
+                        f"{REGISTRATION_ID!r}; rewrite it as a list ('- insert:' then '    - id: ...') or remove it"
+                    )
+                elif not broken:
+                    reason = f"row {index} has a malformed 'insert' block"
                 continue
             if any(e.get("id") == REGISTRATION_ID for e in entries):
                 registered = True
@@ -251,6 +357,93 @@ def _scan_rows(data: Any) -> tuple[bool, bool, str | None]:
     return registered, broken, reason
 
 
+def _starts_without_isolation(entry: dict[str, Any]) -> bool:
+    """True when ``entry`` launches ``-m universal_db_mcp`` without a preceding ``-I``.
+
+    Such a server runs with the harness's working directory first on
+    ``sys.path`` (see ``core.SERVER_ARGS``).
+    """
+    config = entry.get("config")
+    if not isinstance(config, dict):
+        return False
+    return starts_without_isolation(config.get("args"), config.get("command"))
+
+
+def _own_rows(patch: Path) -> str:
+    """What a fail-closed plan shows of ``patch``: its rows for our id, as
+    YAML, and never the other rows (they may hold other servers' secrets);
+    only the reason when it cannot be read or parsed."""
+    data, reason = _load_patch(patch)
+    if reason is not None or not isinstance(data, list):
+        return f"(its contents are not shown: {reason or 'not a YAML sequence'})"
+    import yaml
+
+    rows: list[Any] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        entries = row.get("insert")
+        if isinstance(entries, list):
+            ours = [e for e in entries if isinstance(e, dict) and e.get("id") == REGISTRATION_ID]
+            rows += [{"insert": ours}] if ours else []
+        elif row.get("id") == REGISTRATION_ID or ("insert" in row and _names_our_id(entries)):
+            rows.append(row)
+    if not rows:
+        return f"(no row for id {REGISTRATION_ID!r}; the other rows are not shown)"
+    return f"its rows for id {REGISTRATION_ID!r} (the other rows are not shown):\n" + yaml.safe_dump(
+        rows, sort_keys=False, default_flow_style=False
+    )
+
+
+def _registrations(data: Any) -> list[dict[str, Any]]:
+    """Every insert entry with our id (more than one is a duplicate registration)."""
+    if not isinstance(data, list):
+        return []
+    return [
+        entry
+        for row in data
+        if isinstance(row, dict) and isinstance(row.get("insert"), list)
+        for entry in row["insert"]
+        if isinstance(entry, dict) and entry.get("id") == REGISTRATION_ID
+    ]
+
+
+def registered_config_path(env_home: Path) -> str | None:
+    """The ``UDBMCP_CONFIG`` the registration row in ``env_home``'s patch file
+    names, or None (no single readable row naming one). dsh counts a row with
+    our id as configured whatever config it names, so a registration made with
+    ``UDBMCP_CONFIG`` set elsewhere still names that config later."""
+    data, reason = _load_patch(env_home / PATCH_FILENAME)
+    rows = _registrations(data) if reason is None else []
+    if len(rows) != 1:
+        return None
+    config = rows[0].get("config")
+    env = config.get("env") if isinstance(config, dict) else None
+    named = env.get("UDBMCP_CONFIG") if isinstance(env, dict) else None
+    return named if isinstance(named, str) and named else None
+
+
+def _unisolated_registrations(data: Any) -> int:
+    """Insert entries with our id whose launch lacks ``-I``."""
+    return sum(1 for entry in _registrations(data) if _starts_without_isolation(entry))
+
+
+def _other_unisolated_note(patch: Path) -> str:
+    """``core.unisolated_launches_note`` for insert entries with another id that
+    start this package without ``-I`` (this tool never edits those rows)."""
+    data, reason = _load_patch(patch)
+    if reason is not None or not isinstance(data, list):
+        return ""
+    names = [
+        f"the row with id {entry.get('id')!r}"
+        for row in data
+        if isinstance(row, dict) and isinstance(row.get("insert"), list)
+        for entry in row["insert"]
+        if isinstance(entry, dict) and entry.get("id") != REGISTRATION_ID and _starts_without_isolation(entry)
+    ]
+    return unisolated_launches_note(patch, names)
+
+
 def _looks_like_dsh(env_home: Path) -> bool:
     try:
         return any((env_home / marker).exists() for marker in DSH_HOME_MARKERS)
@@ -262,35 +455,8 @@ def _dsh_cli_on_path() -> bool:
     return shutil.which("dsh") is not None
 
 
-def _unknown_reason(patch: Path) -> str:
-    """Best-effort human reason for an unknown-state fail-closed verdict."""
-    data, reason = _load_patch(patch)
-    if reason is not None:
-        return reason
-    _, _, row_reason = _scan_rows(data)
-    return row_reason or "unrecognized dsh state"
-
-
-# ---------------------------------------------------------------------------
-# Public adapter API.
-# ---------------------------------------------------------------------------
-
-
-def detect(env_home: Path) -> Any:
-    """Classify the dsh installation under ``env_home`` (typically ``~/.dsh``)."""
-    patch = env_home / PATCH_FILENAME
-    if patch.exists():
-        data, reason = _load_patch(patch)
-        if reason is not None:
-            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-        if not isinstance(data, list):
-            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-        registered, broken, _ = _scan_rows(data)
-        if broken:
-            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-        if registered:
-            return AgentStatus.CONFIGURED
-        return AgentStatus.INSTALLED_UNCONFIGURED
+def _home_status(env_home: Path) -> AgentStatus:
+    """:func:`detect` for a dsh home without a patch file, before the create check."""
     if not env_home.is_dir():
         return AgentStatus.NOT_INSTALLED
     if _looks_like_dsh(env_home):
@@ -308,6 +474,87 @@ def detect(env_home: Path) -> Any:
     return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
 
 
+def _create_refusal(env_home: Path, patch: Path) -> str | None:
+    """Why the missing ``patch`` of a usable dsh home may not be created (a
+    read-only home, or as root a planted link: ``core.ensure_replaceable``);
+    None when it may, or when the home itself is not usable."""
+    if _home_status(env_home) is not AgentStatus.INSTALLED_UNCONFIGURED:
+        return None
+    return unreplaceable_reason(patch)
+
+
+def _unknown_reason(patch: Path) -> str:
+    """Best-effort human reason for an unknown-state fail-closed verdict."""
+    data, reason = _load_patch(patch)
+    if reason is not None:
+        return reason
+    _, broken, row_reason = _scan_rows(data)
+    rows = len(_registrations(data))
+    unisolated = _unisolated_registrations(data)
+    if not broken and rows > 1:
+        lacking = f", {unisolated} of them starting the server without -I (isolated mode)" if unisolated else ""
+        return (
+            f"{rows} rows insert id {REGISTRATION_ID!r}{lacking}; remove the duplicate rows, keeping one "
+            "whose args start with '-I'"
+        )
+    if not broken and unisolated and not (unisolated == 1 and _holds_legacy_row(patch)):
+        row = next(entry for entry in _registrations(data) if _starts_without_isolation(entry))
+        config = row["config"]
+        return (
+            f"a row with id {REGISTRATION_ID!r} starts the server without -I (isolated mode) and is not "
+            "an unedited row an earlier release wrote for this interpreter and config, so it is not "
+            f"upgraded automatically; {isolation_advice(config.get('args'), config.get('command'))}"
+        )
+    refused = unreplaceable_reason(patch) if isinstance(data, list) and not broken else None
+    return refused or row_reason or "unrecognized dsh state"
+
+
+# ---------------------------------------------------------------------------
+# Public adapter API.
+# ---------------------------------------------------------------------------
+
+
+def detect(env_home: Path) -> Any:
+    """Classify the dsh installation under ``env_home`` (typically ``~/.dsh``).
+
+    Once dsh is there, the registration is resolved first, as every adapter
+    does: an override that cannot be registered (a relative ``UDBMCP_CONFIG``
+    naming no file) is refused here (``CONFIG_ERROR``), before a write is
+    offered.
+    """
+    patch = env_home / PATCH_FILENAME
+    if not patch.exists() and _home_status(env_home) is AgentStatus.NOT_INSTALLED:
+        return AgentStatus.NOT_INSTALLED
+    _registration_entry()
+    if patch.exists():
+        data, reason = _load_patch(patch)
+        if reason is not None:
+            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+        if not isinstance(data, list):
+            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+        registered, broken, _ = _scan_rows(data)
+        if broken:
+            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+        if len(_registrations(data)) > 1:
+            # Duplicate rows (the legacy one beside the current one, too):
+            # an upgrade would leave two current rows.
+            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+        unisolated = _unisolated_registrations(data)
+        upgradeable = unisolated == 1 and _holds_legacy_row(patch)
+        if unisolated and not upgradeable:
+            # Any other row still launching without -I is never "configured".
+            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+        if registered and not upgradeable:
+            return AgentStatus.CONFIGURED
+        if unreplaceable_reason(patch) is not None:
+            return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED  # the write would replace a file it may not
+        return AgentStatus.INSTALLED_UNCONFIGURED  # the upgrade, or a new row
+    status = _home_status(env_home)
+    if status is AgentStatus.INSTALLED_UNCONFIGURED and unreplaceable_reason(patch) is not None:
+        return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED  # the create may not happen
+    return status
+
+
 def plan(env_home: Path) -> Plan:
     """Describe exactly what :func:`apply` would change, without changing it."""
     patch = env_home / PATCH_FILENAME
@@ -320,23 +567,20 @@ def plan(env_home: Path) -> Plan:
             summary=(
                 f"action=none: already configured; {patch} contains an insert row with "
                 f"id {REGISTRATION_ID!r}; nothing to do"
-            ),
+            )
+            + _other_unisolated_note(patch),
             config_block="",
         )
     if status == AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
+        refused = None if patch.exists() else _create_refusal(env_home, patch)
         if patch.exists():
             reason = _unknown_reason(patch)
-            try:
-                existing = patch.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                # The fail-closed report itself must never raise (e.g. the
-                # patch path is a directory); report the reason without the
-                # config-block dump instead.
-                existing = "<existing config could not be read for display>"
             summary = (
                 f"action=none (FAIL CLOSED): not modifying {patch} ({reason}). "
-                "Manual review required; existing config block:\n" + existing
+                "Manual review required; " + _own_rows(patch)
             )
+        elif refused is not None:
+            summary = f"action=none (FAIL CLOSED): not creating {patch} ({refused})."
         else:
             summary = (
                 f"action=none (FAIL CLOSED): {env_home} exists but is not a recognizable dsh "
@@ -365,7 +609,14 @@ def plan(env_home: Path) -> Plan:
     exists = patch.exists()
     block = _registration_block()
     size = len(block.encode("utf-8"))
-    if exists:
+    if exists and _holds_legacy_row(patch):
+        action = "upgrade-registration"
+        summary = (
+            f"action={action}: would replace the args line of this tool's earlier registration "
+            f"row in {patch} (after a timestamped {patch.name}.bak.<UTC stamp> backup) so the "
+            "server starts in isolated mode (-I); all other bytes preserved untouched."
+        )
+    elif exists:
         action = "append-registration"
         summary = (
             f"action={action}: would append {size} bytes to {patch} (after a timestamped "
@@ -378,7 +629,7 @@ def plan(env_home: Path) -> Plan:
         agent=AGENT_NAME,
         config_path=patch,
         status=status,
-        summary=summary + "\n" + block,
+        summary=summary + _other_unisolated_note(patch) + "\n" + block,
         config_block=block,
         entry=_registration_entry(),
     )
@@ -390,8 +641,8 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
     Refuses unconfirmed calls (the CLI layer owns the interactive y/n). Creates
     a timestamped ``.bak`` before modifying an existing patch file, preserves
     all pre-existing rows, verifies the merged document still parses BEFORE
-    writing (fail closed without touching the file on any inconsistency), and
-    is idempotent.
+    writing (fail closed without touching the file on any inconsistency),
+    replaces the file atomically, and is idempotent.
     """
     import yaml
 
@@ -413,7 +664,10 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
             f"already configured: {patch} contains id {REGISTRATION_ID!r}; nothing written",
         )
     if status_before == AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
-        detail = _unknown_reason(patch) if patch.exists() else "unrecognized dsh home"
+        if patch.exists():
+            detail = _unknown_reason(patch)
+        else:
+            detail = _create_refusal(env_home, patch) or "unrecognized dsh home"
         return ApplyResult(
             AGENT_NAME, status_before, status_before, False, None,
             f"FAIL CLOSED: {detail}; {patch} left untouched",
@@ -423,47 +677,93 @@ def apply(env_home: Path, confirmed: bool) -> ApplyResult:
     backup: Path | None = None
     if patch.exists():
         try:
-            original = patch.read_text(encoding="utf-8")
+            # Not read_config_text: universal newlines would write every CRLF back as LF.
+            original = read_config_bytes(patch).decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             # TOCTOU guard: the file changed/unreadable between detect() and
             # here. Fail closed; nothing has been written or backed up yet.
             return ApplyResult(
                 AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
                 False, None,
-                f"FAIL CLOSED: could not read {patch} ({exc}); nothing written",
+                f"FAIL CLOSED: could not read {patch} ({describe_read_error(exc)}); nothing written",
+            )
+        try:
+            ensure_replaceable(patch)  # refused before the backup, so none is left behind
+        except OSError as exc:
+            return ApplyResult(
+                AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
+                False, None,
+                f"FAIL CLOSED: writing {patch} failed ({exc}); {patch} left as it was",
             )
         backup = backup_path(patch)
-        backup.write_text(original, encoding="utf-8")
-        payload = original if (not original or original.endswith("\n")) else original + "\n"
-        payload += block
+        try:
+            write_private_backup(patch, backup)
+        except OSError as exc:
+            return ApplyResult(
+                AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
+                False, None,
+                f"FAIL CLOSED: could not back up {patch} to {backup} ({exc}); nothing written",
+            )
+        # Our rows follow the file's line endings, so every other byte stays as it was.
+        newline = _line_ending(original)
+        legacy, current = (row.replace("\n", newline) for row in _registration_rows())
+        if _count_rows(original, legacy) == 1:
+            # Upgrade this tool's own pre-``-I`` row in place (see detect()).
+            verb = "upgraded registration row (-I) in"
+            payload = ("\n" + original).replace("\n" + legacy, "\n" + current, 1)[1:]
+        else:
+            verb = "appended registration row to"
+            payload = original if (not original or original.endswith("\n")) else original + newline
+            payload += block.replace("\n", newline)
     else:
+        verb = "created"
         payload = _NEW_FILE_HEADER + block
 
     # Verification gate: the merged document must parse as a sequence that now
     # contains our registration. Otherwise roll back and fail closed.
     try:
-        merged = yaml.safe_load(payload)
-        registered, _, _ = _scan_rows(merged)
+        try:
+            merged = yaml.safe_load(payload)
+        except Exception as exc:  # noqa: BLE001 - described, never quoted (the payload holds the other rows)
+            from universal_db_mcp.config import describe_yaml_error
+
+            raise _UnparsedMerge(describe_yaml_error(exc)) from None
+        registered, broken, row_reason = _scan_rows(merged)
+        if broken:
+            raise ValueError(row_reason)
         if not isinstance(merged, list) or not registered:
             raise ValueError("merged patch file does not contain the registration row")
+        if len(_registrations(merged)) > 1:
+            raise ValueError(f"the merged patch file holds more than one row with id {REGISTRATION_ID!r}")
+        if _unisolated_registrations(merged):
+            raise ValueError("a registration row in the merged patch file still starts the server without -I")
     except Exception as exc:
         # Verification runs BEFORE the write, so patch still holds the
-        # original bytes; nothing to roll back, just fail closed.
+        # original bytes; nothing to roll back, just fail closed. A parse
+        # error is described, never quoted (the payload holds the other rows).
+        why = str(exc)  # _UnparsedMerge carries a content-free description; the rest are this module's own
         return ApplyResult(
             AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED, False, backup,
-            f"FAIL CLOSED: merged patch failed verification ({exc}); original content restored",
+            f"FAIL CLOSED: merged patch failed verification ({why}); original content restored",
         )
 
-    patch.write_text(payload, encoding="utf-8")
+    try:
+        # Found absent: only ever created, so one that appeared meanwhile fails closed.
+        atomic_write_text(patch, payload, create=backup is None)
+    except OSError as exc:
+        return ApplyResult(
+            AGENT_NAME, status_before, AgentStatus.UNKNOWN_STATE_FAIL_CLOSED, False, backup,
+            f"FAIL CLOSED: writing {patch} failed ({exc}); {patch} left as it was"
+            + (f" (backup: {backup})" if backup is not None else ""),
+        )
     status_after = detect(env_home)
     if status_after != AgentStatus.CONFIGURED:  # defensive: should not happen
         return ApplyResult(
             AGENT_NAME, status_before, status_after, True, backup,
             f"wrote {patch} but post-write verification is inconclusive; re-run detect",
         )
-    verb = "appended registration row to" if backup is not None else "created"
     bak_note = f" (backup: {backup})" if backup is not None else ""
     return ApplyResult(
         AGENT_NAME, status_before, status_after, True, backup,
-        f"{verb} {patch}{bak_note}",
+        f"{verb} {patch}{bak_note}" + _other_unisolated_note(patch),
     )

@@ -11,7 +11,7 @@ and non-secret env only)::
       "mcpServers": {
         "universal-db": {
           "command": "<venv>/bin/python",
-          "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+          "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
           "env": {"UDBMCP_CONFIG": "<config path>"}
         }
       }
@@ -23,10 +23,18 @@ Fail-closed rules implemented here:
   a JSON object yields ``AgentStatus.UNKNOWN_STATE_FAIL_CLOSED`` and the
   adapter refuses to write. A valid file that already holds a
   differently-shaped "universal-db" registration is user-managed state and
-  also fails closed (reported as a conflicting entry, never overwritten).
+  also fails closed (reported as a conflicting entry, never overwritten). The
+  one exception is this tool's own pre-``-I`` registration (identical except
+  for the launch args), which is upgraded like a fresh write.
+- A config the write would replace or create but may not (read-only,
+  another user's, hard-linked, with an access control list the replace would
+  change, in a read-only directory, or as root behind a user's symlink:
+  ``core.ensure_replaceable``) fails closed at detection too.
 - ``apply`` only writes when ``confirmed=True`` (the CLI layer owns the
   interactive y/n prompt and the ``--yes`` / ``--dry-run`` flags).
-- Every first write is preceded by a timestamped ``.bak`` copy of the target.
+- Every first write is preceded by a timestamped, private ``.bak`` copy of
+  the target, and the write replaces the file atomically (a failed write
+  leaves it as it was).
 - Re-runs are idempotent: an existing equivalent registration is never
   duplicated or rewritten.
 """
@@ -34,18 +42,31 @@ Fail-closed rules implemented here:
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from .core import (
+    SERVER_ARGS,
     AgentStatus,
     Plan,
+    absolute_interpreter,
+    atomic_write_text,
     backup_path,
+    ensure_directory,
+    ensure_replaceable,
+    fail_closed_block,
+    holds_legacy_entry,
+    is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
+    other_unisolated_note,
+    require_isolated_import,
     resolve_harness_config_path,
+    unisolated_entry_note,
+    unreplaceable_reason,
+    write_private_backup,
 )
 
 AGENT_NAME = "cursor"
@@ -69,13 +90,17 @@ def config_path(home: Path) -> Path:
 def _venv_python(env: Mapping[str, str]) -> str:
     """Interpreter that will be written into the launch command.
 
-    Prefers an explicit ``UDBMCP_VENV_PYTHON`` override; otherwise uses the
-    interpreter running this CLI, which is the venv python whenever the
-    package was installed into a virtual environment.
+    Prefers an explicit ``UDBMCP_VENV_PYTHON`` override (made absolute: a
+    path is anchored at the working directory, a bare name looked up on PATH;
+    one naming no file is refused); otherwise uses the interpreter running
+    this CLI, which is the venv python whenever the package was installed into
+    a virtual environment (refused when it cannot import the package under
+    ``-I``, as with a user-site install).
     """
     override = env.get(VENV_PYTHON_ENV, "").strip()
     if override:
-        return override
+        return absolute_interpreter(override, VENV_PYTHON_ENV, env)
+    require_isolated_import(sys.executable)
     return sys.executable
 
 
@@ -89,7 +114,7 @@ def _udbmcp_config_path(env: Mapping[str, str], home: Path) -> str:
     2026-09-14); the resolver falls back to the per-user config, which
     ``configure-agents`` seeds on apply.
     """
-    return resolve_harness_config_path(env, home)
+    return resolve_harness_config_path(env, home, strict=True, for_harness=True)
 
 
 def registration_entry(env: Mapping[str, str], home: Path) -> dict[str, Any]:
@@ -100,7 +125,7 @@ def registration_entry(env: Mapping[str, str], home: Path) -> dict[str, Any]:
     """
     return {
         "command": _venv_python(env),
-        "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+        "args": list(SERVER_ARGS),
         "env": {UDBMCP_CONFIG_ENV: _udbmcp_config_path(env, home)},
     }
 
@@ -119,14 +144,28 @@ def detect(env: Mapping[str, str], home: Path) -> AgentStatus:
     - ``configured``: ``mcp.json`` parses, has ``mcpServers``, and contains an
       entry for this server.
     - ``installed_unconfigured``: ``mcp.json`` absent, or parses and lacks our
-      entry (it may hold other servers; those are preserved on apply).
+      entry (it may hold other servers; those are preserved on apply), or
+      holds the pre-``-I`` registration (upgraded on apply).
     - ``unknown_state_fail_closed``: ``mcp.json`` exists but is unreadable or
-      is not a JSON object / ``mcpServers`` is not an object.
+      is not a JSON object / ``mcpServers`` is not an object, or it would be
+      written but may not be replaced (read-only, another user's,
+      hard-linked: ``core.ensure_replaceable``).
     """
+    status = _config_status(env, home)
+    if status is AgentStatus.INSTALLED_UNCONFIGURED and unreplaceable_reason(config_path(home)) is not None:
+        return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+    return status
+
+
+def _config_status(env: Mapping[str, str], home: Path) -> AgentStatus:
+    """:func:`detect` from the config's content alone (no replace check)."""
     cursor_dir = home / CONFIG_DIR_NAME
     if not cursor_dir.is_dir():
         return AgentStatus.NOT_INSTALLED
 
+    # Resolved up front: an override that cannot be registered (a relative
+    # path naming no file) is refused at detection, before any write is offered.
+    entry = registration_entry(env, home)
     target = config_path(home)
     if not target.exists():
         return AgentStatus.INSTALLED_UNCONFIGURED
@@ -141,7 +180,9 @@ def detect(env: Mapping[str, str], home: Path) -> AgentStatus:
     if not isinstance(servers, dict):
         return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
 
-    if SERVER_KEY in servers and not _entries_equal(servers[SERVER_KEY], registration_entry(env, home)):
+    if SERVER_KEY in servers and is_legacy_entry(servers[SERVER_KEY], entry):
+        return AgentStatus.INSTALLED_UNCONFIGURED
+    if SERVER_KEY in servers and not _entries_equal(servers[SERVER_KEY], entry):
         # A differently-shaped registration for our server key: treat the
         # file as user-managed state we must not silently rewrite.
         return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
@@ -169,30 +210,34 @@ def _has_conflicting_registration(
     servers = data.get(MCP_SERVERS_KEY)
     if not isinstance(servers, dict):
         return False
-    return SERVER_KEY in servers and not _entries_equal(
-        servers[SERVER_KEY], registration_entry(env, home)
-    )
+    entry = registration_entry(env, home)
+    existing = servers.get(SERVER_KEY)
+    return SERVER_KEY in servers and not (_entries_equal(existing, entry) or is_legacy_entry(existing, entry))
 
 
 def plan(env: Mapping[str, str], home: Path) -> Plan:
     """Describe exactly what would be added to ``~/.cursor/mcp.json``."""
     target = config_path(home)
     status = detect(env, home)
+    if status is AgentStatus.NOT_INSTALLED:
+        # Nothing would be registered, so nothing is resolved: an override
+        # that cannot be registered must not turn "not installed" into an error.
+        return Plan(
+            agent=AGENT_NAME,
+            config_path=target,
+            status=status,
+            summary=f"{AGENT_NAME}: not installed ({home / CONFIG_DIR_NAME} does not exist); nothing would be written",
+        )
     entry = registration_entry(env, home)
 
-    if status is AgentStatus.NOT_INSTALLED:
-        summary = (
-            f"{AGENT_NAME}: not installed ({home / CONFIG_DIR_NAME} does not "
-            "exist); nothing would be written"
-        )
-        block = ""
-    elif status is AgentStatus.CONFIGURED:
+    if status is AgentStatus.CONFIGURED:
         summary = (
             f"{AGENT_NAME}: already configured in {target} under "
             f'"{MCP_SERVERS_KEY}"["{SERVER_KEY}"]; no changes needed'
         )
         block = ""
     elif status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
+        refused = unreplaceable_reason(target)
         if _has_conflicting_registration(target, env, home):
             summary = (
                 f'{AGENT_NAME}: {target} already contains a "{SERVER_KEY}" '
@@ -200,15 +245,24 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
                 "what this tool would write; refusing to overwrite "
                 "user-managed state (edit or remove that entry manually, "
                 "then re-run)"
-            )
+            ) + unisolated_entry_note(target, MCP_SERVERS_KEY, SERVER_KEY)
+        elif refused is not None and _config_status(env, home) is AgentStatus.INSTALLED_UNCONFIGURED:
+            summary = f"{AGENT_NAME}: refusing to write: {refused}"
         else:
             summary = (
-                f"{AGENT_NAME}: {target} is missing, unreadable, or malformed; "
+                f"{AGENT_NAME}: {target} is missing, unreadable, or malformed{load_problem_note(target)}; "
                 "refusing to write (fix or remove the file, then re-run)"
             )
-        block = _fail_closed_block(target)
+        block = _fail_closed_block(target, entry)
     else:
-        if target.exists():
+        if holds_legacy_entry(target, MCP_SERVERS_KEY, SERVER_KEY, entry):
+            summary = (
+                f"{AGENT_NAME}: would back up {target} to a timestamped .bak, "
+                f'then replace this tool\'s earlier "{SERVER_KEY}" registration '
+                "with one that starts the server in isolated mode (-I) (other "
+                "entries preserved)"
+            )
+        elif target.exists():
             summary = (
                 f'{AGENT_NAME}: would back up {target} to a timestamped .bak, '
                 f'then add "{SERVER_KEY}" under "{MCP_SERVERS_KEY}" (other '
@@ -225,19 +279,31 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
         agent=AGENT_NAME,
         config_path=target,
         status=status,
-        summary=summary,
+        summary=summary + other_unisolated_note(target, MCP_SERVERS_KEY, SERVER_KEY),
         config_block=block,
         entry=entry,
     )
 
 
-def _fail_closed_block(target: Path) -> str:
-    """Render the offending file's current bytes for operator inspection."""
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"# {target} could not be read: {exc}"
-    return f"# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: dict[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, MCP_SERVERS_KEY, SERVER_KEY, entry)
+
+
+def _write_failed(step: str, target: Path, entry: dict[str, Any], exc: OSError, backup: Path | None) -> Plan:
+    """Fail-closed result for a backup or write (``step``) that raised
+    (target unchanged)."""
+    note = f"; backup: {backup}" if backup is not None else ""
+    return Plan(
+        agent=AGENT_NAME,
+        config_path=target,
+        status=AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
+        backup_paths=(backup,) if backup is not None else (),
+        summary=f"{AGENT_NAME}: {step} failed ({exc}); {target} was left as it was{note}",
+        config_block=_fail_closed_block(target, entry),
+        entry=entry,
+    )
 
 
 def apply(env: Mapping[str, str], home: Path, confirmed: bool) -> Plan:
@@ -273,6 +339,7 @@ def apply(env: Mapping[str, str], home: Path, confirmed: bool) -> Plan:
 
     entry = registration_entry(env, home)
 
+    backup: Path | None = None
     if target.exists():
         data, error = load_json_or_fail_closed(target)
         if data is None:
@@ -287,27 +354,41 @@ def apply(env: Mapping[str, str], home: Path, confirmed: bool) -> Plan:
             return plan(env, home)
         if SERVER_KEY in servers and _entries_equal(servers[SERVER_KEY], entry):
             return plan(env, home)  # idempotent no-op
+        if SERVER_KEY in servers and not is_legacy_entry(servers[SERVER_KEY], entry):
+            return plan(env, home)  # a differing entry appeared since detect(): never overwrite
+        try:
+            ensure_replaceable(target)  # refused before the backup, so none is left behind
+        except OSError as exc:
+            return _write_failed(f"writing {target}", target, entry, exc, None)
         backup = backup_path(target)
-        shutil.copy2(target, backup)
+        try:
+            write_private_backup(target, backup)
+        except OSError as exc:
+            return _write_failed(f"backing up {target} to {backup}", target, entry, exc, None)
         servers[SERVER_KEY] = entry
         data[MCP_SERVERS_KEY] = servers
         payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
-        target.write_text(payload, encoding="utf-8")
         summary = (
             f"{AGENT_NAME}: added \"{SERVER_KEY}\" to {target} "
             f"(backup: {backup})"
         )
     else:
-        target.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps({MCP_SERVERS_KEY: {SERVER_KEY: entry}}, indent=2, sort_keys=True) + "\n"
-        target.write_text(payload, encoding="utf-8")
         summary = f"{AGENT_NAME}: created {target} with \"{SERVER_KEY}\""
+
+    try:
+        ensure_directory(target.parent)
+        # Found absent: only ever created, so one that appeared meanwhile fails closed.
+        atomic_write_text(target, payload, create=backup is None)
+    except OSError as exc:
+        return _write_failed(f"writing {target}", target, entry, exc, backup)
 
     return Plan(
         agent=AGENT_NAME,
         config_path=target,
         status=AgentStatus.CONFIGURED,
-        summary=summary,
+        backup_paths=(backup,) if backup is not None else (),
+        summary=summary + other_unisolated_note(target, MCP_SERVERS_KEY, SERVER_KEY),
         config_block=json.dumps({MCP_SERVERS_KEY: {SERVER_KEY: entry}}, indent=2, sort_keys=True),
         entry=entry,
     )

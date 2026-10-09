@@ -55,10 +55,23 @@ BUILD_MSI = REPO_ROOT / "scripts" / "package" / "build_msi.sh"
 WXS = REPO_ROOT / "packaging" / "msi" / "udbmcp.wxs"
 WIX_NS = "http://wixtoolset.org/schemas/v4/wxs"
 
-# A PATH with the bare minimum for bash to run the script, but guaranteed to
-# contain neither `dotnet` nor `wix` (macOS base installs ship neither, and
-# the user-local toolchain lives in ~/.dotnet* which is NOT listed here).
-SCRUBBED_PATH = "/usr/bin:/bin"
+# The tools a staging host's PATH gives the script, minus the two the gate
+# looks for. /usr/bin:/bin alone is not enough: a host may install dotnet there
+# (GitHub's ubuntu-24.04 runner links /usr/bin/dotnet), so the PATH is a
+# directory of links to every other tool in them.
+GATED_TOOLS = frozenset({"dotnet", "wix"})
+
+
+def _scrubbed_path(root: Path) -> str:
+    scrubbed = root / "scrubbed-bin"
+    if not scrubbed.is_dir():
+        scrubbed.mkdir()
+        for directory in (Path("/usr/bin"), Path("/bin")):
+            for tool in directory.iterdir():
+                link = scrubbed / tool.name
+                if tool.name not in GATED_TOOLS and not link.exists() and not link.is_symlink():
+                    link.symlink_to(tool)
+    return str(scrubbed)
 
 
 # --------------------------------------------------------------------------
@@ -108,13 +121,14 @@ def _write_stub(stub_dir: Path, name: str) -> None:
 
 
 def _run_build(bundle: Path, pubkey: Path, out_dir: Path, stub: str | None = None):
-    env = {**os.environ, "PATH": SCRUBBED_PATH}
+    scrubbed_path = _scrubbed_path(out_dir.parent)
+    env = {**os.environ, "PATH": scrubbed_path}
     if stub is not None:
         # one dedicated stub dir per case: a shared dir would let one case's
         # stub satisfy the OTHER prerequisite of a later case
         stub_dir = out_dir.parent / f"stubbin-{stub}"
         _write_stub(stub_dir, stub)
-        env["PATH"] = f"{stub_dir}{os.pathsep}{SCRUBBED_PATH}"
+        env["PATH"] = f"{stub_dir}{os.pathsep}{scrubbed_path}"
     return subprocess.run(  # noqa: S603 - fixed args, tmp_path sandbox
         ["/bin/bash", str(BUILD_MSI), str(bundle), "--pubkey", str(pubkey), "--out", str(out_dir)],
         capture_output=True,
@@ -248,14 +262,25 @@ def test_wxs_uses_launch_not_launchcondition() -> None:
     assert not _iter_local(root, "LaunchCondition"), (
         "LaunchCondition is a WiX v3 element (WIX0005); use <Launch>"
     )
-    launches = _iter_local(root, "Launch")
-    assert len(launches) == 1, "exactly one Launch prerequisite is expected"
+    launches = [el for el in _iter_local(root, "Launch") if "CPYTHON312" in (el.get("Condition") or "")]
+    assert len(launches) == 1, "exactly one Launch holds the CPython prerequisite"
     launch = launches[0]
     assert launch.get("Condition") == "Installed OR CPYTHON312", (
         "the Launch condition must keep the Installed-OR short circuit so "
         "uninstall/repair work even if Python was later removed"
     )
-    assert launch.get("Message"), "the Launch refusal must carry a remediation message"
+    # the others refuse a UDBMCP_ALLOW_DOWNGRADE value other than 1, either
+    # property from anyone but an administrator, and an account value that
+    # would break out of its quotes on the custom actions' command lines
+    others = [el.get("Condition") for el in _iter_local(root, "Launch") if el is not launch]
+    assert others == [
+        'NOT UDBMCP_ALLOW_DOWNGRADE OR UDBMCP_ALLOW_DOWNGRADE="1"',
+        "AdminUser OR NOT (UDBMCP_SERVICE_ACCOUNT OR UDBMCP_ALLOW_DOWNGRADE)",
+        'NOT (UDBMCP_SERVICE_ACCOUNT >< UdbmcpQuoteChar OR UDBMCP_SERVICE_ACCOUNT >> "\\")',
+        "NOT (INSTALLFOLDER >< \"'\")",
+    ], others
+    for el in _iter_local(root, "Launch"):
+        assert el.get("Message"), "a Launch refusal must carry a remediation message"
 
 
 def test_wxs_uses_common_app_data_standard_directory() -> None:

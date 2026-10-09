@@ -212,3 +212,31 @@ def test_db2_explain_without_tables_says_what_the_dba_must_run(tmp_path: Path, m
     with pytest.raises(NotImplementedError, match="SYSINSTALLOBJECTS"):
         conn.explain("SELECT 1 FROM SYSIBM.SYSDUMMY1", False)
     assert not any(s.startswith("EXPLAIN PLAN") for s in fake.log), "nothing is written without explain tables"
+
+
+# ------------------------------------------------------------ EXPLAIN ANALYZE
+_ANALYZE_REFUSAL = "db_explain never executes the statement; EXPLAIN ANALYZE is not supported"
+
+
+@pytest.mark.parametrize("engine", ["postgres", "mysql", "clickhouse", "oracle", "mssql", "db2", "sqlite"])
+def test_explain_analyze_is_refused_for_what_db_explain_is_not_for_policy(
+    engine: str, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Wave-3 review (I03): the refusal read 'EXPLAIN ANALYZE is
+    policy-disabled', also where security.allow_explain_analyze is on. No
+    policy enables it: db_explain captures plans without executing. The
+    exception type stays NotImplementedError (CAPABILITY_UNSUPPORTED), and
+    nothing is dialed."""
+    if engine == "sqlite":
+        body = {"type": "sqlite", "database": str(tmp_path / "x.db")}
+        r = ResolvedConnection("c", ConnectionConfig.model_validate(body))
+        conn = registry.build_connector(r, EffectivePolicy.build(SecurityConfig(), r))
+    else:
+        conn = _connector(engine, tmp_path)
+    monkeypatch.setattr(conn, "_connect", lambda: pytest.fail("EXPLAIN ANALYZE dialed the server"), raising=False)
+    monkeypatch.setattr(conn, "_open", lambda: pytest.fail("EXPLAIN ANALYZE opened the database"), raising=False)
+    with pytest.raises(NotImplementedError) as info:
+        conn.explain("SELECT 1", True)
+    assert str(info.value) == _ANALYZE_REFUSAL
+    for limitation in conn.capabilities().limitations:
+        assert "policy-disabled" not in limitation.detail, limitation

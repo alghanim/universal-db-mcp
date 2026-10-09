@@ -51,7 +51,7 @@ VENV=/opt/universal-db-mcp/venv/bin
 if [ "$FAILED" = 0 ]; then
   note "creating synthetic SQLite demo fixture + config (writable copy; bundle mount is read-only)"
   mkdir -p /tmp/demo && cp "$BUNDLE/config-templates/create_demo.py" "$BUNDLE/config-templates/config.template.yaml" /tmp/demo/
-  "$VENV/python" /tmp/demo/create_demo.py --path /tmp/finlink_demo.db >> /tmp/demo.log 2>&1 \
+  "$VENV/python" /tmp/demo/create_demo.py --path /tmp/demo/finlink_demo.db >> /tmp/demo.log 2>&1 \
     || fail "demo fixture creation failed"
 
   note "doctor (local artifacts + generated config, no database credentials needed)"
@@ -66,7 +66,7 @@ if [ "$FAILED" = 0 ]; then
   fi
 
   note "protocol probe over stdio (no network)"
-  if "$VENV/python" "$BUNDLE/tests/protocol_probe.py" "$VENV/python" /tmp/finlink_demo.db > "$EVIDENCE/protocol-probe.json" 2>/tmp/probe.err; then
+  if "$VENV/python" "$BUNDLE/tests/protocol_probe.py" "$VENV/python" /tmp/demo/finlink_demo.db > "$EVIDENCE/protocol-probe.json" 2>/tmp/probe.err; then
     note "protocol probe passed"
     echo "  \"protocol_probe\": \"passed\"," >> "$RESULT"
   else
@@ -120,7 +120,7 @@ security:
 connections:
   demo_sqlite:
     type: sqlite
-    database: /tmp/finlink_demo.db
+    database: /tmp/demo/finlink_demo.db
     read_only: true
 """,
             encoding="utf-8",

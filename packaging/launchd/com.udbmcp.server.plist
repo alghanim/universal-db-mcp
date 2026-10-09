@@ -19,6 +19,9 @@
     [Service] ExecStart=... serve             ProgramArguments
     [Service] Restart=on-failure              KeepAlive { SuccessfulExit = false; }
     [Service] RestartSec=5                    ThrottleInterval 5
+    [Service] LimitNOFILE=65536               SoftResourceLimits / HardResourceLimits
+                                               NumberOfFiles 65536 (launchd's
+                                               default soft limit is 256)
     [Install] WantedBy=multi-user.target      RunAtLoad (start at boot/load),
                                                installed in /Library/LaunchDaemons/
     (implicit low priority service)           ProcessType Background, LowPriorityIO
@@ -79,6 +82,16 @@
 		     env fallback keeps the config shareable with stdio spawns. -->
 		<key>UDBMCP_HTTP_BEARER_TOKEN_FILE</key>
 		<string>/etc/universal-db-mcp/http-token</string>
+		<!-- Runtime log of the HTTP listener, size-bounded by the server
+		     itself (5 MiB plus 3 backups); the daemon opens it as _udbmcp.
+		     Nothing rotates StandardOutPath or StandardErrorPath: a root job
+		     acts on whatever names are in their directory. With this set,
+		     serve empties either file when it is over 5 MiB, at startup and
+		     before an ERROR record, and stderr only gets startup failures
+		     and ERROR records (a port in use, an exception), which http.log
+		     has too. -->
+		<key>UDBMCP_HTTP_LOG_FILE</key>
+		<string>/var/log/universal-db-mcp/http.log</string>
 	</dict>
 
 	<!-- Mirrors systemd User=udbmcp (macOS service account created by
@@ -114,10 +127,30 @@
 	<key>LowPriorityIO</key>
 	<true/>
 
+	<!-- Mirrors systemd LimitNOFILE=65536: every connection holds a
+	     descriptor, and launchd's default soft limit is 256. -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>65536</integer>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>65536</integer>
+	</dict>
+
+	<!-- launchd opens these itself, as root, before the daemon becomes
+	     _udbmcp, creating them and following a symlink there. So they are
+	     never in /var/log/universal-db-mcp, which _udbmcp owns (a link it
+	     put at server.log would lead root's open to any file), but in
+	     /Library/Logs/universal-db-mcp, which only root can write; the
+	     postinstall creates it and makes both files _udbmcp's, so the
+	     daemon can cap them (it empties only a file it owns). -->
 	<key>StandardOutPath</key>
-	<string>/var/log/universal-db-mcp/server.log</string>
+	<string>/Library/Logs/universal-db-mcp/server.log</string>
 
 	<key>StandardErrorPath</key>
-	<string>/var/log/universal-db-mcp/server.err.log</string>
+	<string>/Library/Logs/universal-db-mcp/server.err.log</string>
 </dict>
 </plist>

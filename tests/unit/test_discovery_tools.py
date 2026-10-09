@@ -5,11 +5,13 @@ findings and masking, cross-table value search, relationship inference."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers_sqlite import connector_reads_dbstat
 
 from universal_db_mcp.config import load_resolved
 from universal_db_mcp.server import AppContext, build_server
@@ -211,7 +213,7 @@ def test_foreign_key_targets_outside_the_allowlist_are_redacted(monkeypatch: pyt
     monkeypatch.setenv("U", "app_ro")
     from universal_db_mcp.connectors.base import KeyInfo
     from universal_db_mcp.security.policy import EffectivePolicy
-    from universal_db_mcp.server import _redact_foreign_target
+    from universal_db_mcp.server import _SchemaView
 
     cfg = ConnectionConfig.model_validate(
         {"type": "postgres", "host": "h", "database": "d", "username_env": "U", "allowed_schemas": ["app"]}
@@ -221,9 +223,10 @@ def test_foreign_key_targets_outside_the_allowlist_are_redacted(monkeypatch: pyt
                      ref_table="customers", ref_columns=["id"])
     visible = KeyInfo(kind="foreign_key", name="fk2", columns=["order_id"], ref_schema="app",
                       ref_table="orders", ref_columns=["id"])
-    assert _redact_foreign_target(policy, hidden)["ref_table"] == "<not permitted>"
-    assert _redact_foreign_target(policy, hidden)["columns"] == ["customer_id"]
-    assert _redact_foreign_target(policy, visible)["ref_table"] == "orders"
+    view = _SchemaView(policy)
+    assert view.foreign_key(dataclasses.asdict(hidden))["ref_table"] == "<not permitted>"
+    assert view.foreign_key(dataclasses.asdict(hidden))["columns"] == ["customer_id"]
+    assert view.foreign_key(dataclasses.asdict(visible))["ref_table"] == "orders"
 
 
 def test_catalog_and_index_listing_hide_system_catalogs_unless_asked(server: Any, monkeypatch: Any) -> None:
@@ -276,8 +279,9 @@ def test_review_schema_profiles_every_table_and_prioritizes_findings(server: Any
     codes = {r["code"] for r in data["recommendations"]}
     # the seed's only foreign key is indexed, so the unindexed-key rule cannot
     # fire here (it is pinned in test_discovery_logic); the review must carry
-    # the metadata finding on order_items and the sampling notice
-    assert {"no_primary_key", "sampled"} <= codes
+    # the metadata finding on order_items and the sampling notice (which needs
+    # a row estimate; see helpers_sqlite for the builds that have none)
+    assert {"no_primary_key", "sampled"} <= codes if connector_reads_dbstat() else "no_primary_key" in codes
     assert any(r["table"] == "order_items" and r["code"] == "no_primary_key" for r in data["recommendations"])
     ranks = [{"high": 0, "medium": 1, "low": 2, "info": 3}[r["severity"]] for r in data["recommendations"]]
     assert ranks == sorted(ranks), "recommendations must be ordered by severity"

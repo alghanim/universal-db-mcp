@@ -1,31 +1,31 @@
 {
   "label": "clickhouse/clickhouse-server:24.3",
   "engine": "clickhouse",
-  "probe_rev": "c820896",
-  "started_utc": "2026-09-16T20:36:35Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:47:28Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 115,
+      "ms": 581,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 6,
+      "ms": 16,
       "detail": "24.3.18.7"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 4,
+      "ms": 8,
       "detail": "vm"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 2,
+      "ms": 3,
       "detail": "[TableSummary(schema='vm', name='customers', kind='table', row_estimate=300, row_estimate_source='catalog_estimate(system.tables.total_rows)', comment=None), TableSummary(schema='vm', name='orders', k"
     },
     {
@@ -38,7 +38,7 @@
       "check": "list_columns",
       "status": "passed",
       "ms": 2,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='vm', table='customers', name='email', data_type='S"
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0, default_kind=None), ColumnInfo(schema='vm', table='customers', name='e"
     },
     {
       "check": "list_columns_count",
@@ -49,13 +49,13 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 2,
+      "ms": 3,
       "detail": "[IndexInfo(name='(sorting key)', columns=['id'], unique=False, definition='MergeTree ORDER BY (id)', primary=True, kind='sorting_key', schema='vm', table='orders'), IndexInfo(name='ix_cust', columns=["
     },
     {
@@ -67,7 +67,7 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 2,
+      "ms": 3,
       "detail": "(sorting key)"
     },
     {
@@ -85,7 +85,7 @@
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 1,
+      "ms": 2,
       "detail": "v_orders"
     },
     {
@@ -103,37 +103,37 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 6,
+      "ms": 7,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 5,
+      "ms": 9,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 8,
+      "ms": 19,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 6,
+      "ms": 11,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 5,
+      "ms": 6,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 3,
+      "ms": 5,
       "detail": "['raw']"
     }
   ],
@@ -147,19 +147,21 @@
     "read_only_requested": true,
     "server_read_only_available": true,
     "applied": [
+      "read_only",
       "max_execution_time=60s",
-      "read_only"
+      "max_memory_usage=2147483648"
     ],
     "skipped": [],
     "read_only_enforced": true,
     "read_only_verified": true,
     "server_reports": {
       "readonly": "1",
-      "max_execution_time": "60.0"
+      "max_execution_time": "60.0",
+      "max_memory_usage": "2147483648"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:36:35Z",
+  "finished_utc": "2026-10-03T14:47:28Z",
   "summary": {
     "passed": 19,
     "failed": []

@@ -64,6 +64,19 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    # Every connection holds a descriptor; the server also closes connections
+    # that send no complete request head within its header deadline.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Docker's default json-file log has no size limit; a full disk also
+    # stops the audit trail (audit_fail_closed then refuses every call).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 networks:
   db-internal:

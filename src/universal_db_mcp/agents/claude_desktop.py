@@ -6,7 +6,7 @@ config directory is platform-specific:
 
 * macOS:   ``~/Library/Application Support/Claude/``
 * Windows: ``%APPDATA%\\Claude\\``
-* Linux:   ``~/.config/Claude/`` (unofficial builds)
+* Linux:   ``$XDG_CONFIG_HOME/Claude/`` or ``~/.config/Claude/`` (unofficial builds)
 
 Detection counts Claude Desktop as installed when any of these hold: one of
 the platform config directories exists, the app bundle is present (macOS:
@@ -22,7 +22,7 @@ and non-secret env only)::
       "mcpServers": {
         "universal-db": {
           "command": "<venv>/bin/python",
-          "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+          "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
           "env": {"UDBMCP_CONFIG": "<config path>"}
         }
       }
@@ -33,31 +33,54 @@ Fail-closed rules implemented here (shared by every adapter):
 - ``apply`` only writes when ``confirmed=True`` (the CLI layer owns the
   interactive y/n prompt and the ``--yes`` / ``--dry-run`` flags); with
   ``confirmed=False`` nothing is ever written.
-- Every first write to an existing config is preceded by a timestamped
-  ``.bak`` copy (a brand-new file needs no backup).
+- Every first write to an existing config is preceded by a timestamped,
+  private ``.bak`` copy (a brand-new file needs no backup), and the write
+  replaces the file atomically (a failed write leaves it as it was).
 - Re-runs are idempotent: an existing equivalent registration is never
   duplicated or rewritten.
 - An existing config that is unreadable, malformed, not a JSON object, has a
   non-object ``mcpServers``, or holds a *differing* entry under our server
-  key yields ``AgentStatus.UNKNOWN_STATE_FAIL_CLOSED``: the offending file's
-  raw bytes are printed and nothing is written.
+  key yields ``AgentStatus.UNKNOWN_STATE_FAIL_CLOSED``: the reason and this
+  tool's own entry in the file are printed (never its other servers), and
+  nothing is written. The one exception is this
+  tool's own pre-``-I`` registration (identical except for the launch args),
+  which is upgraded like a fresh write.
+- A config the write would replace or create but may not (read-only,
+  another user's, hard-linked, with an access control list the replace would
+  change, in a read-only directory, or as root behind a user's symlink:
+  ``core.ensure_replaceable``) fails closed at detection too.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from .core import (
+    SERVER_ARGS,
     AgentStatus,
     Plan,
+    absolute_interpreter,
+    app_data_base,
+    atomic_write_text,
     backup_path,
+    ensure_directory,
+    ensure_replaceable,
+    fail_closed_block,
+    holds_legacy_entry,
+    is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
+    other_unisolated_note,
+    require_isolated_import,
     resolve_harness_config_path,
+    unisolated_entry_note,
+    unreplaceable_reason,
+    windows_env_dir,
+    write_private_backup,
 )
 
 AGENT_NAME = "claude-desktop"
@@ -86,27 +109,25 @@ _ALLOWED_ENTRY_ENV_KEYS = frozenset({UDBMCP_CONFIG_ENV})
 
 
 def _windows_config_dir(env: Mapping[str, str], home: Path) -> Path:
-    appdata = env.get("APPDATA", "").strip()
-    base = Path(appdata) if appdata else home / "AppData" / "Roaming"
-    return base / CONFIG_DIR_NAME
+    return app_data_base(env, home, "win32") / CONFIG_DIR_NAME
 
 
 def _macos_config_dir(home: Path) -> Path:
     return home / "Library" / "Application Support" / CONFIG_DIR_NAME
 
 
-def _linux_config_dir(home: Path) -> Path:
-    return home / ".config" / CONFIG_DIR_NAME
+def _linux_config_dir(env: Mapping[str, str], home: Path) -> Path:
+    return app_data_base(env, home, "linux") / CONFIG_DIR_NAME
 
 
 def _candidate_dirs(env: Mapping[str, str], home: Path) -> list[Path]:
     """Platform-canonical config dir first, then the other platforms' locations."""
     if sys.platform == "win32":
-        ordered = [_windows_config_dir(env, home), _macos_config_dir(home), _linux_config_dir(home)]
+        ordered = [_windows_config_dir(env, home), _macos_config_dir(home), _linux_config_dir(env, home)]
     elif sys.platform == "darwin":
-        ordered = [_macos_config_dir(home), _windows_config_dir(env, home), _linux_config_dir(home)]
+        ordered = [_macos_config_dir(home), _windows_config_dir(env, home), _linux_config_dir(env, home)]
     else:
-        ordered = [_linux_config_dir(home), _macos_config_dir(home), _windows_config_dir(env, home)]
+        ordered = [_linux_config_dir(env, home), _macos_config_dir(home), _windows_config_dir(env, home)]
     unique: list[Path] = []
     for d in ordered:
         if d not in unique:
@@ -137,8 +158,8 @@ def _app_installed(env: Mapping[str, str], home: Path) -> bool:
     if sys.platform == "darwin" and (home / "Applications" / "Claude.app").exists():
         return True
     if sys.platform == "win32":
-        local = env.get("LOCALAPPDATA", "").strip()
-        base = Path(local) if local else home / "AppData" / "Local"
+        # Never a relative %LOCALAPPDATA%: it would name a folder in the open project.
+        base = windows_env_dir(env, "LOCALAPPDATA") or home / "AppData" / "Local"
         if (base / "AnthropicClaude").exists():
             return True
     return False
@@ -150,11 +171,15 @@ def _app_installed(env: Mapping[str, str], home: Path) -> bool:
 
 
 def _venv_python(env: Mapping[str, str]) -> str:
-    """Interpreter for the launch command: ``UDBMCP_VENV_PYTHON`` override,
-    else the interpreter running this CLI (the venv python in an install)."""
+    """Interpreter for the launch command: ``UDBMCP_VENV_PYTHON`` override
+    (made absolute: a path is anchored at the working directory, a bare name
+    looked up on PATH; one naming no file is refused), else the interpreter
+    running this CLI (the venv python in an install; refused when it cannot
+    import the package under ``-I``, as with a user-site install)."""
     override = env.get(VENV_PYTHON_ENV, "").strip()
     if override:
-        return override
+        return absolute_interpreter(override, VENV_PYTHON_ENV, env)
+    require_isolated_import(sys.executable)
     return sys.executable
 
 
@@ -167,14 +192,14 @@ def _udbmcp_config_path(env: Mapping[str, str], home: Path) -> str:
     not. Unreadable-system spawns died right after connecting (seen live
     2026-09-14); the resolver falls back to the per-user config, which
     ``configure-agents`` seeds on apply."""
-    return resolve_harness_config_path(env, home)
+    return resolve_harness_config_path(env, home, strict=True, for_harness=True)
 
 
 def registration_entry(env: Mapping[str, str], home: Path) -> dict[str, Any]:
     """The exact dict written under ``mcpServers`` (contains no secrets)."""
     entry: dict[str, Any] = {
         "command": _venv_python(env),
-        "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+        "args": list(SERVER_ARGS),
         "env": {UDBMCP_CONFIG_ENV: _udbmcp_config_path(env, home)},
     }
     _assert_no_secrets(entry)
@@ -202,13 +227,10 @@ def _intended_block(entry: Mapping[str, Any]) -> str:
     return json.dumps({MCP_SERVERS_KEY: {SERVER_KEY: dict(entry)}}, indent=2, sort_keys=True)
 
 
-def _fail_closed_block(target: Path) -> str:
-    """Render the offending file's current bytes for operator inspection."""
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"# {target} could not be read: {exc}"
-    return f"# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: Mapping[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, MCP_SERVERS_KEY, SERVER_KEY, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -223,15 +245,28 @@ def detect(env: Mapping[str, str], home: Path) -> AgentStatus:
     - ``configured``: the config parses and already holds an equivalent
       ``universal-db`` registration.
     - ``installed_unconfigured``: the config is absent, or parses and lacks
-      our entry (other keys and servers are preserved on apply).
+      our entry (other keys and servers are preserved on apply), or holds
+      the pre-``-I`` registration (upgraded on apply).
     - ``unknown_state_fail_closed``: the config is unreadable/malformed/not a
       JSON object, ``mcpServers`` is present but not an object (including an
       explicit JSON null), or our key holds a differing entry (operator state
-      we must not silently rewrite).
+      we must not silently rewrite), or it would be written but may not be
+      replaced (read-only, another user's, hard-linked).
     """
+    status = _config_status(env, home)
+    if status is AgentStatus.INSTALLED_UNCONFIGURED and unreplaceable_reason(config_path(env, home)) is not None:
+        return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+    return status
+
+
+def _config_status(env: Mapping[str, str], home: Path) -> AgentStatus:
+    """:func:`detect` from the config's content alone (no replace check)."""
     if not _app_installed(env, home):
         return AgentStatus.NOT_INSTALLED
 
+    # Resolved up front: an override that cannot be registered (a relative
+    # path naming no file) is refused at detection, before any write is offered.
+    entry = registration_entry(env, home)
     target = config_path(env, home)
     if not target.exists():
         return AgentStatus.INSTALLED_UNCONFIGURED
@@ -250,7 +285,9 @@ def detect(env: Mapping[str, str], home: Path) -> AgentStatus:
     else:
         servers = {}
 
-    if SERVER_KEY in servers and not _entries_equal(servers[SERVER_KEY], registration_entry(env, home)):
+    if SERVER_KEY in servers and is_legacy_entry(servers[SERVER_KEY], entry):
+        return AgentStatus.INSTALLED_UNCONFIGURED
+    if SERVER_KEY in servers and not _entries_equal(servers[SERVER_KEY], entry):
         return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
     if SERVER_KEY in servers:
         return AgentStatus.CONFIGURED
@@ -261,29 +298,46 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
     """Describe exactly what would be added to ``claude_desktop_config.json``."""
     target = config_path(env, home)
     status = detect(env, home)
+    if status is AgentStatus.NOT_INSTALLED:
+        # Nothing would be registered, so nothing is resolved: an override
+        # that cannot be registered must not turn "not installed" into an error.
+        return Plan(
+            agent=AGENT_NAME,
+            config_path=target,
+            status=status,
+            summary=(
+                f"{AGENT_NAME}: not installed (no Claude config directory and no "
+                "Claude app bundle found); nothing would be written"
+            ),
+        )
     entry = registration_entry(env, home)
 
-    if status is AgentStatus.NOT_INSTALLED:
-        summary = (
-            f"{AGENT_NAME}: not installed (no Claude config directory and no "
-            "Claude app bundle found); nothing would be written"
-        )
-        block = ""
-    elif status is AgentStatus.CONFIGURED:
+    if status is AgentStatus.CONFIGURED:
         summary = (
             f"{AGENT_NAME}: already configured in {target} under "
             f'"{MCP_SERVERS_KEY}"["{SERVER_KEY}"]; no changes needed'
         )
         block = ""
     elif status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
-        summary = (
-            f"{AGENT_NAME}: {target} is unreadable, malformed, or holds "
-            "unrecognized state; refusing to write (fix or remove the file, "
-            "then re-run)"
-        )
-        block = _fail_closed_block(target)
+        refused = unreplaceable_reason(target)
+        if refused is not None and _config_status(env, home) is AgentStatus.INSTALLED_UNCONFIGURED:
+            summary = f"{AGENT_NAME}: refusing to write: {refused}"
+        else:
+            summary = (
+                f"{AGENT_NAME}: {target} is unreadable, malformed, or holds "
+                f"unrecognized state{load_problem_note(target)}; refusing to write (fix or remove the file, "
+                "then re-run)"
+            ) + unisolated_entry_note(target, MCP_SERVERS_KEY, SERVER_KEY)
+        block = _fail_closed_block(target, entry)
     else:
-        if target.exists():
+        if holds_legacy_entry(target, MCP_SERVERS_KEY, SERVER_KEY, entry):
+            summary = (
+                f"{AGENT_NAME}: would back up {target} to a timestamped .bak "
+                f"({target.name}.bak.<YYYYmmddTHHMMSSffffffZ>), then replace this "
+                f'tool\'s earlier "{SERVER_KEY}" registration with one that starts '
+                "the server in isolated mode (-I) (all other existing keys preserved)"
+            )
+        elif target.exists():
             summary = (
                 f"{AGENT_NAME}: would back up {target} to a timestamped .bak "
                 f"({target.name}.bak.<YYYYmmddTHHMMSSffffffZ>), then add "
@@ -301,8 +355,25 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
         agent=AGENT_NAME,
         config_path=target,
         status=status,
-        summary=summary,
+        summary=summary + other_unisolated_note(target, MCP_SERVERS_KEY, SERVER_KEY),
         config_block=block,
+        entry=dict(entry),
+    )
+
+
+def _write_failed(
+    step: str, target: Path, entry: Mapping[str, Any], exc: OSError, backup: Path | None
+) -> Plan:
+    """Fail-closed result for a backup or write (``step``) that raised
+    (target unchanged)."""
+    note = f"; backup: {backup}" if backup is not None else ""
+    return Plan(
+        agent=AGENT_NAME,
+        config_path=target,
+        status=AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
+        backup_paths=(backup,) if backup is not None else (),
+        summary=f"{AGENT_NAME}: {step} failed ({exc}); {target} was left as it was{note}",
+        config_block=_fail_closed_block(target, entry),
         entry=dict(entry),
     )
 
@@ -352,8 +423,17 @@ def apply(env: Mapping[str, str], home: Path, confirmed: bool) -> Plan:
             return plan(env, home)
         if isinstance(servers, dict) and SERVER_KEY in servers and _entries_equal(servers[SERVER_KEY], entry):
             return plan(env, home)  # idempotent no-op
+        if isinstance(servers, dict) and SERVER_KEY in servers and not is_legacy_entry(servers[SERVER_KEY], entry):
+            return plan(env, home)  # a differing entry appeared since detect(): never overwrite
+        try:
+            ensure_replaceable(target)  # refused before the backup, so none is left behind
+        except OSError as exc:
+            return _write_failed(f"writing {target}", target, entry, exc, None)
         backup = backup_path(target)
-        shutil.copy2(target, backup)
+        try:
+            write_private_backup(target, backup)
+        except OSError as exc:
+            return _write_failed(f"backing up {target} to {backup}", target, entry, exc, None)
         if not isinstance(servers, dict):
             servers = {}
         servers[SERVER_KEY] = dict(entry)
@@ -367,14 +447,19 @@ def apply(env: Mapping[str, str], home: Path, confirmed: bool) -> Plan:
 
     # Verification gate: never write bytes we cannot parse back.
     json.loads(payload)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(payload, encoding="utf-8")
+    try:
+        ensure_directory(target.parent)
+        # Found absent: only ever created, so one that appeared meanwhile fails closed.
+        atomic_write_text(target, payload, create=backup is None)
+    except OSError as exc:
+        return _write_failed(f"writing {target}", target, entry, exc, backup)
 
     return Plan(
         agent=AGENT_NAME,
         config_path=target,
         status=AgentStatus.CONFIGURED,
-        summary=summary,
+        backup_paths=(backup,) if backup is not None else (),
+        summary=summary + other_unisolated_note(target, MCP_SERVERS_KEY, SERVER_KEY),
         config_block=_intended_block(entry),
         entry=dict(entry),
     )

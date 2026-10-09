@@ -24,6 +24,23 @@
 #                              now-unpacked payload via verify_bundle.py
 #                              --pubkey BEFORE anything in it is executed.
 # Verify-then-execute is inherited from that installer, not re-implemented.
+#
+# WHAT VOUCHES FOR THIS SCRIPT ITSELF
+# The maintainer scripts (this one, postinst, prerm, postrm) are
+# NOT covered by the bundle signature: it covers only the payload, and dpkg
+# runs preinst as root from the .deb's control archive before any payload
+# exists. The .deb as a whole, maintainer scripts included, is covered by the
+# release stick's SHA256SUMS, which release_usb.sh signs with the release key
+# (SHA256SUMS.sig). That signature vouches for the .deb only when tools the
+# site ALREADY trusts check it with the key the site already holds, BEFORE
+# anything from the stick runs: the bootstrap.sh an earlier bootstrap
+# installed (sudo bash /usr/local/lib/udbmcp-trust/bootstrap.sh --stick
+# <stick>), or, on a site that has none yet, the installed verifier
+# (verify_bundle.py --verify-file) or /usr/bin/openssl run by hand. A plain
+# `sha256sum -c SHA256SUMS` proves nothing (the list can be regenerated), and
+# the stick's own trust-bootstrap-linux/bootstrap.sh is the stick checking
+# itself. A .deb that was not checked that way runs whatever preinst it
+# carries, and nothing in this file can prevent that.
 # ---------------------------------------------------------------------------
 set -eu
 
@@ -66,6 +83,18 @@ administrator; it is deliberately NOT shipped inside any package):
     sudo install -m 644 <trusted-path>/udbmcp-release.pub.pem /etc/universal-db-mcp/keys/release.pub.pem
 EOF
 }
+
+# --- what dpkg runs after a refusal here ------------------------------------
+# On an upgrade dpkg has already run the INSTALLED release's prerm, which
+# stopped the service. A refusal here, or a failed unpack after this script
+# passed (a file conflict, a full disk), makes dpkg run this package's postrm
+# with abort-upgrade and then the installed release's postinst with
+# abort-upgrade. A postinst from before this release ignores its argument and
+# configures again, spawning a deferred install worker that re-installs the
+# installed release (replacing venv.previous, the rollback point). This
+# package's postrm keeps it from doing that (see 'abort-upgrade' there): the
+# postrm is the one script dpkg runs on every path that undoes an upgrade.
+DEFERRED_LOCK=/run/udbmcp-deferred-install.lock
 
 # --- prerequisite 1: the trusted verifier -----------------------------------
 # Installed by the admin with `install -m 644`, so it is executed via
@@ -142,10 +171,12 @@ then re-run this install."
     echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
     exit 1
 fi
-# The installer also carries a format marker ('# udbmcp-installer-format: N');
+# The installer also carries a format marker ('# udbmcp-installer-format: N',
+# one line per format it serves: the current one first, then the earlier ones
+# whose packages it still installs, as in the runbook's package rollback);
 # any pip-running copy without the current number is refused the same way
 # (build-then-switch venvs, --copies interpreters and rollback all depend on it).
-INSTALLER_FORMAT=3
+INSTALLER_FORMAT=4
 if [ -s "$INSTALLER" ] && grep -q "PIP_FIND_LINKS" "$INSTALLER" \
    && ! grep -q "^# udbmcp-installer-format: ${INSTALLER_FORMAT}\$" "$INSTALLER"; then
     fail "the trusted installer at $INSTALLER is an OUTDATED copy (no 'udbmcp-installer-format: ${INSTALLER_FORMAT}' marker).
@@ -158,6 +189,91 @@ half-replaced install). Refresh the trusted tools from the release stick first:
 then re-run this install."
     echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
     exit 1
+fi
+
+# --- prerequisite 4: the trusted verifier can refuse a downgrade -----------
+# postinst verifies with --installed-manifest (anti-rollback). A verifier
+# that parses options (argparse's add_argument) but has none predates that
+# check: refused here, before the old prerm's stop is followed by an unpack
+# this package could only leave half-configured. postinst keeps its own check
+# (and the one its argparse gives away) for a configure run without this
+# preinst. Nothing here runs the verifier.
+if grep -q -- 'add_argument(' "$VERIFIER" && ! grep -q -- '"--installed-manifest"' "$VERIFIER"; then
+    fail "the trusted verifier at $VERIFIER is an OUTDATED copy (no --installed-manifest option): it cannot refuse a downgrade to an older release. Refresh the trusted tools from the release stick first:
+
+    sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh
+
+then re-run this install."
+    echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+    exit 1
+fi
+
+# --- prerequisite 5: not an older release than the installed one ----------
+# postinst's verifier refuses an OLDER release than the installed one, but
+# only after dpkg unpacked it over the newer payload, leaving the package
+# half-configured. The payload's release_seq and source revision, written
+# here by scripts/package/build_deb.sh from the signed manifest, are known
+# now, so an older package (or another release with the same release_seq)
+# stops before dpkg unpacks anything. Empty in the repository copy. The
+# verifier in postinst stays the authority for everything this cannot order
+# (releases that predate release_seq, an unreadable installed manifest).
+PAYLOAD_RELEASE_SEQ=""
+PAYLOAD_SOURCE_REV=""
+INSTALLED_MANIFEST="/opt/universal-db-mcp/manifest.json"
+if [ -n "$PAYLOAD_RELEASE_SEQ" ] && [ -f "$INSTALLED_MANIFEST" ] && [ "${UDBMCP_ALLOW_DOWNGRADE:-}" != "1" ] \
+   && command -v python3 >/dev/null 2>&1; then
+    installed="$(python3 -I -S -c 'import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+seq, rev = m.get("release_seq"), m.get("source_rev")
+print(seq if type(seq) is int and seq >= 0 else "")
+print(rev.strip() if isinstance(rev, str) and rev.strip().lower() not in ("", "unknown") else "")' "$INSTALLED_MANIFEST" 2>/dev/null)" || installed=""
+    installed_seq="$(printf '%s\n' "$installed" | sed -n 1p)"
+    installed_rev="$(printf '%s\n' "$installed" | sed -n 2p)"
+    refused=""
+    if [ -n "$installed_seq" ] && [ "$PAYLOAD_RELEASE_SEQ" -lt "$installed_seq" ]; then
+        refused="this package is release_seq $PAYLOAD_RELEASE_SEQ, OLDER than the installed release_seq $installed_seq"
+    elif [ -n "$installed_seq" ] && [ "$PAYLOAD_RELEASE_SEQ" -eq "$installed_seq" ] && [ -n "$PAYLOAD_SOURCE_REV" ] \
+         && [ -n "$installed_rev" ] && [ "$PAYLOAD_SOURCE_REV" != "$installed_rev" ]; then
+        refused="this package (source_rev $PAYLOAD_SOURCE_REV) is another release with the installed release's release_seq $installed_seq (source_rev $installed_rev), which may be the older one"
+    fi
+    if [ -n "$refused" ]; then
+        fail "rollback refused: $refused ($INSTALLED_MANIFEST); nothing was unpacked.
+If the downgrade is intended, run:
+
+    sudo UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <this .deb>"
+        echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+        exit 1
+    fi
+fi
+
+# --- prerequisite 6: no deferred install is still running ------------------
+# A deferred install worker (see postinst) holds $DEFERRED_LOCK while it
+# installs, from a private copy of the payload it was started for. An unpack
+# now would leave dpkg recording this package while that worker publishes
+# the other release's code and starts the service on it (an earlier
+# package's postinst spawns one when dpkg undoes a refused upgrade). Refused
+# here, before anything is unpacked. A holder that ends within 15 seconds
+# (the one this package's postrm leaves while dpkg undoes a failed upgrade,
+# until that dpkg run is over) is waited for.
+if command -v flock >/dev/null 2>&1 && [ -e "$DEFERRED_LOCK" ]; then
+    deferred_free=""
+    for _ in $(seq 1 30); do
+        if (exec 8>>"$DEFERRED_LOCK" && flock -n 8) 2>/dev/null; then
+            deferred_free=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [ -z "$deferred_free" ]; then
+        STATUS_FILE=/var/log/universal-db-mcp-install.status
+        fail "a deferred install started by an earlier configure is still running (status: $(head -c 16 "$STATUS_FILE" 2>/dev/null | tr -cd 'a-z' || true)); nothing was unpacked.
+Installing now would let that worker publish its release's code after dpkg
+records this package. Wait until it has finished, then re-run this install:
+
+    until grep -qxE 'success|failed' $STATUS_FILE; do sleep 5; done; cat $STATUS_FILE"
+        echo "universal-db-mcp: package installation ABORTED (fail closed)." >&2
+        exit 1
+    fi
 fi
 
 echo "universal-db-mcp preinst: trust prerequisites present."

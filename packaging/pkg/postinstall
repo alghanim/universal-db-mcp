@@ -12,6 +12,8 @@
 #   3. pip runs --no-index --require-hashes against the bundle wheelhouse only,
 #      with the inherited (hostile) pip environment neutralized.
 #   4. Every verification failure exits nonzero so the install aborts.
+#   5. A payload that is an OLDER release than the installed one is refused
+#      unless root asked for the downgrade with a one-shot flag file (step 1).
 #
 # This script is a pkg-embedded copy of the trusted-channel installer logic
 # (scripts/install_offline.sh); the verifier it invokes is NOT — it must come
@@ -24,6 +26,19 @@
 # deliberately ignored.
 set -euo pipefail
 
+# >>> run natively on Apple silicon: identical in preinstall and postinstall
+# The Installer runs a package's scripts under Rosetta 2 unless its
+# Distribution declares the arm64 host (build_pkg.sh declares it: this block
+# is the second line of defence). Everything below would then run as x86_64,
+# and so would a universal2 python started from it: the verifier would see an
+# x86_64 machine and refuse the macos-arm64 bundle, and pip the bundle's arm64
+# wheels. On arm64 hardware the script starts over as a native process (once:
+# the guard stops a loop if the kernel still reports translation).
+if [ "$(/usr/sbin/sysctl -n sysctl.proc_translated 2>/dev/null || true)" = 1 ] && [ -z "${UDBMCP_PKG_NATIVE:-}" ]; then
+  UDBMCP_PKG_NATIVE=1 exec /usr/bin/arch -arm64 /bin/bash "$0" "$@"
+fi
+# <<< run natively on Apple silicon
+
 PREFIX="/usr/local/universal-db-mcp"
 BUNDLE="$PREFIX/bundle"
 VENV="$PREFIX/venv"
@@ -33,6 +48,8 @@ CONFIG_DIR="/etc/universal-db-mcp"
 CONFIG="$CONFIG_DIR/config.yaml"
 STATE_DIR="/var/lib/universal-db-mcp"
 LOG_DIR="/var/log/universal-db-mcp"
+# launchd's StandardOutPath and StandardErrorPath for the daemon (step 6c).
+LAUNCHD_LOG_DIR="/Library/Logs/universal-db-mcp"
 SERVICE_USER="_udbmcp"
 SERVICE_GROUP="_udbmcp"
 
@@ -43,13 +60,22 @@ TRUST_DIR="${UDBMCP_TRUST_DIR:-/usr/local/lib/udbmcp-trust}"
 VERIFIER="${UDBMCP_VERIFIER:-$TRUST_DIR/verify_bundle.py}"
 PUBKEY="${UDBMCP_RELEASE_PUBKEY:-$CONFIG_DIR/keys/release.pub.pem}"
 
-# launchd runs pkg scripts with a minimal PATH that may exclude /usr/local/bin.
-# Extend it so the OS tools below (dscl, install, launchctl) resolve on that
-# minimal PATH; the interpreter and everything else we execute is referenced by
-# absolute path — never a PATH search (see step 1: a PATH-searched python3
-# could resolve to a Homebrew or per-user interpreter that is writable by
-# someone other than root, yet it would be executed as root here).
-PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# An intended downgrade is asked for with a root-owned flag file (step 1): the
+# Installer does not pass the caller's environment. It authorises THIS install
+# attempt only, so it is removed on every exit: an attempt that fails early
+# never leaves it armed for a later, unrelated older package.
+DOWNGRADE_FLAG="$CONFIG_DIR/allow-downgrade"
+trap 'rm -f "$DOWNGRADE_FLAG" 2>/dev/null || true' EXIT
+
+# The payload's release_seq, written here by scripts/package/build_pkg.sh from
+# the signed manifest. Empty in the repository copy, and for a bundle without
+# one (the verifier orders such a release in postinstall).
+PAYLOAD_RELEASE_SEQ=""
+
+# The OS tools only (dscl, install, launchctl, find): nothing executed as root
+# here may resolve from a user-writable prefix such as /opt/homebrew/bin. The
+# interpreter is referenced by absolute path, never a PATH search (see step 1).
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
 fail() {
@@ -88,32 +114,341 @@ case "$(cd "$(dirname "$PUBKEY")" && pwd -P)" in
     fail "refusing to verify with a pubkey shipped inside the bundle; install it at $PUBKEY from the trusted channel" ;;
 esac
 
-# The verifier executes as root, so it must run under an interpreter preinstall
-# already validated — never a PATH search: `python3` could resolve to a
-# Homebrew or per-user interpreter that preinstall never checked and that is
-# writable by someone other than root, yet it would be executed as root here
-# BEFORE the payload is verified. Select EXACTLY the candidates preinstall
-# approved; the same interpreter is reused to build the venv in step 3.
+# The verifier executes as root, so it runs under the interpreter preinstall
+# validated, selected by the same code: never a PATH search, never before its
+# installation is proven root's alone. The same interpreter builds the venv in
+# step 3.
+# >>> root-owned CPython 3.12: this block is identical in preinstall and postinstall
+# Root runs the selected interpreter BEFORE the payload is verified: the
+# trusted verifier runs under it, the venv is copied from it, and its stdlib
+# loads into every root-side python here. Whoever can write to that
+# installation therefore runs code as root (a .pth file dropped into an
+# admin-writable Homebrew site-packages turned a tampered bundle into
+# "bundle verification PASSED"). So no candidate is executed until its whole
+# installation, resolved through symlinks, and every directory above it are
+# owned by root and writable by root only (group write only for wheel, gid 0,
+# and no ACL), and none of its symlinks leads out of it. That proves who owns
+# each file, not what a .pth file in site-packages names (a directory, or an
+# import line, outside the installation), so every root-side run of the
+# interpreter is also -I -S: site.py never reads site-packages at all.
+# The candidates are FIXED all-users paths, never a PATH search, which could
+# find a per-user interpreter the _udbmcp service account cannot see:
+#   - the python.org 3.12 installer's framework, and /usr/local/bin/python3,
+#     its symlink. That installer leaves the framework writable by the admin
+#     group, so preparing the host includes the fix printed below;
+#   - Homebrew (Apple Silicon /opt/homebrew, Intel /usr/local), accepted only
+#     when the whole Homebrew prefix is root's: its python imports
+#     <prefix>/lib/python3.12/site-packages and its _ssl/_hashlib load the
+#     openssl@3 keg through <prefix>/opt.
 FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
 USR_LOCAL_PY="/usr/local/bin/python3"
-# Same fixed Homebrew candidates preinstall validates (machine-wide prefix,
-# never a PATH search) — keep this list in lockstep with preinstall.
 BREW_ARM_PY="/opt/homebrew/bin/python3.12"
 BREW_INTEL_PY="/usr/local/bin/python3.12"
-PY=""
-for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY" "$BREW_ARM_PY" "$BREW_INTEL_PY"; do
-  if [ -x "$candidate" ] && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
-    PY="$candidate"
-    break
+FIND="/usr/bin/find"
+
+# Physical path of $1 with every symlink resolved (macOS before 13 ships no
+# realpath(1), and its readlink(1) has no -f).
+resolve_path() {
+  local path="$1" dir link hops=0
+  while :; do
+    dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+    path="${dir%/}/$(basename "$path")"
+    [ -L "$path" ] || break
+    link="$(readlink "$path")" || return 1
+    case "$link" in
+      /*) path="$link" ;;
+      *) path="${dir%/}/$link" ;;
+    esac
+    hops=$((hops + 1))
+    [ "$hops" -lt 40 ] || return 1
+  done
+  printf '%s\n' "$path"
+}
+
+# The first entry of the tree $1 (itself included) that is not owned by root,
+# that another account can write, or that carries an ACL (an "everyone allow
+# write" entry survives chmod go-w). Symlinks are skipped here: the directory
+# that holds them is checked, and escaping_symlink checks where they lead. A
+# tree find cannot read reports itself.
+untrusted_in_tree() {
+  local hit
+  hit="$("$FIND" "$1" ! -type l \( ! -user 0 -o -perm -0002 -o \( -perm -0020 ! -group 0 \) -o -acl \) \
+    -print -quit 2>/dev/null)" || hit="${hit:-$1}"
+  printf '%s' "$hit"
+}
+
+# $1 when that one directory is not root's alone. A sticky directory such as
+# /tmp may be writable: nobody else can rename what root owns inside it. An
+# ACL is refused either way.
+untrusted_dir() {
+  local hit
+  hit="$("$FIND" "$1" -maxdepth 0 \( ! -user 0 -o -acl -o \( ! -perm -1000 \( -perm -0002 -o \
+    \( -perm -0020 ! -group 0 \) \) \) \) -print 2>/dev/null)" || hit="$1"
+  printf '%s' "$hit"
+}
+
+NL=$'\n'
+
+# Prints "<why>\n<fix>" for the first symlink in the tree $1 that does not
+# stay inside the trees $2...: chown -R and chmod -R do not follow symlinks
+# and the checks above skip them, so a stdlib module or extension linked out
+# of the installation (to a file another account can write, or to one it
+# creates later) would still run as root, -I -S or not. A link passes when it
+# resolves to something that exists and its text, walked from the link's
+# directory, stays on root's ground: '..' only before the first name (a '..'
+# after a name climbs out of wherever that name leads) and the end inside the
+# trees. A link that ends on another link is safe because that one is
+# checked too. Link texts are read in batches, one per line, and walked with
+# shell builtins (a Homebrew prefix holds tens of thousands of links), so a
+# name or link text with a line break is refused before any is read.
+escaping_symlink() {
+  local tree="$1" link rest part path named inside t i n=0 at=0
+  local -a links=() targets=()
+  shift
+  link="$("$FIND" "$tree" \( -name "*$NL*" -o -lname "*$NL*" \) -print -quit 2>/dev/null)" || link="$tree"
+  if [ -n "$link" ]; then
+    printf '%s\n%s' "$tree holds a name or a symlink text with a line break, or could not be read" "reinstall it"
+    return
   fi
+  while IFS= read -r link; do links[n]="$link"; n=$((n + 1)); done < <("$FIND" "$tree" -type l -print 2>/dev/null)
+  while [ "$at" -lt "$n" ]; do
+    while IFS= read -r t; do targets[${#targets[@]}]="$t"; done < <(readlink "${links[@]:at:1000}")
+    at=$((at + 1000))
+  done
+  if [ "${#targets[@]}" -ne "$n" ]; then
+    printf '%s\n%s' "the symlinks in $tree could not be read" "reinstall it"
+    return
+  fi
+  for ((i = 0; i < n; i++)); do
+    link="${links[i]}"
+    rest="${targets[i]}"
+    case "$rest" in /*) path="" ;; *) path="${link%/*}" ;; esac
+    named=0
+    inside=0
+    while [ -n "$rest" ]; do
+      part="${rest%%/*}"
+      if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+      case "$part" in
+        "" | .) ;;
+        ..) if [ "$named" -ne 0 ]; then named=2; break; fi; path="${path%/*}" ;;
+        *) named=1; path="$path/$part" ;;
+      esac
+    done
+    if [ "$named" -ne 2 ]; then
+      for t in "$@"; do
+        case "${path:-/}" in "$t" | "$t"/*) inside=1 ;; esac
+      done
+    fi
+    if [ "$inside" -eq 0 ] || [ ! -e "$link" ]; then
+      printf '%s\n%s' "$link is a symlink to ${targets[i]}, which leads out of $* or to nothing: chown -R and chmod -R do not follow it, and root would load whatever it leads to" \
+        "sudo rm $link"
+      return
+    fi
+  done
+}
+
+# Returns 0 when each tree in $@, every directory above it and wherever its
+# symlinks lead are root's alone. Otherwise returns 1 with UNTRUSTED_WHY
+# saying which path is the problem and UNTRUSTED_FIX the command that
+# repairs it. The check only stats files and reads links.
+root_only_trees() {
+  local tree dir hit
+  for tree in "$@"; do
+    dir="$tree"
+    while [ "$dir" != "/" ]; do
+      dir="$(dirname "$dir")"
+      hit="$(untrusted_dir "$dir")"
+      if [ -n "$hit" ]; then
+        UNTRUSTED_WHY="$hit is not owned by root, or another account can write to it (write bits or an ACL)"
+        UNTRUSTED_FIX="sudo chown root:wheel $hit; sudo chmod go-w $hit; sudo chmod -N $hit"
+        return 1
+      fi
+    done
+    hit="$(untrusted_in_tree "$tree")"
+    if [ -n "$hit" ]; then
+      UNTRUSTED_WHY="$hit is not owned by root, or another account can write to it (write bits or an ACL)"
+      UNTRUSTED_FIX="sudo chown -R root:wheel $tree; sudo chmod -R go-w $tree; sudo chmod -R -N $tree"
+      return 1
+    fi
+    hit="$(escaping_symlink "$tree" "$@")"
+    if [ -n "$hit" ]; then
+      UNTRUSTED_WHY="${hit%%"$NL"*}"
+      UNTRUSTED_FIX="${hit#*"$NL"}"
+      return 1
+    fi
+  done
+}
+
+# Returns 0 with PY_REAL set to the resolved binary when the installation of
+# candidate $1 is root's alone. Otherwise returns 1 with UNTRUSTED_WHY and
+# UNTRUSTED_FIX set (see root_only_trees). The candidate is never executed
+# here.
+root_only_python() {
+  local bin prefix root site cfg
+  PY_REAL=""
+  UNTRUSTED_WHY="$1 does not resolve to a file"
+  UNTRUSTED_FIX="reinstall CPython 3.12"
+  bin="$(resolve_path "$1")" || return 1
+  prefix="$(dirname "$(dirname "$bin")")"
+  # A virtual environment loads its stdlib from the "home" its pyvenv.cfg
+  # names, which is not what the checks below cover.
+  for cfg in "$(dirname "$bin")/pyvenv.cfg" "$prefix/pyvenv.cfg"; do
+    if [ -e "$cfg" ]; then
+      UNTRUSTED_WHY="$cfg makes it a virtual environment, whose standard library lives elsewhere"
+      UNTRUSTED_FIX="point the installer at CPython 3.12 itself, not at a virtual environment"
+      return 1
+    fi
+  done
+  case "$bin" in
+    */Cellar/*) root="${bin%%/Cellar/*}" ;;
+    */Python.framework/*) root="${bin%%/Python.framework/*}/Python.framework" ;;
+    *) root="$prefix" ;;
+  esac
+  set -- "$root"
+  if [ -e "$prefix/lib/python3.12/site-packages" ]; then
+    site="$(resolve_path "$prefix/lib/python3.12/site-packages")" || return 1
+    case "$site" in
+      "$root" | "$root"/*) ;;
+      *) set -- "$root" "$site" ;;
+    esac
+  fi
+  root_only_trees "$@" || return 1
+  PY_REAL="$bin"
+}
+
+# Sets PY to the resolved binary of the first candidate that is root's alone
+# and is CPython 3.12. A refused candidate is never run; the first one refused
+# is kept in REFUSED_PY/REFUSED_WHY/REFUSED_FIX.
+select_root_python() {
+  local candidate
+  PY=""
+  REFUSED_PY=""
+  REFUSED_WHY=""
+  REFUSED_FIX=""
+  for candidate in "$FRAMEWORK_PY" "$USR_LOCAL_PY" "$BREW_ARM_PY" "$BREW_INTEL_PY"; do
+    [ -x "$candidate" ] || continue
+    if ! root_only_python "$candidate"; then
+      if [ -z "$REFUSED_PY" ]; then
+        REFUSED_PY="$candidate"
+        REFUSED_WHY="$UNTRUSTED_WHY"
+        REFUSED_FIX="$UNTRUSTED_FIX"
+      fi
+      continue
+    fi
+    if "$PY_REAL" -I -S -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null; then
+      PY="$PY_REAL"
+      return 0
+    fi
+  done
+  return 1
+}
+
+report_refused_python() {
+  echo "FAIL: refusing to run $REFUSED_PY as root: $REFUSED_WHY." >&2
+  echo "      The installer runs this interpreter as root before the payload is" >&2
+  echo "      verified, so its whole installation and every directory above it must" >&2
+  echo "      be owned by root and writable by root only, and none of its symlinks" >&2
+  echo "      may lead out of it. Fix it with:" >&2
+  echo "" >&2
+  echo "        $REFUSED_FIX" >&2
+  echo "" >&2
+  echo "      The supported interpreter is the python.org 3.12 installer" >&2
+  echo "      (https://www.python.org/downloads/macos/); it leaves" >&2
+  echo "      /Library/Frameworks/Python.framework writable by the admin group, so run:" >&2
+  echo "        sudo chown -R root:wheel /Library/Frameworks/Python.framework; sudo chmod -R go-w /Library/Frameworks/Python.framework; sudo chmod -R -N /Library/Frameworks/Python.framework" >&2
+  echo "      after installing it. Then re-run this installer." >&2
+}
+# <<< root-owned CPython 3.12
+
+# >>> one-shot downgrade flag: identical in preinstall and postinstall
+# The Installer drops the caller's environment, so an intended downgrade is
+# asked for with a flag file naming the release_seq of the package it
+# authorises: a flag left by an earlier attempt cannot authorise another
+# package. It counts only when root alone wrote it: a regular file with one
+# link, owned by root, in a directory (resolved) that root alone can write
+# (a sticky world-writable one is no exemption here: anyone can hard-link a
+# root-owned file under the flag's name there), below directories that are
+# root's alone.
+if [ -n "$PAYLOAD_RELEASE_SEQ" ]; then
+  ALLOW_DOWNGRADE_CMD="echo $PAYLOAD_RELEASE_SEQ | sudo tee $DOWNGRADE_FLAG"
+else
+  ALLOW_DOWNGRADE_CMD="sudo touch $DOWNGRADE_FLAG"
+fi
+downgrade_authorised() {
+  local dir flag
+  dir="$(cd "$(dirname "$DOWNGRADE_FLAG")" 2>/dev/null && pwd -P)" || return 1
+  flag="$dir/$(basename "$DOWNGRADE_FLAG")"
+  [ -n "$("$FIND" "$flag" -maxdepth 0 -type f -links 1 -user 0 -print 2>/dev/null)" ] || return 1
+  [ -n "$("$FIND" "$dir" -maxdepth 0 -user 0 ! -perm -0002 ! \( -perm -0020 ! -group 0 \) ! -acl \
+    -print 2>/dev/null)" ] || return 1
+  while [ "$dir" != "/" ]; do
+    dir="$(dirname "$dir")"
+    [ -z "$(untrusted_dir "$dir")" ] || return 1
+  done
+  [ "$(head -c 64 "$flag" | tr -d '[:space:]')" = "$PAYLOAD_RELEASE_SEQ" ]
+}
+# <<< one-shot downgrade flag
+
+if ! select_root_python; then
+  if [ -n "$REFUSED_PY" ]; then
+    report_refused_python
+    fail "no root-owned CPython 3.12 to run the verifier with (see above)"
+  fi
+  fail "CPython 3.12 (all-users install) not found at $FRAMEWORK_PY, $USR_LOCAL_PY, $BREW_ARM_PY or $BREW_INTEL_PY (the exact paths preinstall validated); install the python.org 3.12 framework installer and re-run"
+fi
+
+# The verifier, the profiles.py it imports and the release key decide what
+# root installs next, so they get the interpreter's check too: their
+# directories, every directory above them and wherever their symlinks lead
+# must be root's alone (where Homebrew owns /usr/local/lib, as on Intel Macs,
+# whoever can rename a directory there could swap in a verifier that prints
+# PASSED). The check proves the RESOLVED directories, so everything below uses
+# those: the paths as given may lead through a symlink in a directory another
+# account can write, which could be re-pointed between the check and the use.
+verifier_dir="$(cd "$(dirname "$VERIFIER")" && pwd -P)" || fail "cannot resolve the directory of $VERIFIER"
+key_dir="$(cd "$(dirname "$PUBKEY")" && pwd -P)" || fail "cannot resolve the directory of $PUBKEY"
+for trust_dir in "$verifier_dir" "$key_dir"; do
+  root_only_trees "$trust_dir" \
+    || fail "refusing to run the trusted verifier: $UNTRUSTED_WHY. Fix it with: $UNTRUSTED_FIX"
 done
-[ -n "$PY" ] || fail "CPython 3.12 (all-users install) not found at $FRAMEWORK_PY, $USR_LOCAL_PY, $BREW_ARM_PY or $BREW_INTEL_PY (the exact paths preinstall validated); install the python.org 3.12 framework installer or 'brew install python@3.12' and re-run"
+VERIFIER="$verifier_dir/$(basename "$VERIFIER")"
+PUBKEY="$key_dir/$(basename "$PUBKEY")"
+
+# Anti-rollback: the verifier refuses a bundle that is an OLDER release than
+# the installed one ($PREFIX/manifest.json, published by step 7 of the last
+# install), so an older signed .pkg cannot bring back code later releases
+# fixed. A .pkg built before this check runs its own postinstall, which names
+# no installed manifest: the trusted verifier then checks this same file on
+# its own (it is this platform's default), so that .pkg is refused too, but
+# only here. It has no check in its preinstall (this release's preinstall
+# refuses an older payload before it lands), so the Installer has already
+# written its bundle folder, share scripts and LaunchDaemon plist and does not
+# put them back; the refusal says to re-install the current .pkg. A
+# verifier that parses options but has no --installed-manifest
+# predates that check and would stop on the unknown option with a bare usage
+# error; name the fix instead. One that names the option only in a comment
+# gets past this text check, and its argparse then gives it away (below).
+OUTDATED_VERIFIER="the trusted verifier at $VERIFIER is an OUTDATED copy (no --installed-manifest option): it cannot refuse a downgrade to an older release. Install verify_bundle.py and profiles.py from this release's trusted channel into $TRUST_DIR, then re-run the installer"
+if grep -q -- '"--pubkey"' "$VERIFIER" && ! grep -q -- '"--installed-manifest"' "$VERIFIER"; then
+  fail "$OUTDATED_VERIFIER"
+fi
+# An intended downgrade: the flag file $DOWNGRADE_FLAG, naming this release
+# and written by root alone (see downgrade_authorised), used once.
+ROLLBACK_ARGS=(--installed-manifest "$PREFIX/manifest.json")
+if downgrade_authorised; then
+  ROLLBACK_ARGS+=(--allow-downgrade)
+  echo "==> postinstall: $DOWNGRADE_FLAG authorises this release: an older release is accepted this once"
+fi
+rm -f "$DOWNGRADE_FLAG" 2>/dev/null || true
 
 # Execute the verifier under the validated interpreter (it is installed with
-# install -m 644 on the documented channel); VEXEC is pinned to the absolute
-# candidate path — the same contract as install_offline.sh's VEXEC handling
-# without its PATH search.
-VEXEC="$PY"
+# install -m 644 on the documented channel). -I: root-side python never reads
+# PYTHON* variables, the user site or the working directory; the verifier puts
+# its own directory on sys.path for profiles.py. -S: nor the interpreter's
+# site-packages (see the interpreter block); the verifier needs only the
+# standard library. $VEXEC is unquoted at the call site: the resolved
+# interpreter path contains no spaces.
+VEXEC="$PY -I -S"
 # Exit code alone is not proof: python3 on an empty, truncated or no-op
 # verifier exits 0 without certifying anything. Every other call site (deb
 # postinst, install_offline.sh, upgrade_offline.sh, msi verify.ps1) requires
@@ -121,8 +456,18 @@ VEXEC="$PY"
 # the only gap.
 VERIFY_OUT="$(mktemp /var/tmp/udbmcp-verify.XXXXXX)"
 VRC=0
-$VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" >"$VERIFY_OUT" 2>&1 || VRC=$?
+$VEXEC "$VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" "${ROLLBACK_ARGS[@]}" >"$VERIFY_OUT" 2>&1 || VRC=$?
 cat "$VERIFY_OUT"
+# 'rollback refused' or 'rollback check impossible' (an unreadable installed
+# manifest): the verifier's advice, --allow-downgrade, is the flag file here.
+if [ "$VRC" -ne 0 ] && grep -q '^FAIL: rollback ' "$VERIFY_OUT"; then
+  rm -f "$VERIFY_OUT"
+  fail "this package is an OLDER release than the one installed, or the installed $PREFIX/manifest.json is unreadable (see above). To install it anyway, run '$ALLOW_DOWNGRADE_CMD' and run the installer again"
+fi
+if [ "$VRC" -ne 0 ] && grep -q -- 'unrecognized arguments: --installed-manifest' "$VERIFY_OUT"; then
+  rm -f "$VERIFY_OUT"
+  fail "$OUTDATED_VERIFIER"
+fi
 if [ "$VRC" -ne 0 ]; then
   rm -f "$VERIFY_OUT"
   fail "bundle verification FAILED — the payload may be tampered or corrupt; nothing will be installed or executed"
@@ -185,13 +530,16 @@ dscl . -read "/Users/$SERVICE_USER" >/dev/null 2>&1 || {
 # --- step 3: build the venv from the bundle wheelhouse (no index, hashed) ----
 echo "==> postinstall: creating virtual environment at $VENV"
 
-# $PY was selected before step 1 from exactly the preinstall-approved
-# candidates (never a PATH search) and is the interpreter the verifier ran
-# under; re-assert the minor version as defense in depth.
-"$PY" -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"' || {
+# $PY was selected before step 1 by the same code as preinstall (a
+# root-owned installation, never a PATH search) and is the interpreter the
+# verifier ran under; re-assert the minor version as defense in depth. Every
+# root-side run of it below is -I -S, like the verifier; the venv's own
+# python needs its site-packages (filled by pip from the verified wheelhouse)
+# and runs with -I.
+"$PY" -I -S -c 'import sys; assert sys.version_info[:2] == (3, 12), f"CPython 3.12.x required, got {sys.version}"' || {
   fail "CPython 3.12.x is required (the wheelhouse is built for cp312)"
 }
-"$PY" -c 'import ensurepip, venv' 2>/dev/null || fail "venv/ensurepip not available in $PY"
+"$PY" -I -S -c 'import ensurepip, venv' 2>/dev/null || fail "venv/ensurepip not available in $PY"
 
 if [ ! -d "$PREFIX" ]; then
   # Root-owned 755: the venv is code that root-run tools and the service
@@ -215,7 +563,7 @@ for stale in "$VENV/bin/python" "$VENV/bin/python3" "$VENV/bin/python3."*; do
     rm -f "$stale"
   fi
 done
-"$PY" -m venv --copies "$VENV" || fail "could not create the virtual environment at $VENV"
+"$PY" -I -S -m venv --copies "$VENV" || fail "could not create the virtual environment at $VENV"
 
 echo "==> postinstall: installing application from bundle wheelhouse (no index, hashed)"
 # Hostile-env neutralization (mirrors scripts/install_offline.sh): a curated
@@ -235,7 +583,7 @@ env \
   PIP_DISABLE_PIP_VERSION_CHECK=1 \
   PIP_NO_INDEX=1 \
   PIP_FIND_LINKS="$BUNDLE/wheelhouse" \
-  "$VENV/bin/python" -m pip --isolated --disable-pip-version-check install \
+  "$VENV/bin/python" -I -m pip --isolated --disable-pip-version-check install \
   --no-index \
   --no-cache-dir \
   --find-links="$BUNDLE/wheelhouse" \
@@ -249,7 +597,7 @@ env \
 # --- step 4: smoke check — the FIRST execution of payload code, so it is only
 # reached after the step-1 verification passed -------------------------------
 echo "==> postinstall: smoke check"
-"$VENV/bin/python" -m universal_db_mcp version || {
+"$VENV/bin/python" -I -m universal_db_mcp version || {
   fail "smoke check failed: the installed package does not respond to 'universal_db_mcp version'"
 }
 
@@ -301,7 +649,7 @@ else
   [ ! -e "$TOKEN_FILE" ] || echo "    $TOKEN_FILE is empty; regenerating it"
   install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /dev/null "$TOKEN_FILE" \
     || fail "could not create the HTTP bearer token file at $TOKEN_FILE"
-  "$PY" -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" \
+  "$PY" -I -S -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" \
     || fail "could not generate the HTTP bearer token (python secrets)"
   echo "    generated $TOKEN_FILE (0600 $SERVICE_USER:$SERVICE_GROUP)"
 fi
@@ -313,43 +661,157 @@ echo "==> postinstall: provisioning state and log directories"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR" "$LOG_DIR" || {
   fail "could not create $STATE_DIR and $LOG_DIR (the service's state and log directories)"
 }
+# An older release's root site check (sudo udbmcp site-check or doctor) could
+# leave the audit log, its .lock sidecar or a rotated backup in $LOG_DIR owned
+# by root; this release no longer repairs them at run time, so under
+# audit_fail_closed the daemon would refuse every audited call. Hand them back
+# before launchd starts it. $SERVICE_USER owns the directory, so each entry is
+# opened without following links and checked on the open descriptor (a
+# regular file, one link, owned by root) before fchown: a symlink, or a name
+# that is a second link to another file, is left alone. Best effort.
+# >>> hand root-owned audit files back: identical in the deb postinst, the pkg postinstall, install_offline.sh and upgrade_offline.sh
+"$PY" -I -S - "$LOG_DIR" "$SERVICE_USER" <<'PYEOF' || echo "WARNING: could not hand root-owned audit files in $LOG_DIR back to $SERVICE_USER" >&2
+import os
+import pwd
+import stat
+import sys
+
+ROOT = 0
+log_dir, account = sys.argv[1], sys.argv[2]
+owner = pwd.getpwnam(account)
+try:
+    # Logs moved to another volume and linked back: the link is followed only
+    # when root owns it and the directory it is in, so no other account made or
+    # can re-point it. Where it leads is opened like the name itself.
+    if os.path.islink(log_dir):
+        if os.lstat(log_dir).st_uid != ROOT or os.stat(os.path.dirname(os.path.abspath(log_dir))).st_uid != ROOT:
+            sys.exit(f"{log_dir}: a symlink another account could have made or re-pointed")
+        log_dir = os.path.realpath(log_dir)
+    dir_fd = os.open(log_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError as exc:
+    sys.exit(f"{log_dir}: {exc.strerror}")
+try:
+    for name in sorted(os.listdir(dir_fd)):
+        if not name.startswith("audit.jsonl"):
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError:
+            continue  # a symlink, or gone
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == ROOT:
+                os.fchmod(fd, 0o600)  # the audit writer's own mode: it opens the file read-write
+                os.fchown(fd, owner.pw_uid, owner.pw_gid)
+                print(f"==> {log_dir}/{name} was owned by root; handed back to {account}")
+        finally:
+            os.close(fd)
+except OSError as exc:
+    sys.exit(f"{log_dir}: {exc.strerror}")
+finally:
+    os.close(dir_fd)
+PYEOF
+# <<< hand root-owned audit files back
 
 # The shipped config template references this demo database and doctor marks a
 # missing SQLite data file FATAL, so without it the documented post-install
-# check fails on every clean install. Never clobber a seeded one.
+# check fails on every clean install. Never clobber a seeded one (an empty
+# file is an empty SQLite database). $SERVICE_USER owns $STATE_DIR, so root
+# never follows a link there: the demo directory and the file are opened
+# without following links, the file is created only if no name is there yet,
+# and both are handed over on their descriptors.
 # BEST-EFFORT by design: this is a convenience file for the template's example
 # connection, never a reason to fail an otherwise complete install.
 DEMO_DB="$STATE_DIR/demo/finlink_demo.db"
 if [ ! -f "$DEMO_DB" ]; then
-  if install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR/demo" 2>/dev/null \
-     && "$VENV/bin/python" -c "import sqlite3, sys; sqlite3.connect(sys.argv[1]).close()" "$DEMO_DB" 2>/dev/null; then
-    chown "$SERVICE_USER":"$SERVICE_GROUP" "$DEMO_DB" 2>/dev/null || true
-    chmod 0640 "$DEMO_DB" 2>/dev/null || true
-  else
+  # >>> create the demo database: identical in install_offline.sh and the pkg postinstall
+  "$PY" -I -S - "$STATE_DIR" "$SERVICE_USER" <<'PYEOF' 2>/dev/null || {
+import os
+import pwd
+import stat
+import sys
+
+state_dir, account = sys.argv[1], sys.argv[2]
+owner = pwd.getpwnam(account)
+state_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    try:
+        os.mkdir("demo", 0o750, dir_fd=state_fd)
+    except FileExistsError:
+        pass
+    demo_fd = os.open("demo", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+finally:
+    os.close(state_fd)
+try:
+    os.fchown(demo_fd, owner.pw_uid, owner.pw_gid)
+    os.fchmod(demo_fd, 0o750)
+    try:
+        fd = os.open("finlink_demo.db", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=demo_fd)
+    except FileExistsError:
+        # never clobbered; anything but a regular file there is reported
+        st = os.stat("finlink_demo.db", dir_fd=demo_fd, follow_symlinks=False)
+        sys.exit(0 if stat.S_ISREG(st.st_mode) else 1)
+    try:
+        os.fchown(fd, owner.pw_uid, owner.pw_gid)
+        os.fchmod(fd, 0o640)
+    finally:
+        os.close(fd)
+finally:
+    os.close(demo_fd)
+PYEOF
     echo "WARNING: could not create the demo database at $DEMO_DB; doctor will report the" >&2
     echo "         template's demo_sqlite connection as a missing data file." >&2
-  fi
+  }
+  # <<< create the demo database
 fi
 
-# --- step 6b: newsyslog rotation for the launchd daemon's logs ---------------
-# The plist sends StandardOutPath/StandardErrorPath to $LOG_DIR and launchd
-# never rotates them. The rotation config is payload material staged by
-# build_pkg.sh beside the bundle at $PREFIX/share/ (like the GUI app script).
-# BEST-EFFORT by design (like the udbmcp alias and the demo database): the
-# daemon does not depend on rotation, so a failure here degrades to a loud
-# WARNING, never an aborted install.
-echo "==> postinstall: installing newsyslog rotation for $LOG_DIR"
-NEWSYSLOG_SRC="$PREFIX/share/udbmcp.newsyslog.conf"
+# --- step 6b: no root rotation job over the service's log directory ----------
+# Earlier releases installed a newsyslog(8) rule for $LOG_DIR/*.log at
+# /etc/newsyslog.d/udbmcp.conf. The system newsyslog job runs it as root every
+# hour, and a rotation renames, chmods and chowns each archive by name,
+# following a symlink there: $SERVICE_USER owns $LOG_DIR, so it chose which of
+# root's files became its own. The daemon caps its launchd logs itself now
+# (serve, as $SERVICE_USER), so the rule and its payload copy are removed.
+# FAIL CLOSED: a rule left behind keeps root acting on names the service
+# account controls.
 NEWSYSLOG_DST="/etc/newsyslog.d/udbmcp.conf"
-if [ ! -f "$NEWSYSLOG_SRC" ]; then
-  echo "WARNING: $NEWSYSLOG_SRC missing from the payload; logs under $LOG_DIR are not rotated." >&2
-elif install -d -m 0755 -o root -g wheel "$(dirname "$NEWSYSLOG_DST")" 2>/dev/null \
-     && install -m 0644 -o root -g wheel "$NEWSYSLOG_SRC" "$NEWSYSLOG_DST" 2>/dev/null; then
-  echo "    installed $NEWSYSLOG_DST (rotates $LOG_DIR/*.log)"
-else
-  echo "WARNING: could not install $NEWSYSLOG_DST; logs under $LOG_DIR are not rotated" >&2
-  echo "         (install it manually from $NEWSYSLOG_SRC)." >&2
-fi
+for stale in "$NEWSYSLOG_DST" "$PREFIX/share/udbmcp.newsyslog.conf"; do
+  if [ -e "$stale" ] || [ -L "$stale" ]; then
+    rm -f -- "$stale" || fail "could not remove $stale, an earlier release's newsyslog rule over $LOG_DIR; remove it and install again"
+    echo "==> postinstall: removed $stale (an earlier release's newsyslog rule; the daemon caps its own logs)"
+  fi
+done
+
+# --- step 6c: launchd's output files, where only root can write --------------
+# launchd opens the daemon's StandardOutPath and StandardErrorPath itself, as
+# root, before the daemon becomes $SERVICE_USER, creating them and following
+# a symlink there. Earlier releases kept them in $LOG_DIR, which
+# $SERVICE_USER owns: a link it put at server.log led root's open to any
+# file. The plist names $LAUNCHD_LOG_DIR now: only root can write it or any
+# directory above it. Each file is $SERVICE_USER's, so the daemon can cap it
+# (serve empties only a file its account owns); it can do no more than
+# write to it there. FAIL CLOSED: the daemon is not started yet.
+echo "==> postinstall: provisioning $LAUNCHD_LOG_DIR (launchd's stdout and stderr files for the daemon)"
+[ ! -L "$LAUNCHD_LOG_DIR" ] || fail "$LAUNCHD_LOG_DIR is a symlink: launchd opens the daemon's output files there as root; remove it and install again"
+install -d -m 0755 -o root -g wheel "$LAUNCHD_LOG_DIR" || fail "could not create $LAUNCHD_LOG_DIR (launchd's output files for the daemon)"
+above="$LAUNCHD_LOG_DIR"
+while :; do
+  hit="$(untrusted_dir "$above")"
+  [ -z "$hit" ] || fail "$hit is not owned by root, or another account can write to it (write bits or an ACL), and launchd opens the daemon's output files in $LAUNCHD_LOG_DIR as root. Fix: sudo chown root:wheel $hit; sudo chmod go-w $hit; sudo chmod -N $hit"
+  [ "$above" != "/" ] || break
+  above="$(dirname "$above")"
+done
+for out in "$LAUNCHD_LOG_DIR/server.log" "$LAUNCHD_LOG_DIR/server.err.log"; do
+  if [ -L "$out" ] || { [ -e "$out" ] && [ ! -f "$out" ]; }; then
+    fail "$out is not a regular file: launchd opens it as root; remove it and install again"
+  elif [ -e "$out" ]; then
+    # launchd creates a missing one as root; the daemon caps only its own
+    { chown "$SERVICE_USER:$SERVICE_GROUP" "$out" && chmod 0640 "$out"; } \
+      || echo "WARNING: could not hand $out to $SERVICE_USER; the daemon caps only a file its account owns" >&2
+  else
+    install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /dev/null "$out" || fail "could not create $out"
+  fi
+done
 
 # --- step 7: publish manifest.json next to the venv (doctor hook) ------------
 # doctor derives the installed profile from this file instead of guessing from
@@ -416,12 +878,23 @@ done
 # a failed install) - it degrades to a loud WARNING with the manual path.
 echo "==> postinstall: installing 'Configure UniversalDB MCP.app' (agent configuration GUI)"
 APP_DIR="/Applications/Configure UniversalDB MCP.app"
-if ! install -d -m 0755 -o root -g wheel "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" 2>/dev/null; then
+# /Applications is the admin group's to write (root:admin 0775): what is at
+# APP_DIR, or below it, may be links another admin-group process made, which
+# cat >, chown and chmod as root would follow. So the .app is built in a new
+# directory only root can write (mktemp -d, 0700, in the sticky /var/tmp,
+# where nobody else can rename what root makes; never wherever TMPDIR points)
+# and renamed into place over whatever was there, which is removed first
+# (rm -rf removes a link, never what it leads to, and a rename never follows
+# one either).
+APP_BUILD_BASE="/var/tmp"
+APP_BUILD="$(mktemp -d "$APP_BUILD_BASE/udbmcp-app.XXXXXX" 2>/dev/null)" || APP_BUILD=""
+APP_NEW="$APP_BUILD/Configure UniversalDB MCP.app"
+if [ -z "$APP_BUILD" ] || ! install -d -m 0755 "$APP_NEW/Contents/MacOS" "$APP_NEW/Contents/Resources" 2>/dev/null; then
   echo "WARNING: could not create '$APP_DIR'; the agent-configuration GUI is" >&2
   echo "         unavailable (the service itself is running). The dialog logic" >&2
   echo "         can be run directly: $APP_SRC" >&2
 else
-cat > "$APP_DIR/Contents/Info.plist" <<'INFO_PLIST'
+cat > "$APP_NEW/Contents/Info.plist" <<'INFO_PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -447,20 +920,28 @@ cat > "$APP_DIR/Contents/Info.plist" <<'INFO_PLIST'
 </dict>
 </plist>
 INFO_PLIST
-cat > "$APP_DIR/Contents/MacOS/udbmcp-configure" <<WRAPPER
+cat > "$APP_NEW/Contents/MacOS/udbmcp-configure" <<WRAPPER
 #!/bin/bash
 # \$@ must survive as LITERAL wrapper args: this heredoc is unquoted so
 # \$PREFIX expands to the (sandbox-rewritten) install prefix at write time.
 exec "$PREFIX/share/configure_agents_app.sh" "\$@"
 WRAPPER
-chown root:wheel "$APP_DIR/Contents/Info.plist" "$APP_DIR/Contents/MacOS/udbmcp-configure" 2>/dev/null || true
-chmod 0644 "$APP_DIR/Contents/Info.plist"
-chmod 0755 "$APP_DIR/Contents/MacOS/udbmcp-configure"
+chmod 0755 "$APP_NEW" "$APP_NEW/Contents"
+chmod 0644 "$APP_NEW/Contents/Info.plist"
+chmod 0755 "$APP_NEW/Contents/MacOS/udbmcp-configure"
+chown -R root:wheel "$APP_NEW" 2>/dev/null || true
+if ! { rm -rf "$APP_DIR" \
+       && "$PY" -I -S -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$APP_NEW" "$APP_DIR"; }; then
+  echo "WARNING: could not put '$APP_DIR' in place; the agent-configuration GUI is" >&2
+  echo "         unavailable (the service itself is running). The dialog logic" >&2
+  echo "         can be run directly: $APP_SRC" >&2
 fi
+fi
+[ -z "$APP_BUILD" ] || rm -rf "$APP_BUILD"
 
 echo "==> postinstall complete. Next steps:"
 echo "    1. Open 'Configure UniversalDB MCP' in /Applications to register your agent harnesses (it asks before writing)."
 echo "    2. Edit $CONFIG (the template was installed only if absent)."
 echo "    3. Run: $VENV/bin/python -m universal_db_mcp doctor"
-echo "    4. Server logs: $LOG_DIR (launchd label: system/$LABEL)"
+echo "    4. Server logs: $LOG_DIR/http.log; launchd's stdout and stderr: $LAUNCHD_LOG_DIR (launchd label: system/$LABEL)"
 exit 0

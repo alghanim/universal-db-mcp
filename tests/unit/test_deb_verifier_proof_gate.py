@@ -103,6 +103,11 @@ def test_postinst_trust_dir_loop_requires_nonempty_tools() -> None:
     )
 
 
+# The proof: no line of the verifier's output starts with FAIL:, and it holds the PASSED line.
+_PROOF = "[[ \"$vout\" != *'bundle verification PASSED'* ]]"
+_NO_FAIL_LINE = "[[ $'\\n'\"$vout\" == *$'\\n'FAIL:* ]]"
+
+
 @_POSIX
 def test_postinst_proof_gate_covers_both_install_modes() -> None:
     """The proof gate must run on the deferred branch (synchronous verify) AND
@@ -112,7 +117,8 @@ def test_postinst_proof_gate_covers_both_install_modes() -> None:
     code = "\n".join(
         line for line in _read(_POSTINST).splitlines() if not line.lstrip().startswith("#")
     )
-    assert 'grep -q \'bundle verification PASSED\'' in code, (
+    # the output is matched in the shell (never kept in a file root opens by name)
+    assert _PROOF in code and _NO_FAIL_LINE in code, (
         "postinst must require the verifier's explicit PASSED proof"
     )
     # Standalone call sites only (not the function definition line).
@@ -139,7 +145,7 @@ def test_installer_requires_proof_for_both_verifier_invocations() -> None:
     assert 'if [ ! -s "$VERIFIER" ]; then' in code, (
         "install_offline.sh must refuse a zero-length verifier"
     )
-    assert 'grep -q \'bundle verification PASSED\'' in code, (
+    assert _PROOF in code and _NO_FAIL_LINE in code, (
         "install_offline.sh must require the verifier's explicit PASSED proof"
     )
     gate_calls = [m.start() for m in re.finditer(r"verify_with_proof \"\$", code)]

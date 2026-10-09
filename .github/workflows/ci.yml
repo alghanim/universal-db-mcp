@@ -1,0 +1,102 @@
+# Runs on every push to main and every pull request: the unit suite, ruff over
+# src, tests and scripts, mypy --strict, a check that the offline bundle's
+# dependency locks are current, and a vulnerability audit of the installed and
+# the shipped dependencies. The dependencies (the drivers and the test, lint and
+# type-check tools) install from uv.lock, whose hashes uv verifies. The project
+# itself is built from this checkout by the hatchling that pyproject.toml's
+# build-constraint-dependencies pins by version only: uv.lock records no hash
+# for a build dependency. --locked fails the run if pyproject.toml and the lock
+# disagree.
+# Actions are pinned to full commit SHAs, with the release in the trailing
+# comment; Dependabot proposes updates to both. The unit suite also pins the
+# checkout and setup-uv commits below (_SETUP_ACTIONS in
+# tests/unit/test_hardening_2026_09_27_ci_hygiene.py), so a bump of either
+# fails until someone reviews the new commit and updates it there too. Do not
+# add pull_request_target: it would run a contributor's code with a writable
+# token and the secrets.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request replaces its older run. Every commit pushed to
+# main gets a group of its own: GitHub cancels a group's pending run when a
+# newer one joins, even with cancel-in-progress false, so a shared group would
+# leave the middle one of three quick pushes without a result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    # The offline bundle's target profile: Ubuntu 24.04, x86_64, CPython 3.12.
+    # The image also ships PowerShell 7: the unit suite's MSI custom-action
+    # tests run the real .ps1 scripts under its pwsh, and in CI the suite fails
+    # rather than let them skip when there is none.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.16"
+          checksum: "74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
+          python-version: "3.12"
+          enable-cache: false
+
+      # uv sync makes a venv without pip, and the offline bundle builder's tests
+      # run 'python -m pip download' (they skip without it). pip comes from one
+      # exact pin with its hashes, which the audit covers and Dependabot bumps.
+      - name: Install the locked dependencies
+        id: sync
+        run: |
+          uv sync --locked --all-extras
+          uv pip install --python .venv/bin/python --require-hashes -r .github/ci-pip-requirements.txt
+
+      # A step timeout fails this step and the checks below still run; reaching
+      # the job timeout would cancel them all. The suite takes 13-15 minutes on
+      # a hosted runner (2026-10-08), and runner speed varies by about half.
+      - name: Unit tests
+        timeout-minutes: 30
+        run: .venv/bin/python -m pytest tests/unit
+
+      # The checks below run even when an earlier one failed, so every result shows.
+      - name: Lint
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: .venv/bin/ruff check src tests scripts
+
+      - name: Type check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: .venv/bin/mypy --strict src
+
+      # The offline bundle ships requirements/locks/<profile>.txt, resolved from
+      # requirements/runtime.in apart from uv.lock. This fails when a lock no
+      # longer matches its input, e.g. after a Dependabot bump of a pin.
+      - name: Check the shipped locks are current
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: .venv/bin/python scripts/prepare_offline_bundle.py --check-locks
+
+      # Audit everything CI installs from uv.lock (every extra: the drivers and
+      # the test, lint and type-check tools), CI's pip and every lock the bundle
+      # ships.
+      # pip-audit's own dependencies resolve only from files uploaded before
+      # --exclude-newer; PyPI never replaces an uploaded file, so every run
+      # installs the same tool. Move the date when bumping the version.
+      - name: Audit the dependencies
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: |
+          uv export --locked --no-emit-project --format requirements-txt --all-extras \
+            > "$RUNNER_TEMP/ci-requirements.txt"
+          for requirements in "$RUNNER_TEMP/ci-requirements.txt" .github/ci-pip-requirements.txt \
+            requirements/locks/*.txt; do
+            uvx --from pip-audit==2.10.1 --exclude-newer 2026-09-27T00:00:00Z \
+              pip-audit --strict --require-hashes --disable-pip -r "$requirements"
+          done

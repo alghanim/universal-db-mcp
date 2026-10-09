@@ -8,6 +8,9 @@
 # flag. When it runs, the live configuration is displaced to
 # <backup-root>/pre-rollback-<ts>/ and preserved — never deleted — and the
 # backup is validated through the restored venv before anything is moved.
+# The release public key (keys/), the HTTP bearer token (http-token) and the
+# external rollback anchor are not restored from the backup: the live ones
+# are kept.
 #
 # Verify-then-use: the restored venv is executed (doctor below) exactly in the
 # failure scenarios where on-disk state is least trustworthy, so nothing under
@@ -36,6 +39,16 @@
 #   that actor. Reinstall from the signed bundle (whose signature IS verified
 #   on the install/upgrade path) to re-anchor cleanly.
 set -euo pipefail
+# The pythons this script starts run as root with -I, which keeps them from
+# reading PYTHON* variables but not any python they start: the caller's are
+# dropped here.
+for _var in $(compgen -e); do case "$_var" in PYTHON*) unset "$_var" ;; esac; done
+# sudo -E keeps the caller's TMPDIR, where root's bash can write a
+# here-document to a file and reopen it by name (the python that restores the
+# metadata cache below reads its code from one), and python's tempfile takes
+# TEMP or TMP: in a directory another account can write, that account could
+# swap the file in between. Root's temporary files go to the system's own.
+unset TMPDIR TEMP TMP
 
 usage() {
   echo "usage: rollback_offline.sh [target-dir] [backup-root] [--restore-config] [--re-anchor]" >&2
@@ -111,7 +124,12 @@ UDBMCP_VERIFIED_MANIFEST=""
 # symlink to an out-of-tree payload and have it executed through a gate that
 # passes on both integrity references. udbmcp_symlinks_contained closes that
 # gap as part of this same gate.
+#
+# The hash list and the list of offending links are kept in the shell, never
+# in a file: root would write one by name, and compare what is there, in a
+# TMPDIR another account may control (sudo -E keeps the caller's).
 udbmcp_hash_tree() {
+  # prints the hash list of the tree $1 (one line each, as the manifests hold it)
   _hash_cmd=""
   if command -v sha256sum >/dev/null 2>&1; then
     _hash_cmd="sha256sum"
@@ -121,13 +139,10 @@ udbmcp_hash_tree() {
     echo "FAIL: neither sha256sum nor shasum is available; cannot verify $1" >&2
     return 1
   fi
-  _hashes="$(mktemp "${TMPDIR:-/tmp}/udbmcp-rollback-verify.XXXXXX")" || return 1
-  if ! (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 $_hash_cmd) > "$_hashes"; then
-    rm -f "$_hashes"
+  if ! (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 $_hash_cmd); then
     echo "FAIL: hashing $1 failed; refusing to execute it" >&2
     return 1
   fi
-  printf '%s\n' "$_hashes"
 }
 
 # Fail closed unless EVERY symlink under the tree resolves back INSIDE the
@@ -139,26 +154,29 @@ udbmcp_hash_tree() {
 # in-tree components are caught too.
 udbmcp_symlinks_contained() {
   _link_canon="$(cd "$1" && pwd -P)" || return 1
-  _bad_links="$(mktemp "${TMPDIR:-/tmp}/udbmcp-rollback-links.XXXXXX")" || return 1
-  : > "$_bad_links"
+  _bad_links=""
   while IFS= read -r -d '' _link; do
     _link_dest="$(readlink -f -- "$_link" 2>/dev/null)" || _link_dest=""
     case "$_link_dest" in
       "$_link_canon"|"$_link_canon"/*) ;;
-      *) printf '%s\n' "$_link" >> "$_bad_links" ;;
+      *) _bad_links="$_bad_links        $_link"$'\n' ;;
     esac
   done < <(find "$1" -type l -print0)
-  if [ -s "$_bad_links" ]; then
+  if [ -n "$_bad_links" ]; then
     echo "FAIL: symlinks inside $1 are dangling, cyclic, or resolve OUTSIDE the" >&2
     echo "      tree; the integrity manifests hash regular files only, so an" >&2
     echo "      out-of-tree link could execute unverified content through this" >&2
     echo "      gate. Offending links:" >&2
-    sed 's/^/        /' "$_bad_links" >&2
-    rm -f "$_bad_links"
+    printf '%s' "$_bad_links" >&2
     return 1
   fi
-  rm -f "$_bad_links"
   return 0
+}
+
+# Whether the hash list in $_actual is, byte for byte, the manifest $1 (the
+# command substitution dropped the list's final line break; printf puts it back).
+udbmcp_matches() {
+  if [ -n "$_actual" ]; then printf '%s\n' "$_actual"; fi | cmp -s - "$1"
 }
 
 udbmcp_verify_previous_venv() {
@@ -185,16 +203,12 @@ udbmcp_verify_previous_venv() {
     echo "      upgrade_offline.sh to rebuild both, or reinstall from the signed bundle." >&2
     return 1
   fi
-  _actual="$(udbmcp_hash_tree "$TARGET/venv.previous")"
-  if [ -z "$_actual" ]; then
-    return 1
-  fi
+  _actual="$(udbmcp_hash_tree "$TARGET/venv.previous")" || return 1
   if ! udbmcp_symlinks_contained "$TARGET/venv.previous"; then
-    rm -f "$_actual"
     return 1
   fi
   _matched=0
-  if cmp -s "$_actual" "$_reference"; then _matched=1; fi
+  if udbmcp_matches "$_reference"; then _matched=1; fi
   # Explicit operator opt-in only: the external anchor is written by a
   # verified rollback and is never refreshed when a later upgrade demotes a
   # different venv.previous, so after upgrades move past the anchored release
@@ -204,7 +218,6 @@ udbmcp_verify_previous_venv() {
   # success. It never skips verification and never runs silently.
   if [ "$_matched" -eq 0 ] && [ "$_reference" = "$_anchor" ] && [ "$RE_ANCHOR" -eq 1 ]; then
     if [ ! -f "$_colocated" ]; then
-      rm -f "$_actual"
       echo "FAIL: --re-anchor needs the co-located manifest at $_colocated to" >&2
       echo "      re-verify against; none found. Reinstall from the signed bundle." >&2
       return 1
@@ -216,10 +229,9 @@ udbmcp_verify_previous_venv() {
     echo "      venv.previous is the legitimate demoted release; on success the" >&2
     echo "      verified manifest is re-anchored at $_anchor." >&2
     _reference="$_colocated"
-    if cmp -s "$_actual" "$_reference"; then _matched=1; fi
+    if udbmcp_matches "$_reference"; then _matched=1; fi
   fi
   if [ "$_matched" -eq 0 ]; then
-    rm -f "$_actual"
     echo "FAIL: $TARGET/venv.previous does not match its integrity reference" >&2
     echo "      ($_reference); refusing to execute it. The tree is left in place" >&2
     if [ "$_reference" = "$_anchor" ]; then
@@ -236,7 +248,6 @@ udbmcp_verify_previous_venv() {
     fi
     return 1
   fi
-  rm -f "$_actual"
   UDBMCP_VERIFIED_MANIFEST="$_reference"
 }
 
@@ -264,6 +275,47 @@ udbmcp_anchor_verified_manifest() {
   echo "    verified manifest anchored at $ROLLBACK_ANCHOR for the next rollback"
 }
 
+# Prints how the installed-release record $1 relates to the record $2 of the
+# release a rollback restored: raise ($1 is missing, unreadable or an older
+# release), same (the same release_seq), or keep (a later release, or no
+# release_seq to order them by).
+udbmcp_record_order() {
+  [ -f "$2" ] || { echo keep; return 0; }
+  python3 -I -S - "$1" "$2" <<'PYEOF' 2>/dev/null || echo keep
+import json
+import sys
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def seq(manifest):
+    value = manifest.get("release_seq")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+record, running = load(sys.argv[1]), load(sys.argv[2])
+if running is None or seq(running) is None:
+    print("keep")
+elif record is None or seq(record) is None or seq(record) < seq(running):
+    print("raise")
+elif seq(record) == seq(running):
+    print("same")
+else:
+    print("keep")
+PYEOF
+}
+
+# The record of the release in venv.previous, kept beside it by the installer
+# that demoted it (install_offline.sh, upgrade_offline.sh).
+RESTORED_RECORD="$TARGET/venv.previous.manifest.json"
+
 if systemctl list-unit-files 2>/dev/null | grep -q universal-db-mcp; then systemctl stop universal-db-mcp || true; fi
 if [ -d "$TARGET/venv.previous" ]; then
   # Integrity gate BEFORE any rename and before the doctor call below executes
@@ -285,13 +337,42 @@ if [ -d "$TARGET/venv.previous" ]; then
   # doctor resolves the config as args.config or $UDBMCP_CONFIG and fails
   # closed with "no config path" when neither is set; pass it explicitly so
   # the rollback is not aborted by its own validation after the venv swap.
-  "$TARGET/venv/bin/python" -m universal_db_mcp doctor \
+  # -I: as root, never import from the working directory or PYTHON* paths.
+  "$TARGET/venv/bin/python" -I -m universal_db_mcp doctor \
     --config "${UDBMCP_CONFIG:-$ETC_DIR/config.yaml}"
   if [ -d "$TARGET/venv.failed" ]; then
     echo "==> rollback complete (failed venv kept at $TARGET/venv.failed for analysis)"
   else
     echo "==> rollback complete"
   fi
+  # Anti-rollback: $TARGET/manifest.json is the installed-release record the
+  # verifier compares the next bundle with. It still names the release rolled
+  # back FROM and stays so (installing the older bundle again is a downgrade
+  # the operator must name), unless that release is OLDER than the one now
+  # running: a rollback after an intended downgrade. A record below the
+  # running release would accept every bundle in between without a word, so
+  # the record of the release now running (kept beside its venv by the
+  # installer that demoted it) replaces it then.
+  case "$(udbmcp_record_order "$TARGET/manifest.json" "$RESTORED_RECORD")" in
+    raise)
+      if cp "$RESTORED_RECORD" "$TARGET/manifest.json.new.$$" && chmod 0644 "$TARGET/manifest.json.new.$$" \
+        && mv -f "$TARGET/manifest.json.new.$$" "$TARGET/manifest.json"; then
+        echo "    the installed-release record $TARGET/manifest.json named an older release than the"
+        echo "    one now running; it now names the running release (an older bundle is refused)"
+      else
+        rm -f "$TARGET/manifest.json.new.$$" 2>/dev/null || true
+        echo "WARN: $TARGET/manifest.json names an older release than the one now running and could" >&2
+        echo "      not be replaced: until a release is installed again, bundles older than the" >&2
+        echo "      running release are not refused" >&2
+      fi
+      ;;
+    same) ;;
+    *)
+      echo "    NOTE: re-installing the older bundle is a downgrade: pass --allow-downgrade to"
+      echo "          install_offline.sh/upgrade_offline.sh (or UDBMCP_ALLOW_DOWNGRADE=1 for dpkg -i)"
+      ;;
+  esac
+  rm -f "$RESTORED_RECORD"
 else
   echo "no $TARGET/venv.previous found"
 fi
@@ -316,6 +397,23 @@ if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP/universal-db-mcp/config.yaml"
     # staged NEXT TO $ETC_DIR (not inside it) so the displacement below
     # cannot carry it away; the final move is a rename within the same
     # directory, hence atomic, and never aborts the restore.
+    # Trust material and credentials are not configuration either: the
+    # release public key (keys/, rotated with bootstrap.sh --rotate-key) and
+    # the HTTP bearer token (http-token, rotated by the operator) are the live
+    # ones, never the backup's. Restoring the backup's would put back the key
+    # a rotation retired, or a token that was rotated because it leaked. The
+    # live copies are carried into the restored directory (a name absent from
+    # the live directory stays absent).
+    for _live in keys http-token; do
+      rm -rf "$ETC_DIR.new/$_live"
+      if [ -e "$ETC_DIR/$_live" ] || [ -L "$ETC_DIR/$_live" ]; then
+        cp -a "$ETC_DIR/$_live" "$ETC_DIR.new/$_live" || {
+          echo "FAIL: could not carry the live $ETC_DIR/$_live into the restored configuration; live configuration left untouched" >&2
+          rm -rf "$ETC_DIR.new"
+          exit 1
+        }
+      fi
+    done
     _anchor_in_etc=0
     _anchor_restore=""
     case "$ROLLBACK_ANCHOR" in
@@ -329,7 +427,7 @@ if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP/universal-db-mcp/config.yaml"
         ;;
     esac
     if [ -x "$TARGET/venv/bin/python" ]; then
-      UDBMCP_CONFIG="$ETC_DIR.new/config.yaml" "$TARGET/venv/bin/python" -m universal_db_mcp doctor \
+      UDBMCP_CONFIG="$ETC_DIR.new/config.yaml" "$TARGET/venv/bin/python" -I -m universal_db_mcp doctor \
         || {
           echo "FAIL: the backup configuration failed validation; live configuration left untouched" >&2
           rm -rf "$ETC_DIR.new"
@@ -368,12 +466,54 @@ elif [ -n "$LATEST_BACKUP" ]; then
   echo "WARN: backup at $LATEST_BACKUP has no config.yaml; leaving live configuration untouched"
 fi
 
-if [ "$RESTORE_CONFIG" -eq 1 ] && [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP/metadata.sqlite" ]; then
+if [ "$RESTORE_CONFIG" -eq 1 ] && [ -n "$LATEST_BACKUP" ] \
+    && { [ -e "$LATEST_BACKUP/metadata.sqlite" ] || [ -L "$LATEST_BACKUP/metadata.sqlite" ]; }; then
   mkdir -p "$STATE_DIR"
-  if [ -f "$STATE_DIR/metadata.sqlite" ]; then
-    cp "$STATE_DIR/metadata.sqlite" "$STATE_DIR/metadata.sqlite.pre-rollback"
-  fi
-  cp "$LATEST_BACKUP/metadata.sqlite" "$STATE_DIR/metadata.sqlite"
+  # The state directory belongs to the service account, which decides what
+  # every name in it is, and cp writes THROUGH a link at its destination. So
+  # the live cache is renamed aside and the backup written to a new file that
+  # is then renamed into place, all by name in the directory opened without
+  # following a link; the new file is the directory owner's, like the cache
+  # the service writes itself. The backup is read only as a regular file
+  # (upgrade_offline.sh copies a planted link or FIFO as one).
+  python3 -I -S - "$STATE_DIR" "$LATEST_BACKUP/metadata.sqlite" <<'PYEOF' \
+    || echo "WARN: the metadata cache was not restored (it is a cache: the service rebuilds it)" >&2
+import os
+import stat
+import sys
+
+state, backup = sys.argv[1], sys.argv[2]
+try:
+    src = os.open(backup, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError as exc:
+    sys.exit(f"{backup}: {exc.strerror} (a link is never followed)")
+dir_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    if not stat.S_ISREG(os.fstat(src).st_mode):
+        sys.exit(f"{backup} is not a regular file")
+    owner = os.fstat(dir_fd)
+    try:  # rename moves the name, whatever it is, and never follows a link
+        os.replace("metadata.sqlite", "metadata.sqlite.pre-rollback", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    new = f".metadata.sqlite.rollback.{os.getpid()}"
+    try:
+        os.unlink(new, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    fd = os.open(new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        while chunk := os.read(src, 1 << 20):
+            os.write(fd, chunk)
+        if os.geteuid() == 0:
+            os.fchown(fd, owner.st_uid, owner.st_gid)
+    finally:
+        os.close(fd)
+    os.replace(new, "metadata.sqlite", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+finally:
+    os.close(dir_fd)
+    os.close(src)
+PYEOF
 fi
 
 echo "==> restart the service (systemctl restart universal-db-mcp)"

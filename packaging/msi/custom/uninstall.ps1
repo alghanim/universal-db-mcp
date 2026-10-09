@@ -8,10 +8,25 @@
 #       -ServiceName "udbmcp"
 #   Exit code 0 = continue; any nonzero exit fails the action and WiX rolls
 #   back the uninstall.
+#   The same script is the rollback twin of RegisterServiceCA
+#   (RollbackRemoveServiceCA, Execute="rollback"), which also passes
+#       -InstalledManifest "[ProgramFiles64Folder]UniversalDB MCP\manifest.json"
+#   so that a failed install puts back the installed-release record
+#   RegisterServiceCA replaced (see "Rollback" below), and
+#       -Repair "[Installed]"
+#   (non-empty when the product was installed before this run: a repair),
+#   and the commit action
+#   CommitReleaseRecordCA (Execute="commit", Return="ignore"), which passes
+#   that and -Commit, and only removes the record's rollback copy once the
+#   install succeeded. The uninstall itself never passes -InstalledManifest:
+#   the record outlives the product, so a downgrade after an uninstall is
+#   still refused.
 #
 # TRUST MODEL - DO NOT BREAK:
 #   * This action only stops/deletes the service registered by service.ps1
-#     and removes the service Environment value. It executes no payload and
+#     and removes the service Environment value (and, as the rollback twin,
+#     restores the installed-release record; as the commit action it only
+#     removes that record's rollback copy). It executes no payload and
 #     must never be reordered to run before the payload verify action on
 #     upgrade paths.
 #   * The release public key is NEVER shipped inside the package; nothing in
@@ -26,18 +41,46 @@
 #     reboot); failing the uninstall for that would strand the files.
 #   * Any other sc.exe/reg.exe failure exits nonzero (fail closed).
 #   * The machine-wide config at ProgramData\UniversalDB MCP\config.yaml is
-#     NOT retained at uninstall: the config component's NeverOverwrite
-#     protects it at install/repair time only, and the MSI RemoveFiles
-#     standard action (which runs immediately after this one) deletes it in
-#     the same transaction. Back it up before uninstalling. This differs
-#     from the .deb, whose postrm keeps the config on remove.
+#     retained at uninstall: the config component is Permanent (and
+#     NeverOverwrite), so neither an uninstall nor the uninstall of the old
+#     product a major upgrade runs first removes it, as the .deb's postrm
+#     keeps the config on remove. This script never touches it.
+#
+# Rollback: RegisterServiceCA copies the installed-release record it replaces
+# to <record>.previous (an empty copy: there was none) just before it writes
+# the new one, and until then keeps the marker <record>.kept beside it. The
+# rollback twin copies the copy back (or removes the record when the copy is
+# empty) and removes both; with the marker there, or no copy, this install
+# never replaced the record and it is left as it is. A copy an earlier
+# install left is never restored: RegisterServiceCA puts the marker down
+# before it removes such a copy, and a copy this script cannot remove (a
+# local user may hold it open: anyone can read under Program Files) keeps
+# the marker. A failure there is reported and the service is still removed.
+# The service: a first install or an upgrade that fails has no service to
+# keep (an upgrade removed the old product, and its service, first), so the
+# twin stops and deletes the one this install registered. A repair (-Repair
+# non-empty) keeps it: the product, and a registered service, were there
+# before the repair began, and the rollback restores the files the service
+# runs. Deleting it there took a working service away whenever the repair
+# failed, even before RegisterServiceCA had touched the service.
+# Commit (-Commit): the install succeeded, so the copy and the marker go and
+# nothing else is done.
 #
 # Parameters may also be supplied via environment variables for manual runs:
 #   UDBMCP_SERVICE_NAME
 #
 [CmdletBinding()]
 param(
-    [string]$ServiceName = 'udbmcp'
+    [string]$ServiceName = 'udbmcp',
+    # The rollback twin and the commit action only: the installed-release
+    # record to restore, or whose rollback copy to remove.
+    [string]$InstalledManifest = '',
+    # The commit action: remove the record's rollback copy, and nothing else.
+    [switch]$Commit,
+    # The rollback twin only: Windows Installer's Installed property, set
+    # when this run maintains an installed product (a repair). The twin then
+    # keeps the service (see "Rollback" above).
+    [string]$Repair = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -91,6 +134,22 @@ function Write-ToolOutput {
     }
 }
 
+function Remove-RecordCopy {
+    # Removes the rollback copy of the installed-release record ($Copy) and
+    # the marker beside it ($Kept). A copy that cannot be removed keeps the
+    # marker, put down here if RegisterServiceCA had already removed it, so
+    # no later rollback restores that copy.
+    param([string]$Copy, [string]$Kept)
+    try {
+        if (Test-Path -LiteralPath $Copy) { Remove-Item -LiteralPath $Copy -Force }
+    }
+    catch {
+        if (-not (Test-Path -LiteralPath $Kept)) { [System.IO.File]::WriteAllBytes($Kept, [byte[]]@()) }
+        throw
+    }
+    if (Test-Path -LiteralPath $Kept) { Remove-Item -LiteralPath $Kept -Force }
+}
+
 function Test-ServiceExists {
     param([string]$Name)
     $r = Invoke-Tool -Tool $script:ScExe -Arguments ("query " + $Name)
@@ -109,6 +168,56 @@ try {
     # rejected here (same guard as service.ps1; fail closed).
     if ($ServiceName -match '[\s"'']') {
         Fail "service name must not contain whitespace or quotes"
+    }
+
+    # --- commit: the install succeeded (see the header) -------------------------
+    if ($Commit) {
+        if ($InstalledManifest) {
+            $recordCopy = $InstalledManifest + '.previous'
+            try {
+                Remove-RecordCopy -Copy $recordCopy -Kept ($InstalledManifest + '.kept')
+                Write-Output ("==> the installed release record " + $InstalledManifest + " stands: its rollback copy is removed")
+            }
+            catch {
+                Write-Output ("==> WARNING: could not remove " + $recordCopy + ": " + $_.Exception.Message +
+                              "; the marker beside it keeps any later rollback from restoring it")
+            }
+        }
+        exit 0
+    }
+
+    # --- rollback: the installed-release record (see the header) --------------
+    if ($InstalledManifest) {
+        $recordCopy = $InstalledManifest + '.previous'
+        $recordKept = $InstalledManifest + '.kept'
+        try {
+            if (Test-Path -LiteralPath $recordKept) {
+                Write-Output ("==> this install did not replace the installed release record " + $InstalledManifest + ": it is unchanged")
+            }
+            elseif (-not (Test-Path -LiteralPath $recordCopy -PathType Leaf)) {
+                Write-Output ("==> no copy of the installed release record at " + $recordCopy + ": the record is unchanged")
+            }
+            elseif ((Get-Item -LiteralPath $recordCopy).Length -gt 0) {
+                [System.IO.File]::Copy($recordCopy, $InstalledManifest, $true)
+                Write-Output ("==> restored the installed release record " + $InstalledManifest + " from " + $recordCopy)
+            }
+            else {
+                if (Test-Path -LiteralPath $InstalledManifest -PathType Leaf) {
+                    Remove-Item -LiteralPath $InstalledManifest -Force
+                }
+                Write-Output ("==> removed the installed release record " + $InstalledManifest + " (none was recorded before this install)")
+            }
+            Remove-RecordCopy -Copy $recordCopy -Kept $recordKept
+        }
+        catch {
+            Write-Output ("==> WARNING: " + $_.Exception.Message + "; inspect the installed release record " +
+                          $InstalledManifest + " and " + $recordCopy)
+        }
+    }
+
+    if ($InstalledManifest -and $Repair) {
+        Write-Output ("==> a failed repair: the service '" + $ServiceName + "' registered before it is kept")
+        exit 0
     }
 
     if (-not (Test-ServiceExists -Name $ServiceName)) {
@@ -180,7 +289,7 @@ try {
         Write-Output ("==> no UDBMCP_CONFIG value under " + $envKey + " (nothing to clean)")
     }
 
-    Write-Output ("==> uninstall custom action complete (machine-wide config.yaml under ProgramData is NOT retained: RemoveFiles deletes it in this transaction; back it up before uninstalling)")
+    Write-Output ("==> uninstall custom action complete (the machine-wide config.yaml under ProgramData is retained)")
     exit 0
 }
 catch {

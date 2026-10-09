@@ -31,6 +31,13 @@ from universal_db_mcp.connectors import oracle as oracle_module
 from universal_db_mcp.connectors.base import ConnectorError
 from universal_db_mcp.security.policy import EffectivePolicy
 
+try:  # captured before the tests below stub sys.modules["oracledb"]
+    import oracledb
+
+    _REAL_CONNECT_PARAMS: Any = oracledb.ConnectParams
+except ImportError:  # pragma: no cover - the oracle extra is not installed
+    _REAL_CONNECT_PARAMS = None
+
 TCPS_ENTRY = """PRODDB =
   (DESCRIPTION =
     (ADDRESS = (PROTOCOL = TCPS)(HOST = db.internal)(PORT = 2484))
@@ -43,6 +50,14 @@ TCP_ENTRY = TCPS_ENTRY.replace("TCPS", "TCP")
 class _FakeOracle:
     def __init__(self) -> None:
         self.connect_kwargs: list[dict[str, Any]] = []
+
+    @property
+    def ConnectParams(self) -> Any:  # noqa: N802 - the driver's attribute name
+        # tnsnames.ora is resolved by the REAL driver: the TLS check has to
+        # read the alias exactly as python-oracledb dials it.
+        if _REAL_CONNECT_PARAMS is None:
+            pytest.skip("python-oracledb is not installed")
+        return _REAL_CONNECT_PARAMS
 
     def init_oracle_client(self, **kwargs: Any) -> None:
         pass
@@ -114,7 +129,9 @@ def test_tns_alias_with_tls_accepts_tcps_and_passes_the_wallet(
     )
     conn._connect()
     kw = fake.connect_kwargs[0]
-    assert kw["dsn"] == "PRODDB"
+    # the checked descriptor is dialed, never the bare alias the driver could
+    # resolve differently
+    assert "(PROTOCOL=tcps)(HOST=db.internal)(PORT=2484)" in kw["dsn"]
     assert kw["wallet_location"] == str(wallet), "TLS material must reach the alias path too"
 
 
@@ -160,7 +177,7 @@ class _FakeOracleCursor:
 def test_oracle_health_check_survives_a_least_privilege_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cursor = _FakeOracleCursor(fail_on="v$version")
+    cursor = _FakeOracleCursor(fail_on="v_$version")
 
     class _Conn:
         def cursor(self) -> _FakeOracleCursor:

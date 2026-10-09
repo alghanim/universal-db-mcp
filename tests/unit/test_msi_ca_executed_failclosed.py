@@ -100,7 +100,17 @@ try:  # verify.ps1 top-level try -> catch { Fail "unexpected error ..." }
         if idx < 1:
             fail("malformed CustomActionData pair '" + t + "' (expected KEY=VALUE); "
                  "this is a packaging bug in udbmcp.wxs, not an admin problem.")
-        data[t[:idx]] = t[idx + 1:].strip()
+        # ALLOW_DOWNGRADE carries a public msiexec property and the wxs passes
+        # it last: a key after it (or one named twice) came from a ';' in it.
+        # verify.ps1's @{} hashtable ignores the case of its keys: so does
+        # this one (stored upper-case, named as given).
+        key = t[:idx]
+        if "ALLOW_DOWNGRADE" in data:
+            fail("CustomActionData names " + key + " after ALLOW_DOWNGRADE; a msiexec property value "
+                 "may not contain ';'.")
+        if key.upper() in data:
+            fail("CustomActionData names " + key + " twice; a msiexec property value may not contain ';'.")
+        data[key.upper()] = t[idx + 1:].strip()
 
     # --- BUNDLE_DIR required and must exist (verify.ps1 prerequisite block) --
     if not data.get("BUNDLE_DIR"):
@@ -120,7 +130,7 @@ try:  # verify.ps1 top-level try -> catch { Fail "unexpected error ..." }
 
     # --- trust dir resolution + containment (a bundle trust dir proves nada) --
     trust_dir = data.get("TRUST_DIR") or os.environ.get("UDBMCP_TRUST_DIR") \
-        or os.path.join(os.sep, "ProgramData", "udbmcp-trust")
+        or os.path.join(os.environ.get("ProgramFiles", os.path.join(os.sep, "Program Files")), "udbmcp-trust")
     verifier = os.path.join(trust_dir, "verify_bundle.py")
     if inside_dir(trust_dir, bundle_dir):
         fail("trust directory (" + trust_dir + ") is inside the installed bundle (" +
@@ -138,6 +148,15 @@ try:  # verify.ps1 top-level try -> catch { Fail "unexpected error ..." }
     if not profiles_py:
         fail("profiles.py not found in the trust directory (" + trust_dir +
              "); installation ABORTED (fail closed).")
+    # a verifier that parses options but predates --installed-manifest would
+    # stop on the unknown option: name the fix instead
+    with open(verifier, encoding="utf-8", errors="replace") as fh:
+        verifier_text = fh.read()
+    if '"--pubkey"' in verifier_text and '"--installed-manifest"' not in verifier_text:
+        fail("the trusted verifier at " + verifier + " is an OUTDATED copy (no --installed-manifest "
+             "option): it cannot refuse a downgrade to an older release. Install verify_bundle.py and "
+             "profiles.py from this release's trusted channel into " + trust_dir +
+             ", then re-run the installer.")
 
     # --- prerequisite 2: release pubkey, NEVER shipped in the MSI ------------
     pubkey = data.get("PUBKEY") or os.environ.get("UDBMCP_RELEASE_PUBKEY")
@@ -170,10 +189,27 @@ try:  # verify.ps1 top-level try -> catch { Fail "unexpected error ..." }
         fail("python interpreter (" + py_exe + ") is inside the installed bundle; "
              "bundle payload (including its python) may not execute before verification passes.")
 
+    # --- anti-rollback: the installed release's manifest where the wxs says
+    #     (else beside the bundle); the override is per run (CustomActionData
+    #     only) -----------------------------------------------------------------
+    # (verify.ps1 also refuses a record that is a reparse point, that a
+    # non-admin owns or that grants anybody else write access: Windows ACL
+    # APIs, locked by drift pins instead.)
+    installed_manifest = data.get("INSTALLED_MANIFEST") or os.path.join(
+        os.path.dirname(real_path(bundle_dir)), "manifest.json")
+    rollback_args = ["--installed-manifest", installed_manifest]
+    if data.get("ALLOW_DOWNGRADE") == "1":
+        rollback_args.append("--allow-downgrade")
+        print("WARNING: ALLOW_DOWNGRADE=1 (msiexec UDBMCP_ALLOW_DOWNGRADE=1): an OLDER release than the "
+              "installed one is accepted for this install only.")
+    elif data.get("ALLOW_DOWNGRADE"):
+        fail("ALLOW_DOWNGRADE='" + data["ALLOW_DOWNGRADE"] + "' is not understood; pass "
+             "UDBMCP_ALLOW_DOWNGRADE=1 to msiexec to accept an older release, or leave it unset.")
+
     # --- run the ONE trusted verifier (verify.ps1: exit code + output are the
-    #     ONLY decision inputs) ------------------------------------------------
+    #     ONLY decision inputs), isolated (-I) ---------------------------------
     proc = subprocess.run(
-        [py_exe, verifier, "--bundle", bundle_dir, "--pubkey", pubkey],
+        [py_exe, "-I", verifier, "--bundle", bundle_dir, "--pubkey", pubkey, *rollback_args],
         capture_output=True, text=True,
     )
     out = (proc.stdout or "") + (proc.stderr or "")
@@ -182,6 +218,10 @@ try:  # verify.ps1 top-level try -> catch { Fail "unexpected error ..." }
             print("  verify: " + line)
 
     # --- fail closed on EVERY non-passing outcome ----------------------------
+    if proc.returncode != 0 and re.search(r"(?m)^FAIL: rollback refused", out):
+        fail("this MSI carries an OLDER release than the one installed (see 'verify:' lines above); "
+             "installation ABORTED. To downgrade on purpose, run msiexec with "
+             "UDBMCP_ALLOW_DOWNGRADE=1 for that one install.")
     if proc.returncode != 0:
         fail("trusted verifier exited " + str(proc.returncode) +
              " (see 'verify:' lines above). The bundle is untrusted: installation ABORTED.")
@@ -221,6 +261,25 @@ _TWIN_TIE_PINS: tuple[tuple[str, str], ...] = (
      "trusted verifier is executed with it)",
      r"sys\.version_info\[:2\] == \(3, 12\)"),
     ("twin: exit 0 only after proof", r"The ONLY exit-0 path: verification passed with proof"),
+    ("twin: outdated-verifier refusal (no --installed-manifest option)",
+     r"""\$verifierText\.Contains\('"--pubkey"'\) -and -not \$verifierText\.Contains\('"--installed-manifest"'\)"""),
+    ("twin: the installed release's manifest beside the bundle",
+     r"\$InstalledManifest = Join-Path \(Split-Path -Parent \(Real-Path \$BundleDir\)\) 'manifest\.json'"),
+    ("twin: the downgrade override comes from CustomActionData only",
+     r"if \(\$data\['ALLOW_DOWNGRADE'\] -eq '1'\) \{"),
+    ("twin: the older-release diagnostic", r"'\(\?m\)\^FAIL: rollback refused'"),
+    ("twin: the verifier runs isolated", r"\$pyArgs = @\('-I'\)"),
+    ("twin: a CustomActionData key given twice is refused", r"if \(\$data\.ContainsKey\(\$key\)\) \{"),
+    ("twin: CustomActionData keys ignore case (a PowerShell @{} hashtable)", r"\$data = @\{\}\n"),
+    ("twin: no CustomActionData key after ALLOW_DOWNGRADE",
+     r"if \(\$data\.ContainsKey\('ALLOW_DOWNGRADE'\)\) \{\s*\n"
+     r"\s*Fail \"CustomActionData names \$key after ALLOW_DOWNGRADE"),
+    ("twin: the record the wxs names comes first",
+     r"\$InstalledManifest = \$data\['INSTALLED_MANIFEST'\]\s*\n"
+     r"\s*if \(-not \$InstalledManifest\) \{ \$InstalledManifest = Join-Path"),
+    ("twin: only '1' asks for a downgrade", r"\} elseif \(\$data\['ALLOW_DOWNGRADE'\]\) \{"),
+    ("twin: the rollback arguments reach the verifier",
+     r"& \$pyExe @pyArgs \$Verifier --bundle \$BundleDir --pubkey \$PubKey @rollbackArgs "),
 )
 
 
@@ -261,8 +320,10 @@ def _sandbox_bundle(tmp_path: Path) -> Path:
     return bundle
 
 
-def _custom_action_data(bundle: Path, trust: Path, pubkey: Path, *, extra: str = "") -> str:
-    return f"BUNDLE_DIR={bundle};TRUST_DIR={trust};PUBKEY={pubkey};PYTHON={sys.executable}{extra}"
+def _custom_action_data(
+    bundle: Path, trust: Path, pubkey: Path, *, extra: str = "", python: str = sys.executable
+) -> str:
+    return f"BUNDLE_DIR={bundle};TRUST_DIR={trust};PUBKEY={pubkey};PYTHON={python}{extra}"
 
 
 def _run_twin(
@@ -471,25 +532,240 @@ def test_twin_malformed_custom_action_data_refuses(tmp_path: Path) -> None:
     assert "malformed CustomActionData pair" in out, f"canonical diagnostic:\n{out}"
 
 
+# ------------------------------------------ executed twin: anti-rollback --
+
+# A stub trusted verifier that runs the REAL release-order check of
+# scripts/verify_bundle.py (no signatures): the twin's wiring is exercised
+# against the verifier's own decision.
+_RELEASE_VERIFIER = f'''
+import argparse
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("verify_bundle", {str(PROJECT / "scripts" / "verify_bundle.py")!r})
+vb = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(vb)
+ap = argparse.ArgumentParser()
+ap.add_argument("--bundle")
+ap.add_argument("--pubkey")
+ap.add_argument("--installed-manifest")
+ap.add_argument("--allow-downgrade", action="store_true")
+args = ap.parse_args()
+print("isolated=%d" % sys.flags.isolated)
+if args.installed_manifest:
+    manifest = json.loads((Path(args.bundle) / "manifest.json").read_text())
+    vb.check_release_order(manifest, Path(args.installed_manifest), args.allow_downgrade)
+if vb.failed:
+    sys.exit(1)
+print("bundle verification PASSED")
+'''
+
+
+def _release_sandbox(tmp_path: Path, *, bundle_seq: int, installed_seq: int | None) -> str:
+    bundle = _sandbox_bundle(tmp_path)
+    (bundle / "manifest.json").write_text(f'{{"release_seq": {bundle_seq}}}\n', encoding="utf-8")
+    if installed_seq is not None:
+        # the installed release's manifest, beside the bundle directory
+        (bundle.parent / "manifest.json").write_text(f'{{"release_seq": {installed_seq}}}\n', encoding="utf-8")
+    trust = _trust_dir(tmp_path, verifier_exit=0)
+    (trust / "verify_bundle.py").write_text(_RELEASE_VERIFIER, encoding="utf-8")
+    pubkey = tmp_path / "k.pem"
+    pubkey.write_text("x\n", encoding="utf-8")
+    return _custom_action_data(bundle, trust, pubkey)
+
+
+def test_twin_refuses_an_older_release_than_the_installed_one(tmp_path: Path) -> None:
+    proc = _run_twin(tmp_path, _release_sandbox(tmp_path, bundle_seq=5, installed_seq=6))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "FAIL: rollback refused" in out, out
+    assert "carries an OLDER release than the one installed" in out and "UDBMCP_ALLOW_DOWNGRADE=1" in out, out
+
+
+def test_twin_downgrade_override_applies_to_one_run_only(tmp_path: Path) -> None:
+    data = _release_sandbox(tmp_path, bundle_seq=5, installed_seq=6)
+    proc = _run_twin(tmp_path, data + ";ALLOW_DOWNGRADE=1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "DOWNGRADE allowed by --allow-downgrade" in proc.stdout
+    # nothing about the override persists: the next run refuses again
+    proc = _run_twin(tmp_path, data)
+    assert proc.returncode != 0 and "FAIL: rollback refused" in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("installed_seq", "expected"),
+    [(None, "nothing installed yet"), (5, "(not a downgrade)"), (4, "(not a downgrade)")],
+    ids=["first-install", "reinstall", "upgrade"],
+)
+def test_twin_accepts_a_first_install_a_reinstall_and_an_upgrade(
+    tmp_path: Path, installed_seq: int | None, expected: str
+) -> None:
+    proc = _run_twin(tmp_path, _release_sandbox(tmp_path, bundle_seq=5, installed_seq=installed_seq))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert expected in proc.stdout
+    assert "isolated=1" in proc.stdout, "the trusted verifier runs under -I"
+
+
+def test_twin_refuses_an_outdated_verifier(tmp_path: Path) -> None:
+    """A verifier that parses options but has no --installed-manifest would
+    stop on the unknown option; it is refused by name, never run."""
+    bundle = _sandbox_bundle(tmp_path)
+    trust = _trust_dir(tmp_path, verifier_exit=0)
+    canary = tmp_path / "outdated-verifier-ran"
+    (trust / "verify_bundle.py").write_text(
+        "import argparse, pathlib\nap = argparse.ArgumentParser()\n"
+        'ap.add_argument("--bundle")\nap.add_argument("--pubkey")\nap.parse_args()\n'
+        f"pathlib.Path({str(canary)!r}).write_text('ran')\nprint('bundle verification PASSED')\n",
+        encoding="utf-8",
+    )
+    pubkey = tmp_path / "k.pem"
+    pubkey.write_text("x\n", encoding="utf-8")
+    proc = _run_twin(tmp_path, _custom_action_data(bundle, trust, pubkey))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "is an OUTDATED copy (no --installed-manifest option)" in out, out
+    assert not canary.exists()
+
+
+def test_twin_refuses_a_customactiondata_key_given_twice(tmp_path: Path) -> None:
+    data = _release_sandbox(tmp_path, bundle_seq=5, installed_seq=None)
+    elsewhere = _trust_dir(tmp_path / "elsewhere", verifier_exit=0, verifier_output="bundle verification PASSED")
+    proc = _run_twin(tmp_path, f"{data};TRUST_DIR={elsewhere}")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "CustomActionData names TRUST_DIR twice" in out, out
+
+
+@pytest.mark.parametrize("injected", ["PUBKEY", "PYTHON", "TRUST_DIR"])
+def test_twin_refuses_any_key_after_the_downgrade_property(tmp_path: Path, injected: str) -> None:
+    """The wxs carries one public msiexec property (UDBMCP_ALLOW_DOWNGRADE)
+    into CustomActionData, last. A value such as '1;PUBKEY=<file>' added a
+    key the wxs never passes (so not a duplicate), which took precedence over
+    the administrator's machine-wide UDBMCP_RELEASE_PUBKEY or UDBMCP_PYTHON."""
+    _release_sandbox(tmp_path, bundle_seq=5, installed_seq=None)
+    bundle, trust, key = tmp_path / "prefix" / "bundle", tmp_path / "trust", tmp_path / "k.pem"
+    admin = {"UDBMCP_RELEASE_PUBKEY": str(key), "UDBMCP_PYTHON": sys.executable}
+    wxs_shaped = f"BUNDLE_DIR={bundle};TRUST_DIR={trust};ALLOW_DOWNGRADE=1"
+    proc = _run_twin(tmp_path, wxs_shaped, env_extra=admin)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    elsewhere = _trust_dir(tmp_path / "elsewhere", verifier_exit=0, verifier_output="bundle verification PASSED")
+    value = {"PUBKEY": str(key), "PYTHON": sys.executable, "TRUST_DIR": str(elsewhere)}[injected]
+    proc = _run_twin(tmp_path, f"{wxs_shaped};{injected}={value}", env_extra=admin)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert f"CustomActionData names {injected} after ALLOW_DOWNGRADE" in out, out
+
+
+@pytest.mark.parametrize(
+    ("extra", "refusal"),
+    [
+        (";trust_dir={elsewhere}", "CustomActionData names trust_dir twice"),
+        (";Allow_Downgrade=1;pubkey={key}", "CustomActionData names pubkey after ALLOW_DOWNGRADE"),
+    ],
+    ids=["duplicate", "after-downgrade"],
+)
+def test_twin_compares_customactiondata_keys_ignoring_case(tmp_path: Path, extra: str, refusal: str) -> None:
+    """verify.ps1 keeps the keys in a PowerShell @{} hashtable, which ignores
+    case: a lower-case key is the same key, refused as a duplicate or after
+    ALLOW_DOWNGRADE, and a lower-case allow_downgrade=1 is honoured."""
+    data = _release_sandbox(tmp_path, bundle_seq=5, installed_seq=6)
+    elsewhere = _trust_dir(tmp_path / "elsewhere", verifier_exit=0, verifier_output="bundle verification PASSED")
+    proc = _run_twin(tmp_path, data + extra.format(elsewhere=elsewhere, key=tmp_path / "k.pem"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert refusal in out, out
+    proc = _run_twin(tmp_path, data + ";allow_downgrade=1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "DOWNGRADE allowed by --allow-downgrade" in proc.stdout
+
+
+def test_twin_reads_the_release_record_the_wxs_names(tmp_path: Path) -> None:
+    """The wxs passes INSTALLED_MANIFEST (a fixed path under Program Files),
+    so an install to another INSTALLFOLDER still finds the record."""
+    data = _release_sandbox(tmp_path, bundle_seq=5, installed_seq=None)
+    record = tmp_path / "ProgramFiles" / "UniversalDB MCP" / "manifest.json"
+    record.parent.mkdir(parents=True)
+    record.write_text('{"release_seq": 6}\n', encoding="utf-8")
+    proc = _run_twin(tmp_path, f"{data};INSTALLED_MANIFEST={record}")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "FAIL: rollback refused" in out and str(record) in out, out
+
+
+def test_twin_refuses_an_unknown_downgrade_value(tmp_path: Path) -> None:
+    data = _release_sandbox(tmp_path, bundle_seq=5, installed_seq=6)
+    proc = _run_twin(tmp_path, data + ";ALLOW_DOWNGRADE=yes")
+    assert proc.returncode != 0
+    assert "ALLOW_DOWNGRADE='yes' is not understood" in proc.stdout, proc.stdout
+
+
 # ------------------------------------------- executed real ps1 (pwsh present)
+
+
+# verify.ps1 secures its ProgramData log directory and checks the folders
+# above the release key and the interpreter's folder with the Windows ACL
+# APIs (Get-Acl, Set-Acl, DirectorySecurity), which pwsh implements on
+# Windows only; this wrapper stubs them (every entry owned by SYSTEM and
+# writable by SYSTEM and Administrators only, Set-Acl a no-op) so the
+# verifier decisions run on any host with pwsh, the CI ubuntu runner
+# included. The ACL decisions themselves are exercised in
+# tests/unit/test_hardening_2026_09_27_msi.py.
+_PS1_WRAPPER = r"""
+param([string]$Script, [string]$CustomActionData)
+function global:Get-Acl {
+    param([string]$LiteralPath)
+    $acl = [pscustomobject]@{ AreAccessRulesProtected = $true }
+    $acl | Add-Member -MemberType ScriptMethod -Name GetOwner -Value {
+        param($type) [pscustomobject]@{ Value = 'S-1-5-18' }
+    }
+    $acl | Add-Member -MemberType ScriptMethod -Name GetAccessRules -Value {
+        param($explicit, $inherited, $type)
+        foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+            [pscustomobject]@{
+                IdentityReference = [pscustomobject]@{ Value = $sid }
+                AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+                FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                PropagationFlags  = [System.Security.AccessControl.PropagationFlags]::None
+            }
+        }
+    }
+    return $acl
+}
+function global:Set-Acl { param([string]$LiteralPath, $AclObject) }
+function global:New-Object {
+    if ($args.Count -ge 1 -and $args[0] -eq 'System.Security.AccessControl.DirectorySecurity') {
+        $security = [pscustomobject]@{}
+        $security | Add-Member -MemberType ScriptMethod -Name SetSecurityDescriptorSddlForm -Value { param($sddl) }
+        return $security
+    }
+    Microsoft.PowerShell.Utility\New-Object @args
+}
+& $Script -CustomActionData $CustomActionData
+exit $LASTEXITCODE
+"""
 
 
 @pytest.mark.skipif(PWSH is None, reason="pwsh not installed on this host (recorded honestly; "
                                          "Windows runtime is ledgered not_run)")
 class TestVerifyPs1ExecutedUnderPwsh:
     """The REAL packaging/msi/custom/verify.ps1, executed by pwsh where one
-    exists. Deliberately limited to the decisions that are host-independent:
-    the containment cases rely on Windows path separators inside
-    Test-InsideDir and are locked by the twin tests + drift pins instead."""
+    exists, with the Windows ACL APIs stubbed (see _PS1_WRAPPER).
+    Deliberately limited to the decisions that are host-independent: the
+    containment cases rely on Windows path separators inside Test-InsideDir
+    and are locked by the twin tests + drift pins instead."""
 
     def _run_ps1(self, tmp_path: Path, data: str) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["ProgramData"] = str(tmp_path)  # Write-Log's log dir, sandboxed
         for key in ("UDBMCP_TRUST_DIR", "UDBMCP_RELEASE_PUBKEY", "UDBMCP_PYTHON"):
             env.pop(key, None)
+        wrapper = tmp_path / "run-verify.ps1"
+        wrapper.write_text(_PS1_WRAPPER, encoding="utf-8")
         return subprocess.run(  # noqa: S603 - fixed args, repo script under test
-            [str(PWSH), "-NoProfile", "-NonInteractive", "-File", str(VERIFY_PS1),
-             "-CustomActionData", data],
+            [str(PWSH), "-NoProfile", "-NonInteractive", "-File", str(wrapper),
+             "-Script", str(VERIFY_PS1), "-CustomActionData", data],
             capture_output=True, text=True, timeout=300, env=env,
         )
 
@@ -498,24 +774,42 @@ class TestVerifyPs1ExecutedUnderPwsh:
         key.write_text("-----BEGIN PUBLIC KEY-----\nSANDBOX\n-----END PUBLIC KEY-----\n", encoding="utf-8")
         return key
 
+    def _data(self, tmp_path: Path, bundle: Path, trust: Path) -> str:
+        # verify.ps1 refuses an interpreter that is a link (sys.executable
+        # often is one): a plain python.exe that runs this interpreter
+        python = tmp_path / "Python312" / "python.exe"
+        python.parent.mkdir()
+        python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+        _make_exec(python)
+        return _custom_action_data(bundle, trust, self._pubkey(tmp_path), python=str(python))
+
     def test_happy_path_exits_zero(self, tmp_path: Path) -> None:
         bundle = _sandbox_bundle(tmp_path)
         trust = _trust_dir(tmp_path, verifier_exit=0, verifier_output="bundle verification PASSED")
-        proc = self._run_ps1(tmp_path, _custom_action_data(bundle, trust, self._pubkey(tmp_path)))
+        proc = self._run_ps1(tmp_path, self._data(tmp_path, bundle, trust))
         assert proc.returncode == 0, f"{proc.stdout}{proc.stderr}"
 
     def test_verifier_nonzero_exit_rolls_back(self, tmp_path: Path) -> None:
         bundle = _sandbox_bundle(tmp_path)
         trust = _trust_dir(tmp_path, verifier_exit=1)
-        proc = self._run_ps1(tmp_path, _custom_action_data(bundle, trust, self._pubkey(tmp_path)))
+        proc = self._run_ps1(tmp_path, self._data(tmp_path, bundle, trust))
         out = proc.stdout + proc.stderr
         assert proc.returncode != 0
         assert "FAIL: trusted verifier exited 1" in out, f"{out}"
 
+    def test_customactiondata_keys_ignore_case_as_in_the_twin(self, tmp_path: Path) -> None:
+        bundle = _sandbox_bundle(tmp_path)
+        trust = _trust_dir(tmp_path, verifier_exit=0, verifier_output="bundle verification PASSED")
+        elsewhere = _trust_dir(tmp_path / "elsewhere", verifier_exit=0, verifier_output="bundle verification PASSED")
+        proc = self._run_ps1(tmp_path, self._data(tmp_path, bundle, trust) + f";trust_dir={elsewhere}")
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0
+        assert "CustomActionData names trust_dir twice" in out, out
+
     def test_exit_zero_without_proof_is_refused(self, tmp_path: Path) -> None:
         bundle = _sandbox_bundle(tmp_path)
         trust = _trust_dir(tmp_path, verifier_exit=0, verifier_output="silent success")
-        proc = self._run_ps1(tmp_path, _custom_action_data(bundle, trust, self._pubkey(tmp_path)))
+        proc = self._run_ps1(tmp_path, self._data(tmp_path, bundle, trust))
         out = proc.stdout + proc.stderr
         assert proc.returncode != 0
         assert "did not print 'bundle verification PASSED'" in out, f"{out}"

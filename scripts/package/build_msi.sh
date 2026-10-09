@@ -26,10 +26,11 @@
 #      (harvest.wxi is a BUILD PRODUCT — the .wxs includes it relatively and
 #      it is intentionally never committed; the build runs out of a temp dir
 #      so the repo tree stays clean).
-#   4. Substitutes the SIGNED manifest.release into the .wxs preprocessor
-#      variables (ProductVersion) plus the build-time paths, then:
+#   4. Substitutes the SIGNED manifest's release_seq into the .wxs
+#      preprocessor variables (ProductVersion, as major.minor.build) plus the
+#      build-time paths, then:
 #        wix build -arch x64 \
-#            -define ProductVersion=<manifest.release> \
+#            -define ProductVersion=<manifest.release_seq as major.minor.build> \
 #            -define ConfigTemplateSource=<staged config template> \
 #            -define BundleSourceDir=<staged signed bundle> \
 #            -out dist/universal-db-mcp-<version>-win-x86_64.msi \
@@ -43,10 +44,12 @@
 #   - No package is produced before a trusted-channel
 #     verify_bundle.py --pubkey run has passed on the source bundle.
 #   - The release public key is NEVER shipped inside the package: it is
-#     distributed out-of-band by the admin (on Windows it is provisioned to
-#     C:\ProgramData\udbmcp-trust by the admin BEFORE running the MSI). The
-#     staged payload is scanned and the build fails if any public key
-#     material would be embedded.
+#     distributed out-of-band by the admin (on Windows it is provisioned,
+#     with the trusted verifier, under C:\Program Files\udbmcp-trust, as
+#     C:\Program Files\udbmcp-trust\keys\udbmcp-release.pub.pem, by the
+#     admin BEFORE running the MSI; a non-admin can pre-create any folder
+#     under C:\ProgramData). The staged payload is scanned and the build
+#     fails if any public key material would be embedded.
 #   - Nothing in the bundle is executed on the staging host; the build only
 #     copies bytes. Runtime verification happens in the deferred custom
 #     actions (packaging/msi/custom/*.ps1) on the target machine.
@@ -89,8 +92,9 @@ find_pubkey_material() {
     # Any file whose NAME looks like key material, anywhere under the given
     # trees. Trust invariant: the release public key is NEVER shipped inside
     # a package — it is distributed out-of-band by the admin (on Windows it
-    # is provisioned to C:\ProgramData\universal-db-mcp\keys BEFORE msiexec
-    # runs; the MSI custom actions read it from machine scope only).
+    # is provisioned to C:\Program Files\udbmcp-trust\keys\udbmcp-release.pub.pem
+    # BEFORE msiexec runs; the MSI custom actions read its path from machine
+    # scope only).
     find "$@" -type f \( -name '*.pub' -o -name '*.pub.pem' -o -name '*.pem' -o -name 'release.pub*' -o -name '*pubkey*' \)
 }
 
@@ -212,33 +216,43 @@ case "$RELEASE" in
     ""|*[!A-Za-z0-9.]*) die "invalid release version in manifest: '$RELEASE'" ;;
 esac
 
-# MSI ProductVersion is numerically limited (first three fields, each
-# <= 65535). Verify against the SIGNED manifest version so a bad version
-# fails here instead of surfacing as a broken installer on the target.
-_fields_ok=1
-python3 - "$RELEASE" <<'PYEOF' || _fields_ok=0
-import sys
+# MSI ProductVersion: what Windows Installer upgrades by. It compares three
+# fields, major (at most 255), minor (255) and build (65535), so the release
+# string cannot order builds. It is the signed manifest's release_seq, the
+# order the verifier's anti-rollback check uses (by default the source
+# commit's timestamp), written in those fields: 1 + seq // 2^24,
+# seq // 2^16 % 256, seq % 2^16. A later release always has a higher version,
+# and every version is above the 0.1.0 of the MSIs published before this:
+# those refuse to install over a newer version (their MajorUpgrade
+# DowngradeErrorMessage), and their verify action cannot refuse an older
+# release itself. The release string stays in the file name.
+VERSION_TMP="$(mktemp "${TMPDIR:-/tmp}/udbmcp-version.XXXXXX")"
+_version_ok=1
+python3 - "$MANIFEST" > "$VERSION_TMP" <<'PYEOF' || _version_ok=0
+import json, sys
 
-version = sys.argv[1]
-parts = version.split(".")
-if not all(p.isdigit() for p in parts) or not parts:
-    print("FAIL: release version is not numeric-dotted: " + version, file=sys.stderr)
+with open(sys.argv[1]) as fh:
+    seq = json.load(fh).get("release_seq")
+if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+    print("FAIL: manifest release_seq is " + repr(seq) + ", not a non-negative integer: the MSI version "
+          "orders releases by it (rebuild the bundle with prepare_offline_bundle.py --release-seq)",
+          file=sys.stderr)
     raise SystemExit(1)
-if len(parts) > 3:
-    print("WARN: release has more than 3 numeric fields; MSI ProductVersion keeps only the first three: "
-          + ".".join(parts[:3]), file=sys.stderr)
-for field in parts[:3]:
-    if int(field) > 65535:
-        print("FAIL: ProductVersion field exceeds 65535: " + field, file=sys.stderr)
-        raise SystemExit(1)
+if seq >= 255 << 24:
+    print("FAIL: release_seq " + str(seq) + " does not fit an MSI ProductVersion (at most "
+          + str((255 << 24) - 1) + ")", file=sys.stderr)
+    raise SystemExit(1)
+print("%d.%d.%d" % (1 + (seq >> 24), (seq >> 16) & 0xFF, seq & 0xFFFF))
 PYEOF
-[ "$_fields_ok" -eq 1 ] || die "manifest release '$RELEASE' is not a valid MSI ProductVersion (fail closed)"
+PRODUCT_VERSION="$(cat "$VERSION_TMP")"
+rm -f "$VERSION_TMP"
+[ "$_version_ok" -eq 1 ] || die "manifest release_seq cannot order this MSI (fail closed)"
 
 MSI_FILE="universal-db-mcp-${RELEASE}-win-${TARGET_ARCH}.msi"
 
 echo "==> bundle:    $BUNDLE"
 echo "==> target:    $TARGET_OS/$TARGET_ARCH"
-echo "==> version:   $RELEASE (from signed manifest)"
+echo "==> version:   $RELEASE, MSI ProductVersion $PRODUCT_VERSION (release_seq, from signed manifest)"
 
 # ---------------------------------------------------------------------------
 # 1. verify the source bundle BEFORE staging anything (fail closed)
@@ -274,10 +288,14 @@ echo "==> verifying bundle via trusted-channel verifier: $TRUSTED/verify_bundle.
 # host is macOS/Linux while the bundle targets windows-x86_64): it skips only
 # the local python-version check, never a signature check. The deferred
 # custom action on the Windows target re-verifies WITHOUT this flag.
+# --no-installed-manifest: a release gate on a build machine, so the
+# release this machine has installed never decides whether the build passes
+# (the verify custom action compares with the target's installed release).
 python3 "$TRUSTED/verify_bundle.py" \
     --bundle "$BUNDLE" \
     --pubkey "$PUBKEY" \
     --allow-platform-mismatch \
+    --no-installed-manifest \
     || die "bundle verification FAILED against $BUNDLE — refusing to package unverified payload"
 
 # ---------------------------------------------------------------------------
@@ -297,10 +315,10 @@ echo "==> staging signed bundle payload"
 cp -a "$BUNDLE/." "$STAGE_BUNDLE/"
 
 # Trust invariant check: the release public key must NEVER ship inside the
-# package (on Windows the admin provisions it out-of-band into
-# C:\ProgramData\universal-db-mcp\keys before the MSI runs; the deferred
-# verify action reads it from machine scope). Scan the staged payload for
-# public-key material and fail closed.
+# package (on Windows the admin provisions it out-of-band as
+# C:\Program Files\udbmcp-trust\keys\udbmcp-release.pub.pem before the MSI
+# runs; the deferred verify action reads its path from machine scope). Scan
+# the staged payload for public-key material and fail closed.
 # Fail closed: CAPTURE the scan output instead of piping into `grep -q`.
 # `grep -q` exits at the first match and closes the pipe; if find still has
 # output to write it dies of SIGPIPE (141) and, under the pipefail above, the
@@ -339,7 +357,7 @@ CUSTOM_SRC="$PROJECT_ROOT/packaging/msi/custom"
 [ -d "$CUSTOM_SRC" ] || die "custom action scripts missing: $CUSTOM_SRC (expected from packaging/msi/custom/)"
 CUSTOM_STAGE="$STAGE/custom"
 mkdir -p "$CUSTOM_STAGE"
-for ps1 in verify.ps1 venv.ps1 doctor.ps1 service.ps1 uninstall.ps1; do
+for ps1 in verify.ps1 venv.ps1 doctor.ps1 service.ps1 uninstall.ps1 folders.ps1; do
     [ -f "$CUSTOM_SRC/$ps1" ] || die "custom action script missing: $CUSTOM_SRC/$ps1 (the deferred action wiring in udbmcp.wxs requires it)"
     cp "$CUSTOM_SRC/$ps1" "$CUSTOM_STAGE/$ps1"
 done
@@ -353,6 +371,29 @@ if [ -n "$custom_key_hits" ]; then
     printf '%s\n' "$custom_key_hits"
     die "public key material found in the staged custom action scripts — the release pubkey is never shipped inside a package"
 fi
+
+# The folder check (CheckFoldersCA) runs before CreateFolders, so before any
+# file is installed: its script cannot be one. udbmcp.wxs includes
+# folders.wxi, which carries the staged folders.ps1 as the private property
+# UdbmcpFolderCheck (UTF-8, base64); the action decodes it into a script
+# block. Generated from the staged, key-scanned copy only.
+python3 - "$CUSTOM_STAGE/folders.ps1" "$STAGE/folders.wxi" <<'PYEOF' \
+    || die "could not generate folders.wxi from the staged folders.ps1"
+import base64
+import sys
+
+with open(sys.argv[1], "rb") as fh:
+    script = fh.read()
+script.decode("utf-8")  # fail closed on anything but UTF-8 text
+encoded = base64.b64encode(script).decode("ascii")
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    fh.write('<?xml version="1.0" encoding="utf-8"?>\n'
+             "<!-- GENERATED by scripts/package/build_msi.sh from packaging/msi/custom/folders.ps1 -->\n"
+             '<Include xmlns="http://wixtoolset.org/schemas/v4/wxs">\n'
+             '  <Property Id="UdbmcpFolderCheck" Value="' + encoded + '" />\n'
+             "</Include>\n")
+PYEOF
+[ -s "$STAGE/folders.wxi" ] || die "folders.wxi is missing/empty (fail closed)"
 
 # ---------------------------------------------------------------------------
 # 3. harvest the staged signed bundle -> harvest.wxi (WiX v4-native)
@@ -529,6 +570,7 @@ python3 "$HARVESTER" "$STAGE_BUNDLE" "$STAGE/harvest.wxi" \
 if command -v xmllint >/dev/null 2>&1; then
     xmllint --noout "$STAGE/udbmcp.wxs" || die "udbmcp.wxs is not well-formed XML (xmllint)"
     xmllint --noout "$STAGE/harvest.wxi" || die "harvest.wxi is not well-formed XML (xmllint)"
+    xmllint --noout "$STAGE/folders.wxi" || die "folders.wxi is not well-formed XML (xmllint)"
 else
     echo "NOTE: xmllint not installed; skipping XML syntax validation (wix build still validates the authoring)" >&2
 fi
@@ -569,7 +611,7 @@ if [ "$(uname -s)" != "Windows_NT" ]; then
 fi
 
 wix build -arch x64 \
-    -define "ProductVersion=$RELEASE" \
+    -define "ProductVersion=$PRODUCT_VERSION" \
     -define "ConfigTemplateSource=$CONFIG_TEMPLATE" \
     -define "BundleSourceDir=$STAGE_BUNDLE" \
     -define "CustomActionScriptsDir=$CUSTOM_STAGE" \
@@ -609,7 +651,7 @@ fi
 
 echo "==> built: $MSI_PATH"
 echo "    sha256: $(sha256_of "$MSI_PATH")"
-echo "==> version $RELEASE derives from the signed manifest (release=$RELEASE, target=$TARGET_OS/$TARGET_ARCH)."
+echo "==> version $RELEASE (ProductVersion $PRODUCT_VERSION) derives from the signed manifest (release=$RELEASE, target=$TARGET_OS/$TARGET_ARCH)."
 echo "    Runtime verification, venv build, and service install are performed by deferred"
 echo "    custom actions on the Windows target (wired in packaging/msi/udbmcp.wxs; scripts"
 echo "    staged from packaging/msi/custom/*.ps1) and are gated by scripts/test_package_msi.ps1"

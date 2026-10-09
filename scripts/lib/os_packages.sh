@@ -30,7 +30,7 @@
 _udbmcp_dpkg_locks_held() {
   command -v python3 >/dev/null 2>&1 || return 0
   local lock_files="${UDBMCP_DPKG_LOCK_FILES:-/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock}"
-  if python3 - $lock_files 2>/dev/null <<'PYEOF'
+  if python3 -I -S - $lock_files 2>/dev/null <<'PYEOF'
 import fcntl, sys
 rc = 0
 for path in sys.argv[1:]:
@@ -127,7 +127,7 @@ udbmcp_install_os_packages() {
   # msodbcsql18, whose postinst runs `odbcinst`). The manifest read runs in the
   # consuming context for the same staging reason as above.
   local order
-  order="$(_udbmcp_rootrun "$py" - "$bundle/manifest.json" <<'PYEOF'
+  order="$(_udbmcp_rootrun "$py" -I -S - "$bundle/manifest.json" <<'PYEOF'
 import json, sys
 try:
     with open(sys.argv[1]) as fh:

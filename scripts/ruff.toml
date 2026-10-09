@@ -1,0 +1,20 @@
+# Lint settings for scripts/: the project's ruff settings plus the file-scoped
+# waivers below, so CI's `ruff check src tests scripts` covers the build and
+# evidence tools too. A waiver names one file and says why the rule does not
+# apply there; a new finding elsewhere still fails the check.
+extend = "../pyproject.toml"
+
+[lint.per-file-ignores]
+# I001: a second blank line after the imports, nothing else; drop this waiver when that line goes.
+"demo_agent_probe.py" = ["I001"]
+# S607: staging-only evidence script that starts openssl and docker by name from the operator's PATH (argv lists, no shell).
+"http_client_evidence.py" = ["S607"]
+# S603/S607: the bundle builder runs pip, openssl and git from the build host's PATH with argv lists, never a shell string.
+# B904: it raises SystemExit inside except clauses, and SystemExit prints only its message, so chaining adds nothing.
+# E501: two long literals (a template copy and the manifest's verification instruction).
+"prepare_offline_bundle.py" = ["S603", "S607", "B904", "E501"]
+# E501: long DDL and seed SQL literals. S608: SQL text built from the probe's own constant table names and
+# placeholders, never from input. S110: best-effort drops of its own seed objects. S607: git from PATH for the revision.
+"version_matrix/probe.py" = ["E501", "S110", "S607", "S608"]
+# E501: one long table-row expression.
+"version_matrix/summarize.py" = ["E501"]

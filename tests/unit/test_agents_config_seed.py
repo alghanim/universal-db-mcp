@@ -12,7 +12,9 @@ falls back to it.
 from __future__ import annotations
 
 import json
+import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -55,6 +57,7 @@ def test_readable_system_config_is_advertised(tmp_path: Path, monkeypatch: pytes
     assert agents_core.resolve_harness_config_path({}, _fake_home(tmp_path)) == str(system)
 
 
+@pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root may read any file")
 def test_unreadable_system_config_falls_back_to_per_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -147,6 +150,7 @@ def test_json_apply_reports_seeded_config(
     fake_home.mkdir()
     (fake_home / ".claude").mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.setenv("PATH", "")
     monkeypatch.setattr(
         agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-such-etc" / "config.yaml"
@@ -181,6 +185,7 @@ def test_bare_doctor_resolves_the_per_user_config(
         "application:\n  transport: stdio\n", encoding="utf-8"
     )
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     monkeypatch.setattr(
         agents_core, "SYSTEM_CONFIG_PATH", tmp_path / "no-such-etc" / "config.yaml"

@@ -5,7 +5,7 @@ Priority: optional
 Architecture: amd64
 Depends: python3 (>= 3.12~), python3-venv, libc6 (>= 2.36)
 Recommends: systemd
-Maintainer: Universal DB MCP Release Engineering <release-eng@example.invalid>
+Maintainer: universal-db-mcp maintainers <maintainers@universal-db-mcp.invalid>
 Description: Air-gapped MCP server for universal database access
  Universal DB MCP exposes PostgreSQL, MySQL/MariaDB, ClickHouse, Oracle,
  Microsoft SQL Server and Db2 to MCP clients behind a single hardened

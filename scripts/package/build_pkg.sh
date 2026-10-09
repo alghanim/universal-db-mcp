@@ -118,12 +118,14 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 # The verifier comes from the trusted channel (repo copy, or an explicit
-# override) — NEVER from inside the bundle being verified.
+# override) — NEVER from inside the bundle being verified. A release installed
+# on this build machine never decides the build (--no-installed-manifest).
 VERIFIER="${UDBMCP_VERIFIER:-$PROJECT/scripts/verify_bundle.py}"
 [ -f "$VERIFIER" ] || fail "trusted verifier not found: $VERIFIER (set UDBMCP_VERIFIER)"
 
 log "==> trusted-channel verification of source bundle (fail closed)"
-if ! "$PYTHON_BIN" "$VERIFIER" --bundle "$BUNDLE_DIR" --pubkey "$PUBKEY" --allow-platform-mismatch >>"$LOG_FILE" 2>&1; then
+if ! "$PYTHON_BIN" "$VERIFIER" --bundle "$BUNDLE_DIR" --pubkey "$PUBKEY" --allow-platform-mismatch \
+    --no-installed-manifest >>"$LOG_FILE" 2>&1; then
   fail "verify_bundle.py FAILED for $BUNDLE_DIR; refusing to stage any payload (see $LOG_FILE)"
 fi
 log "    verify_bundle.py PASSED"
@@ -136,11 +138,34 @@ case "$VERSION" in
 esac
 log "    release: $VERSION"
 
+# The payload's release_seq goes into the pkg scripts: preinstall refuses an
+# OLDER release before the Installer writes any of the payload, and the
+# downgrade flag names the release it authorises. Empty for a bundle without
+# one (the verifier orders such a release in postinstall).
+RELEASE_SEQ="$("$PYTHON_BIN" -c 'import json, sys
+seq = json.load(open(sys.argv[1])).get("release_seq")
+print(seq if type(seq) is int and seq >= 0 else "")' "$BUNDLE_DIR/manifest.json")"
+log "    release_seq: ${RELEASE_SEQ:-<none>}"
+# And its source revision (preinstall refuses another release with the
+# installed release_seq); only characters a git revision or the builder's
+# timestamp fallback use, anything else is left out (the verifier still
+# compares in postinstall).
+SOURCE_REV="$("$PYTHON_BIN" -c 'import json, re, sys
+rev = json.load(open(sys.argv[1])).get("source_rev")
+ok = isinstance(rev, str) and re.fullmatch(r"[A-Za-z0-9._+~-]{1,128}", rev) and rev.lower() != "unknown"
+print(rev if ok else "")' "$BUNDLE_DIR/manifest.json")"
+
 PROFILE="$("$PYTHON_BIN" -c 'import json, sys
 print(json.load(open(sys.argv[1])).get("profile", ""))' "$BUNDLE_DIR/manifest.json")"
+# HOST_ARCHS: the Distribution's hostArchitectures. Without arm64 in it the
+# Installer runs the package's scripts under Rosetta 2, and the universal2
+# python they start then runs as x86_64, which cannot install a macos-arm64
+# bundle (the scripts also start over natively; see packaging/pkg/preinstall).
+HOST_ARCHS="arm64,x86_64"
 case "$PROFILE" in
   macos-*)
     PKG_TAG="macos-arm64"
+    HOST_ARCHS="arm64"
     ;;
   *)
     # Not a hard failure: the payload is verified byte-for-byte either way,
@@ -216,11 +241,20 @@ APP_SRC="$PROJECT/packaging/macos-app/configure_agents_app.sh"
 SHARE_DEST="$ROOT/usr/local/universal-db-mcp/share"
 mkdir -p "$SHARE_DEST"
 install -m 0755 "$APP_SRC" "$SHARE_DEST/configure_agents_app.sh"
-# newsyslog rotation for the daemon's launchd logs; postinstall installs it
-# (best-effort) at /etc/newsyslog.d/udbmcp.conf.
-NEWSYSLOG_SRC="$PROJECT/packaging/launchd/udbmcp.newsyslog.conf"
-[ -f "$NEWSYSLOG_SRC" ] || fail "newsyslog rotation config missing at $NEWSYSLOG_SRC"
-install -m 0644 "$NEWSYSLOG_SRC" "$SHARE_DEST/udbmcp.newsyslog.conf"
+
+# --- pkg scripts, with the payload's release_seq (and source_rev) written in ---
+SCRIPTS_STAGE="$WORK/scripts"
+mkdir -p "$SCRIPTS_STAGE"
+for f in preinstall postinstall; do
+  [ "$(grep -cx 'PAYLOAD_RELEASE_SEQ=""' "$SCRIPTS_DIR/$f")" = 1 ] \
+    || fail "pkg $f must hold exactly one PAYLOAD_RELEASE_SEQ=\"\" line for the release_seq"
+  # preinstall alone compares source revisions (postinstall's verifier does it itself)
+  [ "$f" != preinstall ] || [ "$(grep -cx 'PAYLOAD_SOURCE_REV=""' "$SCRIPTS_DIR/$f")" = 1 ] \
+    || fail "pkg $f must hold exactly one PAYLOAD_SOURCE_REV=\"\" line for the source revision"
+  sed -e "s/^PAYLOAD_RELEASE_SEQ=\"\"\$/PAYLOAD_RELEASE_SEQ=\"$RELEASE_SEQ\"/" \
+      -e "s/^PAYLOAD_SOURCE_REV=\"\"\$/PAYLOAD_SOURCE_REV=\"$SOURCE_REV\"/" "$SCRIPTS_DIR/$f" >"$SCRIPTS_STAGE/$f"
+  chmod 0755 "$SCRIPTS_STAGE/$f"
+done
 
 # --- pkgbuild: component package ---
 CORE_PKG="$WORK/core.pkg"
@@ -229,7 +263,7 @@ PKGBUILD_ARGS=(
   --root "$ROOT"
   --identifier com.udbmcp.universal-db-mcp
   --version "$VERSION"
-  --scripts "$SCRIPTS_DIR"
+  --scripts "$SCRIPTS_STAGE"
   --ownership recommended
 )
 log "    pkgbuild ${PKGBUILD_ARGS[*]} $CORE_PKG"
@@ -242,7 +276,7 @@ cat >"$DIST_XML" <<EOF
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <installer-gui-script minSpecVersion="2">
     <title>Universal DB MCP</title>
-    <options customize="never" rootVolumeOnly="true"/>
+    <options customize="never" rootVolumeOnly="true" hostArchitectures="$HOST_ARCHS"/>
     <welcome file="welcome.rtf" mime-type="text/rtf"/>
     <conclusion file="conclusion.rtf" mime-type="text/rtf"/>
     <!-- Top-level pkg-ref: the text content names the component package file

@@ -1,25 +1,25 @@
 {
   "label": "clickhouse/clickhouse-server:24.8",
   "engine": "clickhouse",
-  "probe_rev": "c820896",
-  "started_utc": "2026-09-16T20:36:55Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:47:49Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 121,
+      "ms": 145,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 6,
+      "ms": 9,
       "detail": "24.8.14.39"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 4,
+      "ms": 8,
       "detail": "vm"
     },
     {
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 2,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='vm', table='customers', name='email', data_type='S"
+      "ms": 3,
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='UInt32', nullable=False, default=None, comment=None, ordinal=0, default_kind=None), ColumnInfo(schema='vm', table='customers', name='e"
     },
     {
       "check": "list_columns_count",
@@ -103,37 +103,37 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 6,
+      "ms": 8,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 7,
+      "ms": 8,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 7,
+      "ms": 17,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.33}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 5,
+      "ms": 7,
       "detail": "[['south', 67], ['north', 67]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 4,
+      "ms": 5,
       "detail": "[12, 'user12@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 4,
+      "ms": 5,
       "detail": "['raw']"
     }
   ],
@@ -147,19 +147,21 @@
     "read_only_requested": true,
     "server_read_only_available": true,
     "applied": [
+      "read_only",
       "max_execution_time=60s",
-      "read_only"
+      "max_memory_usage=2147483648"
     ],
     "skipped": [],
     "read_only_enforced": true,
     "read_only_verified": true,
     "server_reports": {
       "readonly": "1",
-      "max_execution_time": "60.0"
+      "max_execution_time": "60.0",
+      "max_memory_usage": "2147483648"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:36:55Z",
+  "finished_utc": "2026-10-03T14:47:50Z",
   "summary": {
     "passed": 19,
     "failed": []

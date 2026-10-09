@@ -4,12 +4,17 @@
 - Secrets are resolved from the environment or secret *files* at load time and
   wrapped in :class:`SecretMark` so they can never be serialized, logged, or
   echoed. Raw values never live in the config model exposed to tools.
-- Secret files with group/world read bits are rejected where the OS supports
-  the check (POSIX), per the spec's unsafe-permission rule.
+- Secret files other local users can read are rejected, per the spec's
+  unsafe-permission rule: group/world mode bits on POSIX; on Windows an ACE
+  giving a broad group read or write access (or the right to change the DACL
+  or owner), an ACE whose trustee cannot be checked, or a foreign owner.
+- A repeated mapping key is an error (PyYAML would keep the last value), and
+  relative secret, TLS and state paths are relative to the config file.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
@@ -18,7 +23,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from universal_db_mcp.errors import ConfigError
 from universal_db_mcp.security.redact import SecretMark
@@ -55,6 +69,15 @@ class ApplicationConfig(StrictModel):
     http_host: str = "127.0.0.1"  # restrictive default bind
     http_port: int = Field(default=8765, ge=1, le=65535)
     http_bearer_token_file: str | None = None
+    # Set by load_config when the file leaves audit_path unset: which default
+    # location it chose, for doctor to report. Not a config key.
+    _audit_path_default: str | None = PrivateAttr(default=None)
+
+    @property
+    def audit_path_default(self) -> str | None:
+        """The default location load_config chose for an unset ``audit_path``,
+        or None when the config file set it."""
+        return self._audit_path_default
 
     @field_validator("telemetry_enabled")
     @classmethod
@@ -129,7 +152,11 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
         "sslmode": str,
     },
     "mysql": {"os_authentication": bool, "unix_socket": str},
-    "clickhouse": {"os_authentication": bool},
+    # max_memory_usage: the per-query memory ceiling (bytes) the connector
+    # sends when the profile allows settings (default 2 GiB);
+    # memory_limit_from_profile: the operator's acknowledgement that a
+    # readonly=1 profile (settings refused) carries the account-level limit.
+    "clickhouse": {"os_authentication": bool, "max_memory_usage": int, "memory_limit_from_profile": bool},
     # thick_mode + lib_dir: Thick mode via an ADMINISTRATOR-SUPPLIED Oracle
     # Instant Client (licensed by Oracle, never shipped here). It is the only
     # client-side way to authenticate an account that carries just the legacy
@@ -143,7 +170,10 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
         "lib_dir": str,
         "sid": str,
         "tns_alias": str,
-        "wallet_password": str,
+        # a password-protected wallet: the password is a secret, referenced
+        # like password_file/password_env and never inlined in the config
+        "wallet_password_file": str,
+        "wallet_password_env": str,
     },
     # MssqlConnector reads options.odbc_driver to select the installed ODBC
     # driver (and doctor matches the exact name); a wrong name fails closed
@@ -155,6 +185,10 @@ _ENGINE_OPTIONS: dict[str, dict[str, type]] = {
     "db2": {"authentication": str},
 }
 
+
+# The smallest per-query ClickHouse memory ceiling accepted (1 MiB): below it
+# no statement could run, which is a typo (KiB for MiB), not a policy.
+_CLICKHOUSE_MIN_MEMORY_USAGE = 1024 * 1024
 
 # Characters that are GRAMMAR, not data, in an Oracle connect string. Verified
 # against oracledb 4.0.2's own parser (2026-09-15): a `database` of
@@ -197,7 +231,11 @@ ENGINE_ISOLATION_LEVELS: dict[str, tuple[str, ...]] = {
     "clickhouse": (),
     "sqlite": (),
 }
-_APP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,64}$")
+# used with fullmatch: '$' would also accept a trailing newline
+_APP_NAME_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
+# no leading '-': every command line that takes the id would read it as an option
+_CONNECTION_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}")
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class SessionConfig(StrictModel):
@@ -236,7 +274,7 @@ class SessionConfig(StrictModel):
     @field_validator("application_name")
     @classmethod
     def _dsn_safe(cls, v: str | None) -> str | None:
-        if v is not None and not _APP_NAME_RE.match(v):
+        if v is not None and not _APP_NAME_RE.fullmatch(v):
             raise ValueError(
                 "session.application_name may contain only letters, digits, '_', '.', ':', '@' "
                 "and '-' (1-64 chars): it is written into driver connection strings"
@@ -265,6 +303,26 @@ class ConnectionConfig(StrictModel):
     options: dict[str, Any] = Field(default_factory=dict)
     session: SessionConfig = Field(default_factory=SessionConfig)
 
+    def secret_env_variables(self) -> list[str]:
+        """The environment variables this connection reads its credentials
+        from (names only; values are never read here): username_env,
+        password_env and the Oracle options.wallet_password_env. A server a
+        GUI harness spawns does not inherit them from any shell."""
+        wallet = self.options.get("wallet_password_env")
+        return [
+            v for v in (self.username_env, self.password_env, wallet if isinstance(wallet, str) else None) if v
+        ]
+
+    @field_validator("read_only")
+    @classmethod
+    def _read_only_required(cls, v: bool) -> bool:
+        # The server-side read-only session and the Db2/SQL Server UR default
+        # both key off this flag, while db_list_connections reports every
+        # connection read-only.
+        if not v:
+            raise ValueError("read_only=false is not supported in v1; every connection is read-only")
+        return v
+
     @model_validator(mode="after")
     def _hosts(self) -> ConnectionConfig:
         if self.type != "sqlite":
@@ -279,13 +337,26 @@ class ConnectionConfig(StrictModel):
                 "db2 'family' must be 'luw' in this build; z/OS and Db2 for i "
                 "require separate validation and are not implemented"
             )
+        if self.type == "oracle" and "wallet_password" in self.options:
+            raise ValueError(
+                "oracle options.wallet_password would inline a secret in the config file; reference it "
+                "with options.wallet_password_file (a file only the service account can read) or "
+                "options.wallet_password_env instead"
+            )
         allowed = _ENGINE_OPTIONS.get(self.type, {})
         unknown = set(self.options) - set(allowed)
         if unknown:
             raise ValueError(f"connections: unknown options for type '{self.type}': {sorted(unknown)}")
         for key, value in self.options.items():
-            if not isinstance(value, allowed[key]):
+            # bool is an int subclass: True must not pass as a number
+            if not isinstance(value, allowed[key]) or (allowed[key] is int and isinstance(value, bool)):
                 raise ValueError(f"connections: option '{key}' for type '{self.type}' must be {allowed[key].__name__}")
+        if self.type == "clickhouse" and "max_memory_usage" in self.options:
+            if self.options["max_memory_usage"] < _CLICKHOUSE_MIN_MEMORY_USAGE:
+                raise ValueError(
+                    "connections: clickhouse options.max_memory_usage is a byte count of at least "
+                    f"{_CLICKHOUSE_MIN_MEMORY_USAGE} (1 MiB); the default is 2 GiB"
+                )
         if self.type in ("postgres", "mysql", "clickhouse") and not (
             self.username_env or self.username_file or self.options.get("os_authentication")
         ):
@@ -354,6 +425,11 @@ class ConnectionConfig(StrictModel):
                 raise ValueError(
                     "oracle options.tns_alias requires options.tns_admin (the directory "
                     "holding tnsnames.ora); without it the alias cannot be resolved"
+                )
+            if self.options.get("wallet_password_file") and self.options.get("wallet_password_env"):
+                raise ValueError(
+                    "oracle options.wallet_password_file and options.wallet_password_env are mutually "
+                    "exclusive (pick one source for the wallet password)"
                 )
             if self.options.get("lib_dir") and not self.options.get("thick_mode"):
                 raise ValueError(
@@ -480,90 +556,717 @@ class AppConfig(StrictModel):
         return self
 
     @model_validator(mode="after")
-    def _state_isolated_from_data_sources(self) -> AppConfig:
-        """Writable audit/cache state (and secret files) must be separate files
-        from each other and from queried SQLite data sources (spec §5).
+    def _state_isolated_from_data_sources(self, info: ValidationInfo) -> AppConfig:
+        """Writable state must each be a separate file, and none of it may be
+        a file the server reads: a secret, a TLS file, the HTTP bearer token
+        or a queried SQLite data source (spec §5). State is every file the
+        server writes: the audit log, its .lock sidecar, its rotated
+        backups <audit_path>.1..N and <audit_path>.rotating, and the metadata cache with the -wal,
+        -shm and -journal files SQLite keeps beside it. Read-only inputs of
+        one kind may be shared, e.g. two connections using one password file
+        or one CA bundle; the bearer token, which every HTTP client holds,
+        may not double as any other file.
 
-        Paths are resolved with os.path.realpath so a symlink that points at a
-        data source (or at another state file) cannot bypass the check the way
-        a plain os.path.abspath comparison could."""
-        state: list[tuple[str, str]] = []
-        if self.application.audit_path:
-            state.append(("application.audit_path", os.path.realpath(self.application.audit_path)))
-        if self.application.metadata_cache_path:
-            state.append(
-                ("application.metadata_cache_path", os.path.realpath(self.application.metadata_cache_path))
-            )
-        if self.application.http_bearer_token_file:
-            state.append(
-                ("application.http_bearer_token_file", os.path.realpath(self.application.http_bearer_token_file))
-            )
+        Paths are resolved with os.path.realpath so a symlink that points at
+        a data source (or at another state file) cannot bypass the check the
+        way a plain os.path.abspath comparison could. Two existing paths are
+        also one file when they name one inode (a hard link, or a case
+        variant on a case-insensitive filesystem), and on macOS and Windows,
+        whose default filesystems ignore case, paths are compared case-folded.
+        No state file may be a network configuration or wallet file the
+        Oracle client reads from options.wallet_location or tns_admin (other
+        files in those directories are fine), nor lie in the Instant Client
+        directory options.lib_dir itself or in its network/admin subdirectory.
+
+        A message about an audit_path that load_config filled in (validation
+        context ``audit_path_default``) says so: the file never set it."""
+        app = self.application
+        audit_default = info.context.get("audit_path_default") if isinstance(info.context, dict) else None
+
+        def named(label: str) -> str:
+            if audit_default and label.startswith("application.audit_path"):
+                return f"'{label}' (application.audit_path is unset; this is its default in the {audit_default})"
+            return f"'{label}'"
+
+        files: list[tuple[str, str, str | None]] = [
+            ("state", "application.audit_path", app.audit_path),
+            # the cross-process rotation lock AuditLog keeps next to the log
+            ("state", "application.audit_path lock file", f"{app.audit_path}.lock" if app.audit_path else None),
+            # where rotation moves the log before it shifts the backups
+            (
+                "state",
+                "application.audit_path rotation file",
+                f"{app.audit_path}.rotating" if app.audit_path else None,
+            ),
+            ("state", "application.metadata_cache_path", app.metadata_cache_path),
+            ("token", "application.http_bearer_token_file", app.http_bearer_token_file),
+        ]
+        if app.metadata_cache_path:
+            files += [
+                ("state", f"application.metadata_cache_path {suffix} file", f"{app.metadata_cache_path}{suffix}")
+                for suffix in ("-wal", "-shm", "-journal")
+            ]
         for name, conn in self.connections.items():
-            if conn.password_file:
-                state.append((f"connections.{name}.password_file", os.path.realpath(conn.password_file)))
+            files += [
+                ("secret", f"connections.{name}.username_file", conn.username_file),
+                ("secret", f"connections.{name}.password_file", conn.password_file),
+                (
+                    "secret",
+                    f"connections.{name}.options.wallet_password_file",
+                    conn.options.get("wallet_password_file"),
+                ),
+                (
+                    "secret",
+                    f"connections.{name}.options.passfile",
+                    conn.options.get("passfile") if conn.type == "postgres" else None,
+                ),
+                ("tls", f"connections.{name}.tls.ca_file", conn.tls.ca_file),
+                ("tls", f"connections.{name}.tls.client_cert_file", conn.tls.client_cert_file),
+                ("tls", f"connections.{name}.tls.client_key_file", conn.tls.client_key_file),
+                # the connector opens Path(database).expanduser().resolve()
+                (
+                    "data",
+                    f"connections.{name}.database",
+                    os.path.expanduser(conn.database) if conn.type == "sqlite" and conn.database else None,
+                ),
+            ]
 
-        seen: dict[str, str] = {}
-        for label, rp in state:
-            other = seen.get(rp)
-            if other is not None:
+        def state_clash(rp: str, first: str, second: str) -> ValueError:
+            return ValueError(
+                f"application state path '{rp}' is shared by {named(first)} and {named(second)}: the audit log "
+                f"(with its lock file and rotated backups) and the metadata cache (with its SQLite "
+                f"sidecars) must each be a separate file from each other and from every file the "
+                f"server reads"
+            )
+
+        seen: dict[object, tuple[str, str]] = {}
+        resolved: list[tuple[str, str, str]] = []  # (kind, label, realpath)
+        for kind, label, path in files:
+            if not path:
+                continue
+            rp = os.path.realpath(path)
+            resolved.append((kind, label, rp))
+            keys = _same_file_keys(path, rp)
+            clash = next((seen[k] for k in keys if k in seen), None)
+            for k in keys:
+                seen.setdefault(k, (kind, label))
+            if clash is None:
+                continue
+            other_kind, other = clash
+            if kind == other_kind and kind in ("secret", "tls", "data"):
+                continue
+            if "state" in (kind, other_kind):
+                raise state_clash(rp, other, label)
+            if "token" in (kind, other_kind):
                 raise ValueError(
-                    f"application state path '{rp}' is shared by '{other}' and "
-                    f"'{label}': audit, metadata-cache and secret files must "
-                    f"each be a separate file"
+                    f"'{other}' and '{label}' name the same file '{rp}': every HTTP client holds the "
+                    f"bearer token, so the token file must be a separate file"
                 )
-            seen[rp] = label
-
+            raise ValueError(
+                f"'{other}' and '{label}' name the same file '{rp}': a secret, a TLS file and a "
+                f"queried SQLite data source must each be a separate file"
+            )
+        if app.audit_path:
+            # Rotation renames the log to <audit_path>.1 .. .<audit_max_backups>
+            # in the log's own directory, replacing whatever file is there.
+            head, tail = os.path.split(os.path.abspath(app.audit_path))
+            prefix = _fold_case(os.path.join(os.path.realpath(head), tail) + ".")
+            for _kind, label, rp in resolved:
+                folded = _fold_case(rp)
+                n = folded[len(prefix) :] if folded.startswith(prefix) else ""
+                if n.isascii() and n.isdigit() and not n.startswith("0") and int(n) <= app.audit_max_backups:
+                    raise state_clash(rp, f"application.audit_path backup .{n}", label)
+        # The log would append into ewallet.pem or tnsnames.ora, and rotation
+        # would rename it away. Only those files are off limits: TNS_ADMIN is
+        # often $HOME or the per-user state directory itself.
+        state = [(label, rp) for kind, label, rp in resolved if kind == "state"]
+        state_files = [(label, set(_same_file_keys(rp, rp))) for label, rp in state]
         for name, conn in self.connections.items():
-            if conn.type == "sqlite" and conn.database:
-                dbp = os.path.realpath(conn.database)
-                for label, sp in state:
-                    if sp == dbp:
-                        raise ValueError(
-                            f"application state path '{sp}' ('{label}') must be a "
-                            f"separate file from the queried SQLite data source "
-                            f"of connection '{name}'"
-                        )
+            lib_dir = conn.options.get("lib_dir")
+            client_dirs = [(option, conn.options.get(option)) for option in _ORACLE_CLIENT_DIR_OPTIONS]
+            if isinstance(lib_dir, str) and lib_dir:
+                # A full Oracle Client's lib_dir is ORACLE_HOME/lib (ORACLE_HOME\bin
+                # on Windows): its network configuration is ORACLE_HOME/network/admin.
+                client_dirs.append(("lib_dir", os.path.join(lib_dir, os.pardir, "network", "admin")))
+            for option, directory in client_dirs:
+                if not isinstance(directory, str) or not directory:
+                    continue
+                for client_file in (os.path.join(directory, f) for f in _ORACLE_CLIENT_FILES):
+                    client_keys = _same_file_keys(client_file, os.path.realpath(client_file))
+                    for label, state_keys in state_files:
+                        if state_keys.intersection(client_keys):
+                            raise ValueError(
+                                f"{named(label)} is '{client_file}', a file the Oracle client reads through "
+                                f"connections.{name}.options.{option}: the audit log and the metadata cache "
+                                "must be separate from the wallet and network configuration files"
+                            )
+            # The client loads the files in lib_dir and in lib_dir/network/admin
+            # only: deeper down (lib_dir=$HOME with the per-user default) is fine.
+            if not isinstance(lib_dir, str) or not lib_dir:
+                continue
+            lib_dirs = {
+                _fold_case(os.path.realpath(directory)): directory
+                for directory in (lib_dir, os.path.join(lib_dir, "network", "admin"))
+            }
+            for label, rp in state:
+                directory = lib_dirs.get(_fold_case(os.path.dirname(rp)))
+                if directory is not None:
+                    raise ValueError(
+                        f"{named(label)} ('{rp}') is in '{directory}' (connections.{name}.options.lib_dir): the "
+                        "Oracle client loads its libraries from lib_dir and its network configuration from "
+                        "lib_dir/network/admin, so the audit log and the metadata cache must be elsewhere"
+                    )
         return self
 
     @field_validator("connections")
     @classmethod
     def _reserved_names(cls, v: dict[str, ConnectionConfig]) -> dict[str, ConnectionConfig]:
+        folded: dict[str, str] = {}
         for name in v:
-            if not name or len(name) > 64 or not name.replace("-", "").replace("_", "").isalnum():
-                raise ValueError(f"connection id '{name}' must be 1-64 chars of [A-Za-z0-9_-]")
+            # ASCII only (str.isalnum() is Unicode-wide): canonically equivalent
+            # ids such as U+1F71 and U+03AC differ under casefold() but name
+            # the same secret files on a normalization-insensitive filesystem
+            if not _CONNECTION_ID_RE.fullmatch(name):
+                raise ValueError(f"connection id '{name}' must be 1-64 chars of [A-Za-z0-9_-], not starting with '-'")
+            other = folded.setdefault(name.casefold(), name)
+            if other != name:
+                # the wizard names secret files after the id, and a
+                # case-insensitive filesystem would give both ids one pair
+                raise ValueError(
+                    f"connection ids '{other}' and '{name}' differ only in case; rename one "
+                    "(case-insensitive filesystems would give them the same secret files)"
+                )
         return v
 
 
+# Connection options naming a directory the Oracle client reads files from,
+# and the files it reads there: network configuration, Thick mode's
+# oraaccess.xml and the wallet (Thin mode also looks for the wallet in the
+# TNS_ADMIN directory, and a cloud wallet directory is usually TNS_ADMIN too).
+# The Instant Client directory (options.lib_dir) holds the client's libraries
+# and, in network/admin, its default TNS_ADMIN: no state goes in either one.
+# A full client's default TNS_ADMIN is lib_dir/../network/admin, whose
+# files above count as the client's too.
+_ORACLE_CLIENT_DIR_OPTIONS = ("wallet_location", "tns_admin")
+_ORACLE_CLIENT_FILES = (
+    "tnsnames.ora",
+    "sqlnet.ora",
+    "ldap.ora",
+    "oraaccess.xml",
+    "ewallet.pem",
+    "cwallet.sso",
+    "ewallet.p12",
+)
+
+
+def _fold_case(path: str) -> str:
+    """*path* as compared for identity: case-folded on macOS and Windows,
+    whose default filesystems ignore case."""
+    return path.casefold() if sys.platform in ("darwin", "win32") else path
+
+
+def _same_file_keys(path: str, realpath: str) -> list[object]:
+    """Keys under which two configured paths are the same file: the
+    (case-folded) real path, and for an existing file its inode, which also
+    catches a hard link and a case variant on any case-insensitive
+    filesystem."""
+    keys: list[object] = [_fold_case(realpath)]
+    try:
+        st = os.stat(path)
+    except OSError:
+        return keys
+    if st.st_ino:  # 0 where the filesystem has no file ids
+        keys.append((st.st_dev, st.st_ino))
+    return keys
+
+
+# Windows: trustees that stand for "other local users" (or for anyone). A
+# secret file must not grant any of them read or write access, nor the right
+# to rewrite its DACL or take ownership (either leads to read access), and must
+# be owned by SYSTEM, Administrators or the account the server runs as. A
+# grant to one named account, such as the read access the MSI gives the
+# service account, is an administrator's explicit choice and is allowed.
+_WIN32_BROAD_SIDS = {
+    "S-1-1-0": "Everyone",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-32-545": "Users",
+    "S-1-5-4": "Interactive",
+    "S-1-5-32-546": "Guests",
+    "S-1-5-7": "Anonymous Logon",
+    "S-1-5-2": "Network",
+    "S-1-5-1": "Dialup",
+    "S-1-5-3": "Batch",
+    "S-1-5-6": "Service",
+    "S-1-5-13": "Terminal Server User",
+    "S-1-5-14": "Remote Interactive Logon",
+    "S-1-5-15": "This Organization",
+    "S-1-5-113": "Local account",
+    "S-1-5-32-547": "Power Users",
+    "S-1-5-32-555": "Remote Desktop Users",
+    "S-1-2-0": "Local",
+    "S-1-2-1": "Console Logon",
+    "S-1-15-2-1": "All Application Packages",
+    "S-1-15-2-2": "All Restricted Application Packages",
+}
+# Groups every account or computer of a domain is in: the RID that ends a
+# S-1-5-21-<domain>-<rid> SID.
+_WIN32_BROAD_DOMAIN_RIDS = {"513": "Domain Users", "514": "Domain Guests", "515": "Domain Computers"}
+_WIN32_TRUSTED_OWNERS = {"S-1-5-18": "SYSTEM", "S-1-5-32-544": "Administrators"}
+_ACCESS_ALLOWED_ACE_TYPE = 0x0
+# Object, callback (conditional) and callback-object allow ACEs. Their
+# trustee is not read here, so one that grants access is refused unchecked.
+_WIN32_OPAQUE_ALLOW_ACE_TYPES = (0x5, 0x9, 0xB)
+_INHERIT_ONLY_ACE = 0x08
+# FILE_READ_DATA, GENERIC_ALL, GENERIC_READ
+_WIN32_READ_RIGHTS = 0x0001 | 0x10000000 | 0x80000000
+# FILE_WRITE_DATA, FILE_APPEND_DATA, GENERIC_WRITE: the trustee can replace
+# the secret (a bearer token it knows), as group/other write bits on POSIX
+_WIN32_WRITE_RIGHTS = 0x0002 | 0x0004 | 0x40000000
+# WRITE_DAC, WRITE_OWNER: the trustee can grant itself read access
+_WIN32_TAKEOVER_RIGHTS = 0x00040000 | 0x00080000
+_WIN32_REFUSED_RIGHTS = _WIN32_READ_RIGHTS | _WIN32_WRITE_RIGHTS | _WIN32_TAKEOVER_RIGHTS
+
+
+def _win32_file_security(path: Path) -> tuple[str, str, list[tuple[int, int, int, str]] | None]:
+    """(owner SID, SID of this process's user, DACL entries) of *path*. Each
+    entry is (ACE type, ACE flags, access mask, trustee SID); a NULL DACL,
+    which grants everyone full access, is None. Read with pywin32, which is
+    installed on Windows as a dependency of the mcp package."""
+    if sys.platform != "win32":
+        raise OSError(f"cannot read a Windows DACL on {sys.platform}")
+    import win32api  # type: ignore[import-untyped]
+    import win32security  # type: ignore[import-untyped]
+
+    info = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
+    sd = win32security.GetFileSecurity(str(path), info)
+    owner = win32security.ConvertSidToStringSid(sd.GetSecurityDescriptorOwner())
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+    user = win32security.ConvertSidToStringSid(win32security.GetTokenInformation(token, win32security.TokenUser)[0])
+    dacl = sd.GetSecurityDescriptorDacl()
+    if dacl is None:
+        return owner, user, None
+    aces: list[tuple[int, int, int, str]] = []
+    for i in range(dacl.GetAceCount()):
+        (ace_type, ace_flags), mask, *rest = dacl.GetAce(i)
+        # object ACEs carry GUIDs before the SID; only the standard
+        # allow/deny layout ends in the trustee SID
+        sid = win32security.ConvertSidToStringSid(rest[-1]) if ace_type in (0, 1) else ""
+        aces.append((ace_type, ace_flags, mask, sid))
+    return owner, user, aces
+
+
+def win32_secret_file_problems(path: Path) -> list[str]:
+    """Why other local users could read or rewrite the secret file *path*
+    on Windows (empty when they cannot). A DACL that cannot be read is a
+    problem too: a secret whose access cannot be verified is refused."""
+    try:
+        owner, user, aces = _win32_file_security(path)
+    except Exception as exc:  # noqa: BLE001 - fail closed on anything
+        return [f"its Windows access control list could not be read ({exc})"]
+    problems: list[str] = []
+    if owner not in _WIN32_TRUSTED_OWNERS and owner != user:
+        problems.append(f"owned by {owner}, not by SYSTEM, Administrators or the account running this process")
+    if aces is None:
+        problems.append("its DACL is NULL, which grants everyone full access")
+        return problems
+    for ace_type, ace_flags, mask, sid in aces:
+        if ace_flags & _INHERIT_ONLY_ACE or not mask & _WIN32_REFUSED_RIGHTS:
+            continue
+        if ace_type in _WIN32_OPAQUE_ALLOW_ACE_TYPES:
+            problems.append(
+                f"an object or conditional allow entry (ACE type {ace_type}) grants access to a trustee "
+                "that cannot be checked"
+            )
+        elif ace_type == _ACCESS_ALLOWED_ACE_TYPE and (broad := _win32_broad_trustee(sid)):
+            if mask & _WIN32_READ_RIGHTS:
+                problems.append(f"readable by {broad} ({sid})")
+            elif mask & _WIN32_WRITE_RIGHTS:
+                problems.append(f"writable by {broad} ({sid}), which could replace the secret")
+            else:
+                problems.append(f"{broad} ({sid}) may change its DACL or owner, and so grant itself read access")
+    return problems
+
+
+def _win32_broad_trustee(sid: str) -> str | None:
+    """The name of *sid* when it stands for a broad set of accounts."""
+    if sid in _WIN32_BROAD_SIDS:
+        return _WIN32_BROAD_SIDS[sid]
+    parts = sid.split("-")
+    if sid.startswith("S-1-5-21-") and len(parts) == 8:
+        return _WIN32_BROAD_DOMAIN_RIDS.get(parts[-1])
+    return None
+
+
 def _check_secret_file_permissions(path: Path) -> None:
-    """Reject secret files readable by group/other (POSIX systems)."""
-    if sys.platform == "win32":  # pragma: no cover - documented limitation
-        return
+    """Reject secret files other local users can read: group/other mode bits
+    on POSIX, the DACL and owner problems win32_secret_file_problems names on
+    Windows."""
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
     except OSError as exc:
         raise ConfigError(f"secret file '{path}' is not readable: {exc}") from exc
+    if sys.platform == "win32":
+        problems = win32_secret_file_problems(path)
+        if problems:
+            raise ConfigError(
+                f"secret file '{path}' has unsafe permissions: {'; '.join(problems)}. Remove inherited "
+                "access (icacls <file> /inheritance:r) and grant only SYSTEM, Administrators and the "
+                "service account"
+            )
+        return
     if mode & 0o077:
         raise ConfigError(
             f"secret file '{path}' has unsafe permissions ({stat.filemode(mode)}): remove group/other access bits"
         )
+    try:
+        problems = darwin_secret_file_acl_problems(path)
+    except OSError as exc:
+        raise ConfigError(f"secret file '{path}': its access control list cannot be read ({exc.strerror})") from exc
+    if problems:
+        raise ConfigError(
+            f"secret file '{path}' has unsafe permissions: {'; '.join(problems)}. Remove the access control "
+            "list (chmod -N <file>)"
+        )
+
+
+# macOS <sys/acl.h>: ACL_TYPE_EXTENDED (the only ACL type macOS has), the
+# ACL_EXTENDED_ALLOW tag, acl_get_entry's ACL_FIRST_ENTRY/ACL_NEXT_ENTRY and
+# the rights that expose or replace a secret; <membership.h> ID_TYPE_UID.
+_DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+_DARWIN_ACL_EXTENDED_ALLOW = 1
+_DARWIN_ACL_FIRST_ENTRY = 0
+_DARWIN_ACL_NEXT_ENTRY = -1
+_DARWIN_ID_TYPE_UID = 0
+_DARWIN_ACL_RIGHTS = (
+    (1 << 1, "read"),
+    (1 << 2, "write"),
+    (1 << 5, "append"),
+    (1 << 12, "writesecurity"),
+    (1 << 13, "chown"),
+)
+
+
+def darwin_secret_file_acl_problems(path: Path) -> list[str]:
+    """What the macOS extended ACL of *path* grants beyond its mode bits: each
+    allow entry giving anyone but the file's owner read or write access, or
+    the right to rewrite the ACL or take ownership (either leads to read
+    access). A 0600 file with 'everyone allow read' lists as -rw-------+ and
+    every local user can read it. Deny entries only take access away. Empty
+    on other platforms and on a filesystem without ACLs; OSError when the
+    ACL cannot be read."""
+    if sys.platform != "darwin":
+        return []
+    return _darwin_file_grants(path, _DARWIN_ACL_RIGHTS)
+
+
+# A state file (the audit log, its lock and backups, the metadata cache and
+# its sidecars) must also not be deletable, renamable or otherwise alterable
+# by another account: on top of the secret-file rights, delete (of the file
+# itself) and the attribute rights, which change its timestamps and flags.
+_DARWIN_STATE_FILE_ACL_RIGHTS = (
+    *_DARWIN_ACL_RIGHTS,
+    (1 << 4, "delete"),
+    (1 << 8, "writeattr"),
+    (1 << 10, "writeextattr"),
+)
+
+
+def darwin_state_file_acl_problems(path: Path | int) -> list[str]:
+    """What the macOS extended ACL of the state file *path* (a path, or an
+    open descriptor) grants anyone but its owner among the rights that read,
+    change, delete or re-permission it (_DARWIN_STATE_FILE_ACL_RIGHTS). Empty
+    on other platforms and on a filesystem without ACLs; OSError when the ACL
+    cannot be read."""
+    if sys.platform != "darwin":
+        return []
+    return _darwin_file_grants(path, _DARWIN_STATE_FILE_ACL_RIGHTS)
+
+
+def _darwin_file_grants(path: Path | int, rights_table: tuple[tuple[int, str], ...]) -> list[str]:
+    import ctypes
+
+    libc = _darwin_acl_libc()
+    ctypes.set_errno(0)
+    if isinstance(path, int):
+        libc.acl_get_fd_np.restype = ctypes.c_void_p
+        libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl = libc.acl_get_fd_np(path, _DARWIN_ACL_TYPE_EXTENDED)
+        fd = path
+        return _darwin_acl_grants(libc, acl, lambda: os.fstat(fd).st_uid, rights_table, "a state file")
+    libc.acl_get_file.restype = ctypes.c_void_p
+    libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    acl = libc.acl_get_file(os.fsencode(path), _DARWIN_ACL_TYPE_EXTENDED)
+    return _darwin_acl_grants(libc, acl, lambda: os.stat(path).st_uid, rights_table, str(path))
+
+
+# Every right an entry can carry on a directory (<sys/kauth.h> KAUTH_VNODE_*,
+# named as chmod(1) names them for a directory).
+_DARWIN_DIRECTORY_ACL_RIGHTS = (
+    (1 << 1, "list"),
+    (1 << 2, "add_file"),
+    (1 << 3, "search"),
+    (1 << 4, "delete"),
+    (1 << 5, "add_subdirectory"),
+    (1 << 6, "delete_child"),
+    (1 << 7, "readattr"),
+    (1 << 8, "writeattr"),
+    (1 << 9, "readextattr"),
+    (1 << 10, "writeextattr"),
+    (1 << 11, "readsecurity"),
+    (1 << 12, "writesecurity"),
+    (1 << 13, "chown"),
+)
+# The directory rights that let another account add, delete or rename the
+# files in a state directory (or the directory itself), or rewrite its ACL or
+# owner (and so grant itself any of those). list, search and the read rights
+# show names and attributes only, as mode 0750/0755 does.
+_DARWIN_STATE_DIRECTORY_REFUSED = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13)
+# <sys/acl.h> acl_flag_t: an entry copied to every file / subdirectory created
+# in the directory, and one that only does that (no effect on the directory).
+_DARWIN_ENTRY_FILE_INHERIT = 1 << 5
+_DARWIN_ENTRY_ONLY_INHERIT = 1 << 8
+
+
+def darwin_directory_acl_problems(fd: int) -> list[str]:
+    """What the macOS extended ACL of the directory *fd* grants anyone but its
+    owner: each allow entry with any right at all, inheritable ones included
+    (every file created in the directory takes those). Deny entries only take
+    access away ('group:everyone deny delete', which macOS puts on every home
+    directory, among them), and the owner's own entry adds nothing. Empty on
+    other platforms and on a filesystem without ACLs; OSError when the ACL
+    cannot be read. The rule for a secrets directory; a state directory has
+    darwin_state_directory_acl_problems."""
+    if sys.platform != "darwin":
+        return []
+    return [
+        _darwin_entry_problem(entry, _DARWIN_DIRECTORY_ACL_RIGHTS, "")
+        for entry in _darwin_directory_entries(fd)
+        if entry[0] != 0
+    ]
+
+
+def darwin_state_directory_acl_problems(fd: int | Path) -> list[str]:
+    """What the macOS extended ACL of the state directory *fd* (a descriptor,
+    or a path for a directory this process may search but not list; the audit
+    log's or the metadata cache's) lets anyone but its owner do: an allow
+    entry that lets them add, delete or rename files there, or rewrite the
+    directory's ACL or owner; and an inheritable (file_inherit) allow entry
+    that would give them, on every file created there later (each audit
+    rotation creates one), a right darwin_state_file_acl_problems refuses. A
+    read-only entry (list, search, the read rights) is accepted, as mode 0750
+    is. Empty on other platforms and on a filesystem without ACLs; OSError
+    when the ACL cannot be read."""
+    if sys.platform != "darwin":
+        return []
+    file_rights = 0
+    for bit, _name in _DARWIN_STATE_FILE_ACL_RIGHTS:
+        file_rights |= bit
+    problems: list[str] = []
+    for entry in _darwin_directory_entries(fd):
+        rights, flags, _who = entry
+        if rights < 0:
+            problems.append(_darwin_entry_problem(entry, (), ""))
+            continue
+        if not flags & _DARWIN_ENTRY_ONLY_INHERIT and rights & _DARWIN_STATE_DIRECTORY_REFUSED:
+            problems.append(
+                _darwin_entry_problem((rights & _DARWIN_STATE_DIRECTORY_REFUSED, flags, _who),
+                                      _DARWIN_DIRECTORY_ACL_RIGHTS, "")
+            )
+        if flags & _DARWIN_ENTRY_FILE_INHERIT and rights & file_rights:
+            problems.append(
+                _darwin_entry_problem(
+                    (rights & file_rights, flags, _who),
+                    _DARWIN_STATE_FILE_ACL_RIGHTS,
+                    " on every file created in it (an inheritable entry)",
+                )
+            )
+    return problems
+
+
+def _darwin_directory_entries(fd: int | Path) -> list[tuple[int, int, str | None]]:
+    import ctypes
+
+    libc = _darwin_acl_libc()
+    ctypes.set_errno(0)
+    if isinstance(fd, Path):
+        directory = fd
+        libc.acl_get_file.restype = ctypes.c_void_p
+        libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        acl = libc.acl_get_file(os.fsencode(directory), _DARWIN_ACL_TYPE_EXTENDED)
+        return _darwin_foreign_allow_entries(libc, acl, lambda: os.stat(directory).st_uid, str(directory))
+    libc.acl_get_fd_np.restype = ctypes.c_void_p
+    libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    acl = libc.acl_get_fd_np(fd, _DARWIN_ACL_TYPE_EXTENDED)
+    descriptor = fd
+    return _darwin_foreign_allow_entries(libc, acl, lambda: os.fstat(descriptor).st_uid, "a directory")
+
+
+def _darwin_entry_problem(
+    entry: tuple[int, int, str | None], rights_table: tuple[tuple[int, str], ...], where: str
+) -> str:
+    rights, _flags, who = entry
+    if rights < 0:
+        return "an access control list entry cannot be read"
+    names = ",".join(name for bit, name in rights_table if rights & bit) or f"rights 0x{rights:x}"
+    if who is None:
+        return f"an access control list entry grants {names}{where} to a trustee that cannot be checked"
+    return f"an access control list entry grants {names}{where} to {who}"
+
+
+def _darwin_acl_libc() -> Any:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    libc.acl_get_permset.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_perm_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    libc.acl_get_flagset_np.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    libc.acl_get_flag_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    libc.acl_get_qualifier.restype = ctypes.c_void_p
+    libc.acl_get_qualifier.argtypes = [ctypes.c_void_p]
+    libc.mbr_uuid_to_id.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_int)]
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    return libc
+
+
+# Every permission bit an entry can carry (<sys/acl.h> ACL_READ_DATA ..
+# ACL_CHANGE_OWNER) and the inheritance flags read from it.
+_DARWIN_PERM_BITS = tuple(1 << n for n in range(1, 14))
+_DARWIN_FLAG_BITS = (_DARWIN_ENTRY_FILE_INHERIT, 1 << 6, _DARWIN_ENTRY_ONLY_INHERIT)
+
+
+def _darwin_foreign_allow_entries(libc: Any, acl: Any, owner_of: Any, what: str) -> list[tuple[int, int, str | None]]:
+    """(rights mask, inheritance flags, trustee name) of each allow entry of
+    *acl* (from acl_get_file or acl_get_fd_np, just called; freed here) for
+    anyone but the owner (*owner_of*()), with no trustee name (None) when the
+    trustee cannot be resolved and a rights mask of -1 for an entry that
+    cannot be read; [] for no ACL (ENOENT) or none possible."""
+    import ctypes
+
+    if not acl:
+        err = ctypes.get_errno()
+        if err in (errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP):  # no ACL, or none possible here
+            return []
+        raise OSError(err, os.strerror(err), what)
+    entries: list[tuple[int, int, str | None]] = []
+    try:
+        owner = owner_of()
+        entry = ctypes.c_void_p()
+        which = _DARWIN_ACL_FIRST_ENTRY
+        while libc.acl_get_entry(acl, which, ctypes.byref(entry)) == 0:
+            which = _DARWIN_ACL_NEXT_ENTRY
+            tag, permset, flagset = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_void_p()
+            if (
+                libc.acl_get_tag_type(entry, ctypes.byref(tag))
+                or libc.acl_get_permset(entry, ctypes.byref(permset))
+                or libc.acl_get_flagset_np(entry, ctypes.byref(flagset))
+            ):
+                entries.append((-1, 0, None))
+                continue
+            if tag.value != _DARWIN_ACL_EXTENDED_ALLOW:
+                continue
+            rights = 0
+            for bit in _DARWIN_PERM_BITS:
+                if libc.acl_get_perm_np(permset, bit) == 1:
+                    rights |= bit
+            if not rights:
+                continue
+            flags = 0
+            for bit in _DARWIN_FLAG_BITS:
+                if libc.acl_get_flag_np(flagset, bit) == 1:
+                    flags |= bit
+            ident, id_type = ctypes.c_uint32(), ctypes.c_int()
+            qualifier = libc.acl_get_qualifier(entry)
+            unresolved = 1
+            if qualifier:
+                try:
+                    unresolved = libc.mbr_uuid_to_id(qualifier, ctypes.byref(ident), ctypes.byref(id_type))
+                finally:
+                    libc.acl_free(qualifier)
+            if unresolved:
+                entries.append((rights, flags, None))
+            elif id_type.value != _DARWIN_ID_TYPE_UID or ident.value != owner:  # the owner's own entry adds nothing
+                who = _darwin_trustee_name(ident.value, user=id_type.value == _DARWIN_ID_TYPE_UID)
+                entries.append((rights, flags, who))
+    finally:
+        libc.acl_free(acl)
+    return entries
+
+
+def _darwin_acl_grants(
+    libc: Any, acl: Any, owner_of: Any, rights_table: tuple[tuple[int, str], ...], what: str
+) -> list[str]:
+    """The allow entries of *acl* (from acl_get_file or acl_get_fd_np, just
+    called; freed here) that give anyone but the owner (*owner_of*()) one of
+    the rights in *rights_table*; [] for no ACL (ENOENT) or none possible."""
+    mask = 0
+    for bit, _name in rights_table:
+        mask |= bit
+    return [
+        _darwin_entry_problem((rights if rights < 0 else rights & mask, flags, who), rights_table, "")
+        for rights, flags, who in _darwin_foreign_allow_entries(libc, acl, owner_of, what)
+        if rights < 0 or rights & mask
+    ]
+
+
+def _darwin_trustee_name(ident: int, *, user: bool) -> str:
+    import grp
+    import pwd
+
+    try:
+        return f"user {pwd.getpwuid(ident).pw_name}" if user else f"group {grp.getgrgid(ident).gr_name}"
+    except KeyError:
+        return f"uid {ident}" if user else f"gid {ident}"
 
 
 def resolve_env_name(name: str, *, kind: str) -> str:
-    if not name or not name.replace("_", "").isalnum() or name[0].isdigit():
+    # ASCII only, as for connection ids: str.isalnum() is Unicode-wide
+    if not _ENV_NAME_RE.fullmatch(name):
         raise ConfigError(f"invalid environment variable name for {kind}")
     return name
 
 
-class ResolvedConnection:
-    """A connection config with secrets resolved to SecretMark values."""
+def _identity_mark(value: str) -> SecretMark:
+    """Wrap a username so it is never serialized, WITHOUT registering it for
+    free-text scrubbing. A username is an identifier the agent can read back
+    with SELECT current_user; registered as a secret, a common one ('default',
+    'sa') rewrote that word in every unrelated error message. The driver
+    auth-failure shapes that embed a username stay scrubbed by redact_text's
+    own patterns."""
+    mark = SecretMark.__new__(SecretMark)
+    mark.value = value
+    return mark
 
-    __slots__ = ("config", "name", "username", "password")
+
+def _read_secret_file(p: Path, what: str) -> str:
+    _check_secret_file_permissions(p)
+    try:
+        val = p.read_text(encoding="utf-8").strip("\r\n")
+    except UnicodeDecodeError:
+        # the codec's message quotes a byte of the secret and its offset
+        raise ConfigError(f"{what} '{p}' is not valid UTF-8 text") from None
+    if not val:
+        raise ConfigError(f"{what} '{p}' is empty")
+    return val
+
+
+class ResolvedConnection:
+    """A connection config with secrets resolved to SecretMark values.
+
+    An Oracle wallet password (options.wallet_password_file/_env) is resolved
+    too: it is registered for redaction as ``wallet_password`` and handed to
+    the connector as ``config.options['wallet_password']``, the key the
+    Oracle connector reads."""
+
+    __slots__ = ("config", "name", "username", "password", "wallet_password")
 
     def __init__(self, name: str, config: ConnectionConfig) -> None:
         self.name = name
         self.config = config
         self.username: SecretMark | None = None
         self.password: SecretMark | None = None
+        self.wallet_password: SecretMark | None = None
         if config.username_env and config.username_file:
             raise ConfigError(
                 f"connection '{name}': username_env and username_file are mutually "
@@ -574,14 +1277,11 @@ class ResolvedConnection:
             val = os.environ.get(env)
             if not val:
                 raise ConfigError(f"connection '{name}': environment variable {env} (username_env) is not set")
-            self.username = SecretMark(val)
+            self.username = _identity_mark(val)
         elif config.username_file:
-            p = Path(config.username_file)
-            _check_secret_file_permissions(p)
-            val = p.read_text(encoding="utf-8").strip("\r\n")
-            if not val:
-                raise ConfigError(f"connection '{name}': username file '{p}' is empty")
-            self.username = SecretMark(val)
+            self.username = _identity_mark(
+                _read_secret_file(Path(config.username_file), f"connection '{name}': username file")
+            )
         if config.password_env:
             env = resolve_env_name(config.password_env, kind="password_env")
             val = os.environ.get(env)
@@ -589,12 +1289,27 @@ class ResolvedConnection:
                 raise ConfigError(f"connection '{name}': environment variable {env} (password_env) is not set")
             self.password = SecretMark(val)
         elif config.password_file:
-            p = Path(config.password_file)
-            _check_secret_file_permissions(p)
-            val = p.read_text(encoding="utf-8").strip("\r\n")
+            self.password = SecretMark(
+                _read_secret_file(Path(config.password_file), f"connection '{name}': secret file")
+            )
+        wallet_env = config.options.get("wallet_password_env")
+        wallet_file = config.options.get("wallet_password_file")
+        if wallet_env:
+            env = resolve_env_name(wallet_env, kind="options.wallet_password_env")
+            val = os.environ.get(env)
             if not val:
-                raise ConfigError(f"connection '{name}': secret file '{p}' is empty")
-            self.password = SecretMark(val)
+                raise ConfigError(
+                    f"connection '{name}': environment variable {env} (options.wallet_password_env) is not set"
+                )
+            self.wallet_password = SecretMark(val)
+        elif wallet_file:
+            self.wallet_password = SecretMark(
+                _read_secret_file(Path(wallet_file), f"connection '{name}': wallet password file")
+            )
+        if self.wallet_password is not None:
+            self.config = config.model_copy(
+                update={"options": {**config.options, "wallet_password": self.wallet_password.value}}
+            )
 
 
 def _format_validation_errors(exc: ValidationError) -> str:
@@ -638,25 +1353,287 @@ def _apply_http_token_env_override(raw: dict[str, object]) -> dict[str, object]:
     return raw
 
 
+class _DuplicateKeyError(yaml.YAMLError):
+    pass
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader that refuses a mapping key given twice. PyYAML keeps the
+    last value silently, so a repeated allowed_schemas, security block,
+    connection id or read_only would weaken the policy the file shows before
+    pydantic's extra='forbid' could see anything.
+
+    Every mapping of the document is checked before anything is constructed,
+    the sources of '<<' merges included: construction flattens merged pairs
+    into the merging mapping, where an explicit key overriding a merged one
+    is the merge's purpose, not a repeat. A second '<<' in one mapping is a
+    repeat (the later merge would silently win); several sources go in one
+    merge, '<<: [*a, *b]'."""
+
+    def construct_document(self, node: yaml.Node) -> Any:
+        self._refuse_duplicate_keys(node)
+        return super().construct_document(node)
+
+    def construct_object(self, node: yaml.Node, deep: bool = False) -> Any:
+        """A tagged scalar ('!!int Secret') is converted by plain Python, whose
+        error quotes the value: report it as a ConstructorError at the node,
+        naming only the failure's type."""
+        try:
+            return super().construct_object(node, deep=deep)
+        except yaml.YAMLError:
+            raise
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError, IndexError) as exc:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                f"a value could not be read as the type its tag names ({type(exc).__name__})",
+                node.start_mark,
+            ) from None
+
+    def _refuse_duplicate_keys(self, root: yaml.Node) -> None:
+        stack = [root]
+        visited: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if id(node) in visited:
+                continue  # an alias: its anchored node is checked once
+            visited.add(id(node))
+            if isinstance(node, yaml.SequenceNode):
+                stack.extend(node.value)
+                continue
+            if not isinstance(node, yaml.MappingNode):
+                continue
+            first_line: dict[Any, int] = {}
+            merge_line: int | None = None
+            for key_node, value_node in node.value:
+                stack.extend((key_node, value_node))
+                line = key_node.start_mark.line + 1
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    if merge_line is not None:
+                        raise _DuplicateKeyError(
+                            f"duplicate merge key '<<' at line {line} (first given at line {merge_line}); the "
+                            "later merge would silently override the earlier one. Merge several mappings "
+                            "with one key: '<<: [*a, *b]'"
+                        )
+                    merge_line = line
+                    continue
+                if not isinstance(key_node, yaml.ScalarNode):
+                    continue  # a collection key the base constructor refuses as unhashable
+                key = self.construct_object(key_node, deep=True)
+                earlier = first_line.get(key)
+                if earlier is not None:
+                    raise _DuplicateKeyError(
+                        f"duplicate key '{key}' at line {line} (first given at line {earlier}); YAML would "
+                        "silently keep only the last value"
+                    )
+                first_line[key] = line
+
+
+def load_yaml_strict(text: str, source: str = "<string>") -> Any:
+    """``yaml.safe_load`` that raises ConfigError on invalid YAML and on a
+    mapping key given twice (naming the key and both lines). Every loader
+    failure is caught, not only YAMLError: a tagged scalar is converted by
+    plain Python ('password: !!int Secret' raises int()'s ValueError, which
+    quotes the value), and each is described without the file's text."""
+    try:
+        return yaml.load(text, Loader=_UniqueKeySafeLoader)  # noqa: S506 - a SafeLoader subclass
+    except Exception as exc:  # noqa: BLE001 - any loader failure, described without content
+        raise ConfigError(f"invalid YAML in '{source}': {describe_yaml_error(exc)}") from None
+
+
+# A quoted fragment in a PyYAML message: the file's own text (an alias, anchor,
+# tag or escape character) unless it is a token name ('<block end>') or one
+# of the grammar characters the parser expected. Linear: no nested quantifier.
+_YAML_QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+_YAML_TOKEN_NAME = re.compile(r"'<[a-z ]{1,40}>'")
+_YAML_GRAMMAR = frozenset({"','", "'}'", "']'", "':'", "'-'", "'\\t'"})
+_YAML_MESSAGE_CAP = 200
+
+
+def _content_free(message: str) -> str:
+    """*message* (a PyYAML context or problem) without the file's text: each
+    quoted fragment that is not a token name or a grammar character becomes
+    '…', and the rest from an unbalanced quote on is cut."""
+    message = message[:_YAML_MESSAGE_CAP]
+    out: list[str] = []
+    end = 0
+    for match in [*_YAML_QUOTED.finditer(message), None]:
+        between = message[end : match.start() if match else len(message)]
+        quote = min((i for i in (between.find("'"), between.find('"')) if i >= 0), default=-1)
+        if quote >= 0:
+            out.append(between[:quote].rstrip() + " …")
+            break
+        out.append(between)
+        if match is None:
+            break
+        fragment = match.group(0)
+        out.append(fragment if fragment in _YAML_GRAMMAR or _YAML_TOKEN_NAME.fullmatch(fragment) else "…")
+        end = match.end()
+    return "".join(out)
+
+
+def describe_yaml_error(exc: BaseException) -> str:
+    """Why a YAML document did not parse, by line and column, without its text.
+
+    PyYAML's own message quotes the offending line (about 32 characters on
+    each side of the error) and names aliases, anchors and tags from the
+    document. Harness configs hold other MCP servers' tokens, and a config may
+    inline a secret by mistake, so neither is ever printed: the parser's
+    reason, with every quoted fragment of the file replaced, and where it is.
+    A repeated mapping key keeps its own message (the key and both lines).
+    """
+    if isinstance(exc, _DuplicateKeyError):
+        return str(exc)
+    if isinstance(exc, yaml.MarkedYAMLError):
+        reason = "; ".join(_content_free(part) for part in (exc.context, exc.problem) if part) or "malformed"
+        mark = exc.problem_mark or exc.context_mark
+        return f"{reason} (line {mark.line + 1}, column {mark.column + 1})" if mark is not None else reason
+    if isinstance(exc, yaml.reader.ReaderError):
+        return f"a character YAML does not accept at character offset {exc.position}"
+    if isinstance(exc, yaml.YAMLError):
+        return "malformed YAML"
+    if isinstance(exc, RecursionError):
+        return "the document nests too deeply"
+    # a tagged value (!!int, !!float, !!bool, !!timestamp) the constructor
+    # could not convert: the exception's own message quotes the value
+    return f"a value could not be read as the type its tag names ({type(exc).__name__})"
+
+
+def describe_decode_error(exc: UnicodeDecodeError) -> str:
+    """Where a file is not UTF-8, by line: the codec's own message quotes the
+    byte and its offset, and the file may hold a secret."""
+    data = exc.object if isinstance(exc.object, bytes | bytearray) else b""
+    line = data.count(b"\n", 0, exc.start) + 1
+    return f"not valid UTF-8 text (line {line})"
+
+
+# Where auditing goes when the config file leaves application.audit_path unset:
+# omitting the key never switches auditing off. A config in the system
+# deployment directory belongs to the service account and audits into the
+# directory the packages create for it (the path the shipped template names;
+# on Windows the logs subfolder of the machine-wide ProgramData folder, which
+# the MSI makes writable for the service account: the folder itself, holding
+# the config and secrets, is read-only to it). Any other config is a per-user
+# run and audits under ~/.universal-db-mcp, as the seeded per-user config does.
+SYSTEM_AUDIT_DIR = Path("/var/log/universal-db-mcp")
+WIN32_SYSTEM_AUDIT_SUBDIR = "logs"
+AUDIT_FILE_NAME = "audit.jsonl"
+
+
+def is_system_config(config_path: str | Path) -> bool:
+    """True when *config_path* lies in the system deployment directory, i.e.
+    it is the service account's config rather than a per-user one. Either
+    place counts: the directory the name is given in (the service is started
+    with the system path, which may be a symlink to a file kept elsewhere)
+    and the directory the file really is in (a link to the system config
+    runs the service's config). Directories are compared resolved (/etc is
+    /private/etc on macOS) and case-folded on macOS and Windows, where
+    realpath keeps whatever case the name is given in."""
+    from universal_db_mcp.agents import core as agents_core
+
+    system_dir = _fold_case(os.path.realpath(agents_core.system_config_dir()))
+    given = os.path.abspath(config_path)
+    return any(
+        Path(_fold_case(directory)).is_relative_to(system_dir)
+        for directory in (os.path.realpath(os.path.dirname(given)), os.path.dirname(os.path.realpath(given)))
+    )
+
+
+def default_audit_path(config_path: str | Path) -> tuple[Path, str]:
+    """(path, description) of the audit log for a config file that sets no
+    ``application.audit_path``."""
+    from universal_db_mcp.agents import core as agents_core
+
+    if is_system_config(config_path):
+        if sys.platform == "win32":
+            service_dir = agents_core.system_config_dir() / WIN32_SYSTEM_AUDIT_SUBDIR
+        else:
+            service_dir = SYSTEM_AUDIT_DIR
+        return service_dir / AUDIT_FILE_NAME, f"service state directory {service_dir}"
+
+    def underivable(why: object) -> ConfigError:
+        return ConfigError(
+            f"application.audit_path is not set and the per-user default cannot be derived ({why}); "
+            "set application.audit_path"
+        )
+
+    try:
+        home = Path.home()
+    except RuntimeError as exc:
+        raise underivable(exc) from exc
+    # HOME='' reads as '/', and a relative HOME would follow the working
+    # directory of whichever client spawned the server
+    if not home.is_absolute() or home == Path(home.anchor):
+        what = "the filesystem root" if home.is_absolute() else "relative"
+        raise underivable(f"the home directory '{home}' is {what}")
+    user_dir = home / agents_core.PER_USER_CONFIG_DIR
+    return user_dir / AUDIT_FILE_NAME, f"per-user state directory {user_dir}"
+
+
+def _apply_audit_path_default(raw: dict[str, object], config_path: Path) -> str | None:
+    """Fill in an unset (or empty) application.audit_path; returns which
+    default was chosen, or None when the file sets one."""
+    if "application" not in raw:
+        raw["application"] = {}
+    app = raw["application"]
+    if not isinstance(app, dict) or app.get("audit_path"):
+        return None
+    path, where = default_audit_path(config_path)
+    app["audit_path"] = str(path)
+    return where
+
+
+# Path-valued keys that are relative to the config file's directory when not
+# absolute: secrets, TLS material and server state. (A SQLite data source and
+# the engine options that name directories are passed on as written.)
+_APPLICATION_PATH_KEYS = ("audit_path", "metadata_cache_path", "http_bearer_token_file")
+_CONNECTION_PATH_KEYS = ("username_file", "password_file")
+_TLS_PATH_KEYS = ("ca_file", "client_cert_file", "client_key_file")
+_OPTION_PATH_KEYS = ("wallet_password_file", "passfile")
+
+
+def _resolve_relative_paths(raw: dict[str, object], base: Path) -> None:
+    def resolve(section: object, keys: tuple[str, ...]) -> None:
+        if isinstance(section, dict):
+            for key in keys:
+                value = section.get(key)
+                if isinstance(value, str) and value and not os.path.isabs(value):
+                    section[key] = str(base / value)
+
+    resolve(raw.get("application"), _APPLICATION_PATH_KEYS)
+    connections = raw.get("connections")
+    if isinstance(connections, dict):
+        for conn in connections.values():
+            resolve(conn, _CONNECTION_PATH_KEYS)
+            if isinstance(conn, dict):
+                resolve(conn.get("tls"), _TLS_PATH_KEYS)
+                resolve(conn.get("options"), _OPTION_PATH_KEYS)
+
+
 def load_config(path: str | Path) -> AppConfig:
     p = Path(path)
     try:
         raw_text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"cannot read config file '{p}': {exc}") from exc
-    try:
-        raw = yaml.safe_load(raw_text)
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid YAML in '{p}': {exc}") from exc
+    except UnicodeDecodeError:
+        # the codec's message would quote a byte of the file
+        raise ConfigError(f"config file '{p}' is not valid UTF-8 text") from None
+    raw = load_yaml_strict(raw_text, str(p))
     if not isinstance(raw, dict):
         raise ConfigError(f"config '{p}' must be a mapping at the top level")
+    # relative paths follow the file, not the directory the server started in
+    _resolve_relative_paths(raw, Path(os.path.abspath(p)).parent)
     raw = _apply_http_token_env_override(raw)
+    audit_default = _apply_audit_path_default(raw, p)
     try:
-        return AppConfig.model_validate(raw)
+        cfg = AppConfig.model_validate(raw, context={"audit_path_default": audit_default})
     except ValidationError as exc:
         raise ConfigError(f"invalid configuration in '{p}': {_format_validation_errors(exc)}") from exc
     except Exception as exc:
         raise ConfigError(f"invalid configuration in '{p}': {exc}") from exc
+    cfg.application._audit_path_default = audit_default
+    return cfg
 
 
 def load_resolved(path: str | Path) -> tuple[AppConfig, dict[str, ResolvedConnection]]:

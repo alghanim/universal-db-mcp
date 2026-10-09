@@ -158,7 +158,9 @@ def test_service_create_shape(sources: dict[str, str]) -> None:
     assert has_sc_subcommand(text, "create")
     assert "binPath= " in text
     assert "start= auto" in text
-    assert '" -m universal_db_mcp serve --transport http' in text
+    # -I: the LocalSystem service reads no PYTHON* variables, user site or
+    # working directory
+    assert '" -I -m universal_db_mcp serve --transport http' in text
     assert "obj= " in text, "service account property must be passed to obj="
 
 
@@ -222,26 +224,20 @@ def test_uninstall_fails_closed_on_other_errors(sources: dict[str, str]) -> None
     assert re.search(r"\bexit\s+1\b", text)
 
 
-def test_uninstall_states_machine_config_is_not_retained(sources: dict[str, str]) -> None:
-    """The MSI uninstall transaction DOES delete ProgramData\\...\\config.yaml
-    (ConfigYamlComponent has NeverOverwrite but no Permanent, so RemoveFiles
-    removes it right after this action). The script must never claim the
-    config is retained: an admin relying on such a log line would skip the
-    documented backup (docs/offline-deployment.md: uninstall section) and
-    lose hand-edited config. The .deb comparison is the opposite: postrm
-    keeps the conffile on remove."""
+def test_uninstall_states_machine_config_is_retained(sources: dict[str, str]) -> None:
+    """ConfigYamlComponent is Permanent (and NeverOverwrite): a major upgrade
+    uninstalls the old product before installing the new one
+    (afterInstallValidate), and without Permanent that removal deleted the
+    admin's config.yaml and the template took its place. An uninstall
+    therefore keeps it too, as the .deb's postrm keeps the conffile on
+    remove, and the script says so (it never deletes it itself)."""
     text = sources["uninstall.ps1"]
     assert not re.search(r"Remove-Item[^\n]*config\.yaml", text), (
-        "uninstall.ps1 itself must not delete the config (the MSI RemoveFiles "
-        "standard action does that; the script stays out of it)"
+        "uninstall.ps1 itself must not delete the config"
     )
-    assert "NOT retained" in text, (
-        "the script must state explicitly that the machine-wide config is NOT "
-        "retained at uninstall, so admins back it up before uninstalling"
-    )
-    assert "retained by design" not in text, (
-        "the false retention assurance must not come back"
-    )
+    assert "NOT retained" not in text, "the config is retained now: the old warning must not come back"
+    assert "retained at uninstall: the config component is Permanent" in text
+    assert "config.yaml under ProgramData is retained" in text
 
 
 def test_uninstall_validates_service_name_before_tool_invocation(sources: dict[str, str]) -> None:

@@ -4,9 +4,14 @@ machine (network access allowed HERE ONLY; the bundle itself never touches a
 public endpoint at install or runtime).
 
 What it does:
-1. Builds the application wheel.
-2. Downloads the complete dependency closure as wheels for the target
-   profile (see scripts/profiles.py), including connector wheels.
+1. Builds the application wheel without build isolation, in a private venv
+   holding the hash-locked build backend (requirements/locks/build.txt).
+2. Downloads exactly the target profile's committed, hashed dependency lock
+   (requirements/locks/<profile>.txt, see scripts/profiles.py), connector
+   wheels included, with pip isolated from every inherited setting, and fails
+   unless the downloaded wheels ARE that lock. --refresh-locks recompiles the
+   locks with uv from requirements/runtime.in; --check-locks is the release
+   gate that they are current.
 3. Emits a fully pinned, hashed runtime.lock (application wheel included).
 4. Generates a CycloneDX-format SBOM from the wheelhouse.
 5. Vendors the pre-staged OS package closure (unixODBC stack + Microsoft
@@ -33,13 +38,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
+from typing import NamedTuple
 
 PROJECT = Path(__file__).resolve().parent.parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from scripts.profiles import PROFILES, Profile, get_profile  # noqa: E402  (repo-relative import)
+from scripts.profiles import LINUX_PROFILE_NAME, PROFILES, Profile, get_profile  # noqa: E402  (repo-relative import)
 
 CONNECTOR_WHEELS = {
     "core": ["mcp", "PyYAML", "sqlglot"],
@@ -56,6 +63,22 @@ CONNECTOR_WHEELS = {
     "mssql": ["pyodbc"],
     "db2": ["ibm-db"],
 }
+
+# The dependency closure is never resolved at build time. Every wheel comes
+# from the target profile's committed hashed lock, fetched by pip with no
+# inherited PIP_* setting or pip.conf, with --no-deps and --require-hashes,
+# from PYPI_SIMPLE unless --index-url names another index (which can then only
+# serve the locked bytes). The locks are compiled from requirements/runtime.in
+# plus the CONNECTOR_WHEELS extras by --refresh-locks.
+PYPI_SIMPLE = "https://pypi.org/simple"
+LOCK_DIR = PROJECT / "requirements" / "locks"
+RUNTIME_IN = PROJECT / "requirements" / "runtime.in"
+BUILD_LOCK = LOCK_DIR / "build.txt"
+LOCK_REFRESH_COMMAND = "python scripts/prepare_offline_bundle.py --refresh-locks"
+LOCKED_PIP_FLAGS = ("--isolated", "--no-deps", "--require-hashes", "--only-binary=:all:")
+_LOCK_REQ_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[([^\]]*)\])?(==([^\s;\\]+))?")
+_LOCK_HASH_RE = re.compile(r"--hash=sha256:([0-9a-f]{64})")
+_REQ_SPLIT_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[([^\]]*)\])?(.*)$")
 
 WHEEL_RE = re.compile(r"^(?P<name>[^-]+)-(?P<ver>[^-]+)-(?P<py>[^-]+)-(?P<abi>[^-]+)-(?P<plat>[^-]+)\.whl$")
 
@@ -78,9 +101,22 @@ OS_PACKAGE_INSTALL_ORDER = {
 }
 
 
-def sh(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+def scrubbed_env() -> dict[str, str]:
+    """The environment of every pip, build and uv subprocess.
+
+    No inherited PIP_* or UV_* setting (index URLs, find-links, trusted hosts,
+    config files) and no pip configuration file at all, so the command line
+    alone decides where artifacts come from: a PIP_INDEX_URL or pip.conf on the
+    staging host used to choose what was locked and signed.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PIP_", "UV_"))}
+    env["PIP_CONFIG_FILE"] = os.devnull
+    return env
+
+
+def sh(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     print("+", " ".join(cmd))
-    res = subprocess.run(cmd, capture_output=True, text=True)  # type: ignore[arg-type]
+    res = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=scrubbed_env() if env is None else env)
     if res.returncode != 0:
         print(res.stdout[-2000:])
         print(res.stderr[-2000:], file=sys.stderr)
@@ -240,13 +276,207 @@ def check_os_package_closure(
     return False
 
 
-def pip_download_command(profile: Profile, pkgs: list[str], wheelhouse: Path, constraints: Path) -> list[str]:
+class LockEntry(NamedTuple):
+    """One pinned package of a hashed lock (uv pip compile --generate-hashes)."""
+
+    name: str  # canonical (PEP 503) project name
+    version: str
+    hashes: frozenset[str]  # every sha256 the lock accepts for this version
+    via: tuple[str, ...]  # the '# via' annotation: requiring packages, or '-r <input>'
+
+
+def canonical_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def lock_path(profile: Profile) -> Path:
+    return LOCK_DIR / f"{profile.name}.txt"
+
+
+def _shown(path: Path) -> str:
+    return path.relative_to(PROJECT).as_posix() if path.is_relative_to(PROJECT) else str(path)
+
+
+def parse_lock(text: str) -> dict[str, LockEntry]:
+    """Parse a hashed requirements lock in uv's pip-compile output format.
+
+    Raises ValueError on a line that is not an exact == pin, or a second pin
+    of the same project.
+    """
+    raw: list[tuple[str, str, set[str], list[str]]] = []
+    in_via = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not line[0].isspace() and not stripped.startswith("#"):
+            m = _LOCK_REQ_RE.match(stripped)
+            if m is None or m.group(4) is None:
+                raise ValueError(f"not an exact == pin: {stripped[:60]}")
+            name = canonical_name(m.group(1))
+            if any(name == seen[0] for seen in raw):
+                raise ValueError(f"{name} is pinned twice")
+            raw.append((name, m.group(4), set(), []))
+            in_via = False
+        elif not raw:
+            continue  # the header
+        elif stripped.startswith("# via"):
+            rest = stripped[len("# via"):].strip()
+            if rest:
+                raw[-1][3].append(rest)
+            in_via = not rest  # a bare '# via' opens a list of '#   <parent>' lines
+            continue
+        elif stripped.startswith("#"):
+            if in_via:
+                raw[-1][3].append(stripped.lstrip("#").strip())
+            continue
+        raw[-1][2].update(_LOCK_HASH_RE.findall(stripped))
+    return {name: LockEntry(name, version, frozenset(hashes), tuple(via)) for name, version, hashes, via in raw}
+
+
+def _requirement_lines(path: Path) -> list[str]:
+    lines = (line.split("#", 1)[0].strip() for line in path.read_text(encoding="utf-8").splitlines())
+    return [line for line in lines if line]
+
+
+def runtime_pins(runtime_in: Path | None = None) -> dict[str, str]:
+    """{canonical name: version} of the exact pins in requirements/runtime.in."""
+    pins: dict[str, str] = {}
+    for line in _requirement_lines(runtime_in or RUNTIME_IN):
+        m = _LOCK_REQ_RE.match(line)
+        if m is not None and m.group(4) is not None:
+            pins[canonical_name(m.group(1))] = m.group(4)
+    return pins
+
+
+def lock_input(runtime_in: Path | None = None) -> str:
+    """What the profile locks are compiled from.
+
+    requirements/runtime.in, with the extras the bundle downloads
+    (CONNECTOR_WHEELS: PyMySQL[ed25519,rsa], psycopg[binary]) added to the
+    matching pins, and any connector package runtime.in does not pin.
+    """
+    extras: dict[str, set[str]] = {}
+    for pkg in (p for pkgs in CONNECTOR_WHEELS.values() for p in pkgs):
+        name, _, rest = pkg.partition("[")
+        extras.setdefault(canonical_name(name), set()).update(e for e in rest.rstrip("]").split(",") if e)
+    lines: list[str] = []
+    for line in _requirement_lines(runtime_in or RUNTIME_IN):
+        m = _REQ_SPLIT_RE.match(line)
+        if m is None:
+            raise SystemExit(f"unreadable requirement in requirements/runtime.in: {line}")
+        name, own, rest = m.groups()
+        wanted = extras.pop(canonical_name(name), set()) | {e.strip() for e in (own or "").split(",") if e.strip()}
+        lines.append(f"{name}[{','.join(sorted(wanted))}]{rest}" if wanted else f"{name}{rest}")
+    # what is left in extras: connector packages runtime.in does not pin
+    lines += [
+        pkg for pkgs in CONNECTOR_WHEELS.values() for pkg in pkgs if canonical_name(pkg.partition("[")[0]) in extras
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def lock_input_digest(runtime_in: Path | None = None) -> str:
+    return hashlib.sha256(lock_input(runtime_in).encode()).hexdigest()
+
+
+def lock_problems(profile: Profile, runtime_in: Path | None = None, lock: Path | None = None) -> list[str]:
+    """Why the profile's committed lock cannot be used as it is (empty: it can)."""
+    runtime_in = runtime_in or RUNTIME_IN
+    lock = lock or lock_path(profile)
+    if not lock.is_file():
+        return [f"{_shown(lock)} is missing"]
+    text = lock.read_text(encoding="utf-8")
+    try:
+        entries = parse_lock(text)
+    except ValueError as exc:
+        return [f"{_shown(lock)}: {exc}"]
+    problems = [f"{_shown(lock)}: {name} has no --hash" for name, entry in entries.items() if not entry.hashes]
+    for name, version in runtime_pins(runtime_in).items():
+        entry = entries.get(name)
+        if entry is None:
+            problems.append(f"{_shown(lock)} has no {name} (requirements/runtime.in pins {name}=={version})")
+        elif entry.version != version:
+            problems.append(f"{_shown(lock)} pins {name}=={entry.version}, requirements/runtime.in pins {version}")
+    digest = lock_input_digest(runtime_in)
+    if f"# input-sha256: {digest}" not in text:
+        problems.append(
+            f"{_shown(lock)} was not compiled from the current requirements/runtime.in and CONNECTOR_WHEELS "
+            f"extras (input-sha256 {digest[:16]}...)"
+        )
+    return problems
+
+
+def build_lock_problems(lock: Path | None = None) -> list[str]:
+    """Why the build-backend lock cannot build this project (empty: it can)."""
+    from packaging.requirements import Requirement  # staging machine: comes with the dev tools (build, pytest)
+
+    lock = lock or BUILD_LOCK
+    if not lock.is_file():
+        return [f"{_shown(lock)} is missing"]
+    try:
+        entries = parse_lock(lock.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return [f"{_shown(lock)}: {exc}"]
+    problems = [f"{_shown(lock)}: {name} has no --hash" for name, entry in entries.items() if not entry.hashes]
+    for spec in ("build", *build_requires()):
+        req = Requirement(spec)
+        entry = entries.get(canonical_name(req.name))
+        if entry is None:
+            problems.append(f"{_shown(lock)} has no {req.name} (needed to build the application wheel)")
+        elif not req.specifier.contains(entry.version, prereleases=True):
+            problems.append(f"{_shown(lock)} pins {req.name}=={entry.version}, pyproject.toml requires {req}")
+    return problems
+
+
+def build_requires() -> list[str]:
+    pyproject = tomllib.loads((PROJECT / "pyproject.toml").read_text(encoding="utf-8"))
+    return list(pyproject["build-system"]["requires"])
+
+
+def lock_resolver(text: str) -> str | None:
+    """The uv version --refresh-locks recorded in a lock, if any."""
+    m = re.search(r"^# resolver: (.+)$", text, flags=re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def lock_closure(entries: dict[str, LockEntry], connectors: list[str]) -> list[LockEntry]:
+    """The lock entries the selected connectors need: their CONNECTOR_WHEELS
+    packages and everything the lock's '# via' annotations show they pull in."""
+    children: dict[str, set[str]] = {}
+    for entry in entries.values():
+        for parent in entry.via:
+            if not parent.startswith("-"):
+                children.setdefault(canonical_name(parent), set()).add(entry.name)
+    roots = [canonical_name(pkg.partition("[")[0]) for c in connectors for pkg in CONNECTOR_WHEELS[c]]
+    absent = sorted({root for root in roots if root not in entries})
+    if absent:
+        raise SystemExit(f"the dependency lock has no entry for {absent}; run {LOCK_REFRESH_COMMAND}")
+    keep: set[str] = set()
+    todo = list(roots)
+    while todo:
+        name = todo.pop()
+        if name not in keep:
+            keep.add(name)
+            todo.extend(children.get(name, ()))
+    return [entries[name] for name in sorted(keep)]
+
+
+def format_requirements(entries: list[LockEntry]) -> str:
+    return "".join(
+        f"{e.name}=={e.version}" + "".join(f" --hash=sha256:{h}" for h in sorted(e.hashes)) + "\n" for e in entries
+    )
+
+
+def pip_download_command(
+    profile: Profile, wheelhouse: Path, requirements: Path, index_url: str = PYPI_SIMPLE
+) -> list[str]:
     """Build the pip download command for the profile's target interpreter.
 
-    Multiple --platform flags (e.g. both macOS tags) are passed as repeated
-    flags, which pip accepts.
+    Only what *requirements* (hashed exact pins) names, from *index_url*
+    alone, with no inherited configuration. Multiple --platform flags (e.g.
+    both macOS tags) are passed as repeated flags, which pip accepts.
     """
-    cmd = [sys.executable, "-m", "pip", "download", "--only-binary=:all:"]
+    cmd = [sys.executable, "-m", "pip", "download", *LOCKED_PIP_FLAGS, "--index-url", index_url]
     for plat in profile.pip_platforms:
         cmd += ["--platform", plat]
     cmd += [
@@ -254,10 +484,129 @@ def pip_download_command(profile: Profile, pkgs: list[str], wheelhouse: Path, co
         "--python-version", profile.python_version,
         "--abi", profile.abi,
         "--dest", str(wheelhouse),
-        "-c", str(constraints),
-        *pkgs,
+        "-r", str(requirements),
     ]
     return cmd
+
+
+def wheelhouse_problems(wheels: list[Path], entries: list[LockEntry]) -> list[str]:
+    """Differences between downloaded wheels and the lock entries they must be."""
+    expected = {entry.name: entry for entry in entries}
+    seen: set[str] = set()
+    problems: list[str] = []
+    for wheel in wheels:
+        name, version = wheel_meta(wheel)
+        name = canonical_name(name)
+        entry = expected.get(name)
+        if entry is None or name in seen:
+            problems.append(f"{wheel.name} is not a wheel the lock names")
+            continue
+        seen.add(name)
+        if version != entry.version:
+            problems.append(f"{wheel.name}: the lock pins {name}=={entry.version}")
+        elif hashlib.sha256(wheel.read_bytes()).hexdigest() not in entry.hashes:
+            problems.append(f"{wheel.name}: its sha256 is not one the lock accepts")
+    problems += [
+        f"{name}=={expected[name].version} is locked but was not downloaded" for name in sorted(set(expected) - seen)
+    ]
+    return problems
+
+
+def download_closure(profile: Profile, entries: list[LockEntry], workdir: Path, index_url: str) -> list[Path]:
+    """Download exactly *entries* for the profile and prove the result IS them."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    requirements = workdir / "closure.txt"
+    requirements.write_text(format_requirements(entries), encoding="utf-8")
+    cmd = pip_download_command(profile, workdir / "wheels", requirements, index_url)
+    print("+", " ".join(cmd))
+    res = subprocess.run(cmd, capture_output=True, text=True, env=scrubbed_env())
+    if res.returncode != 0:
+        print(res.stdout[-3000:], res.stderr[-3000:], file=sys.stderr)
+        raise SystemExit(
+            "pip download failed for the target profile (every wheel must match the committed hashed lock)"
+        )
+    wheels = sorted((workdir / "wheels").glob("*.whl"))
+    problems = wheelhouse_problems(wheels, entries)
+    if problems:
+        raise SystemExit("the downloaded wheelhouse does not match the lock: " + "; ".join(problems))
+    return wheels
+
+
+def build_app_wheel(workdir: Path, index_url: str) -> Path:
+    """Build the application wheel with the hash-locked build backend.
+
+    `python -m build` used to install whatever hatchling (and hatchling's
+    dependencies) the inherited index served into an isolated environment.
+    The backend now comes from requirements/locks/build.txt, installed with
+    --require-hashes into a private venv, and the build runs there with
+    --no-isolation.
+    """
+    venv = workdir / "build-venv"
+    sh([sys.executable, "-m", "venv", str(venv)])
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    sh([str(python), "-m", "pip", "install", *LOCKED_PIP_FLAGS, "--index-url", index_url, "-r", str(BUILD_LOCK)])
+    sh([str(python), "-m", "build", "--wheel", "--no-isolation", "--outdir", str(workdir / "dist"), str(PROJECT)])
+    wheels = list((workdir / "dist").glob("*.whl"))
+    assert len(wheels) == 1, wheels
+    return wheels[0]
+
+
+def check_locks() -> int:
+    """--check-locks: 0 when every committed lock is current, else 1."""
+    problems = [p for profile in PROFILES.values() for p in lock_problems(profile)] + build_lock_problems()
+    for problem in problems:
+        print(f"FAIL: {problem}", file=sys.stderr)
+    if problems:
+        print(f"Refresh them with '{LOCK_REFRESH_COMMAND}' (network), review the diff and commit it.", file=sys.stderr)
+        return 1
+    print(f"locks: {len(PROFILES)} profile locks and the build lock match requirements/runtime.in and pyproject.toml")
+    return 0
+
+
+def _stamp_lock(path: Path, what: str, resolver: str, digest: str | None) -> None:
+    """Record, under uv's header, what a lock is for, what resolved it and from which input."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    head = 2 if lines[:1] == ["# This file was autogenerated by uv via the following command:"] else 0
+    stamp = [f"# lock for: {what}", f"# resolver: {resolver}"]
+    if digest is not None:
+        stamp.append(f"# input-sha256: {digest}")
+    path.write_text("\n".join([*lines[:head], *stamp, *lines[head:]]) + "\n", encoding="utf-8")
+
+
+def refresh_locks(index_url: str) -> None:
+    """--refresh-locks: recompile every committed lock with uv (network).
+
+    uv keeps the versions already in an existing lock wherever the input still
+    allows them; delete a lock to re-resolve it from scratch.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        raise SystemExit("--refresh-locks needs uv on PATH (https://docs.astral.sh/uv/)")
+    resolver = sh([uv, "--version"]).stdout.strip()
+    compile_cmd = [
+        uv, "pip", "compile", "--quiet", "--no-config", "--generate-hashes", "--only-binary", ":all:",
+        "--index-url", index_url, "--custom-compile-command", LOCK_REFRESH_COMMAND,
+    ]
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "runtime.in").write_text(lock_input(), encoding="utf-8")
+        for profile in PROFILES.values():
+            env = scrubbed_env()
+            macos = [tuple(int(v) for v in m.groups()) for p in profile.pip_platforms
+                     if (m := re.match(r"macosx_(\d+)_(\d+)_", p))]
+            if macos:  # uv otherwise assumes its oldest macOS; ibm_db ships macosx_14_0 wheels only
+                env["MACOSX_DEPLOYMENT_TARGET"] = "{}.{}".format(*max(macos))
+            sh([*compile_cmd, "--python-version", profile.python_version, "--python-platform", profile.lock_platform,
+                "--output-file", str(lock_path(profile)), "runtime.in"], cwd=Path(td), env=env)
+            _stamp_lock(lock_path(profile), f"{profile.name} (--python-platform {profile.lock_platform})",
+                        resolver, lock_input_digest())
+        (Path(td) / "build.in").write_text("\n".join(["build", *build_requires()]) + "\n", encoding="utf-8")
+        # the build backend runs on the staging host: a universal lock for the
+        # project's oldest supported Python
+        sh([*compile_cmd, "--universal", "--python-version", PROFILES[LINUX_PROFILE_NAME].python_version,
+            "--output-file", str(BUILD_LOCK), "build.in"], cwd=Path(td))
+        _stamp_lock(BUILD_LOCK, "the build backend of the application wheel (universal)", resolver, None)
+    print(f"locks refreshed with {resolver}: review 'git diff {_shown(LOCK_DIR)}' and commit it")
 
 
 def connectors_arg(value: str) -> str:
@@ -280,11 +629,22 @@ def connectors_arg(value: str) -> str:
     return ",".join(names)
 
 
+def release_seq_arg(value: str) -> int:
+    """--release-seq / UDBMCP_RELEASE_SEQ: a non-negative integer."""
+    try:
+        seq = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"release sequence must be an integer, got {value!r}") from None
+    if seq < 0:
+        raise argparse.ArgumentTypeError(f"release sequence must not be negative, got {seq}")
+    return seq
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", default="linux-x86_64-ubuntu24.04-cp312", choices=sorted(PROFILES),
                     help="target profile (see scripts/profiles.py)")
-    ap.add_argument("--out", required=True, help="bundle output directory")
+    ap.add_argument("--out", help="bundle output directory (required unless --check-locks/--refresh-locks)")
     ap.add_argument("--connectors", default="core,postgres,mysql,clickhouse,oracle,mssql,db2",
                     type=connectors_arg,
                     help="comma list; 'core' is always included")
@@ -299,6 +659,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "unavailable, the tree is not a repository, or no commit exists — "
                          "package versions derived from 'unknown' cannot be tied to a "
                          "source revision.")
+    ap.add_argument("--release-seq", type=release_seq_arg,
+                    default=os.environ.get("UDBMCP_RELEASE_SEQ") or None,
+                    help="integer release_seq recorded in manifest.json; the installers refuse a "
+                         "bundle whose release_seq is lower than the installed one. Default: the "
+                         "committer timestamp (UNIX seconds) of --source-rev, "
+                         "UDBMCP_RELEASE_SEQ as an environment override; omitted with a WARNING "
+                         "when --source-rev is not a commit of this repository.")
+    ap.add_argument("--index-url", default=PYPI_SIMPLE,
+                    help="package index for the locked wheels and the locked build backend (default: "
+                         "%(default)s). Inherited PIP_* settings and pip.conf are ignored; a mirror can only "
+                         "serve the bytes requirements/locks/ hashes.")
+    ap.add_argument("--check-locks", action="store_true",
+                    help="check that requirements/locks/ holds a current hashed lock for every profile and "
+                         "for the build backend, then exit (1 when one is missing or out of date)")
+    ap.add_argument("--refresh-locks", action="store_true",
+                    help="recompile requirements/locks/ with uv from requirements/runtime.in, the "
+                         "CONNECTOR_WHEELS extras and pyproject.toml's build-system (network), then exit")
     return ap
 
 
@@ -340,6 +717,36 @@ def resolve_source_rev(explicit: str | None) -> str:
         file=sys.stderr,
     )
     return "unknown"
+
+
+def resolve_release_seq(explicit: int | None, source_rev: str) -> int | None:
+    """Resolve the manifest release_seq (the anti-rollback order of releases).
+
+    An explicit --release-seq / UDBMCP_RELEASE_SEQ wins. Otherwise it is the
+    committer timestamp of source_rev, so it grows with every commit and a
+    rebuild of an old commit keeps its old place. None (no release_seq, which
+    the verifier treats as older than any sequenced release) with a WARNING
+    when source_rev is not a commit of this repository.
+    """
+    if explicit is not None:
+        return explicit
+    try:
+        res = subprocess.run(  # noqa: S603 - fixed git argv, the revision is the builder's own
+            ["git", "-C", str(PROJECT), "show", "-s", "--format=%ct", f"{source_rev}^{{commit}}", "--"],  # noqa: S607
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    else:
+        if res.returncode == 0 and res.stdout.strip().isdigit():
+            return int(res.stdout.strip())
+    print(
+        f"WARNING: source_rev {source_rev!r} is not a commit of this repository, so the "
+        "manifest carries no release_seq. Installers treat such a bundle as OLDER than any "
+        "installed release that has one (anti-rollback); pass --release-seq to order it.",
+        file=sys.stderr,
+    )
+    return None
 
 
 def stage_os_packages(out: Path, staging: Path) -> list[dict[str, object]]:
@@ -413,7 +820,15 @@ def stage_os_packages(out: Path, staging: Path) -> list[dict[str, object]]:
 
 
 def main() -> None:
-    args = build_arg_parser().parse_args()
+    ap = build_arg_parser()
+    args = ap.parse_args()
+    if args.check_locks:
+        raise SystemExit(check_locks())
+    if args.refresh_locks:
+        refresh_locks(args.index_url)
+        return
+    if not args.out:
+        ap.error("--out is required (unless --check-locks or --refresh-locks)")
     check_signing_conflict(args.signing_key, args.allow_missing_connectors)
     source_rev = resolve_source_rev(args.source_rev)
     if args.signing_key and source_rev == "unknown":
@@ -424,7 +839,15 @@ def main() -> None:
             "record one.",
             file=sys.stderr,
         )
+    release_seq = resolve_release_seq(args.release_seq, source_rev)
     profile = get_profile(args.profile)
+    lock = lock_path(profile)
+    problems = lock_problems(profile) + build_lock_problems()
+    if problems:
+        raise SystemExit(
+            "the committed dependency locks cannot be used: " + "; ".join(problems)
+            + f". Run '{LOCK_REFRESH_COMMAND}' (network), review the diff and commit it."
+        )
 
     connectors = ["core"] + [c for c in args.connectors.split(",") if c != "core"]
     missing: list[str] = []
@@ -437,36 +860,22 @@ def main() -> None:
               "test-evidence"):
         (out / d).mkdir(parents=True)
 
-    # 1. application wheel -----------------------------------------------------
+    # 1. application wheel (hash-locked build backend, no build isolation) ------
     with tempfile.TemporaryDirectory() as td:
-        sh([sys.executable, "-m", "build", "--wheel", "--outdir", td, str(PROJECT)])
-        app_wheels = list(Path(td).glob("*.whl"))
-        assert len(app_wheels) == 1, app_wheels
-        app_wheel_name = app_wheels[0].name
-        shutil.copy2(app_wheels[0], out / "wheelhouse" / app_wheel_name)
+        app_wheel = build_app_wheel(Path(td), args.index_url)
+        app_wheel_name = app_wheel.name
+        shutil.copy2(app_wheel, out / "wheelhouse" / app_wheel_name)
 
-    # 2. dependency closure ----------------------------------------------------
-    pkgs = [p for c in connectors for p in CONNECTOR_WHEELS[c]]
-    # Constrain resolution to the reviewed pins in requirements/runtime.in so
-    # a rebuild cannot silently ship different (undocumented) versions.
-    constraints = Path(tempfile.mkstemp(suffix=".txt")[1])
-    # pip rejects extras in constraint files, so strip [extras] while keeping
-    # the pinned version (the extra is still requested on the command line).
-    import re as _re
-
-    constraints.write_text(
-        "\n".join(
-            _re.sub(r"([A-Za-z0-9._-]+)\[[^\]]*\]", r"\1", line.split(" #")[0].strip())
-            for line in (PROJECT / "requirements" / "runtime.in").read_text().splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        )
-        + "\n"
-    )
-    cmd = pip_download_command(profile, pkgs, out / "wheelhouse", constraints)
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        print(res.stdout[-3000:], res.stderr[-3000:], file=sys.stderr)
-        raise SystemExit("pip download failed for the target profile")
+    # 2. dependency closure: exactly the profile's committed hashed lock --------
+    # A rebuild cannot ship different (unreviewed) transitive versions, and a
+    # wheel the index serves that the lock does not hash fails the build here,
+    # before anything is locked or signed.
+    lock_bytes = lock.read_bytes()
+    lock_text = lock_bytes.decode("utf-8")
+    closure = lock_closure(parse_lock(lock_text), connectors)
+    with tempfile.TemporaryDirectory() as td:
+        for wheel in download_closure(profile, closure, Path(td), args.index_url):
+            shutil.copy2(wheel, out / "wheelhouse" / wheel.name)
 
     # record which top-level connector wheels actually landed, and fail loud
     # when any are missing (a signed release can never ship a knowingly
@@ -539,8 +948,10 @@ def main() -> None:
     trusted.mkdir(parents=True, exist_ok=True)
     trusted_lib = trusted / "lib"
     trusted_lib.mkdir(exist_ok=True)
+    # The container-mode image loader is a trusted tool too: it refuses to run
+    # from inside a bundle and loads only a verified private copy of it.
     for name in ("verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh",
-                 "profiles.py"):
+                 "profiles.py", "load_images_offline.sh"):
         shutil.copy2(PROJECT / "scripts" / name, trusted / name)
     # install_offline.sh / upgrade_offline.sh source lib/os_packages.sh from
     # the directory they run from; a trusted-tools copy without the helper
@@ -549,7 +960,7 @@ def main() -> None:
     shutil.copy2(PROJECT / "scripts" / "lib" / "os_packages.sh", trusted_lib / "os_packages.sh")
     trusted_names = (
         "verify_bundle.py", "install_offline.sh", "upgrade_offline.sh", "rollback_offline.sh",
-        "profiles.py", "lib/os_packages.sh",
+        "profiles.py", "lib/os_packages.sh", "load_images_offline.sh",
     )
     (trusted / "SHA256SUMS").write_text(
         "".join(
@@ -596,8 +1007,13 @@ def main() -> None:
             "(e.g. Microsoft ODBC driver .deb files, after EULA acceptance). "
             "The application never adds vendor repositories on targets.\n"
         )
+    # universal-db-mcp's own license (Apache-2.0) and the NOTICE it requires
+    for name in ("LICENSE", "NOTICE"):
+        shutil.copy2(PROJECT / name, out / "licenses" / name)
     (out / "licenses" / "README.md").write_text(
-        "# Licenses\n\nWheel licenses are recorded in the SBOM. Vendor driver "
+        "# Licenses\n\nLICENSE and NOTICE are universal-db-mcp's own (Apache-2.0). "
+        "The third-party wheels are listed in sbom/cyclonedx.json and each carries "
+        "its own license files. Vendor driver "
         "licenses (IBM, Microsoft, Oracle) are NOT included; administrators "
         "must hold the required entitlements.\n"
     )
@@ -610,14 +1026,25 @@ def main() -> None:
         admin_supplied["mssql_odbc_driver"] = (
             f"Microsoft ODBC Driver 18 for SQL Server ({profile.odbc_driver_package}) + EULA acceptance"
         )
+    build_backend = parse_lock(BUILD_LOCK.read_text(encoding="utf-8"))
     manifest = {
         "release": "0.1.0",
         "profile": args.profile,
         "source_rev": source_rev,
+        # anti-rollback order, covered by the signed SHA256SUMS: the verifier
+        # refuses a bundle whose release_seq is below the installed one's
+        "release_seq": release_seq,
         "created": datetime.datetime.now(datetime.UTC).isoformat(),
         "build_tools": {
             "python": platform.python_version(),
             "pip": sh([sys.executable, "-m", "pip", "--version"]).stdout.split()[1],
+            # the pinned inputs: the build backend, and the locks with the uv that resolved them
+            "build": build_backend["build"].version,
+            "hatchling": build_backend["hatchling"].version,
+            "uv": lock_resolver(lock_text),
+            "runtime_lock": _shown(lock),
+            "runtime_lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
+            "build_lock_sha256": hashlib.sha256(BUILD_LOCK.read_bytes()).hexdigest(),
         },
         "target": dict(profile.manifest_target),
         "selected_connectors": connectors,
@@ -653,6 +1080,7 @@ def main() -> None:
 
     print(f"\nbundle ready: {out}")
     print(f"source_rev: {source_rev}")
+    print(f"release_seq: {release_seq if release_seq is not None else 'none (older than any sequenced release)'}")
     print(f"wheels: {len(wheelhouse)}  missing connector artifacts: {missing or 'none'}")
     if os_packages:
         print(f"os packages: {len(os_packages)} vendored into os-packages/ (hash-pinned in manifest)")

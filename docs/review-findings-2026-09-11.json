@@ -16,7 +16,7 @@
     {
      "refuted": false,
      "severity": "P0",
-     "why": "CONFIRMED by tracing the code and executing it against the real SqlGuard.\n\nCode path (/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/security/sql_guard.py): `_walk_validate` collects `cte.alias_or_name.lower()` for every exp.CTE (lines 215-217). For each exp.Table it checks `if name.lo"
+     "why": "CONFIRMED by tracing the code and executing it against the real SqlGuard.\n\nCode path (src/universal_db_mcp/security/sql_guard.py): `_walk_validate` collects `cte.alias_or_name.lower()` for every exp.CTE (lines 215-217). For each exp.Table it checks `if name.lo"
     },
     {
      "refuted": false,
@@ -26,7 +26,7 @@
     {
      "refuted": false,
      "severity": "P0",
-     "why": "CONFIRMED by direct reproduction, not refuted.\n\n1. Unit-level, real EffectivePolicy (not the test fake), real StaticResolver, allowed_schemas={reporting}, default_deny_objects=True, with a counting wrapper on check_object. Script: /private/tmp/claude-501/-Users-ag-work-Projects-universalDB-MCP/79f56"
+     "why": "CONFIRMED by direct reproduction, not refuted.\n\n1. Unit-level, real EffectivePolicy (not the test fake), real StaticResolver, allowed_schemas={reporting}, default_deny_objects=True, with a counting wrapper on check_object. Script: <scratch>"
     }
    ]
   },
@@ -43,17 +43,17 @@
     {
      "refuted": false,
      "severity": "P1",
-     "why": "CONFIRMED by tracing the code and reproducing against the real SqlGuard with the repo venv.\n\nExecution path (all verified in-file):\n1. /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py:146-149 `guard_for` -> `app.tables_for(policy, connector)` -> line 124 `c.list_tables(None, ki"
+     "why": "CONFIRMED by tracing the code and reproducing against the real SqlGuard with the repo venv.\n\nExecution path (all verified in-file):\n1. src/universal_db_mcp/server.py:146-149 `guard_for` -> `app.tables_for(policy, connector)` -> line 124 `c.list_tables(None, ki"
     },
     {
      "refuted": false,
      "severity": "P1",
-     "why": "Verified as real, and slightly worse than described.\n\nCode path (all in /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp):\n- server.py:117-126 `tables_for()` calls `c.list_tables(None, kinds, None)`. The docstring says \"policy-scoped\" but no policy filter is applied. connectors/postgres."
+     "why": "Verified as real, and slightly worse than described.\n\nCode path (all in src/universal_db_mcp):\n- server.py:117-126 `tables_for()` calls `c.list_tables(None, kinds, None)`. The docstring says \"policy-scoped\" but no policy filter is applied. connectors/postgres."
     },
     {
      "refuted": false,
      "severity": "P1",
-     "why": "CONFIRMED by executing the real code path, not just by reading it.\n\nReproduction (/private/tmp/claude-501/-Users-ag-work-Projects-universalDB-MCP/79f568f7-b5dc-4ffc-9aaf-933230e6f531/scratchpad/test_repro_resolver_scope.py, 3/3 pass with .venv/bin/python -m pytest): built a real AppContext from a YA"
+     "why": "CONFIRMED by executing the real code path, not just by reading it.\n\nReproduction (<scratch>/test_repro_resolver_scope.py, 3/3 pass with .venv/bin/python -m pytest): built a real AppContext from a YA"
     }
    ]
   },
@@ -97,7 +97,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "VERIFIED REAL, but the impact is overstated; I assess P3, not P2.\n\nWhat I confirmed by tracing and live reproduction (/Users/ag-work/Projects/universalDB-MCP/.venv/bin/python, sqlglot 30.18.0, using the repo's own FakePolicy/make_guard from tests/unit/test_sql_guard.py):\n- src/universal_db_mcp/secur"
+     "why": "VERIFIED REAL, but the impact is overstated; I assess P3, not P2.\n\nWhat I confirmed by tracing and live reproduction (.venv/bin/python, sqlglot 30.18.0, using the repo's own FakePolicy/make_guard from tests/unit/test_sql_guard.py):\n- src/universal_db_mcp/secur"
     },
     {
      "refuted": false,
@@ -113,7 +113,7 @@
   },
   {
    "title": "Db2: every catalog loop crashes because ibm_db.fetch_tuple returns False, not None, at end of result set",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/db2.py",
+   "file": "src/universal_db_mcp/connectors/db2.py",
    "line": 180,
    "severity": "P1",
    "category": "driver-contract",
@@ -124,7 +124,7 @@
     {
      "refuted": false,
      "severity": "P1",
-     "why": "CONFIRMED. The finding is correct on every point I could verify.\n\nCode at the cited location: /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/db2.py lines 180, 212, 241, 270, 287, 304, 325 all loop with `while (row := self._module.fetch_tuple(stmt)) is not None:` and then sub"
+     "why": "CONFIRMED. The finding is correct on every point I could verify.\n\nCode at the cited location: src/universal_db_mcp/connectors/db2.py lines 180, 212, 241, 270, 287, 304, 325 all loop with `while (row := self._module.fetch_tuple(stmt)) is not None:` and then sub"
     },
     {
      "refuted": false,
@@ -140,7 +140,7 @@
   },
   {
    "title": "Shared metadata connection is handed out without the lock: PyMySQL connection shared across threads corrupts the protocol; ClickHouse shared client hits SESSION_IS_LOCKED",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mysql.py",
+   "file": "src/universal_db_mcp/connectors/mysql.py",
    "line": 71,
    "severity": "P1",
    "category": "thread-safety",
@@ -167,7 +167,7 @@
   },
   {
    "title": "A query waiting on _exec_lock that hits its deadline cancels the *other* caller's running query",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/postgres.py",
+   "file": "src/universal_db_mcp/connectors/postgres.py",
    "line": 92,
    "severity": "P1",
    "category": "cancellation",
@@ -194,7 +194,7 @@
   },
   {
    "title": "ClickHouse list_columns reports `nullable` inverted",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/clickhouse.py",
+   "file": "src/universal_db_mcp/connectors/clickhouse.py",
    "line": 216,
    "severity": "P2",
    "category": "correctness",
@@ -221,7 +221,7 @@
   },
   {
    "title": "ClickHouse cancel_current calls a method that does not exist on clickhouse-connect Client (cancel is silently a no-op)",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/clickhouse.py",
+   "file": "src/universal_db_mcp/connectors/clickhouse.py",
    "line": 99,
    "severity": "P2",
    "category": "cancellation",
@@ -237,7 +237,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified the core claim directly against the bundled wheel (clickhouse-connect 1.8.0 in the project venv): hasattr(Client, 'cancel_query') is False, HttpClient has no cancel/kill methods at all. Therefore cancel_current() at /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/cli"
+     "why": "Verified the core claim directly against the bundled wheel (clickhouse-connect 1.8.0 in the project venv): hasattr(Client, 'cancel_query') is False, HttpClient has no cancel/kill methods at all. Therefore cancel_current() at src/universal_db_mcp/connectors/cli"
     },
     {
      "refuted": false,
@@ -248,7 +248,7 @@
   },
   {
    "title": "Driver exceptions escape unwrapped from mysql, clickhouse, oracle, mssql and db2 (only postgres wraps in ConnectorError)",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mysql.py",
+   "file": "src/universal_db_mcp/connectors/mysql.py",
    "line": 350,
    "severity": "P2",
    "category": "error-handling",
@@ -259,7 +259,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified the defect by tracing the full path. (1) Only postgres wraps driver exceptions: /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/postgres.py:395-396 and 433-434 wrap connect/execute in `ConnectorError(scrub_exception(exc))`. The other five connectors have try/finally "
+     "why": "Verified the defect by tracing the full path. (1) Only postgres wraps driver exceptions: src/universal_db_mcp/connectors/postgres.py:395-396 and 433-434 wrap connect/execute in `ConnectorError(scrub_exception(exc))`. The other five connectors have try/finally "
     },
     {
      "refuted": false,
@@ -269,13 +269,13 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced end-to-end at /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mysql.py. I instantiated MySQLConnector against a real ResolvedConnection (built via load_resolved from a config with a mysql connection), stubbed _connect() with a fake connection whose cursor.execute r"
+     "why": "Reproduced end-to-end at src/universal_db_mcp/connectors/mysql.py. I instantiated MySQLConnector against a real ResolvedConnection (built via load_resolved from a config with a mysql connection), stubbed _connect() with a fake connection whose cursor.execute r"
     }
    ]
   },
   {
    "title": "JSON/array/UUID/network values are returned as Python repr strings labelled 'decimal'",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/driver_helpers.py",
+   "file": "src/universal_db_mcp/connectors/driver_helpers.py",
    "line": 67,
    "severity": "P2",
    "category": "type-adaptation",
@@ -296,13 +296,13 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced directly by invoking _adapt_one from /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/driver_helpers.py:68. A dict mimicking psycopg's jsonb return value adapts to the Python-repr string \"{'a': 1, 'tags': ['x']}\" (single quotes, invalid JSON) labelled 'decimal'; lis"
+     "why": "Reproduced directly by invoking _adapt_one from src/universal_db_mcp/connectors/driver_helpers.py:68. A dict mimicking psycopg's jsonb return value adapts to the Python-repr string \"{'a': 1, 'tags': ['x']}\" (single quotes, invalid JSON) labelled 'decimal'; lis"
     }
    ]
   },
   {
    "title": "MySQL truncation drains the entire remaining result set over the network before returning (SSCursor.close)",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mysql.py",
+   "file": "src/universal_db_mcp/connectors/mysql.py",
    "line": 377,
    "severity": "P2",
    "category": "result-bounding",
@@ -329,7 +329,7 @@
   },
   {
    "title": "Postgres get_foreign_keys derives schema from search_path-dependent regclass text and ignores the schema argument",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/postgres.py",
+   "file": "src/universal_db_mcp/connectors/postgres.py",
    "line": 262,
    "severity": "P2",
    "category": "catalog-sql",
@@ -350,13 +350,13 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced the defect end-to-end against a real PostgreSQL 16.14 instance (throwaway Homebrew cluster on port 55432, removed afterwards) using the actual PostgresConnector from /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/postgres.py (note: the method is at lines 307-328, "
+     "why": "Reproduced the defect end-to-end against a real PostgreSQL 16.14 instance (throwaway Homebrew cluster on port 55432, removed afterwards) using the actual PostgresConnector from src/universal_db_mcp/connectors/postgres.py (note: the method is at lines 307-328, "
     }
    ]
   },
   {
    "title": "MySQL and Db2 list_tables include system schemas, which become 'permitted' resolver entries under the default config",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mysql.py",
+   "file": "src/universal_db_mcp/connectors/mysql.py",
    "line": 202,
    "severity": "P2",
    "category": "policy",
@@ -383,7 +383,7 @@
   },
   {
    "title": "MSSQL driver detection accepts any 'ODBC Driver N for SQL Server' but the connection string hardcodes 18; options.odbc_driver is ignored",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mssql.py",
+   "file": "src/universal_db_mcp/connectors/mssql.py",
    "line": 52,
    "severity": "P2",
    "category": "deployment",
@@ -410,7 +410,7 @@
   },
   {
    "title": "Schema-qualified object requests keep the caller's spelling, so Oracle/Db2 (upper-case catalogs) and case-sensitive Postgres lookups silently miss",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py",
+   "file": "src/universal_db_mcp/server.py",
    "line": 1029,
    "severity": "P2",
    "category": "identifier-case",
@@ -431,13 +431,13 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced with a runnable script against the real code (/tmp/repro_resolve.py run via .venv/bin/python, monkeypatching only run_meta and app.tables_for; real server._resolve_object, real EffectivePolicy, real OracleConnector).\n\nCode facts confirmed:\n- src/universal_db_mcp/server.py:1153-1163: the s"
+     "why": "Reproduced with a runnable script against the real code (<scratch>/repro_resolve.py run via .venv/bin/python, monkeypatching only run_meta and app.tables_for; real server._resolve_object, real EffectivePolicy, real OracleConnector).\n\nCode facts confirmed:\n- src/universal_db_mcp/server.py:1153-1163: the s"
     }
    ]
   },
   {
    "title": "SQLite: a relative `database` path crashes every operation with ValueError from Path.as_uri()",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/sqlite.py",
+   "file": "src/universal_db_mcp/connectors/sqlite.py",
    "line": 122,
    "severity": "P2",
    "category": "robustness",
@@ -458,13 +458,13 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced end to end with the repo's own code (.venv against /Users/ag-work/Projects/universalDB-MCP/src). (1) A YAML config with sqlite `database: ./data/demo.db` passes load_config \u2014 ConnectionConfig imposes no path constraints on sqlite `database` and AppConfig._state_isolated_from_data_sources "
+     "why": "Reproduced end to end with the repo's own code (.venv against src). (1) A YAML config with sqlite `database: ./data/demo.db` passes load_config \u2014 ConnectionConfig imposes no path constraints on sqlite `database` and AppConfig._state_isolated_from_data_sources "
     }
    ]
   },
   {
    "title": "Column type labels for Oracle/Db2 are always 'unknown' and MSSQL labels use Python type names, not the documented label vocabulary",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/oracle.py",
+   "file": "src/universal_db_mcp/connectors/oracle.py",
    "line": 352,
    "severity": "P3",
    "category": "type-labels",
@@ -480,18 +480,18 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "I attempted to refute the finding and could not; every mechanical claim checks out against the code and driver semantics.\n\nVerified facts:\n1. All three connectors use the identical pattern `getattr(d[1], \"__name__\", \"unknown\").lower()` on cursor.description[1]: /Users/ag-work/Projects/universalDB-MC"
+     "why": "I attempted to refute the finding and could not; every mechanical claim checks out against the code and driver semantics.\n\nVerified facts:\n1. All three connectors use the identical pattern `getattr(d[1], \"__name__\", \"unknown\").lower()` on cursor.description[1]: <repo>"
     },
     {
      "refuted": false,
      "severity": "P3",
-     "why": "CONFIRMED by running the exact code expression against the real driver objects installed in /Users/ag-work/Projects/universalDB-MCP/.venv.\n\nCode (verified locations): src/universal_db_mcp/connectors/oracle.py:352-355, mssql.py:415-417, db2.py:385-387 all compute the column type label as `getattr(d[1"
+     "why": "CONFIRMED by running the exact code expression against the real driver objects installed in .venv.\n\nCode (verified locations): src/universal_db_mcp/connectors/oracle.py:352-355, mssql.py:415-417, db2.py:385-387 all compute the column type label as `getattr(d[1"
     }
    ]
   },
   {
    "title": "Postgres _execute re-wraps DriverUnavailableError as a generic ConnectorError (DRIVER_MISSING becomes CONNECTION) and turns [] parameters into () which forces placeholder parsing",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/postgres.py",
+   "file": "src/universal_db_mcp/connectors/postgres.py",
    "line": 341,
    "severity": "P3",
    "category": "error-handling",
@@ -512,13 +512,13 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Both defects verified at runtime in /Users/ag-work/Projects/universalDB-MCP. (1) Category downgrade: postgres.py:401-402 catches Exception around self._connect(), which includes DriverUnavailableError raised by open_module; with psycopg's import blocked, PostgresConnector._execute raised a plain Con"
+     "why": "Both defects verified at runtime in <repo>. (1) Category downgrade: postgres.py:401-402 catches Exception around self._connect(), which includes DriverUnavailableError raised by open_module; with psycopg's import blocked, PostgresConnector._execute raised a plain Con"
     }
    ]
   },
   {
    "title": "Configured username (modelled as a secret) leaks in driver error text returned by health_check and query errors",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/postgres.py",
+   "file": "src/universal_db_mcp/connectors/postgres.py",
    "line": 160,
    "severity": "P3",
    "category": "redaction",
@@ -545,7 +545,7 @@
   },
   {
    "title": "Engine options are validated and accepted but never applied by the connectors (ssl_mode, application_name, compress, odbc_driver)",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/config.py",
+   "file": "src/universal_db_mcp/config.py",
    "line": 95,
    "severity": "P3",
    "category": "config",
@@ -572,7 +572,7 @@
   },
   {
    "title": "ClickHouse materialized views are classified as tables; list_views/kind filters never see them",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/clickhouse.py",
+   "file": "src/universal_db_mcp/connectors/clickhouse.py",
    "line": 188,
    "severity": "P3",
    "category": "catalog-sql",
@@ -599,7 +599,7 @@
   },
   {
    "title": "MSSQL get_statistics filters by table name only, summing partitions across schemas",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mssql.py",
+   "file": "src/universal_db_mcp/connectors/mssql.py",
    "line": 278,
    "severity": "P3",
    "category": "catalog-sql",
@@ -610,7 +610,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified the defect in /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/connectors/mssql.py:375-394 (actual location; the finding cited line 278, a minor offset). The SQL is \"SELECT SUM(p.rows) FROM sys.partitions p JOIN sys.tables t ON p.object_id = t.object_id WHERE t.name = ? AND p.in"
+     "why": "Verified the defect in src/universal_db_mcp/connectors/mssql.py:375-394 (actual location; the finding cited line 278, a minor offset). The SQL is \"SELECT SUM(p.rows) FROM sys.partitions p JOIN sys.tables t ON p.object_id = t.object_id WHERE t.name = ? AND p.in"
     },
     {
      "refuted": false,
@@ -647,7 +647,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "CONFIRMED with a runnable reproduction against the real module code (fake connector whose quoting is byte-identical to the real OracleConnector.build_sample_query, real `_resolve_object`, real `EffectivePolicy`).\n\nVerified chain:\n1. /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server"
+     "why": "CONFIRMED with a runnable reproduction against the real module code (fake connector whose quoting is byte-identical to the real OracleConnector.build_sample_query, real `_resolve_object`, real `EffectivePolicy`).\n\nVerified chain:\n1. src/universal_db_mcp/server"
     }
    ]
   },
@@ -691,7 +691,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified the defect is real by reading the code and reproducing both failure modes.\n\nCode path: /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/__main__.py `_serve` catches exceptions only around `load_resolved` (line 76: `CONFIG_ERROR: {exc}`), then calls `_serve_http(cfg, server)` out"
+     "why": "Verified the defect is real by reading the code and reproducing both failure modes.\n\nCode path: src/universal_db_mcp/__main__.py `_serve` catches exceptions only around `load_resolved` (line 76: `CONFIG_ERROR: {exc}`), then calls `_serve_http(cfg, server)` out"
     },
     {
      "refuted": false,
@@ -701,7 +701,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced both failure modes against /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/__main__.py line 111 using the repo venv.\n\n1) Missing token file: `python -m universal_db_mcp serve --config <cfg with http_bearer_token_file pointing to nonexistent path>` exits with an uncaught `File"
+     "why": "Reproduced both failure modes against src/universal_db_mcp/__main__.py line 111 using the repo venv.\n\n1) Missing token file: `python -m universal_db_mcp serve --config <cfg with http_bearer_token_file pointing to nonexistent path>` exits with an uncaught `File"
     }
    ]
   },
@@ -728,7 +728,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified by executing the actual code path at /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py:812 (db_search_metadata). The loop `for cid in conn_ids:` calls `_require_engine(app, cid)` and `await app.tables_for(policy, connector)` with no per-connection try/except; any ToolFa"
+     "why": "Verified by executing the actual code path at src/universal_db_mcp/server.py:812 (db_search_metadata). The loop `for cid in conn_ids:` calls `_require_engine(app, cid)` and `await app.tables_for(policy, connector)` with no per-connection try/except; any ToolFa"
     }
    ]
   },
@@ -755,7 +755,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified by executing the real code. `tool_span` at /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py:201 catches bare `LookupError` and maps it to ToolError(\"VALIDATION_ERROR: ...\") with audit outcome=deny/category=VALIDATION_ERROR. Since KeyError and IndexError subclass Lookup"
+     "why": "Verified by executing the real code. `tool_span` at src/universal_db_mcp/server.py:201 catches bare `LookupError` and maps it to ToolError(\"VALIDATION_ERROR: ...\") with audit outcome=deny/category=VALIDATION_ERROR. Since KeyError and IndexError subclass Lookup"
     }
    ]
   },
@@ -809,7 +809,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "REPRODUCED against the real classes. I imported the actual ExecutionService and abstract DatabaseConnector from /Users/ag-work/Projects/universalDB-MCP/src and simulated the exact production flow: (1) a connector is poisoned via `self._poisoned.add(id(connector))` (executor.py:139), (2) server.py:10"
+     "why": "REPRODUCED against the real classes. I imported the actual ExecutionService and abstract DatabaseConnector from src and simulated the exact production flow: (1) a connector is poisoned via `self._poisoned.add(id(connector))` (executor.py:139), (2) server.py:10"
     }
    ]
   },
@@ -853,12 +853,12 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified the exact execution path in /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py.\n\n1. `parameters` ignored: `db_explain` (lines 1047-1065) declares `parameters: list[Any] | dict[str, Any] | None = None` at line 1051, but the body never references it \u2014 it calls `c.explain(r"
+     "why": "Verified the exact execution path in src/universal_db_mcp/server.py.\n\n1. `parameters` ignored: `db_explain` (lines 1047-1065) declares `parameters: list[Any] | dict[str, Any] | None = None` at line 1051, but the body never references it \u2014 it calls `c.explain(r"
     },
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified the defect is real in /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py. (1) Line 1062 passes `result.ast.sql(dialect=...)` \u2014 sqlglot-regenerated SQL \u2014 to the connector, while db_query (line 961) forwards the caller's original text with parameters. (2) The `parameters` "
+     "why": "Verified the defect is real in src/universal_db_mcp/server.py. (1) Line 1062 passes `result.ast.sql(dialect=...)` \u2014 sqlglot-regenerated SQL \u2014 to the connector, while db_query (line 961) forwards the caller's original text with parameters. (2) The `parameters` "
     },
     {
      "refuted": false,
@@ -885,7 +885,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified in /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py. `_page` (line ~302) validates the cursor against identity, connection_id, kind, policy fingerprint, and expiry only \u2014 the cursor body carries just `offset` plus those bindings. `db_list_tables` uses a constant `kind="
+     "why": "Verified in src/universal_db_mcp/server.py. `_page` (line ~302) validates the cursor against identity, connection_id, kind, policy fingerprint, and expiry only \u2014 the cursor body carries just `offset` plus those bindings. `db_list_tables` uses a constant `kind="
     },
     {
      "refuted": false,
@@ -939,7 +939,7 @@
     {
      "refuted": true,
      "severity": "P3",
-     "why": "The code-level mechanics check out: /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/services/metadata.py:70 keys entries by `tables:{connection_id}:{policy_fp}`, and `policy_fingerprint` (src/universal_db_mcp/security/cursors.py:94-100) hashes only `EffectivePolicy` fields \u2014 which inclu"
+     "why": "The code-level mechanics check out: src/universal_db_mcp/services/metadata.py:70 keys entries by `tables:{connection_id}:{policy_fp}`, and `policy_fingerprint` (src/universal_db_mcp/security/cursors.py:94-100) hashes only `EffectivePolicy` fields \u2014 which inclu"
     },
     {
      "refuted": false,
@@ -971,7 +971,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced every claim against /Users/ag-work/Projects/universalDB-MCP with .venv/bin/python (macOS, CPython 3.12.13).\n\n1. doctor false-positive on unreadable audit file: created /tmp/udb-repro/log/audit.jsonl mode 0444 inside a writable directory; `.venv/bin/python -m universal_db_mcp doctor --conf"
+     "why": "Reproduced every claim against <repo> with .venv/bin/python (macOS, CPython 3.12.13).\n\n1. doctor false-positive on unreadable audit file: created <scratch>/udb-repro/log/audit.jsonl mode 0444 inside a writable directory; `.venv/bin/python -m universal_db_mcp doctor --conf"
     }
    ]
   },
@@ -993,7 +993,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified empirically. (1) /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/config.py lines 122-128: `_hosts` only enforces `host`/`database` for `type != \"sqlite\"`, so a sqlite block with no `database` loads fine \u2014 confirmed: `load_config` returns it with `database: None`. (2) /Users/ag-"
+     "why": "Verified empirically. (1) src/universal_db_mcp/config.py lines 122-128: `_hosts` only enforces `host`/`database` for `type != \"sqlite\"`, so a sqlite block with no `database` loads fine \u2014 confirmed: `load_config` returns it with `database: None`. (2) <repo>"
     },
     {
      "refuted": false,
@@ -1047,12 +1047,12 @@
     {
      "refuted": true,
      "severity": "not-a-bug",
-     "why": "Every technical claim in the finding is factually correct \u2014 I verified all of them against /Users/ag-work/Projects/universalDB-MCP:\n\n1. config.py:100 allowlists `thick_mode: bool` and optional `wallet_location: str` for oracle; `ConnectionConfig._hosts` (config.py:122-141) performs no oracle-specifi"
+     "why": "Every technical claim in the finding is factually correct \u2014 I verified all of them against <repo>:\n\n1. config.py:100 allowlists `thick_mode: bool` and optional `wallet_location: str` for oracle; `ConnectionConfig._hosts` (config.py:122-141) performs no oracle-specifi"
     },
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced by direct execution (/tmp/repro_oracle_finding/repro.py). Both cases verified: (1) config with oracle options.thick_mode: true passes ConnectionConfig._hosts validation (config.py:100 allowlists it as bool; no semantic check), run_doctor returns healthy:true, and first use fails \u2014 OracleC"
+     "why": "Reproduced by direct execution (<scratch>/repro_oracle_finding/repro.py). Both cases verified: (1) config with oracle options.thick_mode: true passes ConnectionConfig._hosts validation (config.py:100 allowlists it as bool; no semantic check), run_doctor returns healthy:true, and first use fails \u2014 OracleC"
     }
    ]
   },
@@ -1079,7 +1079,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced the defect end-to-end in /Users/ag-work/Projects/universalDB-MCP.\n\n1. Validator gap (src/universal_db_mcp/config.py:82-89): `_verify_needs_ca` only raises when `enabled and verify_server and not ca_file`. Direct construction confirmed: `TlsConfig(enabled=True, verify_server=True)` (no ca_"
+     "why": "Reproduced the defect end-to-end in <repo>.\n\n1. Validator gap (src/universal_db_mcp/config.py:82-89): `_verify_needs_ca` only raises when `enabled and verify_server and not ca_file`. Direct construction confirmed: `TlsConfig(enabled=True, verify_server=True)` (no ca_"
     }
    ]
   },
@@ -1187,7 +1187,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "All three sub-claims reproduced against the live code. (1) No permission check: /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/__main__.py:111 opens the bearer token file with no _check_secret_file_permissions call (that check only applies to connection password_file, config.py:280). I"
+     "why": "All three sub-claims reproduced against the live code. (1) No permission check: src/universal_db_mcp/__main__.py:111 opens the bearer token file with no _check_secret_file_permissions call (that check only applies to connection password_file, config.py:280). I"
     }
    ]
   },
@@ -1268,7 +1268,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Reproduced via a python snippet against /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/config.py:_check_secret_file_permissions. (1) A FIFO created with mode 0o600 passes the check (only `mode & 0o077` is tested, no S_ISREG check) and the follow-up `p.read_text()` in ResolvedConnection"
+     "why": "Reproduced via a python snippet against src/universal_db_mcp/config.py:_check_secret_file_permissions. (1) A FIFO created with mode 0o600 passes the check (only `mode & 0o077` is tested, no S_ISREG check) and the follow-up `p.read_text()` in ResolvedConnection"
     }
    ]
   },
@@ -1328,7 +1328,7 @@
   },
   {
    "title": "dpkg idempotency check uses `dpkg -s`, which succeeds for removed/half-installed packages and never compares versions",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh",
+   "file": "scripts/install_offline.sh",
    "line": 92,
    "severity": "P2",
    "category": "partial-install state / stale driver",
@@ -1355,7 +1355,7 @@
   },
   {
    "title": "Verified files are re-read and installed (dpkg -i as root, pip) with no re-check, giving a verify-then-use race on writable bundle paths",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh",
+   "file": "scripts/install_offline.sh",
    "line": 91,
    "severity": "P2",
    "category": "TOCTOU",
@@ -1371,7 +1371,7 @@
     {
      "refuted": true,
      "severity": "P3",
-     "why": "Code-level behavior confirmed: /Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh invokes the trusted verifier exactly once (line ~40), then pip installs from \"$BUNDLE/wheelhouse\" with -r \"$BUNDLE/requirements/runtime.lock\" (lines 53-59) and dpkg -i's each \"$OSPKG_DIR/<file>\" (line ~"
+     "why": "Code-level behavior confirmed: scripts/install_offline.sh invokes the trusted verifier exactly once (line ~40), then pip installs from \"$BUNDLE/wheelhouse\" with -r \"$BUNDLE/requirements/runtime.lock\" (lines 53-59) and dpkg -i's each \"$OSPKG_DIR/<file>\" (line ~"
     },
     {
      "refuted": false,
@@ -1382,7 +1382,7 @@
   },
   {
    "title": "sudo_ok is derived from writability of the target's parent, so root-only steps are silently skipped or fail with misleading errors when the target dir is user-writable",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh",
+   "file": "scripts/install_offline.sh",
    "line": 23,
    "severity": "P2",
    "category": "privilege handling",
@@ -1398,18 +1398,18 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified in /Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh (cited line 23 is actually lines 52-53, but the behavior matches): sudo_ok is set only when dirname($TARGET) is not writable, yet groupadd/useradd (lines 68-69, silenced by || true), install -d -o udbmcp (line 71, || true"
+     "why": "Verified in scripts/install_offline.sh (cited line 23 is actually lines 52-53, but the behavior matches): sudo_ok is set only when dirname($TARGET) is not writable, yet groupadd/useradd (lines 68-69, silenced by || true), install -d -o udbmcp (line 71, || true"
     },
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced every claimed element by extracting the exact lines from /Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh (lines 52-53, 67-71, 134-141 via sed) and executing them as a non-root user (uid 501) against stub groupadd/useradd/install/dpkg that mimic Linux root-only behavior."
+     "why": "Reproduced every claimed element by extracting the exact lines from scripts/install_offline.sh (lines 52-53, 67-71, 134-141 via sed) and executing them as a non-root user (uid 501) against stub groupadd/useradd/install/dpkg that mimic Linux root-only behavior."
     }
    ]
   },
   {
    "title": "Installer chowns the application directory to the invoking operator, giving an unprivileged account ownership of the code the service and root-run tools execute",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh",
+   "file": "scripts/install_offline.sh",
    "line": 45,
    "severity": "P2",
    "category": "privilege boundary",
@@ -1436,7 +1436,7 @@
   },
   {
    "title": "upgrade_offline.sh never installs the new bundle's os-packages, so driver security fixes cannot reach the target",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/upgrade_offline.sh",
+   "file": "scripts/upgrade_offline.sh",
    "line": 24,
    "severity": "P2",
    "category": "incomplete upgrade path",
@@ -1463,7 +1463,7 @@
   },
   {
    "title": "Rollback permanently deletes the live configuration with no copy kept; the 'validated before deleting anything' claim is false",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/rollback_offline.sh",
+   "file": "scripts/rollback_offline.sh",
    "line": 29,
    "severity": "P2",
    "category": "data loss",
@@ -1474,12 +1474,12 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified at /Users/ag-work/Projects/universalDB-MCP/scripts/rollback_offline.sh. Lines 25-33 do exactly what the finding claims (the destructive rm -rf of the displaced live config is at line 33, not 29, but the substance is identical): LATEST_BACKUP is the newest pre-upgrade-* snapshot created by u"
+     "why": "Verified at scripts/rollback_offline.sh. Lines 25-33 do exactly what the finding claims (the destructive rm -rf of the displaced live config is at line 33, not 29, but the substance is identical): LATEST_BACKUP is the newest pre-upgrade-* snapshot created by u"
     },
     {
      "refuted": true,
      "severity": "P3",
-     "why": "The mechanical description is accurate \u2014 at /Users/ag-work/Projects/universalDB-MCP/scripts/rollback_offline.sh lines 28-33 the script copies the pre-upgrade backup to /etc/universal-db-mcp.new, swaps, and `rm -rf /etc/universal-db-mcp.old`, with no validation of the backup beyond existence of confi"
+     "why": "The mechanical description is accurate \u2014 at scripts/rollback_offline.sh lines 28-33 the script copies the pre-upgrade backup to /etc/universal-db-mcp.new, swaps, and `rm -rf /etc/universal-db-mcp.old`, with no validation of the backup beyond existence of confi"
     },
     {
      "refuted": false,
@@ -1490,7 +1490,7 @@
   },
   {
    "title": "Rollback after an interrupted upgrade aborts before restoring venv.previous because `mv venv` fails under set -e",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/rollback_offline.sh",
+   "file": "scripts/rollback_offline.sh",
    "line": 13,
    "severity": "P2",
    "category": "interruption safety",
@@ -1517,7 +1517,7 @@
   },
   {
    "title": "openssl signing reads stdin with -rawin, which OpenSSL 3 rejects for Ed25519; the undeclared cryptography fallback is load-bearing",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/prepare_offline_bundle.py",
+   "file": "scripts/prepare_offline_bundle.py",
    "line": 350,
    "severity": "P2",
    "category": "release tooling robustness",
@@ -1544,7 +1544,7 @@
   },
   {
    "title": "Container-mode target path never verifies the bundle signature; load_images_offline.sh trusts an unauthenticated manifest.json",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/load_images_offline.sh",
+   "file": "scripts/load_images_offline.sh",
    "line": 29,
    "severity": "P2",
    "category": "signature verification gap",
@@ -1560,7 +1560,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified the defect is real. (1) /Users/ag-work/Projects/universalDB-MCP/scripts/load_images_offline.sh never invokes verify_bundle.py and never requires a pubkey; its only hash check (lines 29-33) compares the baseline tar's sha256 against manifest.json's image_identity.sha256 \u2014 a file inside the s"
+     "why": "Verified the defect is real. (1) scripts/load_images_offline.sh never invokes verify_bundle.py and never requires a pubkey; its only hash check (lines 29-33) compares the baseline tar's sha256 against manifest.json's image_identity.sha256 \u2014 a file inside the s"
     },
     {
      "refuted": false,
@@ -1571,7 +1571,7 @@
   },
   {
    "title": "Backup timestamp is computed three separate times, so a second-boundary crossing scatters the backup and rollback cannot find it",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/upgrade_offline.sh",
+   "file": "scripts/upgrade_offline.sh",
    "line": 19,
    "severity": "P3",
    "category": "robustness",
@@ -1582,12 +1582,12 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified the defect in /Users/ag-work/Projects/universalDB-MCP/scripts/upgrade_offline.sh (actual lines 49, 50, 52, not 19/20/22 as cited, but the substance is identical): three separate `$(date -u +%Y%m%dT%H%M%SZ)` evaluations build the backup path. If a second boundary is crossed between the mkdir"
+     "why": "Verified the defect in scripts/upgrade_offline.sh (actual lines 49, 50, 52, not 19/20/22 as cited, but the substance is identical): three separate `$(date -u +%Y%m%dT%H%M%SZ)` evaluations build the backup path. If a second boundary is crossed between the mkdir"
     },
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified in code: /Users/ag-work/Projects/universalDB-MCP/scripts/upgrade_offline.sh lines 49, 50, 52 each evaluate $(date -u +%Y%m%dT%H%M%SZ) independently, and both cp failures are swallowed (2>/dev/null || true and || true). If the second boundary is crossed between mkdir and cp, the copies targe"
+     "why": "Verified in code: scripts/upgrade_offline.sh lines 49, 50, 52 each evaluate $(date -u +%Y%m%dT%H%M%SZ) independently, and both cp failures are swallowed (2>/dev/null || true and || true). If the second boundary is crossed between mkdir and cp, the copies targe"
     },
     {
      "refuted": false,
@@ -1598,7 +1598,7 @@
   },
   {
    "title": "Fallback dpkg ordering (no manifest os_packages) installs unixodbc and odbcinst before their dependencies",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh",
+   "file": "scripts/install_offline.sh",
    "line": 83,
    "severity": "P3",
    "category": "dead/incorrect fallback",
@@ -1625,7 +1625,7 @@
   },
   {
    "title": "Nested files named SHA256SUMS/SIGNATURE at any depth are excluded from the signed manifest",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/prepare_offline_bundle.py",
+   "file": "scripts/prepare_offline_bundle.py",
    "line": 342,
    "severity": "P3",
    "category": "signature coverage",
@@ -1641,18 +1641,18 @@
     {
      "refuted": true,
      "severity": "not-a-bug",
-     "why": "The factual claims check out: /Users/ag-work/Projects/universalDB-MCP/scripts/prepare_offline_bundle.py:362 (not 342) and verify_bundle.py:102 both exclude by basename (`f.name not in (\"SHA256SUMS\", \"SIGNATURE\")`) at any depth, so `os-packages/SHA256SUMS` (copied at prepare_offline_bundle.py:139) an"
+     "why": "The factual claims check out: scripts/prepare_offline_bundle.py:362 (not 342) and verify_bundle.py:102 both exclude by basename (`f.name not in (\"SHA256SUMS\", \"SIGNATURE\")`) at any depth, so `os-packages/SHA256SUMS` (copied at prepare_offline_bundle.py:139) an"
     },
     {
      "refuted": false,
      "severity": "P3",
-     "why": "CONFIRMED by code reading and a live reproduction against the real scripts.\n\nCode evidence:\n1. /Users/ag-work/Projects/universalDB-MCP/scripts/prepare_offline_bundle.py:361-364 \u2014 the bundle-wide sums loop excludes by basename only: `if f.is_file() and f.name not in (\"SHA256SUMS\", \"SIGNATURE\")`. This"
+     "why": "CONFIRMED by code reading and a live reproduction against the real scripts.\n\nCode evidence:\n1. scripts/prepare_offline_bundle.py:361-364 \u2014 the bundle-wide sums loop excludes by basename only: `if f.is_file() and f.name not in (\"SHA256SUMS\", \"SIGNATURE\")`. This"
     }
    ]
   },
   {
    "title": "Runbooks use `sudo bash`, which strips UDBMCP_RELEASE_PUBKEY, so the documented install/upgrade commands fail their own precondition",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/install_offline.sh",
+   "file": "scripts/install_offline.sh",
    "line": 14,
    "severity": "P3",
    "category": "documentation / usability (fails closed)",
@@ -1679,7 +1679,7 @@
   },
   {
    "title": "Stale venv.new-* directories are never discarded despite the script's claim",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/upgrade_offline.sh",
+   "file": "scripts/upgrade_offline.sh",
    "line": 28,
    "severity": "P3",
    "category": "interruption cleanup",
@@ -1706,7 +1706,7 @@
   },
   {
    "title": "verify_bundle crashes with a traceback (and leaks the temp file) when the openssl binary is absent instead of using the fallback",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/verify_bundle.py",
+   "file": "scripts/verify_bundle.py",
    "line": 126,
    "severity": "P3",
    "category": "robustness (fails closed)",
@@ -1722,18 +1722,18 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "VERIFIED REAL by direct execution against /Users/ag-work/Projects/universalDB-MCP/scripts/verify_bundle.py with a minimal bundle and openssl absent from PATH. Reproduced output: traceback ending in \"FileNotFoundError: [Errno 2] No such file or directory: 'openssl'\" at line 126, exit 1, no actionable"
+     "why": "VERIFIED REAL by direct execution against scripts/verify_bundle.py with a minimal bundle and openssl absent from PATH. Reproduced output: traceback ending in \"FileNotFoundError: [Errno 2] No such file or directory: 'openssl'\" at line 126, exit 1, no actionable"
     },
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Reproduced all three claims against /Users/ag-work/Projects/universalDB-MCP/scripts/verify_bundle.py.\n\n1. Traceback instead of FAIL line: built a minimal bundle (manifest.json, SHA256SUMS, SIGNATURE, ed25519 pubkey signed with the venv's cryptography 50.0.1) and ran the script with `env -i PATH=<emp"
+     "why": "Reproduced all three claims against scripts/verify_bundle.py.\n\n1. Traceback instead of FAIL line: built a minimal bundle (manifest.json, SHA256SUMS, SIGNATURE, ed25519 pubkey signed with the venv's cryptography 50.0.1) and ran the script with `env -i PATH=<emp"
     }
    ]
   },
   {
    "title": "metadata.sqlite is copied while the service runs (WAL mode) and restored without its sidecar files",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/scripts/upgrade_offline.sh",
+   "file": "scripts/upgrade_offline.sh",
    "line": 22,
    "severity": "P3",
    "category": "state backup consistency",
@@ -1754,7 +1754,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified with reproduction scripts against the real MetadataCache class (/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/services/metadata.py:37 sets journal_mode=WAL; connections are opened per operation and a SIGTERM mid-op leaves metadata.sqlite-wal/-shm on disk). Scenario 1 confirme"
+     "why": "Verified with reproduction scripts against the real MetadataCache class (src/universal_db_mcp/services/metadata.py:37 sets journal_mode=WAL; connections are opened per operation and a SIGTERM mid-op leaves metadata.sqlite-wal/-shm on disk). Scenario 1 confirme"
     }
    ]
   },
@@ -1781,7 +1781,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Reproduced the defect. (1) In /Users/ag-work/Projects/universalDB-MCP/scripts/test_airgap_failures.sh, summary() (lines 33-39, redirected into \"$EVID/results.json\") echoes \"{\", \"gate\", \"cases\": [...], \"],\", and \"status\" but never emits a closing \"}\" \u2014 the redirect block simply ends at line 39. (2) B"
+     "why": "Reproduced the defect. (1) In scripts/test_airgap_failures.sh, summary() (lines 33-39, redirected into \"$EVID/results.json\") echoes \"{\", \"gate\", \"cases\": [...], \"],\", and \"status\" but never emits a closing \"}\" \u2014 the redirect block simply ends at line 39. (2) B"
     }
    ]
   },
@@ -1803,7 +1803,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified in /Users/ag-work/Projects/universalDB-MCP/scripts/in_container_test.sh:78-89: the misconfigured `serve` run (UDBMCP_CONFIG=/tmp/nonexistent.yaml) is wrapped in `if ...; then :; fi` so its exit status \u2014 including rc=124 for a hang or rc=0 for wrongly accepting the bad config \u2014 is discarded,"
+     "why": "Verified in scripts/in_container_test.sh:78-89: the misconfigured `serve` run (UDBMCP_CONFIG=/tmp/nonexistent.yaml) is wrapped in `if ...; then :; fi` so its exit status \u2014 including rc=124 for a hang or rc=0 for wrongly accepting the bad config \u2014 is discarded,"
     },
     {
      "refuted": false,
@@ -1825,7 +1825,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified against /Users/ag-work/Projects/universalDB-MCP/scripts/protocol_probe.py. Line 84 is `record(\"write_denied\", res.is_error)` \u2014 it accepts any error category. The server's own errors.py documents that tool-error messages begin with `<CATEGORY>:` (guard denials raise ToolFailure(ErrorCategory"
+     "why": "Verified against scripts/protocol_probe.py. Line 84 is `record(\"write_denied\", res.is_error)` \u2014 it accepts any error category. The server's own errors.py documents that tool-error messages begin with `<CATEGORY>:` (guard denials raise ToolFailure(ErrorCategory"
     },
     {
      "refuted": true,
@@ -1835,7 +1835,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified both sub-claims against /Users/ag-work/Projects/universalDB-MCP/scripts/protocol_probe.py. (A) Line 84 `record(\"write_denied\", res.is_error)` checks only is_error. Baseline run of the probe reproduced the committed evidence (test-evidence/airgap-gateAB/protocol-probe.json) with write_denied"
+     "why": "Verified both sub-claims against scripts/protocol_probe.py. (A) Line 84 `record(\"write_denied\", res.is_error)` checks only is_error. Baseline run of the probe reproduced the committed evidence (test-evidence/airgap-gateAB/protocol-probe.json) with write_denied"
     }
    ]
   },
@@ -1862,7 +1862,7 @@
     {
      "refuted": true,
      "severity": "not-a-bug",
-     "why": "I reproduced the gate directly by running `bash /Users/ag-work/Projects/universalDB-MCP/scripts/test_airgap_failures.sh` against the current verifier (scripts/verify_bundle.py, mtime Sep 11 21:24), the current signed bundle (out/bundle/universal-db-mcp-0.1.0-...-cp312, SIGNATURE present, rebuilt Sep"
+     "why": "I reproduced the gate directly by running `bash scripts/test_airgap_failures.sh` against the current verifier (scripts/verify_bundle.py, mtime Sep 11 21:24), the current signed bundle (out/bundle/universal-db-mcp-0.1.0-...-cp312, SIGNATURE present, rebuilt Sep"
     }
    ]
   },
@@ -1916,7 +1916,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "CONFIRMED by direct reproduction in /Users/ag-work/Projects/universalDB-MCP.\n\n1. Tautology verified logically and empirically: in tests/integration/test_mcp_stdio.py:147, `all(\"sql_fingerprint\" in h or h[\"sql_fingerprint\"] is None for h in history)` can never evaluate False. The `in` check short-cir"
+     "why": "CONFIRMED by direct reproduction in <repo>.\n\n1. Tautology verified logically and empirically: in tests/integration/test_mcp_stdio.py:147, `all(\"sql_fingerprint\" in h or h[\"sql_fingerprint\"] is None for h in history)` can never evaluate False. The `in` check short-cir"
     }
    ]
   },
@@ -1949,7 +1949,7 @@
   },
   {
    "title": "Cancel-hook budget is not enforced: `run_sync(cancel_fn)` is shielded, so a blocking cancel() extends the timeout indefinitely",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/services/executor.py",
+   "file": "src/universal_db_mcp/services/executor.py",
    "line": 93,
    "severity": "P2",
    "category": "timeout-enforcement",
@@ -1970,13 +1970,13 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified the defect by direct reproduction against /Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/services/executor.py.\n\nCode confirms the claim: `_handle_timeout` (executor.py:132-133) wraps `await anyio.to_thread.run_sync(cancel_fn)` in `anyio.move_on_after(_CANCEL_HOOK_BUDGET)` (2.0"
+     "why": "Verified the defect by direct reproduction against src/universal_db_mcp/services/executor.py.\n\nCode confirms the claim: `_handle_timeout` (executor.py:132-133) wraps `await anyio.to_thread.run_sync(cancel_fn)` in `anyio.move_on_after(_CANCEL_HOOK_BUDGET)` (2.0"
     }
    ]
   },
   {
    "title": "Poison set keyed by `id(connector)` is never pruned: recycled addresses make healthy fresh connectors refused as 'uncertain state'",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/services/executor.py",
+   "file": "src/universal_db_mcp/services/executor.py",
    "line": 99,
    "severity": "P2",
    "category": "robustness-stale-identity",
@@ -2003,7 +2003,7 @@
   },
   {
    "title": "Abandoned worker threads are not counted by any limiter: each timeout on a no-cancel engine leaks a running thread and DB connection, unbounded under retries",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/services/executor.py",
+   "file": "src/universal_db_mcp/services/executor.py",
    "line": 85,
    "severity": "P2",
    "category": "resource-exhaustion",
@@ -2030,7 +2030,7 @@
   },
   {
    "title": "Process cannot exit while an abandoned query thread is running: worker threads are non-daemon and nothing cancels in-flight queries at shutdown",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/__main__.py",
+   "file": "src/universal_db_mcp/__main__.py",
    "line": 86,
    "severity": "P2",
    "category": "shutdown-behaviour",
@@ -2057,7 +2057,7 @@
   },
   {
    "title": "Metadata cache SQLite I/O runs on the event loop and a cache write error fails the whole request",
-   "file": "/Users/ag-work/Projects/universalDB-MCP/src/universal_db_mcp/server.py",
+   "file": "src/universal_db_mcp/server.py",
    "line": 125,
    "severity": "P2",
    "category": "event-loop-blocking",
@@ -2127,7 +2127,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Partially verified \u2014 the script half of the claim is real and reproduced; the doc half is false, and the security impact is nil.\n\nVERIFIED (script defect is real): /Users/ag-work/Projects/universalDB-MCP/scripts/db2-enable-tls.sh emits `databases:` as the top-level key in both YAML heredocs (lines 1"
+     "why": "Partially verified \u2014 the script half of the claim is real and reproduced; the doc half is false, and the security impact is nil.\n\nVERIFIED (script defect is real): scripts/db2-enable-tls.sh emits `databases:` as the top-level key in both YAML heredocs (lines 1"
     },
     {
      "refuted": false,
@@ -2311,7 +2311,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified the defect is real by tracing the exact path. (1) The generated config blocks do set `allowed_schemas: []` \u2014 at /Users/ag-work/Projects/universalDB-MCP/docs/db2-tls-setup.md:196 and /Users/ag-work/Projects/universalDB-MCP/scripts/db2-enable-tls.sh:158 and :363 (the finding's line numbers we"
+     "why": "Verified the defect is real by tracing the exact path. (1) The generated config blocks do set `allowed_schemas: []` \u2014 at docs/db2-tls-setup.md:196 and scripts/db2-enable-tls.sh:158 and :363 (the finding's line numbers we"
     },
     {
      "refuted": true,
@@ -2365,7 +2365,7 @@
     {
      "refuted": false,
      "severity": "P2",
-     "why": "Verified every factual claim at the cited locations in /Users/ag-work/Projects/universalDB-MCP:\n\n1. IMPLEMENTATION_STATUS.md (root, updated 2026-09-11) line 23 names `dist/udbmcp-bundle/...` as the rebuilt bundle (\"rebuilt 2026-09-08 with hardened scripts (`dist/udbmcp-bundle/...`)\"), and the \u00a73 tab"
+     "why": "Verified every factual claim at the cited locations in <repo>:\n\n1. IMPLEMENTATION_STATUS.md (root, updated 2026-09-11) line 23 names `dist/udbmcp-bundle/...` as the rebuilt bundle (\"rebuilt 2026-09-08 with hardened scripts (`dist/udbmcp-bundle/...`)\"), and the \u00a73 tab"
     },
     {
      "refuted": false,
@@ -2446,7 +2446,7 @@
     {
      "refuted": false,
      "severity": "P3",
-     "why": "Verified the defect is real (docs-only inconsistency; one cited line number is off but the text exists).\n\nWhat I read:\n- /Users/ag-work/Projects/universalDB-MCP/config.example.yaml:51-52 \u2014 the commented Db2 example (lines 53-66 set `family: luw`, host db2.internal.example, port 50001) says: \"IBM Db2"
+     "why": "Verified the defect is real (docs-only inconsistency; one cited line number is off but the text exists).\n\nWhat I read:\n- config.example.yaml:51-52 \u2014 the commented Db2 example (lines 53-66 set `family: luw`, host db2.internal.example, port 50001) says: \"IBM Db2"
     },
     {
      "refuted": false,

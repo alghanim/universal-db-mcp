@@ -30,7 +30,11 @@ extract-and-rewrite technique the deb tests use:
 - the CPython 3.12 candidates point at a ``python312-sandbox`` shim: postinstall
   selects the interpreter BEFORE running the verifier (never a PATH search), so
   the sandbox must supply the preinstall-validated candidate; it passes the
-  `-c` prerequisite probes and executes the verifier stub via the host python3.
+  `-I -S -c` prerequisite probes and executes the verifier stub via the host python3;
+- ``FIND`` (the stat of the root-ownership check on the interpreter) is mocked
+  to report every path as root's alone: the sandbox shim belongs to the test
+  account. The check itself is exercised in
+  test_hardening_2026_09_27_packaging.py (F53).
 
 Invariant 1 (nothing executes payload before the trusted-channel verifier
 passes) and invariant 2 (pubkey never sourced from the bundle) are asserted
@@ -70,8 +74,10 @@ POSTINSTALL = PROJECT / "packaging" / "pkg" / "postinstall"
 # 'bundle verification PASSED' line are fatal - the rule every other call site
 # already enforced.
 _FATAL_VERIFY_BRANCH = re.compile(
-    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY" >"\$VERIFY_OUT" 2>&1 \|\| VRC=\$\?'
-    r'[\s\S]{0,400}?fail "bundle verification FAILED'
+    r'\$VEXEC "\$VERIFIER" --bundle "\$BUNDLE" --pubkey "\$PUBKEY" "\$\{ROLLBACK_ARGS\[@\]\}" '
+    r'>"\$VERIFY_OUT" 2>&1 \|\| VRC=\$\?'
+    # the refused-downgrade branch (its own message, same exit) sits between the call and this one
+    r'[\s\S]{0,700}?fail "bundle verification FAILED'
 )
 _VERIFY_PROOF_REQUIRED = re.compile(
     r"grep -q 'bundle verification PASSED'[\s\S]{0,400}?fail \"trusted verifier exited 0"
@@ -92,24 +98,24 @@ _PATH_REWRITES = [
         'FRAMEWORK_PY="{pyshim}"',
     ),
     (r'^USR_LOCAL_PY="/usr/local/bin/python3"$', 'USR_LOCAL_PY="{pyshim}"'),
-    # postinstall re-prepends the system dirs to PATH (its launchd-minimal-PATH
-    # workaround), which would put the REAL /usr/bin/dscl and /bin/launchctl
-    # ahead of the sandbox shim dir inherited via env["PATH"] — leaving the
-    # `_shim_invocations(...) == []` guards vacuous and the real directory
-    # service reachable by a verify-branch mutant. Drop the prepend so the
-    # inherited PATH (shim dir first) stays in effect inside the sandbox copy.
-    (
-        r'^PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"$',
-        'PATH="$PATH"',
-    ),
+    # postinstall pins PATH to the system dirs, which would put the REAL
+    # /usr/bin/dscl and /bin/launchctl ahead of the sandbox shim dir inherited
+    # via env["PATH"] — leaving the `_shim_invocations(...) == []` guards
+    # vacuous and the real directory service reachable by a verify-branch
+    # mutant. Keep the inherited PATH (shim dir first) inside the sandbox copy.
+    (r'^PATH="/usr/bin:/bin:/usr/sbin:/sbin"$', 'PATH="$PATH"'),
+    # stat mocked: the sandbox interpreter shim counts as root-owned
+    (r'^FIND="/usr/bin/find"$', 'FIND="{find_root_owned}"'),
     # The GUI app assembly must land inside the sandbox, not /Applications.
     (
         r'^APP_DIR="/Applications/Configure UniversalDB MCP\.app"$',
         'APP_DIR="{app_dir}"',
     ),
-    # The best-effort newsyslog rotation install must land inside the sandbox,
-    # not the real /etc/newsyslog.d.
+    # The removal of an earlier release's newsyslog rule must act inside the
+    # sandbox, not the real /etc/newsyslog.d.
     (r'^NEWSYSLOG_DST="/etc/newsyslog\.d/udbmcp\.conf"$', 'NEWSYSLOG_DST="{newsyslog}"'),
+    # launchd's output files for the daemon: the sandbox, not /Library/Logs.
+    (r'^LAUNCHD_LOG_DIR="/Library/Logs/universal-db-mcp"$', 'LAUNCHD_LOG_DIR="{launchd_log}"'),
 ]
 
 
@@ -134,6 +140,8 @@ def _sandbox_postinstall(tmp_path: Path, *, verifier: str | None = None, pubkey:
         "pyshim": str(tmp_path / "shim-bin" / "python312-sandbox"),
         "app_dir": str(tmp_path / "applications" / "Configure UniversalDB MCP.app"),
         "newsyslog": str(tmp_path / "etc" / "newsyslog.d" / "udbmcp.conf"),
+        "launchd_log": str(tmp_path / "Library-Logs" / "universal-db-mcp"),
+        "find_root_owned": str(_find_root_owned(tmp_path)),
     }
     for pattern, replacement in _PATH_REWRITES:
         new_text, n = re.subn(pattern, replacement.format(**dirs), text, flags=re.MULTILINE)
@@ -146,6 +154,14 @@ def _sandbox_postinstall(tmp_path: Path, *, verifier: str | None = None, pubkey:
     script.write_text(text, encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return script
+
+
+def _find_root_owned(tmp_path: Path) -> Path:
+    """A find(1) that reports nothing: every path counts as root's alone."""
+    shim = tmp_path / "find-root-owned"
+    shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+    return shim
 
 
 def _build_bundle(tmp_path: Path) -> Path:
@@ -202,8 +218,10 @@ def _shim_bin(tmp_path: Path) -> Path:
     pyshim = bin_dir / "python312-sandbox"
     pyshim.write_text(
         "#!/bin/sh\n"
-        "# rewritten preinstall-approved candidate: `-c` probes pass; anything\n"
+        "# rewritten preinstall-approved candidate: `-I -S -c` probes pass; anything\n"
         "# else is the trusted verifier stub executing under this interpreter.\n"
+        'if [ "$1" = "-I" ]; then shift; fi\n'
+        'if [ "$1" = "-S" ]; then shift; fi\n'
         'if [ "$1" = "-c" ]; then exit 0; fi\n'
         'exec python3 "$@"\n',
         encoding="utf-8",

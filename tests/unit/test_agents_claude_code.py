@@ -101,7 +101,7 @@ def test_installed_unconfigured_plan_and_apply(tmp_path: Path) -> None:
     assert entry == {
         "type": "stdio",
         "command": "/opt/universal-db-mcp/venv/bin/python",
-        "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+        "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
         "env": {"UDBMCP_CONFIG": "/etc/universal-db-mcp/config.yaml"},
     }
     assert result.entry == entry
@@ -213,13 +213,13 @@ def test_null_mcpServers_fails_closed(tmp_path: Path) -> None:
     planned = plan(ENV, home, project_dir=project_dir)
     assert planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
     assert str(target) in planned.config_block
-    assert raw in planned.config_block
+    assert '"mcpServers" in' in planned.config_block and "is not an object" in planned.config_block
     assert "refusing to write" in planned.summary
 
     result = apply(ENV, home, True, project_dir=project_dir)
     assert result.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
     assert "refusing to write" in result.summary
-    assert raw in result.config_block
+    assert "is not an object" in result.config_block
     # Never silently overwritten, never silently no-op'd into a write.
     assert target.read_text(encoding="utf-8") == raw
     assert _bak_files(home) == []
@@ -236,9 +236,9 @@ def test_malformed_config_fails_closed_no_write(tmp_path: Path) -> None:
 
     planned = plan(ENV, home, project_dir=project_dir)
     assert planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-    # Fail-closed output prints the offending config block verbatim.
+    # Fail-closed output describes the offending file, never prints it.
     assert str(target) in planned.config_block
-    assert raw in planned.config_block
+    assert "is not valid JSON" in planned.config_block and raw not in planned.config_block
     assert "refusing to write" in planned.summary
 
     result = apply(ENV, home, True, project_dir=project_dir)
@@ -256,7 +256,7 @@ def test_malformed_project_config_blocks_user_scope_write(tmp_path: Path) -> Non
     assert detect(ENV, home, project_dir=project_dir) is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
     result = apply(ENV, home, True, project_dir=project_dir)
     assert result.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-    assert "not json at all" in result.config_block
+    assert "is not valid JSON" in result.config_block and "not json at all" not in result.config_block
     assert not user_config_path(home).exists()  # nothing written anywhere
 
 
@@ -293,31 +293,31 @@ def test_confirmed_false_refuses_and_never_writes(tmp_path: Path) -> None:
     assert not target.exists()  # nothing written without explicit confirmation
 
 
-def test_project_scope_existing_mcp_json_is_updated_with_backup(tmp_path: Path) -> None:
+def test_project_scope_existing_mcp_json_is_left_alone(tmp_path: Path) -> None:
+    # A project .mcp.json is shared through the repository: this machine's
+    # interpreter and config paths are never added to it.
     home, project_dir = _fake_env(tmp_path, installed=False, project=True)
     proj_cfg = project_dir / ".mcp.json"
     original = {"mcpServers": {"other": {"command": "/bin/echo"}}}
     _write_json(proj_cfg, original)
+    committed = proj_cfg.read_bytes()
 
     # Installed only via the project config (no home artifacts).
     assert detect(ENV, home, project_dir=project_dir) is AgentStatus.INSTALLED_UNCONFIGURED
 
     result = apply(ENV, home, True, project_dir=project_dir)
     assert result.status is AgentStatus.CONFIGURED
-    # User scope created, project scope updated in place.
-    data = _read(proj_cfg)
-    assert data["mcpServers"][SERVER_KEY]["args"] == [
+    # User scope created, project scope left as it was.
+    assert _read(user_config_path(home))["mcpServers"][SERVER_KEY]["args"] == [
+        "-I",
         "-m",
         "universal_db_mcp",
         "serve",
         "--transport",
         "stdio",
     ]
-    assert data["mcpServers"]["other"] == {"command": "/bin/echo"}
-    assert user_config_path(home).is_file()
-    baks = [p for p in _bak_files(project_dir) if p.name.startswith(".mcp.json")]
-    assert len(baks) == 1
-    assert _read(baks[0]) == original
+    assert proj_cfg.read_bytes() == committed
+    assert not [p for p in _bak_files(project_dir) if p.name.startswith(".mcp.json")]
 
 
 def test_absent_project_mcp_json_is_not_created(tmp_path: Path) -> None:

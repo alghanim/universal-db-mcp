@@ -211,6 +211,7 @@ def test_add_connection_cli_non_interactive_json(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
 
     rc = main(
@@ -238,6 +239,7 @@ def test_add_connection_cli_requires_tty_or_flags(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
 
     rc = main(["add-connection"])  # no TTY, no flags: must refuse, write nothing
@@ -317,6 +319,7 @@ def test_add_connection_cli_port_zero_is_config_error(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     pw = tmp_path / "pw"
     pw.write_text("s3cret\n", encoding="utf-8")
@@ -332,6 +335,8 @@ def test_add_connection_cli_port_zero_is_config_error(
     assert rc != 0
     assert "CONFIG_ERROR" in err, "a raw pydantic traceback is not a fail-closed diagnostic"
     assert "Traceback" not in err
+    # the connection is validated before any credential is written
+    assert not (home / ".universal-db-mcp" / "secrets").exists()
 
 
 def test_add_connection_cli_missing_password_file_is_config_error(
@@ -340,6 +345,7 @@ def test_add_connection_cli_missing_password_file_is_config_error(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
 
     rc = main([
@@ -361,6 +367,7 @@ def test_add_connection_cli_traversal_name_writes_nothing(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     victim = tmp_path / "authorized_keys"
     victim.write_text("original\n", encoding="utf-8")
@@ -403,6 +410,7 @@ def test_cli_default_falls_back_to_per_user_when_system_not_writable(
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # a Linux host's own would win over HOME
     monkeypatch.delenv("UDBMCP_CONFIG", raising=False)
     # a READABLE but NOT writable system config (0444, owned by this user)
     system = tmp_path / "etc-config.yaml"

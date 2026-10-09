@@ -54,6 +54,6 @@ def test_installer_builds_beside_a_running_venv_and_switches_with_a_manifest() -
     )
     assert switch.index('mv "$TARGET/venv" "$TARGET/venv.previous"') < switch.index('mv "$VENV_BUILD" "$TARGET/venv"')
     # the smoke check and mode normalization run on the NEW tree before the switch
-    smoke_at = text.index('"$VENV_BUILD/bin/python" -m universal_db_mcp version')
+    smoke_at = text.index('"$VENV_BUILD/bin/python" -I -m universal_db_mcp version')
     assert smoke_at < text.index('if [ "$VENV_BUILD" != "$TARGET/venv" ]; then')
     assert "restore_previous_venv_on_interrupt" in text and "trap on_exit EXIT" in text

@@ -27,7 +27,7 @@ ENV: dict[str, str] = {
 EXPECTED_ENTRY: dict[str, Any] = {
     "type": "stdio",
     "command": "/opt/universal-db-mcp/venv/bin/python",
-    "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+    "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
     "env": {"UDBMCP_CONFIG": "/etc/universal-db-mcp/config.yaml"},
 }
 
@@ -221,9 +221,9 @@ def test_malformed_config_fails_closed_without_write(tmp_path: Path, bad_content
 
     planned = vscode.plan(ENV, home, platform="darwin")
     assert planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-    # The plan prints the offending file's contents for the operator.
+    # The plan describes the offending file, never prints it (other servers' secrets).
     assert "mcp.json" in planned.summary
-    assert bad_content in planned.config_block
+    assert "its contents are not shown" in planned.config_block
 
     applied = vscode.apply(ENV, home, confirmed=True, platform="darwin")
     assert applied.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
@@ -260,7 +260,7 @@ def test_servers_null_fails_closed_at_every_stage(tmp_path: Path) -> None:
 
     planned = vscode.plan(ENV, home, platform="darwin")
     assert planned.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
-    assert bad_content in planned.config_block
+    assert '"servers" in' in planned.config_block and "is not an object" in planned.config_block
 
     applied = vscode.apply(ENV, home, confirmed=True, platform="darwin")
     assert applied.status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED

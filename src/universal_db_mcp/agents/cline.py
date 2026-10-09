@@ -8,7 +8,8 @@ the universal-db MCP server into Cline's MCP settings file:
         saoudrizwan.claude-dev/settings/cline_mcp_settings.json   (macOS)
 
 (plus the platform-appropriate VS Code ``globalStorage`` location on
-Linux/Windows). Detection is defined as that settings path existing.
+Linux/Windows: under ``$XDG_CONFIG_HOME`` or ``~/.config``, and under
+``%APPDATA%``). Detection is defined as that settings path existing.
 
 Written registration shape (no secrets — launch command, ``UDBMCP_CONFIG``
 path and nothing else)::
@@ -17,7 +18,7 @@ path and nothing else)::
       "mcpServers": {
         "universal-db": {
           "command": "<venv python>",
-          "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+          "args": ["-I", "-m", "universal_db_mcp", "serve", "--transport", "stdio"],
           "env": {"UDBMCP_CONFIG": "<config path>"},
           "disabled": false,
           "autoApprove": []
@@ -36,11 +37,18 @@ Fail-closed rules implemented here:
   printed and nothing is ever written.
 * An existing ``universal-db`` entry whose contents differ from what this
   adapter would write is operator-managed state; it is reported fail-closed,
-  never silently rewritten.
+  never silently rewritten. The one exception is this tool's own pre-``-I``
+  registration (identical except for the launch args), which is upgraded
+  like a fresh write.
+* A settings file the write would replace but may not (read-only, another
+  user's, hard-linked, with an access control list the replace would change,
+  in a read-only directory, or as root behind a user's symlink:
+  ``core.ensure_replaceable``) fails closed at detection.
 * ``apply`` writes only when ``confirmed=True`` (the CLI layer owns the
   interactive y/n prompt, ``--yes`` and ``--dry-run``). Every first write is
-  preceded by a timestamped ``.bak`` copy of the settings file; re-runs are
-  idempotent and never duplicate an existing equivalent registration.
+  preceded by a timestamped, private ``.bak`` copy of the settings file and
+  replaces the file atomically (a failed write leaves it as it was); re-runs
+  are idempotent and never duplicate an existing equivalent registration.
 """
 
 from __future__ import annotations
@@ -52,11 +60,25 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
+    SERVER_ARGS,
     AgentStatus,
     Plan,
+    absolute_interpreter,
+    app_data_base,
+    atomic_write_text,
     backup_path,
+    ensure_replaceable,
+    fail_closed_block,
+    holds_legacy_entry,
+    is_legacy_entry,
     load_json_or_fail_closed,
+    load_problem_note,
+    other_unisolated_note,
+    require_isolated_import,
     resolve_harness_config_path,
+    unisolated_entry_note,
+    unreplaceable_reason,
+    write_private_backup,
 )
 
 AGENT_NAME = "cline"
@@ -67,13 +89,11 @@ EXTENSION_ID = "saoudrizwan.claude-dev"
 SETTINGS_FILENAME = "cline_mcp_settings.json"
 
 # Cline stores its MCP settings inside the per-user VS Code globalStorage
-# directory of the extension. Keyed by sys.platform; an unknown platform is
-# fail-closed (we refuse to guess where the settings live).
-_STORAGE_ROOT = {
-    "darwin": ("Library", "Application Support", "Code", "User", "globalStorage"),
-    "linux": (".config", "Code", "User", "globalStorage"),
-    "win32": ("AppData", "Roaming", "Code", "User", "globalStorage"),
-}
+# directory of the extension, under the platform's application-config root
+# (core.app_data_base). An unknown platform is fail-closed (we refuse to
+# guess where the settings live).
+_SUPPORTED_PLATFORMS = frozenset({"darwin", "linux", "win32"})
+_STORAGE_SUBDIR = ("Code", "User", "globalStorage")
 
 VENV_PYTHON_ENV = "UDBMCP_VENV_PYTHON"
 UDBMCP_CONFIG_ENV = "UDBMCP_CONFIG"
@@ -86,26 +106,34 @@ _ALLOWED_ENTRY_KEYS = frozenset({"command", "args", "env", "disabled", "autoAppr
 _ALLOWED_ENTRY_ENV_KEYS = frozenset({UDBMCP_CONFIG_ENV})
 
 
-def settings_path(home: Path) -> Path:
-    """Absolute path of Cline's ``cline_mcp_settings.json`` for ``home``."""
-    root = _STORAGE_ROOT.get(sys.platform)
-    if root is None:
+def settings_path(home: Path, env: Mapping[str, str] | None = None) -> Path:
+    """Absolute path of Cline's ``cline_mcp_settings.json`` for ``home``.
+
+    ``env`` supplies ``APPDATA`` / ``XDG_CONFIG_HOME``; without it the
+    HOME-relative defaults are used.
+    """
+    if sys.platform not in _SUPPORTED_PLATFORMS:
         raise RuntimeError(
             f"cline adapter: unsupported platform {sys.platform!r}; refusing to guess the settings location"
         )
-    return home.joinpath(*root, EXTENSION_ID, "settings", SETTINGS_FILENAME)
+    root = app_data_base(env or {}, home, sys.platform)
+    return root.joinpath(*_STORAGE_SUBDIR, EXTENSION_ID, "settings", SETTINGS_FILENAME)
 
 
 def _venv_python(env: Mapping[str, str]) -> str:
     """Interpreter written into the launch command.
 
-    Prefers an explicit ``UDBMCP_VENV_PYTHON`` override; otherwise uses the
-    interpreter running this CLI, which is the venv python whenever the
-    package was installed into a virtual environment.
+    Prefers an explicit ``UDBMCP_VENV_PYTHON`` override (made absolute: a
+    path is anchored at the working directory, a bare name looked up on PATH;
+    one naming no file is refused); otherwise uses the interpreter running
+    this CLI, which is the venv python whenever the package was installed into
+    a virtual environment (refused when it cannot import the package under
+    ``-I``, as with a user-site install).
     """
     override = env.get(VENV_PYTHON_ENV, "").strip()
     if override:
-        return override
+        return absolute_interpreter(override, VENV_PYTHON_ENV, env)
+    require_isolated_import(sys.executable)
     return sys.executable
 
 
@@ -119,14 +147,14 @@ def _udbmcp_config_path(env: Mapping[str, str], home: Path) -> str:
     2026-09-14); the resolver falls back to the per-user config, which
     ``configure-agents`` seeds on apply.
     """
-    return resolve_harness_config_path(env, home)
+    return resolve_harness_config_path(env, home, strict=True, for_harness=True)
 
 
 def registration_entry(env: Mapping[str, str], home: Path) -> dict[str, Any]:
     """The exact dict written under ``mcpServers`` (contains no secrets)."""
     entry: dict[str, Any] = {
         "command": _venv_python(env),
-        "args": ["-m", "universal_db_mcp", "serve", "--transport", "stdio"],
+        "args": list(SERVER_ARGS),
         "env": {UDBMCP_CONFIG_ENV: _udbmcp_config_path(env, home)},
         "disabled": False,
         "autoApprove": [],
@@ -157,15 +185,28 @@ def detect(env: Mapping[str, str], home: Path) -> AgentStatus:
     - ``configured``: the file parses and already holds an equivalent
       ``universal-db`` entry.
     - ``installed_unconfigured``: the file parses and lacks our entry (it may
-      hold other servers; those are preserved on apply).
+      hold other servers; those are preserved on apply), or holds the
+      pre-``-I`` registration (upgraded on apply).
     - ``unknown_state_fail_closed``: the file is unreadable/malformed/not a
       JSON object, ``mcpServers`` is not an object, or our key holds a
-      differing entry.
+      differing entry, or it would be written but may not be replaced
+      (read-only, another user's, hard-linked).
     """
-    target = settings_path(home)
+    status = _config_status(env, home)
+    if status is AgentStatus.INSTALLED_UNCONFIGURED and unreplaceable_reason(settings_path(home, env)) is not None:
+        return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
+    return status
+
+
+def _config_status(env: Mapping[str, str], home: Path) -> AgentStatus:
+    """:func:`detect` from the settings file's content alone (no replace check)."""
+    target = settings_path(home, env)
     if not target.is_file():
         return AgentStatus.NOT_INSTALLED
 
+    # Resolved up front: an override that cannot be registered (a relative
+    # path naming no file) is refused at detection, before any write is offered.
+    entry = registration_entry(env, home)
     data, _error = load_json_or_fail_closed(target)
     if data is None:
         return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
@@ -176,7 +217,9 @@ def detect(env: Mapping[str, str], home: Path) -> AgentStatus:
     if not isinstance(servers, dict):
         return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
 
-    if SERVER_KEY in servers and not _entries_equal(servers[SERVER_KEY], registration_entry(env, home)):
+    if SERVER_KEY in servers and is_legacy_entry(servers[SERVER_KEY], entry):
+        return AgentStatus.INSTALLED_UNCONFIGURED
+    if SERVER_KEY in servers and not _entries_equal(servers[SERVER_KEY], entry):
         # A differently-shaped registration under our server key: operator
         # state we must not silently rewrite.
         return AgentStatus.UNKNOWN_STATE_FAIL_CLOSED
@@ -185,38 +228,66 @@ def detect(env: Mapping[str, str], home: Path) -> AgentStatus:
     return AgentStatus.INSTALLED_UNCONFIGURED
 
 
-def _fail_closed_block(target: Path, intended_block: str) -> str:
-    """Render the intended registration plus the offending file's bytes."""
-    header = f"# intended registration for {target}:\n{intended_block}\n"
-    try:
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return f"{header}\n# {target} could not be read: {exc}"
-    return f"{header}\n# current contents of {target}:\n{raw}"
+def _fail_closed_block(target: Path, entry: Mapping[str, Any]) -> str:
+    """What a fail-closed plan prints: the registration and this tool's own
+    entry in ``target``, never its other servers (``core.fail_closed_block``)."""
+    return fail_closed_block(target, MCP_SERVERS_KEY, SERVER_KEY, entry)
+
+
+def _write_failed(step: str, target: Path, entry: dict[str, Any], exc: OSError, backup: Path | None) -> Plan:
+    """Fail-closed result for a backup or write (``step``) that raised
+    (target unchanged)."""
+    note = f"; backup: {backup}" if backup is not None else ""
+    return Plan(
+        agent=AGENT_NAME,
+        config_path=target,
+        status=AgentStatus.UNKNOWN_STATE_FAIL_CLOSED,
+        backup_paths=(backup,) if backup is not None else (),
+        summary=f"{AGENT_NAME}: {step} failed ({exc}); {target} was left as it was{note}",
+        config_block=_fail_closed_block(target, entry),
+        entry=entry,
+    )
 
 
 def plan(env: Mapping[str, str], home: Path) -> Plan:
     """Describe exactly what would be added to Cline's settings; never writes."""
-    target = settings_path(home)
+    target = settings_path(home, env)
     status = detect(env, home)
+    if status is AgentStatus.NOT_INSTALLED:
+        # Nothing would be registered, so nothing is resolved: an override
+        # that cannot be registered must not turn "not installed" into an error.
+        return Plan(
+            agent=AGENT_NAME,
+            config_path=target,
+            status=status,
+            summary=f"{AGENT_NAME}: not installed ({target} does not exist); nothing would be written",
+        )
     entry = registration_entry(env, home)
     block = json.dumps({MCP_SERVERS_KEY: {SERVER_KEY: entry}}, indent=2)
 
-    if status is AgentStatus.NOT_INSTALLED:
-        summary = f"{AGENT_NAME}: not installed ({target} does not exist); nothing would be written"
-        block = ""
-    elif status is AgentStatus.CONFIGURED:
+    if status is AgentStatus.CONFIGURED:
         summary = (
             f"{AGENT_NAME}: already configured in {target} under "
             f'"{MCP_SERVERS_KEY}"["{SERVER_KEY}"]; no changes needed'
         )
         block = ""
     elif status is AgentStatus.UNKNOWN_STATE_FAIL_CLOSED:
+        refused = unreplaceable_reason(target)
+        if refused is not None and _config_status(env, home) is AgentStatus.INSTALLED_UNCONFIGURED:
+            summary = f"{AGENT_NAME}: refusing to write: {refused}"
+        else:
+            summary = (
+                f"{AGENT_NAME}: {target} is unreadable, malformed, or holds a differing "
+                f'"{SERVER_KEY}" entry{load_problem_note(target)}; refusing to write (fix or inspect the file, '
+                "then re-run)"
+            ) + unisolated_entry_note(target, MCP_SERVERS_KEY, SERVER_KEY)
+        block = _fail_closed_block(target, entry)
+    elif holds_legacy_entry(target, MCP_SERVERS_KEY, SERVER_KEY, entry):
         summary = (
-            f"{AGENT_NAME}: {target} is unreadable, malformed, or holds a differing "
-            f'"{SERVER_KEY}" entry; refusing to write (fix or inspect the file, then re-run)'
+            f"{AGENT_NAME}: would back up {target} to a timestamped .bak, then replace this tool's "
+            f'earlier "{SERVER_KEY}" registration with one that starts the server in isolated mode (-I) '
+            "(other entries preserved)"
         )
-        block = _fail_closed_block(target, block)
     else:
         summary = (
             f'{AGENT_NAME}: would back up {target} to a timestamped .bak, then add '
@@ -227,7 +298,7 @@ def plan(env: Mapping[str, str], home: Path) -> Plan:
         agent=AGENT_NAME,
         config_path=target,
         status=status,
-        summary=summary,
+        summary=summary + other_unisolated_note(target, MCP_SERVERS_KEY, SERVER_KEY),
         config_block=block,
         entry=entry,
     )
@@ -242,7 +313,7 @@ def apply(env: Mapping[str, str], home: Path, confirmed: bool) -> Plan:
     existing equivalent registration, and never touches a malformed config
     (fail closed).
     """
-    target = settings_path(home)
+    target = settings_path(home, env)
     status = detect(env, home)
 
     if status is not AgentStatus.INSTALLED_UNCONFIGURED:
@@ -272,24 +343,36 @@ def apply(env: Mapping[str, str], home: Path, confirmed: bool) -> Plan:
     if not isinstance(servers, dict):
         servers = {}
         data[MCP_SERVERS_KEY] = servers
-    if SERVER_KEY in servers:
+    if SERVER_KEY in servers and not is_legacy_entry(servers[SERVER_KEY], entry):
         # Concurrent modification between detect() and this re-read: an equal
         # entry is an idempotent no-op; a differing entry is operator state
         # this adapter must never silently overwrite (plan() re-detects and
         # reports it fail-closed).
         return plan(env, home)
 
+    try:
+        ensure_replaceable(target)  # refused before the backup, so none is left behind
+    except OSError as exc:
+        return _write_failed(f"writing {target}", target, entry, exc, None)
     backup = backup_path(target)
-    backup.write_bytes(target.read_bytes())
+    try:
+        write_private_backup(target, backup)
+    except OSError as exc:
+        return _write_failed(f"backing up {target} to {backup}", target, entry, exc, None)
     servers[SERVER_KEY] = entry
     payload = json.dumps(data, indent=2) + "\n"
-    target.write_text(payload, encoding="utf-8")
+    try:
+        atomic_write_text(target, payload)
+    except OSError as exc:
+        return _write_failed(f"writing {target}", target, entry, exc, backup)
 
     return Plan(
         agent=AGENT_NAME,
         config_path=target,
         status=AgentStatus.CONFIGURED,
-        summary=f'{AGENT_NAME}: added "{SERVER_KEY}" to {target} (backup: {backup})',
+        backup_paths=(backup,),
+        summary=f'{AGENT_NAME}: added "{SERVER_KEY}" to {target} (backup: {backup})'
+        + other_unisolated_note(target, MCP_SERVERS_KEY, SERVER_KEY),
         config_block=json.dumps({MCP_SERVERS_KEY: {SERVER_KEY: entry}}, indent=2),
         entry=entry,
     )

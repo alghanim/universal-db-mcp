@@ -311,8 +311,10 @@ fi
 # documented staging-side mode (this host may be macOS/arm64); the ENFORCING
 # verification happens in the container, on the bundle's own platform, both
 # before dpkg -i (preinst prerequisites) and inside postinst (install_offline.sh).
+# Every gate verification passes --no-installed-manifest: a release installed
+# on the machine running the gate never decides it.
 require source_bundle_verified "trusted verifier rejected the source bundle" -- \
-  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" --allow-platform-mismatch
+  "$PY" "$TRUSTED_VERIFIER" --bundle "$BUNDLE" --pubkey "$PUBKEY" --allow-platform-mismatch --no-installed-manifest
 
 # Record gate context early so even an early failure yields a complete
 # evidence document.
@@ -386,12 +388,15 @@ NEG_STAGING="$WORK/neg-keymaterial"
 NEG_OUT="$WORK/neg-out"
 mkdir -p "$NEG_STAGING" "$NEG_OUT"
 copy_tree() {
-  # Fast copy for the 100M+ bundle: APFS clone (macOS) -> hardlink (Linux)
-  # -> plain copy. Only ever read afterwards; the poison lands in the
+  # Fast copy for the 100M+ bundle: APFS clone (macOS) -> reflink where the
+  # filesystem has one (GNU cp) -> plain copy. Never hard links: the verifier
+  # refuses a SHA256SUMS or SIGNATURE with a second link (whoever holds the
+  # other name can change it), so a linked copy fails build_deb.sh's source
+  # verification, and the original with it. The poison lands in the
   # trusted-tools copy, never in the bundle copy itself.
   if cp -cR "$1" "$2" 2>/dev/null; then return 0; fi
   rm -rf "$2"
-  if cp -al "$1" "$2" 2>/dev/null; then return 0; fi
+  if cp -R --reflink=auto "$1" "$2" 2>/dev/null; then return 0; fi
   rm -rf "$2"
   cp -R "$1" "$2"
 }
@@ -489,12 +494,72 @@ else
   rec payload_layout failed "payload incomplete; missing:$MISSING"
 fi
 
+# Files under $1 that hold key material: an armour line (BEGIN ... KEY, or
+# ... KEY BLOCK, dashes optional) followed by a key body, in any layout a key
+# can be written down in: a PEM file, a single line, string literals joined
+# or concatenated, a JSON line array, printf arguments, '# ' comments, XML
+# entities or written \n between the lines. A body is base64 text after the
+# armour, before its END line (or within 4 KiB): a run of 20 or more base64
+# characters that mixes upper case, lower case and digits, or, up to an END
+# line, 40 such characters in pieces of 4 or more. Not the armour text alone:
+# the shipped verify_bundle.py names 'BEGIN PUBLIC KEY' in its PEM parser, and
+# a package without any key must still pass. Every file is read, text or not;
+# a failure to read one is reported as a hit (fail closed). Every pattern is
+# bounded or linear, and each armour's window is at most 4 KiB.
+pem_key_files() {
+  python3 -I -S - "$1" <<'PYEOF'
+import os
+import re
+import sys
+
+ARMOUR = re.compile(rb"-{0,5}BEGIN [A-Z0-9 ]{0,40}?KEY(?: BLOCK)?-{0,5}")
+END = re.compile(rb"-{0,5}END [A-Z0-9 ]{0,40}?KEY(?: BLOCK)?")
+RUN = re.compile(rb"[A-Za-z0-9+/]+")
+WINDOW = 4096
+
+
+def mixed(text):
+    return re.search(rb"[A-Z]", text) and re.search(rb"[a-z]", text) and re.search(rb"[0-9]", text)
+
+
+def holds_key(data):
+    for armour in ARMOUR.finditer(data):
+        window = data[armour.end():armour.end() + WINDOW]
+        end = END.search(window)
+        if end:
+            window = window[:end.start()]
+        runs = RUN.findall(window)
+        if any(len(run) >= 20 and mixed(run) for run in runs):
+            return True
+        pieces = b"".join(run for run in runs if len(run) >= 4)
+        if end and len(pieces) >= 40 and mixed(pieces):
+            return True
+    return False
+
+
+for top, dirs, files in os.walk(sys.argv[1]):
+    dirs.sort()
+    for name in sorted(files):
+        path = os.path.join(top, name)
+        if os.path.islink(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            print(f"{path} (unreadable: {exc.strerror})")
+            continue
+        if holds_key(data):
+            print(path)
+PYEOF
+}
+
 # Trust invariant (2): the release pubkey is NEVER shipped inside the package.
 # Name patterns mirror build_deb.sh's find_pubkey_material (plus *.key) so the
 # scan stays equally strict on the UDBMCP_DEB pre-built-package path, which
 # bypasses the builder's staged-root scan.
 LEAKS="$(find /tmp/inspect -type f \( -name '*.pem' -o -name '*.pub' -o -name '*.key' -o -name 'release.pub*' -o -name '*pubkey*' \) 2>/dev/null | tr '\n' ' ')"
-TEXT_LEAKS="$(grep -rIl -- 'BEGIN PUBLIC KEY\|BEGIN PRIVATE KEY' /tmp/inspect 2>/dev/null | head -3 | tr '\n' ' ')"
+TEXT_LEAKS="$(pem_key_files /tmp/inspect | head -3 | tr '\n' ' ')"
 if [ -z "$LEAKS" ] && [ -z "$TEXT_LEAKS" ]; then
   rec no_keys_in_package passed "no .pem/.pub/.key/*pubkey*/release.pub* files and no PEM blocks anywhere in the package payload"
 else
@@ -599,8 +664,8 @@ fi
 mkdir -p /tmp/demo
 cp "$BUNDLE_INSTALLED/config-templates/create_demo.py" \
    "$BUNDLE_INSTALLED/config-templates/config.template.yaml" /tmp/demo/
-if "$VENV/python" /tmp/demo/create_demo.py --path /tmp/finlink_demo.db > /tmp/demo.log 2>&1; then
-  rec demo_fixture passed "synthetic SQLite demo fixture created at /tmp/finlink_demo.db"
+if "$VENV/python" /tmp/demo/create_demo.py --path /tmp/demo/finlink_demo.db > /tmp/demo.log 2>&1; then
+  rec demo_fixture passed "synthetic SQLite demo fixture created at /tmp/demo/finlink_demo.db"
 else
   rec demo_fixture failed "create_demo.py failed: $(tail -c 300 /tmp/demo.log | tr '\n' ' ')"
   exit 1
@@ -610,11 +675,13 @@ if "$VENV/python" -m universal_db_mcp doctor --config /tmp/demo/config.yaml \
     > "$EV/doctor.json" 2> "$EV/doctor.stderr.txt"; then
   rec doctor passed "doctor passed against the deb-installed venv (config: /tmp/demo/config.yaml)"
 else
-  rec doctor failed "doctor reported fatal checks: $(tail -c 300 "$EV/doctor.stderr.txt" | tr '\n' ' ')"
+  # doctor reports its checks as JSON on stdout; name the fatal ones
+  fatal="$(python3 -c 'import json,sys; print("; ".join(c["check"] + ": " + c.get("detail", "") for c in json.load(open(sys.argv[1])).get("checks", []) if c.get("status") == "fatal"))' "$EV/doctor.json" 2>/dev/null || true)"
+  rec doctor failed "doctor reported fatal checks: ${fatal:-$(tail -c 300 "$EV/doctor.stderr.txt" | tr '\n' ' ')}"
 fi
 
 # --- protocol probe over stdio (no network) ----------------------------------
-if "$VENV/python" "$BUNDLE_INSTALLED/tests/protocol_probe.py" "$VENV/python" /tmp/finlink_demo.db \
+if "$VENV/python" "$BUNDLE_INSTALLED/tests/protocol_probe.py" "$VENV/python" /tmp/demo/finlink_demo.db \
     > "$EV/protocol-probe.json" 2> "$EV/protocol-probe.stderr.txt"; then
   rec protocol_probe passed "stdio MCP protocol lifecycle probe passed"
 else
@@ -693,7 +760,7 @@ rec wheel_tampered passed "sqlglot wheel byte-flipped inside a repacked COPY of 
 
 # --- the trusted verifier must reject the tampered payload -------------------
 TAMPERED_BUNDLE=/tmp/tamper/tree/usr/share/universal-db-mcp/bundle
-VOUT="$(python3 /usr/local/lib/udbmcp-trust/verify_bundle.py --bundle "$TAMPERED_BUNDLE" --pubkey /etc/universal-db-mcp/keys/release.pub.pem 2>&1)"
+VOUT="$(python3 /usr/local/lib/udbmcp-trust/verify_bundle.py --bundle "$TAMPERED_BUNDLE" --pubkey /etc/universal-db-mcp/keys/release.pub.pem --no-installed-manifest 2>&1)"
 VRC=$?
 echo "$VOUT" > "$EV/tamper-verify.log"
 if [ "$VRC" -ne 0 ] && echo "$VOUT" | grep -q "signature verification FAILED"; then

@@ -224,7 +224,7 @@ def test_rollback_integrity_gate_runs_before_any_rename(tmp_path) -> None:  # ty
     gate_idx = text.index("udbmcp_verify_previous_venv || exit 1")
     failed_idx = text.index('mv "$TARGET/venv" "$TARGET/venv.failed"')
     restore_idx = text.index('mv "$TARGET/venv.previous" "$TARGET/venv"')
-    doctor_idx = text.index('"$TARGET/venv/bin/python" -m universal_db_mcp doctor')
+    doctor_idx = text.index('"$TARGET/venv/bin/python" -I -m universal_db_mcp doctor')
     assert gate_idx < failed_idx < restore_idx < doctor_idx, (
         "verify-then-use: the manifest gate must precede the swap and the doctor call"
     )

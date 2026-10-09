@@ -51,7 +51,15 @@ def redact_text(text: str) -> str:
     if not text:
         return text
     patterns = [
-        (re.compile(r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[=:]\s*\S+"), r"\1=<redacted>"),
+        # MySQL's own "(using password: YES)" is a hint, not a value: cut, it
+        # took the closing quote and parenthesis of PyMySQL's (errno, "...")
+        # wrapper with it, and the error then lost its errno and message.
+        (
+            re.compile(
+                r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[=:]\s*(?!(?<=using password: )(?:YES|NO)\))\S+"
+            ),
+            r"\1=<redacted>",
+        ),
         (re.compile(r"(?i)(postgres(?:ql)?|mysql|db2|oracle|mssql|clickhouse)://[^\s]+"), r"\1://<redacted-url>"),
         # Backstop: usernames embedded by driver auth-failure messages.
         # keyword=value / keyword: value / keyword "value" forms.
@@ -64,6 +72,7 @@ def redact_text(text: str) -> str:
     out = text
     for pat, repl in patterns:
         out = pat.sub(repl, out)
+    out = _redact_clickhouse_login(out)
     # Registered SecretMark literals, longest first. Matched as standalone
     # tokens (no adjacent word characters) so a short or generic secret is
     # still scrubbed wherever it appears as a value, without shredding
@@ -79,6 +88,39 @@ def redact_text(text: str) -> str:
     return out
 
 
+# ClickHouse names the login first: DB::Exception: svc_ro: Authentication
+# failed (the name may hold spaces and colons, live 26.3). Scanned with
+# str.find, not a lazy regex: (DB::Exception: )[^\n]*?(?=: Authentication
+# failed) rescanned the rest of the line from every anchor, quadratic on a
+# driver error that echoes a long value (cr2 V7-e/V7-h).
+_CH_LOGIN_ANCHOR = "DB::Exception: "
+_CH_LOGIN_END = ": Authentication failed"
+
+
+def _redact_clickhouse_login(text: str) -> str:
+    """The text between each 'DB::Exception: ' and the first ': Authentication
+    failed' after it on the same line replaced by '<redacted>' (what the
+    regex above did), in one left-to-right pass."""
+    out: list[str] = []
+    last = i = 0
+    eol = -1
+    n = len(text)
+    while (anchor := text.find(_CH_LOGIN_ANCHOR, i)) != -1:
+        start = anchor + len(_CH_LOGIN_ANCHOR)
+        if eol < start:
+            eol = text.find("\n", start)
+            eol = n if eol == -1 else eol
+        end = text.find(_CH_LOGIN_END, start, eol)
+        if end == -1:  # no later anchor on this line has one either
+            i = eol
+            continue
+        out.append(text[last:start])
+        out.append("<redacted>")
+        last = i = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def redact_value(value: Any) -> Any:
     if isinstance(value, SecretMark):
         return "<redacted>"
@@ -91,9 +133,50 @@ def redact_value(value: Any) -> Any:
     return value
 
 
+# scrub_exception shows 500 characters. An error up to _SCRUB_MAX_CHARS is
+# redacted whole; a longer one only its first _SCRUB_HEAD_CHARS, cut before
+# any pattern runs: a driver error can echo a parameter value of any length,
+# and redaction ran over all of it on the request's thread (V7-h).
+_SCRUB_MAX_CHARS = 16384
+_SCRUB_HEAD_CHARS = 4096
+_SCRUB_SHOWN_CHARS = 500
+
+
 def scrub_exception(exc: BaseException) -> str:
     """One-line, redacted representation of an exception for error paths."""
-    return redact_text(f"{type(exc).__name__}: {exc}".replace("\n", " "))[:500]
+    text = f"{type(exc).__name__}: {exc}"
+    if len(text) <= _SCRUB_MAX_CHARS:
+        return redact_text(text.replace("\n", " "))[:_SCRUB_SHOWN_CHARS]
+    # Cut first, then redact the head. A secret or a login cut in two at the
+    # boundary is no longer whole for redaction, and it can only be in the
+    # text the redaction left verbatim at the end of the head: that tail is
+    # dropped, as far back as the longest registered secret (and a margin).
+    # The verbatim tail is no longer than the common suffix of the head and
+    # its redaction; a value redaction that shrank the head (password=<4 KiB>)
+    # leaves none, and the head of the engine's message stays (cr3 A6-7: it
+    # collapsed to 'TypeName:  [...]').
+    margin = max([256, *(len(s) + 64 for s in _REGISTERED_SECRETS)])
+    head = text[:_SCRUB_HEAD_CHARS].replace("\n", " ")
+    redacted = redact_text(head)
+    limit = min(margin, len(head), len(redacted))
+    verbatim = 0
+    while verbatim < limit and redacted[-1 - verbatim] == head[-1 - verbatim]:
+        verbatim += 1
+    kept = redacted[: len(redacted) - verbatim]
+    if len(kept) >= _SCRUB_SHOWN_CHARS:
+        return kept[:_SCRUB_SHOWN_CHARS]
+    return kept.rstrip() + " [...]"
+
+
+# Quoted literals in the unrolled form: the old (?:[^']|'')* pushed one
+# backtrack frame per character of an unterminated literal (~150 bytes each,
+# ~300 MB for a 2M-character statement). This form matches the same text.
+_SQ_LITERAL = re.compile(r"'[^']*(?:''[^']*)*'")
+_DQ_LITERAL = re.compile(r'"[^"]*(?:""[^"]*)*"')
+# The SQL guard refuses statements over 64 KiB, so no longer statement ever
+# runs; only this prefix (plus the full length) is fingerprinted, which bounds
+# the work done on the event loop for hostile input.
+_FINGERPRINT_MAX_CHARS = 65536
 
 
 def sql_fingerprint(sql: str) -> str:
@@ -103,11 +186,16 @@ def sql_fingerprint(sql: str) -> str:
     with ``?`` by a conservative scanner, then hashed. Raw SQL text is never
     stored when ``audit_sql_text`` is false (the default).
     """
-    s = re.sub(r"'(?:[^']|'')*'", "?", sql)
-    s = re.sub(r'"(?:[^"]|"")*"', "?", s)
+    s = _SQ_LITERAL.sub("?", sql[:_FINGERPRINT_MAX_CHARS])
+    s = _DQ_LITERAL.sub("?", s)
     s = re.sub(r"\b\d+(?:\.\d+)?\b", "?", s)
     s = re.sub(r"\s+", " ", s).strip().lower()
-    return "sha256:" + hashlib.sha256(s.encode()).hexdigest()
+    if len(sql) > _FINGERPRINT_MAX_CHARS:
+        s += f" [{len(sql)} chars]"
+    # surrogatepass: a lone surrogate (a JSON \\udcff escape) must not raise
+    # here, in the audit path, after the statement ran (R2); the audit
+    # digests encode the same way.
+    return "sha256:" + hashlib.sha256(s.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def new_request_id() -> str:

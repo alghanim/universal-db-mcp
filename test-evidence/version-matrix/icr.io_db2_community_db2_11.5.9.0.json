@@ -1,31 +1,31 @@
 {
   "label": "icr.io/db2_community/db2:11.5.9.0",
   "engine": "db2",
-  "probe_rev": "1a66c3c",
-  "started_utc": "2026-09-18T12:33:12Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:57:35Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 1384,
+      "ms": 2756,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 183,
+      "ms": 1066,
       "detail": "DB2 v11.5.9.0"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 8,
+      "ms": 1067,
       "detail": "VM"
     },
     {
       "check": "list_tables",
       "status": "passed",
-      "ms": 16,
+      "ms": 1046,
       "detail": "[TableSummary(schema='VM', name='CUSTOMERS', kind='table', row_estimate=None, row_estimate_source=None, comment=None), TableSummary(schema='VM', name='ORDERS', kind='table', row_estimate=None, row_est"
     },
     {
@@ -37,8 +37,8 @@
     {
       "check": "list_columns",
       "status": "passed",
-      "ms": 14,
-      "detail": "[ColumnInfo(schema='VM', table='CUSTOMERS', name='ID', data_type='INTEGER', nullable=False, default=None, comment=None, ordinal=0), ColumnInfo(schema='VM', table='CUSTOMERS', name='EMAIL', data_type='"
+      "ms": 1058,
+      "detail": "[ColumnInfo(schema='VM', table='CUSTOMERS', name='ID', data_type='INTEGER', nullable=False, default=None, comment=None, ordinal=0, default_kind=None), ColumnInfo(schema='VM', table='CUSTOMERS', name='"
     },
     {
       "check": "list_columns_count",
@@ -49,14 +49,14 @@
     {
       "check": "list_all_columns",
       "status": "passed",
-      "ms": 9,
+      "ms": 1070,
       "detail": "9"
     },
     {
       "check": "list_indexes",
       "status": "passed",
-      "ms": 11,
-      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='reg', schema='VM', table='ORDERS'), IndexInfo(name='SQL260918123313710', columns=['ID"
+      "ms": 1044,
+      "detail": "[IndexInfo(name='IX_ORDERS_CUSTOMER', columns=['CUSTOMER_ID'], unique=False, definition=None, primary=False, kind='reg', schema='VM', table='ORDERS'), IndexInfo(name='SQL261003145736470', columns=['ID"
     },
     {
       "check": "index_on_fk_visible",
@@ -67,8 +67,8 @@
     {
       "check": "primary_key_visible",
       "status": "passed",
-      "ms": 4,
-      "detail": "SQL260918123313670"
+      "ms": 1055,
+      "detail": "SQL261003145736430"
     },
     {
       "check": "composite_unique_index",
@@ -79,61 +79,61 @@
     {
       "check": "get_foreign_keys",
       "status": "passed",
-      "ms": 11,
+      "ms": 1045,
       "detail": "CUSTOMERS"
     },
     {
       "check": "list_views",
       "status": "passed",
-      "ms": 5,
+      "ms": 1039,
       "detail": "V_ORDERS"
     },
     {
       "check": "list_routines",
       "status": "passed",
-      "ms": 34,
+      "ms": 1059,
       "detail": "F_ONE"
     },
     {
       "check": "get_statistics",
       "status": "passed",
-      "ms": 6,
+      "ms": 1072,
       "detail": "catalog_estimate(SYSCAT.TABLES.CARD)"
     },
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 4,
+      "ms": 1070,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 11,
+      "ms": 1069,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 12,
+      "ms": 1068,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 7,
+      "ms": 1050,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 7,
+      "ms": 1065,
       "detail": "[12, 'user12@example.com', 'north']"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 37,
+      "ms": 1047,
       "detail": "['raw', 'rows', 'total_cost']"
     }
   ],
@@ -147,6 +147,7 @@
     "read_only_requested": true,
     "server_read_only_available": false,
     "applied": [
+      "sql_compat=DB2",
       "isolation=ur",
       "lock_timeout=5s"
     ],
@@ -160,7 +161,7 @@
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-18T12:33:14Z",
+  "finished_utc": "2026-10-03T14:57:57Z",
   "summary": {
     "passed": 22,
     "failed": []

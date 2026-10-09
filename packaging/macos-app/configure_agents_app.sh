@@ -26,18 +26,22 @@
 #   * `chosen as text` joins with the CURRENT delimiters (empty by default!):
 #     without setting them first, a multi-selection becomes ONE concatenated
 #     bogus name (verified on Darwin 25).
+#   * `display dialog` takes `with title "..." with icon note`: the shorthand
+#     `with icon note title "..."` does not compile (-2740), and osascript
+#     then exits non-zero with no dialog, so the app ended silently and
+#     registered nothing. Every snippet is compiled by a unit test.
 set -u
 
 VENV_PY="/usr/local/universal-db-mcp/venv/bin/python"
 TITLE="Configure UniversalDB MCP"
 
 fail_dialog() {
-  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with icon stop title \"$TITLE\"" >/dev/null 2>&1
+  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with title \"$TITLE\" with icon stop" >/dev/null 2>&1
   exit 1
 }
 
 info_dialog() {
-  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with icon note title \"$TITLE\"" >/dev/null 2>&1
+  osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with title \"$TITLE\" with icon note" >/dev/null 2>&1
 }
 
 [ -x "$VENV_PY" ] || fail_dialog "UniversalDB MCP is not installed at /usr/local/universal-db-mcp. Install the package first."
@@ -49,7 +53,9 @@ detect_json="$("$VENV_PY" -m universal_db_mcp configure-agents --json 2>/dev/nul
 
 # The configurable set, sanitized to the fixed adapter name charset. A PARSE
 # failure here is an ERROR (never "nothing to configure"): a broken payload
-# must not masquerade as all-set.
+# must not masquerade as all-set. Neither may a harness configure-agents
+# cannot configure (adapter error, or a config it refuses to touch): those
+# come back as FAILED:<name> rows.
 rows="$(printf '%s' "$detect_json" | "$VENV_PY" -c '
 import json, sys
 try:
@@ -58,28 +64,40 @@ except Exception as exc:
     print("PARSE_ERROR:" + str(exc))
     raise SystemExit(3)
 for h in data.get("harnesses", []):
-    if h.get("writable") and isinstance(h.get("agent"), str):
-        name = h["agent"]
-        if name.replace("-", "").isalnum():
-            print(name)
+    name = h.get("agent")
+    if not (isinstance(name, str) and name.replace("-", "").isalnum()):
+        continue
+    if h.get("writable"):
+        print(name)
+    elif h.get("status") in ("adapter_error", "fail_closed", "unknown_state_fail_closed"):
+        print("FAILED:" + name)
 ')"
 rows_rc=$?
 if [ "$rows_rc" -ne 0 ] || [ "${rows#PARSE_ERROR}" != "$rows" ]; then
   fail_dialog "Agent detection output unreadable. Run this in Terminal for the diagnostic:
 /usr/local/universal-db-mcp/venv/bin/python -m universal_db_mcp configure-agents"
 fi
+failed_names="$(printf '%s\n' "$rows" | sed -n 's/^FAILED://p')"
+failed="$(printf '%s\n' "$failed_names" | awk 'NF {printf "%s%s", sep, $0; sep=", "}')"
+rows="$(printf '%s\n' "$rows" | sed '/^FAILED:/d')"
 
 if [ -z "$rows" ]; then
+  [ -z "$failed" ] || fail_dialog "UniversalDB MCP cannot configure: $failed (detection failed, or the existing config needs a manual fix). Run this in Terminal for the diagnostic:
+/usr/local/universal-db-mcp/venv/bin/python -m universal_db_mcp configure-agents"
   info_dialog "No configurable agent harnesses found: nothing new is installed, or every detected harness already has UniversalDB MCP registered."
   exit 0
 fi
+prompt="UniversalDB MCP can be registered with these detected AI agent harnesses. Choose which ones:"
+[ -z "$failed" ] || prompt="$prompt
+
+Not listed, because configure-agents cannot configure them (run it in Terminal for the diagnostic): $failed"
 
 # --- step 2: consent dialog 1 - which harnesses ------------------------------
 # AppleScript list literal from sanitized rows: {"a", "b"}.
 as_list="$(printf '%s\n' "$rows" | awk '{printf "%s\"%s\"", sep, $0; sep=", "}')"
 selected="$(osascript <<APPLESCRIPT
 set harnessList to {$as_list}
-set chosen to choose from list harnessList with title "$TITLE" with prompt "UniversalDB MCP can be registered with these detected AI agent harnesses. Choose which ones:" with multiple selections allowed
+set chosen to choose from list harnessList with title "$TITLE" with prompt "$prompt" with multiple selections allowed
 if chosen is false then return "CANCELLED"
 set text item delimiters of AppleScript to "|"
 return chosen as text
@@ -94,7 +112,7 @@ APPLESCRIPT
 pretty="${selected//|/, }"
 osascript -e "display dialog \"Register UniversalDB MCP with: $pretty?
 
-Each config file gets a timestamped .bak backup before anything is written; re-running never duplicates entries.\" buttons {\"Cancel\", \"Configure\"} default button \"Configure\" with icon note title \"$TITLE\"" >/dev/null || exit 0
+Each config file gets a timestamped .bak backup before anything is written; re-running never duplicates entries.\" buttons {\"Cancel\", \"Configure\"} default button \"Configure\" with title \"$TITLE\" with icon note" >/dev/null || exit 0
 
 # --- step 4: apply per selected harness (--yes is the recorded consent) ------
 # stderr is NOT merged into the JSON payload: the success path parses stdout
@@ -128,6 +146,14 @@ $agent - FAILED: run in Terminal for the diagnostic:
     rc_all=1
   fi
 done
+# Harnesses that could not be offered are failures too.
+while IFS= read -r agent; do
+  [ -n "$agent" ] || continue
+  report="$report
+$agent - FAILED: not configurable here; run in Terminal for the diagnostic:
+  /usr/local/universal-db-mcp/venv/bin/python -m universal_db_mcp configure-agents --agent $agent"
+  rc_all=1
+done <<< "$failed_names"
 
 # Strip characters that would break the AppleScript string literal: both the
 # quote AND the backslash (a lone backslash escapes the closing quote and

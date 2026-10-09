@@ -53,6 +53,7 @@ class ErrorCategory:
     POLICY = "POLICY_VIOLATION"
     VALIDATION = "VALIDATION_ERROR"
     CONNECTION = "CONNECTION_ERROR"
+    QUERY = "QUERY_ERROR"  # the statement ran and the engine rejected it (data or SQL error)
     AUTHZ = "AUTHORIZATION_DENIED"
     TIMEOUT = "TIMEOUT"
     LIMIT = "LIMIT_EXCEEDED"

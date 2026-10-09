@@ -12,7 +12,23 @@
 #     implementation, scripts/install_offline.sh, so verify-then-use staging
 #     (private root-owned copy, re-verified in the privileged context) and the
 #     hostile-env pip neutralization (--no-index --require-hashes,
-#     PIP_CONFIG_FILE=/dev/null) are inherited, not re-implemented.
+#     PIP_CONFIG_FILE=/dev/null) are inherited, not re-implemented;
+#   - the payload must not be an OLDER release than the one installed: the
+#     verifier compares its signed manifest with $TARGET/manifest.json and
+#     refuses a downgrade unless UDBMCP_ALLOW_DOWNGRADE=1 is set for an
+#     intended rollback (sudo UDBMCP_ALLOW_DOWNGRADE=1 dpkg -i <older .deb>);
+#   - "never executes payload before verification" holds for the PAYLOAD
+#     only. This script and the other maintainer scripts are
+#     NOT covered by the bundle signature, which signs only the payload: dpkg
+#     runs them from the .deb's control archive. They are covered by the
+#     release stick's SHA256SUMS, signed with the release key
+#     (SHA256SUMS.sig), which vouches for them only when tools the site
+#     ALREADY trusts check it with the installed key before anything from
+#     the stick runs: the installed copy of bootstrap.sh
+#     (sudo bash /usr/local/lib/udbmcp-trust/bootstrap.sh --stick <stick>),
+#     or, on a site that has none yet, the installed verifier or
+#     /usr/bin/openssl run by hand. `sha256sum -c` alone, or the stick's own
+#     bootstrap.sh, is the stick checking itself (see the preinst).
 #
 # The deb payload (laid out by scripts/package/build_deb.sh) is:
 #   /usr/share/universal-db-mcp/bundle/         the SIGNED offline bundle
@@ -70,6 +86,69 @@
 # set -e: ANY verification or pre-flight failure exits nonzero, which makes
 # dpkg abort the configure step (fail closed, never partially trusted).
 set -e
+# The pythons below run as root with -I, which keeps them from reading PYTHON*
+# variables but not a python they start, nor the ensurepip child of the trust
+# dir installer's `-m venv` (which may be an older copy that keeps them): the
+# caller's are dropped here, before any python runs.
+for _var in $(compgen -e); do case "$_var" in PYTHON*) unset "$_var" ;; esac; done
+# The caller's temporary directories too (`sudo -E dpkg -i` keeps them): root's
+# bash can write a here-document below (the pythons read their code from them)
+# to a file in TMPDIR and reopen it by name, and python's tempfile, the
+# installer's pip and python -m venv included, takes TEMP or TMP when TMPDIR is
+# unset. In a directory another account can write, that account could swap
+# root's file in between: root's temporary files go to the system's own.
+unset TMPDIR TEMP TMP
+
+# dpkg undoes a failed upgrade or removal (the new package's preinst refused,
+# or its unpack was rolled back): this release's files are the installed ones
+# still, and only the service the prerm stopped has to run again. Nothing is
+# verified or installed again. Unless a deferred install of this release is
+# still running (an earlier configure's worker, which names itself in the
+# owner file and holds the lock): it has not built the venv yet, records its
+# own status and starts the service itself, so nothing here touches either,
+# and the package stays 'installed'. Otherwise, unless the venv is gone: the
+# runbook's package rollback deletes it before `dpkg -i` of the older package,
+# so when that package's preinst refuses, nothing can run. That is recorded
+# ('failed' in the status file the runbook waits on) and this script fails,
+# which leaves the package 'unpacked' in dpkg instead of 'installed': `dpkg
+# --configure universal-db-mcp` then installs this release's payload again.
+case "${1:-}" in
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ABORT_VENV_PYTHON=/opt/universal-db-mcp/venv/bin/python
+    ABORT_STATUS=/var/log/universal-db-mcp-install.status
+    ABORT_LOCK=/run/udbmcp-deferred-install.lock
+    ABORT_OWNER=/run/udbmcp-deferred-install.owner
+    # '<pid> <payload>' in the owner file names a worker; it counts while that
+    # pid is still a worker (its script is /var/tmp/udbmcp-postinst-worker.*)
+    # and the lock is held. Else the name is stale (that worker was killed and
+    # its pid may be another process now), and the lock, if held, is the
+    # refused package's postrm holder, which installs nothing.
+    abort_worker=""
+    { command -v flock >/dev/null 2>&1 && { read -r abort_worker _ < "$ABORT_OWNER"; } 2>/dev/null \
+      && [[ "$abort_worker" =~ ^[0-9]+$ ]] \
+      && grep -qaF -- /var/tmp/udbmcp-postinst-worker. "/proc/$abort_worker/cmdline" 2>/dev/null \
+      && ! (exec 8>>"$ABORT_LOCK" && flock -n 8) 2>/dev/null; } || abort_worker=""
+    if [ -n "$abort_worker" ]; then
+      echo "universal-db-mcp postinst: dpkg's $1 leaves the deferred install (pid $abort_worker) of the release dpkg records" >&2
+      echo "      to finish; it starts the service itself. Track it: cat $ABORT_STATUS" >&2
+      exit 0
+    fi
+    if [ ! -x "$ABORT_VENV_PYTHON" ]; then
+      abort_status="could not be written"
+      if { echo failed > "$ABORT_STATUS"; } 2>/dev/null; then abort_status="now says 'failed'"; fi
+      echo "FAIL: dpkg's $1 found no venv ($ABORT_VENV_PYTHON is missing): the installed release cannot run," >&2
+      echo "      and $ABORT_STATUS $abort_status. Install this release's payload again with:" >&2
+      echo "        sudo dpkg --configure universal-db-mcp" >&2
+      echo "      or install the intended package with dpkg -i once its refusal (above) is resolved." >&2
+      exit 1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
+       && systemctl is-enabled --quiet universal-db-mcp 2>/dev/null; then
+      systemctl start universal-db-mcp || echo "WARNING: could not start universal-db-mcp again after dpkg's $1" >&2
+    fi
+    exit 0
+    ;;
+esac
 
 BUNDLE=/usr/share/universal-db-mcp/bundle
 TRUST_DIR=/usr/local/lib/udbmcp-trust
@@ -83,6 +162,66 @@ LOG=/var/log/universal-db-mcp-install.log
 STATUS=/var/log/universal-db-mcp-install.status
 UNIT_DROPIN_DIR=/etc/systemd/system/universal-db-mcp.service.d
 UNIT_DROPIN="$UNIT_DROPIN_DIR/deferred-install-guard.conf"
+# A deferred install worker holds DEFERRED_LOCK while it runs and names itself
+# in DEFERRED_OWNER ('<pid> <sha256 of the manifest of the payload it installs>');
+# a worker spawned by an earlier package's postinst names nothing.
+DEFERRED_LOCK=/run/udbmcp-deferred-install.lock
+DEFERRED_OWNER=/run/udbmcp-deferred-install.owner
+
+# $1: a file; prints its sha256 (nothing when it cannot be read)
+manifest_id() {
+  local out
+  out="$(sha256sum -- "$1" 2>/dev/null)" || return 0
+  printf '%s' "${out%% *}"
+}
+
+# >>> one install at a time
+# Whether no deferred install holds the lock. A holder that lets go within 15
+# seconds (the one the postrm leaves while dpkg undoes a failed upgrade, until
+# that dpkg run is over) is waited for.
+deferred_lock_free() {
+  local _
+  [ -e "$DEFERRED_LOCK" ] || return 0  # no worker ever ran since boot (/run is a tmpfs)
+  for _ in $(seq 1 30); do
+    if (exec 8>>"$DEFERRED_LOCK" && flock -n 8) 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+# $1: the sha256 of the payload's manifest. Succeeds when the running worker
+# installs that same payload; fails for any other worker, including one that
+# names nothing (an earlier package's) and a stale name of an ended one.
+deferred_worker_installs() {
+  local pid id
+  { read -r pid id < "$DEFERRED_OWNER"; } 2>/dev/null || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null && [ "$id" = "$1" ]
+}
+# Refuse (exit 1) while a deferred install of another payload runs: exiting 0
+# here would let dpkg record this package while that worker publishes its own
+# release's code and starts the service on it. $1: this payload's manifest
+# sha256; $2: 'same-ok' when a worker for this very payload may keep running
+# (deferred mode: dpkg --configure -a during a long install).
+refuse_while_another_install_runs() {
+  if deferred_lock_free; then
+    return 0
+  fi
+  if [ "${2:-}" = same-ok ] && deferred_worker_installs "$1"; then
+    echo "WARNING: a deferred install of this same payload is still running;" >&2
+    echo "         not spawning a second worker. Track it: cat $STATUS ; tail -f $LOG" >&2
+    exit 0
+  fi
+  echo "FAIL: a deferred install of ANOTHER payload is still running (an earlier configure, possibly" >&2
+  echo "      spawned by the previous package's postinst when dpkg undid a refused upgrade). Configuring" >&2
+  echo "      now would let dpkg record this package while that worker installs its own release." >&2
+  echo "      Nothing was installed. Wait for it, then configure this package:" >&2
+  echo "        until grep -qxE 'success|failed' $STATUS; do sleep 5; done" >&2
+  echo "        sudo dpkg --configure universal-db-mcp" >&2
+  exit 1
+}
+# <<< one install at a time
 
 # --- step 1: the ADMIN trust dir must already be complete (fail closed) ------
 # The package NEVER bootstraps /usr/local/lib/udbmcp-trust from its own
@@ -137,7 +276,7 @@ if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
   echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
   exit 1
 fi
-INSTALLER_FORMAT=3
+INSTALLER_FORMAT=4
 if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
    && ! grep -q "^# udbmcp-installer-format: ${INSTALLER_FORMAT}\$" "$TRUST_DIR/install_offline.sh"; then
   echo "FAIL: the trusted installer at $TRUST_DIR/install_offline.sh is an OUTDATED copy" >&2
@@ -146,6 +285,24 @@ if grep -q "PIP_FIND_LINKS" "$TRUST_DIR/install_offline.sh" \
   echo "      tools from the release stick (sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh)," >&2
   echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
   exit 1
+fi
+# The verification below passes --installed-manifest (anti-rollback). A
+# verifier that parses options ('--pubkey') but has no '--installed-manifest'
+# predates that check and would abort on the unknown option with a bare usage
+# error; name the fix instead. One that names the option only in a comment
+# gets past this text check, and its argparse then gives it away (see
+# verify_payload_with_proof).
+outdated_verifier() {
+  echo "FAIL: the trusted verifier at $TRUST_DIR/verify_bundle.py is an OUTDATED copy" >&2
+  echo "      (no --installed-manifest option): it cannot refuse a downgrade to an older release." >&2
+  echo "      Refresh the trusted tools from the release stick" >&2
+  echo "      (sudo bash <stick>/trust-bootstrap-linux/bootstrap.sh)," >&2
+  echo "      then re-run: sudo dpkg --configure universal-db-mcp" >&2
+  exit 1
+}
+if grep -q -- '"--pubkey"' "$TRUST_DIR/verify_bundle.py" \
+   && ! grep -q -- '"--installed-manifest"' "$TRUST_DIR/verify_bundle.py"; then
+  outdated_verifier
 fi
 echo "==> admin trust dir complete at $TRUST_DIR (the package never writes to it)"
 
@@ -158,6 +315,64 @@ if [ ! -f "$PUBKEY" ]; then
   echo "        sudo install -d -m 755 /etc/universal-db-mcp/keys" >&2
   echo "        sudo install -m 644 <trusted-path>/udbmcp-release.pub.pem $PUBKEY" >&2
   exit 1
+fi
+
+# --- step 2b: audit files an older release left owned by root ---------------
+# An older release's root site check (sudo udbmcp site-check or doctor) could
+# create the audit log, its .lock sidecar or a rotated backup in the service's
+# log directory owned by root. This release no longer repairs them at run
+# time, so under audit_fail_closed the service would refuse every audited
+# call. Hand them back to the service account (an upgrade: on a first install
+# neither the account nor the directory exists yet). That account owns the
+# directory, so each entry is opened without following links and checked on
+# the open descriptor (a regular file, one link, owned by root) before
+# fchown: a symlink, or a name that is a second link to another file, is left
+# alone. Best effort: a failure warns and never aborts the configure step.
+LOG_DIR=/var/log/universal-db-mcp
+if [ -d "$LOG_DIR" ] && id udbmcp >/dev/null 2>&1; then
+  # >>> hand root-owned audit files back: identical in the deb postinst, the pkg postinstall, install_offline.sh and upgrade_offline.sh
+  python3 -I -S - "$LOG_DIR" udbmcp <<'PYEOF' || echo "WARNING: could not hand root-owned audit files in $LOG_DIR back to the service account" >&2
+import os
+import pwd
+import stat
+import sys
+
+ROOT = 0
+log_dir, account = sys.argv[1], sys.argv[2]
+owner = pwd.getpwnam(account)
+try:
+    # Logs moved to another volume and linked back: the link is followed only
+    # when root owns it and the directory it is in, so no other account made or
+    # can re-point it. Where it leads is opened like the name itself.
+    if os.path.islink(log_dir):
+        if os.lstat(log_dir).st_uid != ROOT or os.stat(os.path.dirname(os.path.abspath(log_dir))).st_uid != ROOT:
+            sys.exit(f"{log_dir}: a symlink another account could have made or re-pointed")
+        log_dir = os.path.realpath(log_dir)
+    dir_fd = os.open(log_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError as exc:
+    sys.exit(f"{log_dir}: {exc.strerror}")
+try:
+    for name in sorted(os.listdir(dir_fd)):
+        if not name.startswith("audit.jsonl"):
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError:
+            continue  # a symlink, or gone
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == ROOT:
+                os.fchmod(fd, 0o600)  # the audit writer's own mode: it opens the file read-write
+                os.fchown(fd, owner.pw_uid, owner.pw_gid)
+                print(f"==> {log_dir}/{name} was owned by root; handed back to {account}")
+        finally:
+            os.close(fd)
+except OSError as exc:
+    sys.exit(f"{log_dir}: {exc.strerror}")
+finally:
+    os.close(dir_fd)
+PYEOF
+  # <<< hand root-owned audit files back
 fi
 
 # --- step 3: decide the install mode ----------------------------------------
@@ -176,33 +391,43 @@ fi
 # synchronously here, and the synchronous path pre-verifies before handing to
 # install_offline.sh (whose own copy in the admin trust dir may be an older
 # revision without its own proof gate — the deb must fail closed regardless).
+# Anti-rollback: the verifier also compares the payload's signed manifest with
+# the installed release's ($TARGET/manifest.json; absent on a first install)
+# and refuses an older release unless UDBMCP_ALLOW_DOWNGRADE=1.
 verify_payload_with_proof() {
   local VEXEC="" vout vrc=0
+  local rollback_args=(--installed-manifest "$TARGET/manifest.json")
+  [ "${UDBMCP_ALLOW_DOWNGRADE:-}" != "1" ] || rollback_args+=(--allow-downgrade)
   # Same verifier-execution rule as install_offline.sh: a 644 Python verifier
-  # runs via python3; an executable non-Python verifier is exec'd directly.
-  # $VEXEC is deliberately unquoted at the call site (it is either empty, or
-  # the single word "python3").
+  # runs via python3 -I -S (isolated: no PYTHON* variables, user site or
+  # working directory, the verifier adds its own directory for profiles.py;
+  # no site.py: no .pth file in the interpreter's site-packages can name code
+  # outside it); an executable non-Python verifier is exec'd directly. $VEXEC
+  # is deliberately unquoted at the call site (it is either empty, or
+  # "python3 -I -S").
   if [ -x "$TRUST_DIR/verify_bundle.py" ]; then
     case "$(head -n 1 "$TRUST_DIR/verify_bundle.py" 2>/dev/null)" in
-      *"python"*) VEXEC="python3" ;;
+      *"python"*) VEXEC="python3 -I -S" ;;
     esac
   else
-    VEXEC="python3"
+    VEXEC="python3 -I -S"
   fi
-  vout="$(mktemp "${TMPDIR:-/tmp}/udbmcp-postinst-verify.XXXXXX")"
-  $VEXEC "$TRUST_DIR/verify_bundle.py" --bundle "$BUNDLE" --pubkey "$PUBKEY" >"$vout" 2>&1 || vrc=$?
-  cat "$vout"
+  # The output is kept in the shell, never in a file: root would open one by
+  # name, through whatever link another account put in its place (dpkg keeps
+  # the TMPDIR that `sudo -E` kept).
+  vout="$($VEXEC "$TRUST_DIR/verify_bundle.py" --bundle "$BUNDLE" --pubkey "$PUBKEY" "${rollback_args[@]}" 2>&1)" || vrc=$?
+  printf '%s\n' "$vout"
+  if [ "$vrc" -ne 0 ] && [[ "$vout" == *'unrecognized arguments: --installed-manifest'* ]]; then
+    outdated_verifier
+  fi
   if [ "$vrc" -ne 0 ]; then
     echo "FAIL: trusted verifier exited $vrc; the unpacked payload is UNTRUSTED: configure ABORTED (fail closed)." >&2
-    rm -f "$vout"
     exit 1
   fi
-  if grep -q '^FAIL:' "$vout" || ! grep -q 'bundle verification PASSED' "$vout"; then
+  if [[ $'\n'"$vout" == *$'\n'FAIL:* ]] || [[ "$vout" != *'bundle verification PASSED'* ]]; then
     echo "FAIL: trusted verifier exited 0 but did not certify the payload (no 'bundle verification PASSED' line, or a FAIL diagnostic): exit code alone is not proof. The payload is UNTRUSTED: configure ABORTED (fail closed)." >&2
-    rm -f "$vout"
     exit 1
   fi
-  rm -f "$vout"
 }
 
 if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
@@ -214,6 +439,19 @@ if compgen -G "$BUNDLE/os-packages/*.deb" >/dev/null; then
   # a missing 'bundle verification PASSED' all abort the configure step — an
   # empty/truncated verifier that exits 0 vacuously proves nothing.
   verify_payload_with_proof
+  # Which payload this is (the verified manifest): the worker names it, and a
+  # worker of another payload still running refuses this configure (exit 1),
+  # one of this payload is left to finish (`dpkg --configure -a` during a long
+  # install). Checked before anything here is changed.
+  PAYLOAD_ID="$(manifest_id "$BUNDLE/manifest.json")"
+  if [ -z "$PAYLOAD_ID" ]; then
+    echo "FAIL: $BUNDLE/manifest.json cannot be read; configure ABORTED (fail closed)." >&2
+    exit 1
+  fi
+  refuse_while_another_install_runs "$PAYLOAD_ID" same-ok
+  # The package version dpkg is configuring now: the worker installs only while
+  # dpkg still records it (empty when dpkg-query cannot tell).
+  EXPECT_VERSION="$(dpkg-query -W -f='${Version}' universal-db-mcp 2>/dev/null || true)"
 
   # Pre-flight everything the worker will need, while a failure can still
   # abort the configure step (fail closed — not discovered in the background).
@@ -260,19 +498,16 @@ DROPIN_EOF
     echo "==> systemctl daemon-reload unavailable (no running systemd?) — skipping"
   echo "==> deferred-install guard installed at $UNIT_DROPIN (service refuses to start until the deferred install records success)"
 
-  # Single flight: never spawn a second worker while one is still running
-  # (e.g. postinst re-run by `dpkg --configure -a` during a long install).
-  if ! (exec 8>/run/udbmcp-deferred-install.lock && flock -n 8); then
-    echo "WARNING: a deferred install from a previous configure is still running;" >&2
-    echo "         not spawning a second worker. Track it: cat $STATUS ; tail -f $LOG" >&2
-    exit 0
-  fi
+  # Single flight: no second worker while one still runs (checked above, before
+  # the guard; refuse_while_another_install_runs).
 
   export UDBMCP_DEB_BUNDLE="$BUNDLE" UDBMCP_DEB_TARGET="$TARGET" \
     UDBMCP_DEB_TRUST_DIR="$TRUST_DIR" UDBMCP_DEB_PUBKEY="$PUBKEY" \
     UDBMCP_DEB_UNIT_SRC="$UNIT_SRC" UDBMCP_DEB_UNIT_DST="$UNIT_DST" \
     UDBMCP_DEB_CONFIG_DIR="$CONFIG_DIR" UDBMCP_DEB_CONFIG="$CONFIG" \
-    UDBMCP_INSTALL_LOG="$LOG" UDBMCP_INSTALL_STATUS="$STATUS"
+    UDBMCP_INSTALL_LOG="$LOG" UDBMCP_INSTALL_STATUS="$STATUS" \
+    UDBMCP_DEB_PAYLOAD_ID="$PAYLOAD_ID" UDBMCP_DEB_EXPECT_VERSION="$EXPECT_VERSION" \
+    UDBMCP_DEB_LOCK="$DEFERRED_LOCK" UDBMCP_DEB_OWNER="$DEFERRED_OWNER"
 
   WORKER_SCRIPT="$(mktemp /var/tmp/udbmcp-postinst-worker.XXXXXX)"
   cat > "$WORKER_SCRIPT" <<'WORKER_EOF'
@@ -306,11 +541,16 @@ CONFIG_DIR="${UDBMCP_DEB_CONFIG_DIR:?}"
 CONFIG="${UDBMCP_DEB_CONFIG:?}"
 LOG="${UDBMCP_INSTALL_LOG:?}"
 STATUS="${UDBMCP_INSTALL_STATUS:?}"
+PAYLOAD_ID="${UDBMCP_DEB_PAYLOAD_ID:?}"
+EXPECT_VERSION="${UDBMCP_DEB_EXPECT_VERSION:-}"
+LOCK="${UDBMCP_DEB_LOCK:?}"
+OWNER="${UDBMCP_DEB_OWNER:?}"
 umask 077
 
 on_exit() {
   rc=$?
   rm -f -- "$0" 2>/dev/null || true
+  if [ "${OWNER_WRITTEN:-}" = 1 ]; then rm -f -- "$OWNER" 2>/dev/null || true; fi
   if [ "$rc" -ne 0 ] && [ "${REPORT_FAILURE:-1}" = "1" ]; then
     echo failed > "$STATUS" 2>/dev/null || true
     echo "==> deferred deb install FAILED (rc=$rc; details above; nothing unverified was executed)"
@@ -322,7 +562,7 @@ exec >>"$LOG" 2>&1
 echo "==> deferred deb install started $(date -u '+%Y-%m-%dT%H:%M:%SZ') (pid $$)"
 
 # --- single flight -----------------------------------------------------------
-exec 9>/run/udbmcp-deferred-install.lock
+exec 9>>"$LOCK"
 if ! flock -n 9; then
   # Another worker owns the install (postinst already warned); do not touch
   # the status file it manages.
@@ -330,7 +570,41 @@ if ! flock -n 9; then
   REPORT_FAILURE=0
   exit 1
 fi
+# Name the payload this worker installs: a later configure of another payload
+# refuses while this one runs, and one of this same payload leaves it be.
+printf '%s %s\n' "$$" "$PAYLOAD_ID" > "$OWNER"
+OWNER_WRITTEN=1
 echo running > "$STATUS"
+
+# $1: a file; prints its sha256 (nothing when it cannot be read)
+manifest_id() {
+  local out
+  out="$(sha256sum -- "$1" 2>/dev/null)" || return 0
+  printf '%s' "${out%% *}"
+}
+# This worker installs only the payload dpkg records. Another dpkg run between
+# the postinst that spawned it and its end (a retried or different package)
+# changes the version dpkg records or the unpacked payload; the worker then
+# stops ('failed', nothing started) rather than publish a release dpkg does
+# not record. $1: when.
+still_what_dpkg_records() {
+  local now
+  if [ -n "$EXPECT_VERSION" ]; then
+    now="$(dpkg-query -W -f='${Version}' universal-db-mcp 2>/dev/null || true)"
+    if [ "$now" != "$EXPECT_VERSION" ]; then
+      echo "FAIL: $1, dpkg records universal-db-mcp ${now:-<nothing>}, but this deferred install is for $EXPECT_VERSION." >&2
+      echo "      Another dpkg run changed the package; this worker stops and starts nothing. Configure the" >&2
+      echo "      package dpkg records: sudo dpkg --configure -a (or install the package again)." >&2
+      return 1
+    fi
+  fi
+  if [ "$(manifest_id "$BUNDLE/manifest.json")" != "$PAYLOAD_ID" ]; then
+    echo "FAIL: $1, the unpacked payload at $BUNDLE is not the one this deferred install was started for." >&2
+    echo "      Another dpkg run replaced it; this worker stops and starts nothing. Configure the package" >&2
+    echo "      dpkg records: sudo dpkg --configure -a (or install the package again)." >&2
+    return 1
+  fi
+}
 
 # --- wait for the outer dpkg to release its locks ----------------------------
 # dpkg uses fcntl record locks (flock(2) would not see them), so probe BOTH
@@ -339,7 +613,7 @@ echo running > "$STATUS"
 # two consecutive free probes 2s apart plus a settle delay before touching
 # the dpkg database; give up (loudly, 'failed') after one hour.
 dpkg_locks_free() {
-  python3 - 2>/dev/null <<'PYEOF'
+  python3 -I -S - 2>/dev/null <<'PYEOF'
 import fcntl, sys
 for path in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
     try:
@@ -376,25 +650,145 @@ while [ "$free_runs" -lt 2 ]; do
 done
 sleep 2
 echo "==> dpkg locks are free (waited ${waited}s)"
+still_what_dpkg_records "before the install"
 
 # --- verify + install the unpacked payload via the ONE installer -------------
+# (UDBMCP_ALLOW_DOWNGRADE, when set for dpkg -i, reaches the installer's
+# rollback check through the inherited environment.)
 echo "==> verifying and installing the bundle payload via $TRUST_DIR/install_offline.sh"
 UDBMCP_RELEASE_PUBKEY="$PUBKEY" \
   bash "$TRUST_DIR/install_offline.sh" "$BUNDLE" "$TARGET"
+still_what_dpkg_records "after the install"
+# What the installer published is the payload this worker was started for
+# (its private copy was taken from $BUNDLE after the check above).
+if [ "$(manifest_id "$TARGET/manifest.json")" != "$PAYLOAD_ID" ]; then
+  echo "FAIL: $TARGET/manifest.json is not the manifest of the payload this deferred install was started for;" >&2
+  echo "      the payload changed during the install. Nothing is started. Configure the package dpkg" >&2
+  echo "      records: sudo dpkg --configure -a (or install the package again)." >&2
+  exit 1
+fi
 
 # --- systemd unit, config, enable: kept in lockstep with the postinst tail ---
 # /etc/systemd/system is an admin-controlled path (not dpkg-managed): install
 # the deb-shipped canonical unit only if absent or already identical, and
 # NEVER clobber an admin-modified unit on upgrade — point at the canonical
 # copy instead.
-SHIPPED_UNIT_RECORD=/var/lib/universal-db-mcp/.shipped-unit.sha256
+# >>> shipped-unit hash record: identical in the postinst and its deferred worker
+# The hash of the unit this package last deployed, which tells that unit from
+# an admin's edit on the next upgrade. It lives where root alone can write:
+# releases before this one kept it in /var/lib/universal-db-mcp, which the
+# service account owns, so that account decided what root's write of the name
+# opened and what the record said. Read and written by name in its directory
+# without following a link; the old record counts only when it is a regular
+# file root owns with one link, and the first read takes it over: its hash is
+# recorded here and the old name removed, whether or not a unit is deployed.
+SHIPPED_UNIT_RECORD=/var/lib/universal-db-mcp-package/shipped-unit.sha256
+shipped_unit_record() {
+  # read: print the recorded hash, nothing when none can be trusted; write <sha256>: record it
+  python3 -I -S - "$@" "$SHIPPED_UNIT_RECORD" /var/lib/universal-db-mcp/.shipped-unit.sha256 <<'PYEOF'
+import os
+import re
+import stat
+import sys
+
+ROOT_UID = 0
+command, record, old = sys.argv[1], sys.argv[-2], sys.argv[-1]
+directory, name = os.path.split(record)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def recorded(path, own_directory):
+    """The hash in *path*: a regular file root owns with one link. *own_directory*: its directory
+    must be root's alone too (the old record's is the service account's)."""
+    try:
+        dir_fd = os.open(os.path.dirname(path), DIR_FLAGS)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(dir_fd)
+        if own_directory and (st.st_uid != ROOT_UID or st.st_mode & 0o022):
+            return None
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return None
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != ROOT_UID:
+            return None
+        match = re.fullmatch(rb"([0-9a-f]{64})\n?", os.read(fd, 66))
+    finally:
+        os.close(fd)
+    return match.group(1).decode() if match else None
+
+
+class NotRootsAlone(Exception):
+    pass
+
+
+def write(digest):
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    dir_fd = os.open(directory, DIR_FLAGS)
+    try:
+        st = os.fstat(dir_fd)
+        if st.st_uid != ROOT_UID or st.st_mode & 0o022:
+            raise NotRootsAlone(f"{directory} is not root's alone; the unit hash was not recorded")
+        new = f".{name}.{os.getpid()}"
+        try:
+            os.unlink(new, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
+        try:
+            os.write(fd, f"{digest}\n".encode())
+        finally:
+            os.close(fd)
+        os.replace(new, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)  # replaces a link, never writes through it
+    finally:
+        os.close(dir_fd)
+    try:  # the old record is taken over: unlink removes the name, never what a link leads to
+        dir_fd = os.open(os.path.dirname(old), DIR_FLAGS)
+        try:
+            os.unlink(os.path.basename(old), dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+if command == "read":
+    digest = recorded(record, True)
+    if digest is None:
+        digest = recorded(old, False)
+        if digest:  # taken over now, whether or not this run deploys a unit and writes
+            try:
+                write(digest)
+            except (OSError, NotRootsAlone):
+                pass
+    if digest:
+        print(digest)
+    sys.exit(0)
+digest = sys.argv[2]
+if command != "write" or not re.fullmatch(r"[0-9a-f]{64}", digest):
+    sys.exit(f"shipped_unit_record: usage: read | write <sha256> (got {sys.argv[1:-2]})")
+try:
+    write(digest)
+except NotRootsAlone as exc:
+    sys.exit(str(exc))
+PYEOF
+}
+# <<< shipped-unit hash record
+SHIPPED_HASH="$(shipped_unit_record read)" || SHIPPED_HASH=""
 if [ ! -e "$UNIT_DST" ]; then
   echo "==> installing systemd unit to $UNIT_DST"
   install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 elif cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   echo "==> $UNIT_DST already matches the deb-shipped unit (no change)"
-elif [ -f "$SHIPPED_UNIT_RECORD" ] \
-     && [ "$(sha256sum "$UNIT_DST" | awk '{print $1}')" = "$(awk '{print $1}' "$SHIPPED_UNIT_RECORD")" ]; then
+elif [ -n "$SHIPPED_HASH" ] && [ "$(sha256sum "$UNIT_DST" | awk '{print $1}')" = "$SHIPPED_HASH" ]; then
   # The deployed unit is byte-identical to what a PREVIOUS release of this
   # package shipped (the record is written on every successful deploy below),
   # so it is ours, not an admin modification: deploy the updated unit.
@@ -421,9 +815,9 @@ fi
 # tell our own previous copy from an admin modification. Written only when the
 # deployed unit is exactly what this release ships; an admin-modified unit
 # leaves the record pointing at the last unit WE deployed.
-mkdir -p /var/lib/universal-db-mcp
 if cmp -s "$UNIT_SRC" "$UNIT_DST"; then
-  sha256sum "$UNIT_DST" | awk '{print $1}' > "$SHIPPED_UNIT_RECORD"
+  shipped_unit_record write "$(sha256sum "$UNIT_DST" | awk '{print $1}')" \
+    || echo "WARNING: could not record the deployed unit's hash; the next upgrade treats this unit as an admin's edit and keeps it" >&2
 fi
 
 systemctl daemon-reload 2>/dev/null || \
@@ -459,7 +853,7 @@ else
     echo "FAIL: could not create the HTTP bearer token file at $TOKEN_FILE" >&2
     exit 1
   }
-  python3 -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" || {
+  python3 -I -S -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" || {
     echo "FAIL: could not generate the HTTP bearer token (python secrets)" >&2
     exit 1
   }
@@ -546,6 +940,9 @@ echo "==> verifying and installing the bundle payload via $TRUST_DIR/install_off
 # copy, as before. An empty/truncated/no-op verifier that exits 0 vacuously
 # can no longer get unverified payload installed and the service enabled.
 verify_payload_with_proof
+# A deferred install still running (of any payload: this one never spawns
+# one) would publish its release over this install: refused (exit 1).
+refuse_while_another_install_runs "$(manifest_id "$BUNDLE/manifest.json")"
 # Explicit `bash`: the deb-shipped copy is installed 644 in the bundle layout
 # and the trust-dir copy carries the exec bit; invoking via bash makes the
 # call independent of how the bootstrap above (or the admin) installed it.
@@ -566,14 +963,122 @@ if [ ! -f "$UNIT_SRC" ]; then
   echo "FAIL: systemd unit not found (deb payload and bundle both lack it)." >&2
   exit 1
 fi
-SHIPPED_UNIT_RECORD=/var/lib/universal-db-mcp/.shipped-unit.sha256
+# >>> shipped-unit hash record: identical in the postinst and its deferred worker
+# The hash of the unit this package last deployed, which tells that unit from
+# an admin's edit on the next upgrade. It lives where root alone can write:
+# releases before this one kept it in /var/lib/universal-db-mcp, which the
+# service account owns, so that account decided what root's write of the name
+# opened and what the record said. Read and written by name in its directory
+# without following a link; the old record counts only when it is a regular
+# file root owns with one link, and the first read takes it over: its hash is
+# recorded here and the old name removed, whether or not a unit is deployed.
+SHIPPED_UNIT_RECORD=/var/lib/universal-db-mcp-package/shipped-unit.sha256
+shipped_unit_record() {
+  # read: print the recorded hash, nothing when none can be trusted; write <sha256>: record it
+  python3 -I -S - "$@" "$SHIPPED_UNIT_RECORD" /var/lib/universal-db-mcp/.shipped-unit.sha256 <<'PYEOF'
+import os
+import re
+import stat
+import sys
+
+ROOT_UID = 0
+command, record, old = sys.argv[1], sys.argv[-2], sys.argv[-1]
+directory, name = os.path.split(record)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def recorded(path, own_directory):
+    """The hash in *path*: a regular file root owns with one link. *own_directory*: its directory
+    must be root's alone too (the old record's is the service account's)."""
+    try:
+        dir_fd = os.open(os.path.dirname(path), DIR_FLAGS)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(dir_fd)
+        if own_directory and (st.st_uid != ROOT_UID or st.st_mode & 0o022):
+            return None
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return None
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != ROOT_UID:
+            return None
+        match = re.fullmatch(rb"([0-9a-f]{64})\n?", os.read(fd, 66))
+    finally:
+        os.close(fd)
+    return match.group(1).decode() if match else None
+
+
+class NotRootsAlone(Exception):
+    pass
+
+
+def write(digest):
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    dir_fd = os.open(directory, DIR_FLAGS)
+    try:
+        st = os.fstat(dir_fd)
+        if st.st_uid != ROOT_UID or st.st_mode & 0o022:
+            raise NotRootsAlone(f"{directory} is not root's alone; the unit hash was not recorded")
+        new = f".{name}.{os.getpid()}"
+        try:
+            os.unlink(new, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
+        try:
+            os.write(fd, f"{digest}\n".encode())
+        finally:
+            os.close(fd)
+        os.replace(new, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)  # replaces a link, never writes through it
+    finally:
+        os.close(dir_fd)
+    try:  # the old record is taken over: unlink removes the name, never what a link leads to
+        dir_fd = os.open(os.path.dirname(old), DIR_FLAGS)
+        try:
+            os.unlink(os.path.basename(old), dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+if command == "read":
+    digest = recorded(record, True)
+    if digest is None:
+        digest = recorded(old, False)
+        if digest:  # taken over now, whether or not this run deploys a unit and writes
+            try:
+                write(digest)
+            except (OSError, NotRootsAlone):
+                pass
+    if digest:
+        print(digest)
+    sys.exit(0)
+digest = sys.argv[2]
+if command != "write" or not re.fullmatch(r"[0-9a-f]{64}", digest):
+    sys.exit(f"shipped_unit_record: usage: read | write <sha256> (got {sys.argv[1:-2]})")
+try:
+    write(digest)
+except NotRootsAlone as exc:
+    sys.exit(str(exc))
+PYEOF
+}
+# <<< shipped-unit hash record
+SHIPPED_HASH="$(shipped_unit_record read)" || SHIPPED_HASH=""
 if [ ! -e "$UNIT_DST" ]; then
   echo "==> installing systemd unit to $UNIT_DST"
   install -m 644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
 elif cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   echo "==> $UNIT_DST already matches the deb-shipped unit (no change)"
-elif [ -f "$SHIPPED_UNIT_RECORD" ] \
-     && [ "$(sha256sum "$UNIT_DST" | awk '{print $1}')" = "$(awk '{print $1}' "$SHIPPED_UNIT_RECORD")" ]; then
+elif [ -n "$SHIPPED_HASH" ] && [ "$(sha256sum "$UNIT_DST" | awk '{print $1}')" = "$SHIPPED_HASH" ]; then
   # The deployed unit is byte-identical to what a PREVIOUS release of this
   # package shipped (the record is written on every successful deploy below),
   # so it is ours, not an admin modification: deploy the updated unit.
@@ -600,9 +1105,9 @@ fi
 # tell our own previous copy from an admin modification. Written only when the
 # deployed unit is exactly what this release ships; an admin-modified unit
 # leaves the record pointing at the last unit WE deployed.
-mkdir -p /var/lib/universal-db-mcp
 if cmp -s "$UNIT_SRC" "$UNIT_DST"; then
-  sha256sum "$UNIT_DST" | awk '{print $1}' > "$SHIPPED_UNIT_RECORD"
+  shipped_unit_record write "$(sha256sum "$UNIT_DST" | awk '{print $1}')" \
+    || echo "WARNING: could not record the deployed unit's hash; the next upgrade treats this unit as an admin's edit and keeps it" >&2
 fi
 
 # --- step 6 (before enable --now): install config ONLY if absent ------------
@@ -647,7 +1152,7 @@ else
     echo "FAIL: could not create the HTTP bearer token file at $TOKEN_FILE" >&2
     exit 1
   }
-  python3 -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" || {
+  python3 -I -S -c 'import secrets; print(secrets.token_hex(32))' >> "$TOKEN_FILE" || {
     echo "FAIL: could not generate the HTTP bearer token (python secrets)" >&2
     exit 1
   }

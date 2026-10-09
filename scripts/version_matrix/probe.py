@@ -68,14 +68,17 @@ SEEDS: dict[str, list[str]] = {
         "INSERT INTO vm.orders SELECT number + 1, (number % 300) + 1, (number + 1) * 2.25 FROM numbers(600)",
     ],
     "oracle": [
-        "CREATE TABLE vm_customers (id NUMBER(10) PRIMARY KEY, email VARCHAR2(200), region VARCHAR2(50), note CLOB, created TIMESTAMP, balance NUMBER(12,2))",
-        "CREATE TABLE vm_orders (id NUMBER(10) PRIMARY KEY, customer_id NUMBER(10) REFERENCES vm_customers(id), total NUMBER(12,2))",
-        "CREATE INDEX ix_orders_customer ON vm_orders(customer_id)",
-        "CREATE UNIQUE INDEX ux_customers_region_email ON vm_customers(region, email)",
-        "CREATE VIEW vm_v_orders AS SELECT o.id, c.email, o.total FROM vm_orders o JOIN vm_customers c ON c.id = o.customer_id",
-        "CREATE FUNCTION vm_f_one RETURN NUMBER IS BEGIN RETURN 1; END;",
-        "INSERT INTO vm_customers SELECT level, 'user' || level || '@example.com', CASE WHEN MOD(level,3)=0 THEN 'north' WHEN MOD(level,3)=1 THEN 'south' ELSE NULL END, RPAD('x', MOD(level,40)+1, 'x'), SYSTIMESTAMP, level * 1.5 FROM dual CONNECT BY level <= 300",
-        "INSERT INTO vm_orders SELECT level, MOD(level,300)+1, level * 2.25 FROM dual CONNECT BY level <= 600",
+        # an ordinary schema: SYSTEM is Oracle-maintained, which the connector
+        # leaves out of its listings by design (the login stays SYSTEM)
+        "CREATE USER vm IDENTIFIED BY \"VmSeed_1x\" DEFAULT TABLESPACE users QUOTA UNLIMITED ON users",
+        "CREATE TABLE vm.vm_customers (id NUMBER(10) PRIMARY KEY, email VARCHAR2(200), region VARCHAR2(50), note CLOB, created TIMESTAMP, balance NUMBER(12,2))",
+        "CREATE TABLE vm.vm_orders (id NUMBER(10) PRIMARY KEY, customer_id NUMBER(10) REFERENCES vm.vm_customers(id), total NUMBER(12,2))",
+        "CREATE INDEX vm.ix_orders_customer ON vm.vm_orders(customer_id)",
+        "CREATE UNIQUE INDEX vm.ux_customers_region_email ON vm.vm_customers(region, email)",
+        "CREATE VIEW vm.vm_v_orders AS SELECT o.id, c.email, o.total FROM vm.vm_orders o JOIN vm.vm_customers c ON c.id = o.customer_id",
+        "CREATE FUNCTION vm.vm_f_one RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "INSERT INTO vm.vm_customers SELECT level, 'user' || level || '@example.com', CASE WHEN MOD(level,3)=0 THEN 'north' WHEN MOD(level,3)=1 THEN 'south' ELSE NULL END, RPAD('x', MOD(level,40)+1, 'x'), SYSTIMESTAMP, level * 1.5 FROM dual CONNECT BY level <= 300",
+        "INSERT INTO vm.vm_orders SELECT level, MOD(level,300)+1, level * 2.25 FROM dual CONNECT BY level <= 600",
         "COMMIT",
     ],
     "mssql": [
@@ -283,7 +286,7 @@ def main() -> int:  # noqa: PLR0915 - a linear probe
     resolved = ResolvedConnection("vm", cfg)
     policy = EffectivePolicy.build(SecurityConfig(require_remote_tls=False, default_deny_objects=False), resolved)
     conn = registry.build_connector(resolved, policy)
-    schema = args.schema or {"postgres": "vm", "mysql": "vm", "clickhouse": "vm", "oracle": args.user.upper(),
+    schema = args.schema or {"postgres": "vm", "mysql": "vm", "clickhouse": "vm", "oracle": "VM",
                              "mssql": "dbo", "db2": "VM"}[engine]
     t_customers = {"oracle": "VM_CUSTOMERS", "db2": "CUSTOMERS"}.get(engine, "customers")
     t_orders = {"oracle": "VM_ORDERS", "db2": "ORDERS"}.get(engine, "orders")

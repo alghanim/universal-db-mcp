@@ -97,7 +97,9 @@ def test_validate_explain_keeps_the_statement_text_as_written() -> None:
     assert r.kind == "explain" and r.text == "SELECT * FROM APP.CUSTOMERS OPTIMIZE FOR 10 ROWS WITH UR"
     r = _guard("sqlite").validate_explain("EXPLAIN QUERY PLAN SELECT 1 -- note")
     assert r.text == "SELECT 1 -- note"
-    r = _guard("postgres").validate_explain("EXPLAIN (FORMAT JSON) SELECT a FROM app.t")
+    # (EXPLAIN options are no longer dropped from the text: the guard's F89
+    # re-renders the accepted ones and refuses FORMAT JSON on PostgreSQL)
+    r = _guard("postgres").validate_explain("EXPLAIN SELECT a FROM app.t")
     assert r.text == "SELECT a FROM app.t"
 
 
@@ -299,9 +301,9 @@ MARKERLESS_INSTALLER = "\n".join(
 
 
 def test_the_real_installer_carries_the_current_format_marker() -> None:
-    assert "# udbmcp-installer-format: 3\n" in REAL_INSTALLER
-    assert "INSTALLER_FORMAT=3" in (ROOT / "packaging/deb/preinst").read_text(encoding="utf-8")
-    assert "INSTALLER_FORMAT=3" in (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
+    assert "# udbmcp-installer-format: 4\n" in REAL_INSTALLER
+    assert "INSTALLER_FORMAT=4" in (ROOT / "packaging/deb/preinst").read_text(encoding="utf-8")
+    assert "INSTALLER_FORMAT=4" in (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
 
 
 @_POSIX
@@ -316,7 +318,7 @@ def test_preinst_and_postinst_refuse_a_pip_running_installer_without_the_marker(
     installer.write_text(MARKERLESS_INSTALLER, encoding="utf-8")
     proc = _run(script)
     assert proc.returncode == 1
-    assert "OUTDATED copy" in proc.stderr and "udbmcp-installer-format: 3" in proc.stderr and "ABORTED" in proc.stderr
+    assert "OUTDATED copy" in proc.stderr and "udbmcp-installer-format: 4" in proc.stderr and "ABORTED" in proc.stderr
     installer.write_text(REAL_INSTALLER, encoding="utf-8")
     assert _run(script).returncode == 0
 
@@ -328,7 +330,7 @@ def test_preinst_and_postinst_refuse_a_pip_running_installer_without_the_marker(
     post = _postinst_step1_bootstrap_script(tmp_path, strip_root_owner=True)
     (trust / "install_offline.sh").write_text(MARKERLESS_INSTALLER, encoding="utf-8")
     proc = _run(post)
-    assert proc.returncode != 0 and "udbmcp-installer-format: 3" in proc.stderr
+    assert proc.returncode != 0 and "udbmcp-installer-format: 4" in proc.stderr
     (trust / "install_offline.sh").write_text(REAL_INSTALLER, encoding="utf-8")
     assert _run(post).returncode == 0
 

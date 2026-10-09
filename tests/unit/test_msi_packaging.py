@@ -90,6 +90,17 @@ DEFERRED_INSTALL_ACTIONS = (
 # undoes a half-registered service when any install action fails.
 DEFERRED_UNINSTALL_ACTION = ("RemoveServiceCA", "uninstall.ps1")
 ROLLBACK_ACTION = ("RollbackRemoveServiceCA", "uninstall.ps1")
+# The commit action that removes the rollback copy of the installed-release
+# record once the install has succeeded.
+COMMIT_ACTION = ("CommitReleaseRecordCA", "uninstall.ps1")
+# The venv's rollback twin (puts back the venv BuildVenvCA moved aside) and
+# commit action (removes it once the install has succeeded).
+VENV_ROLLBACK_ACTION = ("RollbackBuildVenvCA", "venv.ps1")
+VENV_COMMIT_ACTION = ("CommitBuildVenvCA", "venv.ps1")
+# The folder check before CreateFolders: its script (folders.ps1) is not an
+# installed file (nothing is installed yet), but the embedded property
+# UdbmcpFolderCheck, run as a script block.
+FOLDER_CHECK_ACTION = "CheckFoldersCA"
 
 BUILD_MSI_SH = REPO_ROOT / "scripts" / "package" / "build_msi.sh"
 
@@ -325,13 +336,13 @@ def _build_msi_code() -> str:
 
 
 def _deferred_actions(root: ET.Element) -> dict[str, ET.Element]:
-    """CustomAction elements that actually execute at install time (deferred
-    or rollback). An immediate type-51 property assignment has no Execute
-    attribute and is excluded."""
+    """CustomAction elements that actually execute at install time (deferred,
+    rollback or commit). An immediate type-51 property assignment has no
+    Execute attribute and is excluded."""
     return {
         ca.get("Id"): ca
         for ca in _iter_local(root, "CustomAction")
-        if ca.get("Execute") in ("deferred", "rollback")
+        if ca.get("Execute") in ("deferred", "rollback", "commit")
     }
 
 
@@ -358,6 +369,15 @@ def test_wxs_wires_the_deferred_custom_actions_as_authored_xml() -> None:
     expected = dict(DEFERRED_INSTALL_ACTIONS)
     expected[DEFERRED_UNINSTALL_ACTION[0]] = DEFERRED_UNINSTALL_ACTION[1]
     expected[ROLLBACK_ACTION[0]] = ROLLBACK_ACTION[1]
+    expected[COMMIT_ACTION[0]] = COMMIT_ACTION[1]
+    expected[VENV_ROLLBACK_ACTION[0]] = VENV_ROLLBACK_ACTION[1]
+    expected[VENV_COMMIT_ACTION[0]] = VENV_COMMIT_ACTION[1]
+    check = deferred.pop(FOLDER_CHECK_ACTION, None)
+    assert check is not None, f"{FOLDER_CHECK_ACTION} must be authored (it runs before CreateFolders)"
+    assert (check.get("Execute"), check.get("Impersonate"), check.get("Return"), check.get("Property")) == (
+        "deferred", "no", "check", "POWERSHELLEXE"
+    )
+    assert "-File" not in (check.get("ExeCommand") or "") and "[UdbmcpFolderCheck]" in (check.get("ExeCommand") or "")
     assert set(deferred) == set(expected), (
         f"the deferred/rollback custom action set changed: got {sorted(deferred)}, expected {sorted(expected)} — "
         "review the change and update this gate; an unreviewed action must not ship silently"
@@ -367,7 +387,11 @@ def test_wxs_wires_the_deferred_custom_actions_as_authored_xml() -> None:
         assert ca.get("Impersonate") == "no", (
             f"{action_id} must run impersonate=no (LocalSystem), got {ca.get('Impersonate')!r}"
         )
-        assert ca.get("Return") == "check", f"{action_id} must use Return=check so a nonzero exit fails the install"
+        if action_id in (COMMIT_ACTION[0], VENV_COMMIT_ACTION[0]):
+            # it runs once the install has committed: nothing is left to roll back
+            assert ca.get("Return") == "ignore", f"{action_id} must use Return=ignore"
+        else:
+            assert ca.get("Return") == "check", f"{action_id} must use Return=check so a nonzero exit fails the install"
         exe = ca.get("ExeCommand") or ""
         assert re.search(rf'-File\s+"\[INSTALLFOLDER\]scripts\\{re.escape(script)}"', exe), (
             f"{action_id} must run packaging/msi/custom/{script} from the installed ScriptsDir, got: {exe!r}"
@@ -380,6 +404,15 @@ def test_wxs_wires_the_deferred_custom_actions_as_authored_xml() -> None:
         assert deferred[action_id].get("Execute") == "deferred", f"{action_id} must be a deferred action"
     assert deferred[ROLLBACK_ACTION[0]].get("Execute") == "rollback", (
         "RollbackRemoveServiceCA must be a rollback action (it undoes a half-registered service)"
+    )
+    assert deferred[COMMIT_ACTION[0]].get("Execute") == "commit", (
+        "CommitReleaseRecordCA must be a commit action (it runs only once the install succeeded)"
+    )
+    assert deferred[VENV_ROLLBACK_ACTION[0]].get("Execute") == "rollback", (
+        "RollbackBuildVenvCA must be a rollback action (it puts the previous venv back)"
+    )
+    assert deferred[VENV_COMMIT_ACTION[0]].get("Execute") == "commit", (
+        "CommitBuildVenvCA must be a commit action (it removes the previous venv only once the install succeeded)"
     )
 
 
@@ -614,7 +647,7 @@ def _verify_lines() -> list[str]:
 def test_verify_runs_trusted_verifier_from_outside_the_bundle_with_pubkey() -> None:
     """Trust invariant 1: the action runs the ADMIN-installed trusted
     verify_bundle.py (resolved from a trust directory OUTSIDE the bundle, e.g.
-    C:\\ProgramData\\udbmcp-trust) with the admin-distributed --pubkey. The
+    C:\\Program Files\\udbmcp-trust) with the admin-distributed --pubkey. The
     verifier is NEVER taken from the payload it would verify."""
     code = _verify_code()
     assert "verify_bundle.py" in code, "verify.ps1 must run the trusted verify_bundle.py"
@@ -633,8 +666,9 @@ def test_verify_first_process_invocation_is_the_trusted_verifier() -> None:
     and proves it is 3.12 before executing the trusted verifier with it. The
     probe is an inline -c version check on that admin-owned interpreter whose
     exit code is the ONLY decision input -- no bundle-derived path or content
-    is involved. The first invocation touching bundle/trust material must
-    still be the verifier run itself."""
+    is involved (run isolated, -I, like every LocalSystem python run). The
+    first invocation touching bundle/trust material must still be the
+    verifier run itself."""
     invocations = _invocation_lines(_verify_lines())
     assert invocations, "verify.ps1 must invoke the trusted verifier"
     first = invocations[0]
@@ -644,7 +678,7 @@ def test_verify_first_process_invocation_is_the_trusted_verifier() -> None:
         f"verifier invocation lacks its arguments: {verifier_run[0]}")
     if "$Verifier" not in first:
         assert re.search(
-            r"&\s*\$pyExe\s+-c\s+'import sys; sys\.exit\(0 if sys\.version_info\[:2\] == \(3, 12\) else 1\)'",
+            r"&\s*\$pyExe\s+-I\s+-c\s+'import sys; sys\.exit\(0 if sys\.version_info\[:2\] == \(3, 12\) else 1\)'",
             first,
         ), (f"the only invocation allowed before the trusted verifier is the "
             f"HKLM-pinned interpreter's cp312 version probe, got: {first}")

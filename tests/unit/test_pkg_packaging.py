@@ -472,20 +472,85 @@ def test_preinstall_checks_both_trust_prerequisites_and_fails_closed() -> None:
     )
 
 
+# The one read under the prefix preinstall may make: the INSTALLED release's
+# manifest.json, parsed as JSON by the interpreter it proved root's, isolated.
+_INSTALLED_MANIFEST_READ = re.compile(r"\"\$PY\" -I -S -c '(import json, sys\n[^']*)' \"\$INSTALLED_MANIFEST\"")
+
+
+def _preinstall_payload_uses(raw: str) -> list[str]:
+    """Everything in the preinstall text that installs, runs or reaches the payload.
+
+    The anti-rollback check reads the installed release's manifest.json before the
+    payload lands; that one read is allowed, and nothing else under the prefix."""
+    lines = _logical_lines(raw)
+    joined = "\n".join(_resolve_shell_vars(lines))
+    uses = [f"runs {tool}" for tool in ("pip", "launchctl") if re.search(rf"\b{tool}\b", joined)]
+    for match in re.finditer(re.escape(PAYLOAD_PREFIX) + r"([^\s\"';|&)]*)", joined):
+        if match.group(1) not in ("", "/manifest.json"):  # the prefix's definition, the installed manifest
+            uses.append(f"reaches {match.group(0)}")
+    uses += [
+        f"names the prefix: {ln.strip()}"
+        for ln in lines
+        if re.search(r"\$\{?PREFIX\b", ln) and ln.strip() != 'INSTALLED_MANIFEST="$PREFIX/manifest.json"'
+    ]
+    reads = _INSTALLED_MANIFEST_READ.findall(raw)
+    if len(reads) > 1 or any(re.search(r"\bimport\b(?! json, sys\n)|\b(exec|eval|subprocess|os)\b", r) for r in reads):
+        uses.append(f'the installed manifest is not read once, as JSON, by "$PY" -I -S: {reads}')
+    rest = _logical_lines(_INSTALLED_MANIFEST_READ.sub("<read>", raw))
+    uses += [
+        f"uses the installed manifest: {ln.strip()}"
+        for ln in rest
+        if "$INSTALLED_MANIFEST" in ln
+        and not ln.lstrip().startswith("echo ")
+        and '[ -f "$INSTALLED_MANIFEST" ]' not in ln
+    ]
+    return uses
+
+
 @_WIN32_ONLY
 def test_preinstall_never_touches_or_executes_payload() -> None:
     """A pkg preinstall runs BEFORE the payload is unpacked: it must not
     reference, install, or execute anything from the bundle payload (no pip,
     no launchctl, no payload path). Word-boundary matched, so 'pipefail'
-    cannot false-positive."""
-    joined = "\n".join(_resolve_shell_vars(_logical_lines(_require(PREINSTALL).read_text(encoding="utf-8"))))
-    assert re.search(r"\bpip\b", joined) is None, "preinstall must not run pip"
-    assert re.search(r"\blaunchctl\b", joined) is None, "preinstall must not touch launchd"
-    assert PAYLOAD_PREFIX not in joined, "preinstall cannot see the payload (it is unpacked after preinstall)"
+    cannot false-positive. Its one look under the prefix is the INSTALLED
+    release's manifest.json (anti-rollback before the payload lands), read
+    as JSON by the root-validated interpreter."""
+    assert _preinstall_payload_uses(_require(PREINSTALL).read_text(encoding="utf-8")) == []
 
 
 @_WIN32_ONLY
-def test_preinstall_functionally_fails_closed_without_trust_bootstrap() -> None:
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("\nexit 0\n", '\n"$PREFIX/venv/bin/python" -I -m universal_db_mcp version\nexit 0\n'),
+        ("\nexit 0\n", '\ncp "/usr/local/universal-db-mcp/bundle/manifest.json" /tmp/m\nexit 0\n'),
+        ("\nexit 0\n", '\nBUNDLE="$PREFIX/bundle"\nexit 0\n'),
+        ("\nexit 0\n", '\nsource "$INSTALLED_MANIFEST"\nexit 0\n'),
+        ("\nexit 0\n", "\npython3 -c 'import json, sys' \"$INSTALLED_MANIFEST\"\nexit 0\n"),
+        ("\nexit 0\n", "\npip install x\nexit 0\n"),
+        ('"$PY" -I -S -c \'import json, sys', '"$PY" -c \'import json, sys'),
+        ("import json, sys\n", "import json, sys\nimport subprocess\n"),
+    ],
+    ids=[
+        "venv",
+        "bundle-path",
+        "prefix-var",
+        "sourced-manifest",
+        "other-python",
+        "pip",
+        "read-not-isolated",
+        "read-imports-more",
+    ],
+)
+def test_the_preinstall_payload_gate_still_sees_every_other_use(old: str, new: str) -> None:
+    """Allowing the manifest read must not open the gate: every other payload use is still caught."""
+    raw = _require(PREINSTALL).read_text(encoding="utf-8")
+    assert raw.count(old) == 1, old
+    assert _preinstall_payload_uses(raw.replace(old, new)) != []
+
+
+@_WIN32_ONLY
+def test_preinstall_functionally_fails_closed_without_trust_bootstrap(tmp_path: Path) -> None:
     """FUNCTIONAL (extract-and-run): on a host without the trust bootstrap,
     preinstall must exit nonzero with the canonical 'FAIL' diagnostic and the
     out-of-band bootstrap instructions.
@@ -496,6 +561,11 @@ def test_preinstall_functionally_fails_closed_without_trust_bootstrap() -> None:
     faking a path. The missing-pubkey and empty-key branches are covered by
     the content gates above; they cannot be reached functionally here without
     first installing a trusted verifier at the hardcoded root path.
+
+    The trust paths stay the real ones; only the config directory moves into
+    tmp_path. A failed preinstall removes the one-shot downgrade flag there on
+    its way out, and run by root against the real path it would remove the
+    host's /etc/universal-db-mcp/allow-downgrade.
     """
     script = _require(PREINSTALL)
     if os.path.exists(TRUST_VERIFIER_PATH):
@@ -504,9 +574,16 @@ def test_preinstall_functionally_fails_closed_without_trust_bootstrap() -> None:
             f"{TRUST_VERIFIER_PATH}; the absent-prerequisite path cannot be "
             "simulated (preinstall hardcodes its paths)"
         )
+    real_config_dir = 'CONFIG_DIR="/etc/universal-db-mcp"\n'
+    text = script.read_text(encoding="utf-8")
+    assert text.count(real_config_dir) == 1 and text.count("/etc/universal-db-mcp/allow-downgrade") == 0
+    sandboxed = tmp_path / "preinstall"
+    sandboxed.write_text(text.replace(real_config_dir, f'CONFIG_DIR="{tmp_path}"\n'), encoding="utf-8")
+    flag = tmp_path / "allow-downgrade"
+    flag.write_text("0\n", encoding="utf-8")
 
-    proc = subprocess.run(  # noqa: S603 - fixed args, read-only checks only
-        ["/bin/bash", str(script)], capture_output=True, text=True, timeout=120
+    proc = subprocess.run(  # noqa: S603 - a copy of the repo script; it writes only below tmp_path
+        ["/bin/bash", str(sandboxed)], capture_output=True, text=True, timeout=120
     )
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"preinstall must fail closed when the trust bootstrap is absent:\n{out}"
@@ -514,6 +591,7 @@ def test_preinstall_functionally_fails_closed_without_trust_bootstrap() -> None:
     assert "sudo install" in out, f"refusal must carry the trust-bootstrap instructions:\n{out}"
     # and it must have failed on the FIRST (verifier) prerequisite
     assert TRUST_VERIFIER_PATH in out
+    assert not flag.exists(), "the failed attempt uses up the flag in the directory the copy names"
 
 
 # --------------------------------------------------------------------------

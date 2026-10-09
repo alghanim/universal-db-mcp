@@ -16,7 +16,9 @@ class FakePolicy:
 
     connection_id: str = "c1"
     engine: str = "sqlite"
-    allowed_schemas: frozenset = frozenset({"reporting"})
+    # 'main' is where make_guard's resolver puts the objects: the guard
+    # re-authorizes the schema an unqualified name binds to
+    allowed_schemas: frozenset = frozenset({"reporting", "main"})
     default_deny_objects: bool = True
     allowed_system_schemas: frozenset = frozenset({"information_schema"})
     allow_explain_analyze: bool = False
@@ -24,8 +26,8 @@ class FakePolicy:
 
     def check_object(self, schema, name):  # noqa: ANN001
         self.calls.append((schema, name))
-        if schema is None:
-            return
+        if schema is None or not self.allowed_schemas:
+            return  # an empty allowlist leaves user schemas unrestricted, as in EffectivePolicy
         if schema.lower() not in {s.lower() for s in self.allowed_schemas}:
             raise ToolFailure("AUTHORIZATION_DENIED", f"schema '{schema}' is not permitted")
 
@@ -137,7 +139,10 @@ def test_explain_hidden_dml_denied() -> None:
 def test_show_allowlist_mysql() -> None:
     guard = make_guard("mysql", objects=("t1",))
     assert guard.validate_show("SHOW TABLES").kind == "show"
-    assert guard.validate_show("DESCRIBE t1").kind == "show"
+    assert guard.validate_show("DESCRIBE main.t1").kind == "show"
+    with pytest.raises(ToolFailure):
+        # under an allowlist the object is named with its schema, as in a query
+        guard.validate_show("DESCRIBE t1")
     with pytest.raises(ToolFailure):
         guard.validate_show("SHOW GRANTS FOR 'x'@'%'")
     with pytest.raises(ToolFailure):

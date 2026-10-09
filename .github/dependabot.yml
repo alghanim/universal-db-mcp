@@ -1,0 +1,29 @@
+# Weekly update proposals. Each one arrives as a pull request and so runs CI
+# (tests, lint, types and the dependency audit) before anyone merges it.
+version: 2
+updates:
+  # pyproject.toml and uv.lock, which CI installs from.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # The reviewed pins the offline bundle ships (requirements/*.in). CI's lock
+  # check stays red on such a bump until someone runs
+  # 'scripts/prepare_offline_bundle.py --refresh-locks' and commits the locks.
+  - package-ecosystem: "pip"
+    directory: "/requirements"
+    schedule:
+      interval: "weekly"
+
+  # The hashed pip CI installs into its venv (.github/ci-pip-requirements.txt).
+  - package-ecosystem: "pip"
+    directory: "/.github"
+    schedule:
+      interval: "weekly"
+
+  # The commit-SHA pins in .github/workflows, with their version comments.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

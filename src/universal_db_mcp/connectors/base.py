@@ -7,12 +7,14 @@ executor (worker threads + deadlines), never on the MCP event loop.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from universal_db_mcp.config import ResolvedConnection
 from universal_db_mcp.models.capabilities import CapabilityMatrix
@@ -22,7 +24,17 @@ from universal_db_mcp.security.session import SessionProfile, resolve_session
 
 class ConnectorError(Exception):
     """Database-layer error. Message must already be sanitized (no DSN,
-    credentials, or raw connection dumps)."""
+    credentials, or raw connection dumps).
+
+    ``category`` names the ErrorCategory value to report when it is not a
+    connection failure. It is only set when given: the server reads it with
+    getattr and a CONNECTION_ERROR default.
+    """
+
+    def __init__(self, *args: object, category: str | None = None) -> None:
+        super().__init__(*args)
+        if category is not None:
+            self.category = category
 
 
 class ObjectNotFound(LookupError):
@@ -59,6 +71,28 @@ class TableSummary:
     comment: str | None = None
 
 
+# explain(sql, analyze=True) on every engine: no setting enables it
+# (security.allow_explain_analyze only picks how the server refuses it).
+EXPLAIN_ANALYZE_UNSUPPORTED = "db_explain never executes the statement; EXPLAIN ANALYZE is not supported"
+
+
+def own_objects_first(
+    tables: list[TableSummary], system_schemas: Iterable[str] | Callable[[str | None], bool]
+) -> list[TableSummary]:
+    """``tables`` with those in the engine's ``system_schemas`` (catalog
+    views an administrator opened; security.allowed_system_schemas lists
+    information_schema by default) after the database's own, each part in
+    the order the catalog gave it: a listing's first page shows user data,
+    not the views MySQL and ClickHouse sort first. ``system_schemas`` names
+    them, or tells one where no list can (Oracle's APEX_nnnnnn owners)."""
+    if callable(system_schemas):
+        is_system = system_schemas
+        return sorted(tables, key=lambda t: is_system(t.schema))
+    system = {s.lower() for s in system_schemas}
+    return sorted(tables, key=lambda t: (t.schema or "").lower() in system)
+
+
+
 @dataclass
 class ColumnInfo:
     schema: str | None
@@ -69,6 +103,15 @@ class ColumnInfo:
     default: str | None = None
     comment: str | None = None
     ordinal: int | None = None
+    # How the engine fills the column where that is not a plain stored value:
+    # ClickHouse's DEFAULT, MATERIALIZED, ALIAS or EPHEMERAL (SELECT * leaves
+    # out the last three: STAR_EXCLUDED_KINDS). None on every other engine.
+    default_kind: str | None = None
+
+
+# The default kinds whose columns SELECT * does not return (ClickHouse, unless
+# the session sets asterisk_include_materialized_columns / _alias_columns).
+STAR_EXCLUDED_KINDS = frozenset({"MATERIALIZED", "ALIAS", "EPHEMERAL"})
 
 
 @dataclass
@@ -111,6 +154,28 @@ class SynonymInfo:
     target_schema: str | None
     target_name: str
     target_kind: str | None = None  # table | view | synonym | remote
+
+
+class SynonymTarget(NamedTuple):
+    """What a synonym (Db2: an alias) names: a schema (None where the
+    catalog keeps none) and a name, and where they are not this database's,
+    the database link (Oracle) or the other database, server first where one
+    is named (SQL Server), that reads them."""
+
+    schema: str | None
+    name: str
+    elsewhere: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NameBinding:
+    """How this connection's sessions look up a table name a statement
+    writes: the schemas a bare name is looked up in, first to last, and
+    whether names compare ignoring case (on SQL Server the database
+    collation decides; the other engines' rules are fixed)."""
+
+    bare_schemas: tuple[str, ...]
+    ignores_case: bool = False
 
 
 @dataclass
@@ -169,6 +234,9 @@ class DatabaseConnector(ABC):
         # Per-thread: a metadata connect on one thread must not interleave
         # its applied/skipped lists with a health check on another.
         self._session_tls = threading.local()
+        # Per-thread too: the timeout of the one query a connect on this
+        # thread opens its connection for (see _query_connect).
+        self._query_tls = threading.local()
 
     # ---- session profile bookkeeping --------------------------------------
 
@@ -197,6 +265,47 @@ class DatabaseConnector(ABC):
             "level. Adjust connections.<id>.session in the config if this server cannot support it"
         )
 
+    def _reading_required(self, what: str, exc: BaseException) -> ConnectorError:
+        """A setting that decides how the server reads statement text could
+        not be held at the value the SQL guard parses under. The guard's
+        reading of a statement (its tables, columns and string literals)
+        would then not be the server's."""
+        return ConnectorError(
+            f"could not set {what} for the session on connection '{self.connection.name}' "
+            f"({type(exc).__name__}: {str(exc)[:160]}); the server would read statements differently from "
+            "the SQL guard that checked them, so the connection is refused"
+        )
+
+    @contextmanager
+    def _query_connect(self, timeout_seconds: float) -> Iterator[None]:
+        """Mark a connect on this thread as opening the connection of one
+        query, so ``_statement_ceiling`` follows that query's timeout."""
+        self._query_tls.timeout = timeout_seconds
+        try:
+            yield
+        finally:
+            self._query_tls.timeout = None
+
+    def _statement_ceiling(self) -> int | None:
+        """Whole seconds for a driver-side statement ceiling: the policy's hard
+        timeout, or the shorter timeout of the query being connected for
+        (``_query_connect``), so the server stops the statement when the
+        caller's deadline does. None when the session profile applies no
+        server-side ceiling."""
+        hard = self.session_profile.statement_timeout_seconds
+        if not hard:
+            return None
+        query_timeout = getattr(self._query_tls, "timeout", None)
+        return int(math.ceil(min(hard, query_timeout) if query_timeout else hard))
+
+    def _opened_schemas(self) -> frozenset[str]:
+        """Schemas the administrator opened, case-folded: the server's
+        security.allowed_system_schemas and this connection's allowed_schemas.
+        A catalog listing that leaves the engine's system schemas out keeps
+        these, because the resolver permits only objects list_tables returns;
+        leaving them out made the allowance inert."""
+        return self.policy.allowed_system_schemas | self.policy.allowed_schemas
+
     def session_report(self, readback: dict[str, Any] | None = None) -> dict[str, Any]:
         """Profile + what was applied/skipped + optional values read back."""
         report = self.session_profile.as_dict()
@@ -221,6 +330,12 @@ class DatabaseConnector(ABC):
         if readback:
             report["server_reports"] = readback
         return report
+
+    def close(self) -> None:  # noqa: B027 - a no-op default, not an abstract method
+        """Release the sessions this connector keeps between calls (a pooled
+        metadata connection or client). The server calls it once a discarded
+        connector's worker has returned. Safe to call more than once; a
+        later metadata call reconnects. The default keeps none."""
 
     @abstractmethod
     def capabilities(self) -> CapabilityMatrix: ...
@@ -257,6 +372,29 @@ class DatabaseConnector(ABC):
 
     @abstractmethod
     def list_synonyms(self, schema: str | None) -> list[SynonymInfo]: ...
+
+    def synonym_chains(
+        self, names: Sequence[tuple[str | None, str]]
+    ) -> dict[tuple[str | None, str], list[SynonymTarget]]:
+        """Of ``names`` (schema, None for a bare name, and name, as the
+        engine looks them up: a quoted name as written, an unquoted one
+        folded), each that names a synonym (Db2: an alias), matched as the
+        engine matches names (TRAVEL."Bookings" is not TRAVEL.BOOKINGS on
+        Oracle), with the objects it names in turn to the end of its chain,
+        as the catalog spells them, and the database link or other database
+        of one that is not this database's (driver_helpers.synonym_chains).
+        An engine without synonyms has none."""
+        return {}
+
+    def name_binding(self) -> NameBinding | None:
+        """How a session of this connection binds the names a statement
+        writes, asked of the database: where default-deny resolves a bare
+        name to a listed table, the engine reads that table only if its
+        schema is the first one the session looks bare names up in (the
+        server checks). None on an engine that binds a bare name only within
+        the connection's own database, whose tables and views the listing
+        holds (MySQL, ClickHouse, SQLite)."""
+        return None
 
     @abstractmethod
     def list_routines(self, schema: str | None) -> list[RoutineInfo]: ...
@@ -314,10 +452,12 @@ class DatabaseConnector(ABC):
     def like_predicate(self, expression: str, placeholder: str) -> str:
         return f"{expression} LIKE {placeholder} ESCAPE '{self.LIKE_ESCAPE}'"
 
-    def text_expression(self, quoted_column: str, portable_name: str) -> str:
+    def text_expression(self, quoted_column: str, portable_name: str, declared_type: str | None = None) -> str:
         """``quoted_column`` as something LOWER()/LIKE accept. Plain strings
         pass through; engines whose UUID or enum types reject string
-        functions override this with a cast."""
+        functions override this with a cast. ``declared_type`` is the
+        column's catalog type when the caller has it (Db2 casts character and
+        graphic columns differently)."""
         return quoted_column
 
     def placeholder(self, index: int) -> str:

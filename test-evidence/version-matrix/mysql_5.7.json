@@ -1,25 +1,25 @@
 {
   "label": "mysql:5.7",
   "engine": "mysql",
-  "probe_rev": "c820896",
-  "started_utc": "2026-09-16T20:34:29Z",
+  "probe_rev": "402c4df",
+  "started_utc": "2026-10-03T14:45:15Z",
   "checks": [
     {
       "check": "seed",
       "status": "passed",
-      "ms": 577,
+      "ms": 565,
       "detail": "seeded"
     },
     {
       "check": "health_check",
       "status": "passed",
-      "ms": 18,
+      "ms": 24,
       "detail": "5.7.44"
     },
     {
       "check": "list_schemas",
       "status": "passed",
-      "ms": 19,
+      "ms": 24,
       "detail": "vm"
     },
     {
@@ -38,7 +38,7 @@
       "check": "list_columns",
       "status": "passed",
       "ms": 3,
-      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int(11)', nullable=False, default=None, comment=None, ordinal=1), ColumnInfo(schema='vm', table='customers', name='email', data_type='"
+      "detail": "[ColumnInfo(schema='vm', table='customers', name='id', data_type='int(11)', nullable=False, default=None, comment=None, ordinal=1, default_kind=None), ColumnInfo(schema='vm', table='customers', name='"
     },
     {
       "check": "list_columns_count",
@@ -103,37 +103,37 @@
     {
       "check": "execute_query_count",
       "status": "passed",
-      "ms": 15,
+      "ms": 21,
       "detail": "300"
     },
     {
       "check": "sample_query",
       "status": "passed",
-      "ms": 19,
+      "ms": 17,
       "detail": "200"
     },
     {
       "check": "profile_aggregate",
       "status": "passed",
-      "ms": 18,
+      "ms": 24,
       "detail": "{'rows': 200, 'region_distinct': 2, 'region_null_ratio': 0.335}"
     },
     {
       "check": "top_values",
       "status": "passed",
-      "ms": 19,
+      "ms": 18,
       "detail": "[['south', 67], ['north', 66]]"
     },
     {
       "check": "value_search_like",
       "status": "passed",
-      "ms": 13,
+      "ms": 15,
       "detail": "[122, 'user122@example.com', None]"
     },
     {
       "check": "explain",
       "status": "passed",
-      "ms": 14,
+      "ms": 16,
       "detail": "['raw']"
     }
   ],
@@ -147,6 +147,8 @@
     "read_only_requested": true,
     "server_read_only_available": true,
     "applied": [
+      "sql_mode without ANSI, ANSI_QUOTES, NO_BACKSLASH_ESCAPES, PIPES_AS_CONCAT, HIGH_NOT_PRECEDENCE, ORACLE, MSSQL, DB2, POSTGRESQL, MAXDB",
+      "character_set_client=utf8mb4",
       "read_only",
       "statement_timeout=60000ms",
       "innodb_lock_wait_timeout=5s",
@@ -159,11 +161,13 @@
       "read_only": "1",
       "isolation": "REPEATABLE-READ",
       "statement_timeout_ms": "60000",
-      "innodb_lock_wait_timeout": "5"
+      "innodb_lock_wait_timeout": "5",
+      "sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION",
+      "character_set_client": "utf8mb4"
     }
   },
   "healthy": true,
-  "finished_utc": "2026-09-16T20:34:30Z",
+  "finished_utc": "2026-10-03T14:45:16Z",
   "summary": {
     "passed": 22,
     "failed": []

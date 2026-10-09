@@ -234,6 +234,7 @@ def test_preinst_functional_fails_closed_without_verifier_then_without_pubkey(tm
 
 
 @_POSIX
+@pytest.mark.skipif(sys.platform != "win32" and os.getuid() == 0, reason="root reads a mode-000 file")
 def test_preinst_functional_fails_closed_when_verifier_unreadable(tmp_path: Path) -> None:
     script, verifier, pubkey = _preinst_sandbox_script(tmp_path)
     verifier.parent.mkdir(parents=True)
