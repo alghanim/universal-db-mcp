@@ -1,0 +1,51 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security issues go to private vulnerability reporting, not here (see SECURITY.md).
+        Remove credentials, hostnames and data from anything you paste.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `udbmcp version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it is installed
+      options:
+        - .deb
+        - macOS .pkg
+        - offline bundle (install_offline.sh)
+        - container image
+        - from source
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Database engine and version
+      placeholder: e.g. PostgreSQL 16.4
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: e.g. Claude Code 2.x, Cursor, VS Code
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: The tool call or statement, the result, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output
+      description: Output of `udbmcp doctor --connectivity` (redacted).
+      render: text
