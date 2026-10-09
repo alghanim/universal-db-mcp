@@ -19,7 +19,7 @@ dependencies = [
     "sqlglot~=30.18.0",
     # the HTTP transport subclasses uvicorn's h11 protocol and reads h11 state
     # (http_protocol.py): held to the reviewed releases, not whatever mcp allows
-    "uvicorn>=0.52.4,<0.54",
+    "uvicorn>=0.54.0,<0.55",
     "h11>=0.16,<0.17",
     # security floor: mcp's pyjwt[crypto] (and PyMySQL[rsa]) accept older releases
     "cryptography>=50",
