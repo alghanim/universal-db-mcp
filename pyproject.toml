@@ -16,7 +16,7 @@ dependencies = [
     "mcp>=2.2.0,<3",
     "PyYAML>=6.0.2,<7",
     # the SQL guard is tested on this parser series only (the bundle pins 30.18.0)
-    "sqlglot~=30.18.0",
+    "sqlglot~=30.21.0",
     # the HTTP transport subclasses uvicorn's h11 protocol and reads h11 state
     # (http_protocol.py): held to the reviewed releases, not whatever mcp allows
     "uvicorn>=0.52.4,<0.54",

@@ -3,7 +3,7 @@
 # runtime.lock. Do not install from this file in production.
 mcp==2.2.0
 PyYAML==6.0.3
-sqlglot==30.18.0
+sqlglot==30.21.0
 # The HTTP transport subclasses uvicorn's h11 protocol and reads h11 state
 # (http_protocol.py): pinned here, not left to whatever mcp allows.
 uvicorn==0.53.0
