@@ -238,12 +238,17 @@ database; the real-`dpkg` container sequences run only with
 CPython 3.12): the unit suite (including the MSI custom-action tests under
 `pwsh`), ruff, `mypy --strict`, `prepare_offline_bundle.py --check-locks`, and
 pip-audit over every lock. Actions are pinned to commit SHAs. It runs on
-every pull request and every push to `main`. `tests/unit/test_hardening_2026_09_27_ci_hygiene.py`
-guards the CI setup itself (pinned actions, pytest options, no skips or hooks
-hidden in conftests or helpers, no compiled or symlinked files in the tree);
-it is a tripwire, not a sandbox, so changes to conftests, test helpers and CI
-files still need a reviewer. After a Dependabot bump of
-`requirements/runtime.in`, refresh and review the locks
+every pull request and every push to `main`, in two jobs at once: the slowest
+installer and packaging test files run in `installer-tests`, and `checks`
+runs the rest and every other check. `.github/workflows/audit.yml` runs the
+same pip-audit every week, so a new advisory fails a run between commits too.
+Dependabot proposes grouped updates monthly.
+`tests/unit/test_hardening_2026_09_27_ci_hygiene.py` guards the CI setup
+itself (pinned actions, pytest options, the two jobs together running every
+test once, no skips or hooks hidden in conftests or helpers, no compiled or
+symlinked files in the tree); it is a tripwire, not a sandbox, so changes to
+conftests, test helpers and CI files still need a reviewer. After a
+Dependabot bump of `requirements/runtime.in`, refresh and review the locks
 (`docs/offline-build.md`).
 
 ## Documentation map

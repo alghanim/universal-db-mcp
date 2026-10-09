@@ -1,6 +1,8 @@
-# Weekly update proposals. Each one arrives as a pull request and so runs CI
+# Monthly update proposals. Each one arrives as a pull request and so runs CI
 # (tests, lint, types and the dependency audit) before anyone merges it.
-# Each ecosystem's updates arrive grouped in one pull request a week.
+# Each ecosystem's updates arrive grouped in one pull request a month. A
+# vulnerability in a pinned version does not wait for it: the weekly audit
+# (.github/workflows/audit.yml) fails on a new advisory between commits.
 #
 # A runtime bump needs the hashed per-platform locks refreshed, which
 # Dependabot cannot do: CI's lock check stays red on it until someone runs
@@ -18,7 +20,7 @@ updates:
   - package-ecosystem: "uv"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     groups:
       python:
         patterns: ["*"]
@@ -56,7 +58,7 @@ updates:
   - package-ecosystem: "pip"
     directory: "/requirements"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     groups:
       bundle-locks:
         patterns: ["*"]
@@ -94,13 +96,13 @@ updates:
   - package-ecosystem: "pip"
     directory: "/.github"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
 
   # The commit-SHA pins in .github/workflows, with their version comments.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     groups:
       actions:
         patterns: ["*"]

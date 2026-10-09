@@ -1,7 +1,8 @@
-# Runs on every push to main and every pull request: the unit suite, ruff over
-# src, tests and scripts, mypy --strict, a check that the offline bundle's
-# dependency locks are current, and a vulnerability audit of the installed and
-# the shipped dependencies. The dependencies (the drivers and the test, lint and
+# Runs on every push to main and every pull request: the unit suite, split
+# between two jobs that run at the same time (checks and installer-tests),
+# ruff over src, tests and scripts, mypy --strict, a check that the offline
+# bundle's dependency locks are current, and a vulnerability audit of the
+# installed and the shipped dependencies. The dependencies (the drivers and the test, lint and
 # type-check tools) install from uv.lock, whose hashes uv verifies. The project
 # itself is built from this checkout by the hatchling that pyproject.toml's
 # build-constraint-dependencies pins by version only: uv.lock records no hash
@@ -62,11 +63,25 @@ jobs:
           uv pip install --python .venv/bin/python --require-hashes -r .github/ci-pip-requirements.txt
 
       # A step timeout fails this step and the checks below still run; reaching
-      # the job timeout would cancel them all. The suite takes 13-15 minutes on
-      # a hosted runner (2026-10-08), and runner speed varies by about half.
+      # the job timeout would cancel them all. The suite took 13-19 minutes in
+      # one job (2026-10-09), so it runs in two at once: this step leaves out
+      # exactly the files the installer-tests job runs (the CI hygiene test
+      # checks that the two lists match), and every test runs once. A new test
+      # file runs here unless it is added to both lists.
       - name: Unit tests
         timeout-minutes: 30
-        run: .venv/bin/python -m pytest tests/unit
+        run: |
+          .venv/bin/python -m pytest tests/unit \
+            --ignore=tests/unit/test_cr2_msi.py \
+            --ignore=tests/unit/test_cr2_packaging.py \
+            --ignore=tests/unit/test_cr3_msi.py \
+            --ignore=tests/unit/test_cr3_packaging.py \
+            --ignore=tests/unit/test_cr_fix_msi.py \
+            --ignore=tests/unit/test_cr_fix_packaging.py \
+            --ignore=tests/unit/test_hardening_2026_09_27_msi.py \
+            --ignore=tests/unit/test_hardening_2026_09_27_packaging.py \
+            --ignore=tests/unit/test_hardening_2026_09_28_converge_packaging.py \
+            --ignore=tests/unit/test_hardening_gates.py
 
       # The checks below run even when an earlier one failed, so every result shows.
       - name: Lint
@@ -100,3 +115,45 @@ jobs:
             uvx --from pip-audit==2.10.1 --exclude-newer 2026-09-27T00:00:00Z \
               pip-audit --strict --require-hashes --disable-pip -r "$requirements"
           done
+
+  # The slowest test files, run at the same time as the checks job: the MSI
+  # custom-action tests start a pwsh per test, and the packaging tests build
+  # and verify signed bundles. Same runner, setup and install as checks.
+  installer-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.16"
+          checksum: "74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
+          python-version: "3.12"
+          enable-cache: false
+
+      # uv sync makes a venv without pip, and the offline bundle builder's tests
+      # run 'python -m pip download' (they skip without it). pip comes from one
+      # exact pin with its hashes, which the audit covers and Dependabot bumps.
+      - name: Install the locked dependencies
+        id: sync
+        run: |
+          uv sync --locked --all-extras
+          uv pip install --python .venv/bin/python --require-hashes -r .github/ci-pip-requirements.txt
+
+      - name: Installer and packaging tests
+        timeout-minutes: 30
+        run: |
+          .venv/bin/python -m pytest \
+            tests/unit/test_cr2_msi.py \
+            tests/unit/test_cr2_packaging.py \
+            tests/unit/test_cr3_msi.py \
+            tests/unit/test_cr3_packaging.py \
+            tests/unit/test_cr_fix_msi.py \
+            tests/unit/test_cr_fix_packaging.py \
+            tests/unit/test_hardening_2026_09_27_msi.py \
+            tests/unit/test_hardening_2026_09_27_packaging.py \
+            tests/unit/test_hardening_2026_09_28_converge_packaging.py \
+            tests/unit/test_hardening_gates.py
