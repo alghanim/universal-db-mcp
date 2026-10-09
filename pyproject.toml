@@ -48,7 +48,7 @@ mysql = ["PyMySQL[ed25519,rsa]>=1.2.0,<2", "PyNaCl>=1.6.2"]
 clickhouse = ["clickhouse-connect>=1.8,<1.9"]
 oracle = ["oracledb>=4,<5"]
 mssql = ["pyodbc>=5.1,<6"]
-db2 = ["ibm-db>=3.2,<4"]
+db2 = ["ibm-db>=3.3.0,<4"]
 
 [project.scripts]
 udbmcp = "universal_db_mcp.__main__:main"

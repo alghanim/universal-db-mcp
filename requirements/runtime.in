@@ -19,7 +19,7 @@ PyMySQL==1.2.0
 clickhouse-connect==1.8.0
 oracledb==4.0.2
 pyodbc==5.3.0
-ibm-db==3.2.9  # tested wheel in the bundle wheelhouse
+ibm-db==3.3.0  # tested wheel in the bundle wheelhouse
 
 # Authentication plugins the connectors need but no connector declares:
 # PyNaCl backs MariaDB's client_ed25519 (the default on many MariaDB builds);
