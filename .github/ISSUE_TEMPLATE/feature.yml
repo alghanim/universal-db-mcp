@@ -1,0 +1,16 @@
+name: Feature request
+description: Something the server should do that it does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where the server falls short.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: The tool, option or behaviour you have in mind. Note anything that would let an agent write to a database or read past the configured schemas.

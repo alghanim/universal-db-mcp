@@ -1,0 +1,25 @@
+name: New database engine
+description: Support for a database the server does not connect to yet.
+labels: [new engine]
+body:
+  - type: input
+    id: engine
+    attributes:
+      label: Engine and versions
+      placeholder: e.g. Snowflake, CockroachDB 24.x
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: Python driver
+      description: The driver you would use, and whether it needs native client libraries.
+  - type: textarea
+    id: readonly
+    attributes:
+      label: How a session is made read-only
+      description: A read-only transaction or session mode, a role setting, or none (the SQL guard then carries it alone). See docs/session-safety.md.
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it matters to you
