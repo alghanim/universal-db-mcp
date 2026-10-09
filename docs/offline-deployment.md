@@ -375,7 +375,10 @@ Each GitHub release also publishes this image to GitHub Packages as
 releases only), for hosts that may reach a registry. `.github/workflows/container.yml`
 builds it from that release's own signed Linux bundle, after checking the
 bundle's signature against the key `SECURITY.md` publishes, and stores a
-build-provenance attestation with it. Check it before running it:
+build-provenance attestation with it. The same workflow then lists that
+version in the official MCP Registry as `io.github.alghanim/universal-db-mcp`
+(`server.json`), so MCP clients that browse the registry can install it.
+Check it before running it:
 
 ```bash
 gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.1.0 --repo alghanim/universal-db-mcp

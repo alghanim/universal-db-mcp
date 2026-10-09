@@ -11,9 +11,15 @@
 # with Microsoft's driver (docs/offline-deployment.md). A build-provenance
 # attestation for the pushed digest is stored with the image.
 #
-# This job's token may push packages and request the OIDC token the
-# attestation needs; the CI hygiene test allows that here only, on release
-# and manual runs, never on a push or a pull request.
+# The registry job then lists that version in the official MCP Registry
+# (server.json, with the version and image of the release): the image's
+# io.modelcontextprotocol.server.name label proves the image is ours, and
+# GitHub's OIDC token proves the publisher is this repository.
+#
+# The image job's token may push packages and request the OIDC token the
+# attestation needs; the registry job's may request an OIDC token only. The
+# CI hygiene test allows that here only, on release and manual runs, never on
+# a push or a pull request.
 name: Container image
 
 on:
@@ -104,6 +110,7 @@ jobs:
             --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
             --label "org.opencontainers.image.licenses=Apache-2.0" \
             --label "org.opencontainers.image.base.name=$base" \
+            --label "io.modelcontextprotocol.server.name=io.github.$GITHUB_REPOSITORY" \
             -t "$image:$version" "$BUNDLE"
           docker run --rm "$image:$version" version
           echo "IMAGE=$image" >> "$GITHUB_ENV"
@@ -135,3 +142,41 @@ jobs:
       - name: Log out of the registry
         if: always()
         run: docker logout ghcr.io
+
+  registry:
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Check the release tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: '$TAG'" >&2; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # One release of the publisher, checked against its published SHA-256.
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/mcp-publisher.tar.gz" \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+          echo "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc  $RUNNER_TEMP/mcp-publisher.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/mcp-publisher.tar.gz" -C "$RUNNER_TEMP" mcp-publisher
+
+      - name: Publish to the MCP Registry
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          [ "$(jq -r .name server.json)" = "io.github.$GITHUB_REPOSITORY" ] \
+            || { echo "server.json's name is not the image's io.modelcontextprotocol.server.name label" >&2; exit 1; }
+          jq --arg version "$version" --arg image "ghcr.io/${GITHUB_REPOSITORY,,}:$version" \
+            '.version = $version | .packages[0].identifier = $image' server.json > "$RUNNER_TEMP/server.json"
+          "$RUNNER_TEMP/mcp-publisher" login github-oidc
+          "$RUNNER_TEMP/mcp-publisher" publish "$RUNNER_TEMP/server.json"
