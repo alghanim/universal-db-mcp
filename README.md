@@ -1,4 +1,24 @@
-# universal-db-mcp
+<h1 align="center">universal-db-mcp</h1>
+
+<p align="center">
+  <a href="https://github.com/alghanim/universal-db-mcp/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/alghanim/universal-db-mcp/ci.yml?branch=main&label=CI"></a>
+  <a href="LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-4c1"></a>
+  <a href="pyproject.toml"><img alt="python: 3.12" src="https://img.shields.io/badge/python-3.12-3776ab"></a>
+  <a href="docs/tools.md"><img alt="MCP: 29 tools" src="https://img.shields.io/badge/MCP-29%20tools-6f42c1"></a>
+  <a href="#what-it-does"><img alt="databases: 8" src="https://img.shields.io/badge/databases-8-e67e22"></a>
+  <a href="#how-it-keeps-the-databases-safe"><img alt="access: read-only" src="https://img.shields.io/badge/access-read--only-0e8a7d"></a>
+  <a href="#install-on-an-air-gapped-site"><img alt="deploy: air-gapped" src="https://img.shields.io/badge/deploy-air--gapped-5b5bd6"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start-development">Quick start</a> ·
+  <a href="docs/tools.md">Tools</a> ·
+  <a href="docs/security.md">Security model</a> ·
+  <a href="#install-on-an-air-gapped-site">Air-gapped install</a> ·
+  <a href="#documentation-map">Docs</a> ·
+  <a href="https://alghanim.github.io/universal-db-mcp/">Landing page</a> ·
+  <a href="SECURITY.md">Report a vulnerability</a>
+</p>
 
 A read-only, air-gap-deployable [MCP](https://modelcontextprotocol.io) server
 for databases. Claude Code, or any MCP client, can discover, document,
