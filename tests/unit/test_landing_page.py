@@ -13,6 +13,7 @@ import glob
 import json
 import re
 import tomllib
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +58,7 @@ def test_the_page_lists_exactly_the_registered_tools(tmp_path: Path) -> None:
 
 def _shield_text(part: str) -> str:
     """A shields.io static badge path segment as it renders: '--' is a dash."""
-    return part.replace("--", "\0").replace("-", " ").replace("\0", "-").replace("%20", " ").replace("_", " ")
+    return urllib.parse.unquote(part.replace("--", "\0").replace("-", " ").replace("\0", "-").replace("_", " "))
 
 
 def test_the_readme_badges_state_what_the_code_and_evidence_say(tmp_path: Path) -> None:
@@ -75,7 +76,12 @@ def test_the_readme_badges_state_what_the_code_and_evidence_say(tmp_path: Path) 
     assert badges["python"] == project["requires-python"].removeprefix(">=")
     assert badges["MCP"] == f"{len(_registered_tools(tmp_path))} tools"
     assert f"tools · {badges['databases']} databases" in PAGE, "the page counts the same databases"
-    assert badges.keys() == {"license", "python", "MCP", "databases", "access", "install"}
+    assert badges.keys() == {"license", "python", "MCP", "databases", "access", "works with"}
+    # every client the badge names has a configure-agents adapter
+    adapters = {path.stem for path in (ROOT / "src" / "universal_db_mcp" / "agents").glob("*.py")}
+    named = {"Claude": "claude_code", "Cursor": "cursor", "VS Code": "vscode"}
+    assert set(badges["works with"].split(" · ")) == named.keys()
+    assert set(named.values()) <= adapters, sorted(set(named.values()) - adapters)
     status = r"img\.shields\.io/github/actions/workflow/status/alghanim/universal-db-mcp/([^?]+)\?branch=main"
     ci = re.search(status, readme)
     assert ci and (ROOT / ".github" / "workflows" / ci.group(1)).is_file()

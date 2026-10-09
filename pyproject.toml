@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 [project]
 name = "universal-db-mcp"
 version = "0.1.0"
-description = "Universal Database MCP Server - air-gapped deployment ready"
+description = "Read-only MCP server that gives AI agents safe access to your databases"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"

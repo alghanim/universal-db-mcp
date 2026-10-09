@@ -32,7 +32,7 @@ _MIN_BEARER_TOKEN_CHARS = 32
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="universal_db_mcp",
-        description="Universal Database MCP Server (air-gapped)",
+        description="Universal Database MCP Server: read-only, safe database access for AI agents",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

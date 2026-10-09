@@ -7,24 +7,28 @@
   <a href="docs/tools.md"><img alt="MCP: 29 tools" src="https://img.shields.io/badge/MCP-29%20tools-6f42c1"></a>
   <a href="#what-it-does"><img alt="databases: 8" src="https://img.shields.io/badge/databases-8-e67e22"></a>
   <a href="#how-it-keeps-the-databases-safe"><img alt="access: read-only" src="https://img.shields.io/badge/access-read--only-0e8a7d"></a>
-  <a href="#install-on-an-air-gapped-site"><img alt="install: offline-ready" src="https://img.shields.io/badge/install-offline--ready-5b5bd6"></a>
+  <a href="docs/claude-code-integration.md"><img alt="works with: Claude · Cursor · VS Code" src="https://img.shields.io/badge/works%20with-Claude%20%C2%B7%20Cursor%20%C2%B7%20VS%20Code-5b5bd6"></a>
 </p>
 
 <p align="center">
-  <a href="#quick-start-development">Quick start</a> ·
+  <a href="#quick-start">Quick start</a> ·
   <a href="docs/tools.md">Tools</a> ·
   <a href="docs/security.md">Security model</a> ·
-  <a href="#install-on-an-air-gapped-site">Air-gapped install</a> ·
+  <a href="#install-offline-air-gapped-sites">Offline install</a> ·
   <a href="#documentation-map">Docs</a> ·
   <a href="https://alghanim.github.io/universal-db-mcp/">Landing page</a> ·
   <a href="SECURITY.md">Report a vulnerability</a>
 </p>
 
-A read-only, air-gap-deployable [MCP](https://modelcontextprotocol.io) server
-for databases. Claude Code, or any MCP client, can discover, document,
-profile, search and query the database connections an administrator declares,
-and nothing else. The server never writes to a database, never calls an LLM,
-never installs anything at runtime, and never needs public internet access.
+**Give AI agents read-only access to your databases, safely.**
+universal-db-mcp is an [MCP](https://modelcontextprotocol.io) server that lets
+Claude Code, Cursor, VS Code or any MCP client discover, document, profile,
+search and query the databases you declare, and nothing else. Every statement
+is parsed before it runs and must be a single read; it runs on a read-only
+session, columns that look sensitive are masked, and every call is audited.
+Writes are refused, not discouraged. The server never calls an LLM, sends no
+telemetry and installs nothing at runtime, so it also runs on networks with
+no internet access at all.
 
 **Status:** hardened through a production security review and three follow-up
 code reviews (2026-09/10). `IMPLEMENTATION_STATUS.md` is the honest ledger of
@@ -118,7 +122,9 @@ Defence in depth; details and limitations in `docs/security.md` and
    server in HTTP mode (bearer token, behind your reverse proxy) under a
    separate service account.
 
-## Quick start (development)
+## Quick start
+
+### From source
 
 ```bash
 uv venv --python 3.12 .venv
@@ -144,6 +150,17 @@ readable by every user, so on a `.deb` host make it `root:udbmcp` 0640 first
 secrets with private permissions; `udbmcp doctor` checks a config, its
 secrets and (with `--connectivity`) every database.
 
+### With the container image
+
+```bash
+docker pull ghcr.io/alghanim/universal-db-mcp:0.1.0
+gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.1.0 --repo alghanim/universal-db-mcp
+```
+
+Mount your config and its secrets read-only and run it over stdio or HTTP as
+`docs/offline-deployment.md` (Container mode) describes. The image has no SQL
+Server driver; the same section shows how to add Microsoft's.
+
 ## A minimal connection
 
 ```yaml
@@ -163,7 +180,7 @@ connections:
 
 `config.example.yaml` documents every setting, per engine.
 
-## Install on an air-gapped site
+## Install offline (air-gapped sites)
 
 | Artifact | Platform | Status |
 | --- | --- | --- |
