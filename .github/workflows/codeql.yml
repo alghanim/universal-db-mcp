@@ -1,0 +1,40 @@
+# CodeQL code scanning (GitHub's static analysis) of the Python code and of
+# these workflows, on every push to main, every pull request and weekly.
+# Findings appear in the repository's code-scanning alerts. The job reads the
+# code and writes only security events; a pull request from a fork gets a
+# read-only token. It runs no scripts: the CI hygiene test pins its shape.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 3" # Wednesdays, 04:41 UTC
+
+permissions: {}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: /language:${{ matrix.language }}
