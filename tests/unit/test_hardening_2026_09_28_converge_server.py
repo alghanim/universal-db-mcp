@@ -432,14 +432,17 @@ def test_the_summary_timer_does_not_create_a_removed_audit_directory(
     timer created it again (a fresh audit.jsonl and lock) about a window
     later. Summaries alone never create it; their counts wait for the next
     record, which does."""
-    monkeypatch.setattr(audit, "_COALESCE_WINDOW_SECONDS", 0.3)
+    # The burst (10 records written in full, 5 counted) must fit in one
+    # window: a slow runner took longer than 0.3 s to write it, the window
+    # rolled mid-burst and split the count. 2 s leaves room and still closes soon.
+    monkeypatch.setattr(audit, "_COALESCE_WINDOW_SECONDS", 2.0)
     state = tmp_path / "state"
     log = AuditLog(str(state / "audit.jsonl"))
     event = {"event": "tool_call", "caller": "svc", "action": "db_query", "outcome": "deny", "category": "X"}
     for _ in range(audit._COALESCE_BURST + 5):
         log.record_refusal(dict(event))
     shutil.rmtree(state)
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline and not (state.exists() or log._coalescer._closed):
         time.sleep(0.02)
     assert not state.exists(), sorted(p.name for p in state.iterdir())

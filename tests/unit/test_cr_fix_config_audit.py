@@ -172,18 +172,35 @@ def test_a1_the_rotation_staging_name_is_state_too(tmp_path: Path) -> None:
 # --- A2: summaries written before an fsync failure are not written again ---------
 
 
+class _ShiftedClock:
+    """The audit module's time, whose monotonic() the test moves forward by
+    hand: a coalescing window closes when the test says so, not when a slow
+    runner happens to outlast a short one (lock waits still see real time)."""
+
+    def __init__(self) -> None:
+        self.shift = 0.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.shift
+
+
+
 def test_a2_an_fsync_failure_after_the_write_does_not_double_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "audit.jsonl"
-    monkeypatch.setattr(audit_module, "_COALESCE_WINDOW_SECONDS", 0.2)
+    clock = _ShiftedClock()
+    monkeypatch.setattr(audit_module, "time", clock)
     log = AuditLog(str(path), fail_closed=True)
     monkeypatch.setattr(log, "_flush_later", lambda: None)  # the summaries go with the next record
     event = {"event": "tool_call", "caller": "u", "action": "db_query", "outcome": "deny",
              "category": "VALIDATION", "connection_id": "c", "sql_fingerprint": "f"}
     for _ in range(13):  # 10 written in full, 3 counted
         log.record_refusal(dict(event))
-    time.sleep(0.3)
+    clock.shift += audit_module._COALESCE_WINDOW_SECONDS + 1  # the window closes
     real_fsync = os.fsync
 
     def bad_fsync(fd: int) -> None:
@@ -203,14 +220,15 @@ def test_a2_a_failed_write_still_keeps_the_summaries(tmp_path: Path, monkeypatch
     """The other side: when nothing reached the file the counts wait for the
     next record, as before."""
     path = tmp_path / "audit.jsonl"
-    monkeypatch.setattr(audit_module, "_COALESCE_WINDOW_SECONDS", 0.2)
+    clock = _ShiftedClock()
+    monkeypatch.setattr(audit_module, "time", clock)
     log = AuditLog(str(path), fail_closed=True)
     monkeypatch.setattr(log, "_flush_later", lambda: None)
     event = {"event": "tool_call", "caller": "u", "action": "db_query", "outcome": "deny",
              "category": "VALIDATION", "connection_id": "c", "sql_fingerprint": "f"}
     for _ in range(13):
         log.record_refusal(dict(event))
-    time.sleep(0.3)
+    clock.shift += audit_module._COALESCE_WINDOW_SECONDS + 1  # the window closes
     real_write = os.write
 
     def bad_write(fd: int, data: Any) -> int:
