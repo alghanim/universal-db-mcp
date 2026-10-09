@@ -171,6 +171,7 @@ connections:
 | `.pkg` | macOS arm64 | release gate passes; unsigned (no Developer ID yet) |
 | `.msi` | Windows x64 | compiles with WiX and its custom actions are tested under PowerShell; never run on a Windows host yet |
 | offline bundle | any of the above | signed with the release key; `scripts/install_offline.sh` |
+| container image | linux/amd64, connected hosts | `ghcr.io/alghanim/universal-db-mcp`, built by CI from each release's signed bundle, with a provenance attestation (`docs/offline-deployment.md`) |
 
 See `docs/offline-deployment.md`, and `docs/site-upgrade-runbook.md` for a
 site that installs from a release stick (`scripts/package/release_usb.sh`
@@ -292,3 +293,11 @@ DEP-5 `/usr/share/doc/universal-db-mcp/copyright` file, with `NOTICE` beside
 it. Third-party components keep their own licenses: the bundle lists them in
 `sbom/cyclonedx.json`, and each wheel in its `wheelhouse/` carries its license
 files.
+
+The Db2 connector's `ibm_db` wheel contains IBM Data Server Driver for ODBC
+and CLI redistributables, which IBM licenses for distribution as part of an
+application. They ship unmodified, with IBM's license and notice files,
+which govern them (see `NOTICE`). Db2 and IBM are trademarks of International
+Business Machines Corporation, used here only to name the database and its
+driver. Microsoft's ODBC Driver for SQL Server and Oracle's Instant Client are
+not redistributed: sites install them from the vendor.

@@ -368,6 +368,40 @@ missing token before any tool runs.
 
 ## Container mode
 
+### The published image (connected hosts)
+
+Each GitHub release also publishes this image to GitHub Packages as
+`ghcr.io/alghanim/universal-db-mcp:<version>` (`latest` follows stable
+releases only), for hosts that may reach a registry. `.github/workflows/container.yml`
+builds it from that release's own signed Linux bundle, after checking the
+bundle's signature against the key `SECURITY.md` publishes, and stores a
+build-provenance attestation with it. Check it before running it:
+
+```bash
+gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.1.0 --repo alghanim/universal-db-mcp
+docker run --rm ghcr.io/alghanim/universal-db-mcp:0.1.0 version
+```
+
+It is a `linux/amd64` image with no configuration inside: mount
+`/etc/universal-db-mcp/config.yaml` and its secrets as the compose file
+below does. It carries no ODBC stack, so SQL Server connections need an
+image built on top of it with Microsoft's driver, whose EULA you accept:
+
+```dockerfile
+FROM ghcr.io/alghanim/universal-db-mcp:0.1.0
+USER root
+# Add Microsoft's package repository for Ubuntu 24.04 as Microsoft's
+# "Install the Microsoft ODBC driver for SQL Server (Linux)" page describes, then:
+RUN apt-get update && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+    && rm -rf /var/lib/apt/lists/*
+USER udbmcp
+```
+
+An air-gapped host does not pull: it loads the image from the bundle as
+the rest of this section describes.
+
+### Loading the image from the bundle
+
 Before starting, two prerequisites the bundle does **not** satisfy on its own:
 
 1. **The application image tar must have been exported on the staging
