@@ -234,6 +234,8 @@ the same way.
   gate (`docs/acceptance-tests.md`).
 - **Supply chain:** pinned, hash-checked locks for every platform, checked
   with pip-audit.
+- **Fuzzing:** the SQL guard is fuzzed with Atheris (`tests/fuzz/`) after each
+  push to `main` and weekly: any input it neither accepts nor refuses cleanly fails the run.
 
 Not yet verified anywhere: the MSI on a real Windows host and a real macOS
 Installer run of the `.pkg`.

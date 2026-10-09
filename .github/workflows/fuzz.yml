@@ -1,0 +1,51 @@
+# Coverage-guided fuzzing of the SQL guard with Atheris
+# (tests/fuzz/fuzz_sql_guard.py): after each push to main, weekly and by
+# hand, five minutes from the seed corpus. It fails on the first input the
+# guard neither accepts nor refuses with a ToolFailure, or takes more than
+# 10 s over, and prints that input. Read-only token; nothing is uploaded.
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 0" # Sundays, 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sql-guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.16"
+          checksum: "74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Install the locked dependencies and Atheris
+        run: |
+          uv sync --locked
+          uv pip install --python .venv/bin/python --require-hashes -r .github/fuzz-requirements.txt
+
+      - name: Fuzz the SQL guard for five minutes
+        timeout-minutes: 10
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpus" "$RUNNER_TEMP/findings"
+          cp tests/fuzz/corpus/* "$RUNNER_TEMP/corpus/"
+          cd "$RUNNER_TEMP/findings"
+          "$GITHUB_WORKSPACE/.venv/bin/python" "$GITHUB_WORKSPACE/tests/fuzz/fuzz_sql_guard.py" "$RUNNER_TEMP/corpus" \
+            -max_total_time=300 -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
+
+      - name: Show the failing input
+        if: failure()
+        run: |
+          for finding in "$RUNNER_TEMP"/findings/*; do echo "== $finding (base64)"; base64 "$finding"; done

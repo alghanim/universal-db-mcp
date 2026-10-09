@@ -1,0 +1,4 @@
+# Atheris for .github/workflows/fuzz.yml: one exact release, by hash (the
+# Linux x86-64 CPython 3.12 wheel; it has no dependencies).
+atheris==3.1.0 \
+    --hash=sha256:ec5e11f21a4c197fe91f7aea2b2de88e623c73a21fc07b105ac6329a1588457b
