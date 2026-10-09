@@ -31,6 +31,10 @@ starts (`docs/mock-environment.md`); the container-based package tests run
 only with `UDBMCP_DOCKER_TESTS=1`. CI runs the unit suite in two parallel jobs
 (`.github/workflows/ci.yml`); both must pass.
 
+The SQL guard is fuzzed with Atheris (`tests/fuzz/fuzz_sql_guard.py`, Linux
+only; `.github/workflows/fuzz.yml`). Add an input that reached a new guard
+path, or that once broke it, to `tests/fuzz/corpus/`.
+
 ## What a change needs
 
 - **One topic per pull request**, with tests for the behaviour it changes.
