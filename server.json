@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.alghanim/universal-db-mcp",
+  "title": "Universal DB (read-only)",
+  "description": "Read-only, guarded SQL access for AI agents: PostgreSQL, MySQL, ClickHouse, Oracle, SQL Server, Db2",
+  "repository": {
+    "url": "https://github.com/alghanim/universal-db-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://alghanim.github.io/universal-db-mcp/",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/alghanim/universal-db-mcp:0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--mount",
+          "description": "Mount, read-only, the directory holding config.yaml and the secret files it names",
+          "value": "type=bind,src={config_dir},dst=/etc/universal-db-mcp,readonly",
+          "isRequired": true,
+          "variables": {
+            "config_dir": {
+              "description": "Host directory with config.yaml (see config.example.yaml) and its secrets",
+              "format": "filepath",
+              "isRequired": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

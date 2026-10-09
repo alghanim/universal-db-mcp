@@ -34,6 +34,7 @@ from __future__ import annotations
 import ast
 import fnmatch
 import importlib.metadata
+import json
 import os
 import re
 import shlex
@@ -2363,18 +2364,21 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
         assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", ref), f"{name}: {ref} is not pinned to a commit SHA"
 
 
-# The container publish (container.yml's image job) pushes to GitHub Packages
-# and stores a provenance attestation, so its token may write exactly these,
-# on a published release or a manual run only (never code from a push or a
-# pull request), with no action but the reviewed checkout and attestation
-# commits: every step of a job gets its token.
-_CONTAINER_JOB = ("container.yml", "image")
-_CONTAINER_WRITES = frozenset({"packages", "id-token", "attestations"})
-_CONTAINER_TRIGGERS = frozenset({"release", "workflow_dispatch"})
-_CONTAINER_ACTIONS = frozenset({
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
-})
+# The release publish jobs: container.yml's image job pushes to GitHub
+# Packages and stores a provenance attestation; its registry job lists the
+# release in the MCP Registry with a GitHub OIDC token. Each may write exactly
+# these, on a published release or a manual run only (never code from a push
+# or a pull request), with no action but the reviewed commits listed: every
+# step of a job gets its token.
+_CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+_RELEASE_WRITERS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
+    ("container.yml", "image"): (
+        frozenset({"packages", "id-token", "attestations"}),
+        frozenset({_CHECKOUT_ACTION, "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"}),
+    ),
+    ("container.yml", "registry"): (frozenset({"id-token"}), frozenset({_CHECKOUT_ACTION})),
+}
+_RELEASE_TRIGGERS = frozenset({"release", "workflow_dispatch"})
 
 
 def _assert_tokens_are_read_only_unless_a_job_needs_more(workflows: dict[str, dict[str, Any]]) -> None:
@@ -2388,11 +2392,12 @@ def _assert_tokens_are_read_only_unless_a_job_needs_more(workflows: dict[str, di
             writes = {k for k, v in perms.items() if v == "write"}
             if not writes:
                 continue
-            if (name, job_name) == _CONTAINER_JOB:
-                assert writes == _CONTAINER_WRITES, f"{name}:{job_name}: {writes}"
-                assert set(_triggers(wf)) <= _CONTAINER_TRIGGERS, f"{name}: runs on {sorted(_triggers(wf))}"
+            if (name, job_name) in _RELEASE_WRITERS:
+                allowed_writes, allowed_actions = _RELEASE_WRITERS[(name, job_name)]
+                assert writes == allowed_writes, f"{name}:{job_name}: {writes}"
+                assert set(_triggers(wf)) <= _RELEASE_TRIGGERS, f"{name}: runs on {sorted(_triggers(wf))}"
                 actions = {str(s["uses"]) for s in job.get("steps", []) if "uses" in s}
-                assert actions <= _CONTAINER_ACTIONS, f"{name}:{job_name}: {sorted(actions - _CONTAINER_ACTIONS)}"
+                assert actions <= allowed_actions, f"{name}:{job_name}: {sorted(actions - allowed_actions)}"
                 continue
             # Otherwise only the Pages deploy may write, only what deploy-pages
             # needs, and in a job that runs deploy-pages alone: every step of
@@ -2420,6 +2425,11 @@ def test_workflow_tokens_are_read_only_unless_a_job_needs_more() -> None:
          "actions/attest-build-provenance@" + "0" * 40),
         ("      - name: Check the release tag\n", "      - uses: docker/login-action@" + "1" * 40 + "\n"
          "      - name: Check the release tag\n"),
+        # the registry job: only an OIDC token, only the checkout
+        ("    permissions:\n      contents: read\n      id-token: write\n    env:\n",
+         "    permissions:\n      contents: read\n      id-token: write\n      packages: write\n    env:\n"),
+        ("      - name: Install mcp-publisher\n",
+         "      - uses: actions/setup-node@" + "2" * 40 + "\n      - name: Install mcp-publisher\n"),
     ],
 )
 def test_the_container_job_cannot_widen_its_token(old: str, new: str) -> None:
@@ -2501,3 +2511,20 @@ def test_scripts_ruff_config_extends_the_project_config_with_file_scoped_ignores
     for match in re.finditer(r'^"[^"]+"\s*=', text, re.M):
         before = text[: match.start()].rstrip("\n").splitlines()
         assert before and before[-1].lstrip().startswith("#"), match.group(0)
+
+
+def test_the_mcp_registry_entry_names_the_image_the_container_workflow_labels() -> None:
+    """server.json lists the published image in the MCP Registry, which accepts
+    it only when the image's io.modelcontextprotocol.server.name label equals
+    the entry's name; container.yml writes that label and the release version."""
+    entry = json.loads((REPO / "server.json").read_text(encoding="utf-8"))
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert entry["name"] == "io.github.alghanim/universal-db-mcp"
+    assert len(entry["description"]) <= 100
+    assert entry["version"] == project["version"]
+    (package,) = entry["packages"]
+    assert package["registryType"] == "oci" and package["transport"] == {"type": "stdio"}
+    assert package["identifier"] == f"ghcr.io/alghanim/universal-db-mcp:{project['version']}"
+    workflow = (WORKFLOWS / "container.yml").read_text(encoding="utf-8")
+    assert '--label "io.modelcontextprotocol.server.name=io.github.$GITHUB_REPOSITORY"' in workflow
+    assert '"io.github.$GITHUB_REPOSITORY"' in workflow, "the registry job checks the name against the label"
