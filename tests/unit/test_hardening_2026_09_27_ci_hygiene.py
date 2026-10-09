@@ -45,7 +45,7 @@ import tempfile
 import tokenize
 import tomllib
 import types
-from collections.abc import Collection, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -418,8 +418,14 @@ _INSTALL = (
     "uv sync --locked --all-extras\n"
     f"uv pip install --python .venv/bin/python --require-hashes -r {_CI_PIP}"
 )
+# The unit suite runs in two jobs at once. 'checks' runs tests/unit without the
+# files it --ignore's, then the other checks; 'installer-tests' runs exactly
+# those files. The two lists must name the same files, each once, so every test
+# runs once; a test file in neither list runs in 'checks'.
+_JOBS = ("checks", "installer-tests")
+_UNIT_RUN = re.compile(r"\.venv/bin/python -m pytest tests/unit((?: --ignore=tests/unit/test_\w+\.py)+)")
+_SPLIT_RUN = re.compile(r"\.venv/bin/python -m pytest((?: tests/unit/test_\w+\.py)+)")
 _CHECKS = (
-    ".venv/bin/python -m pytest tests/unit",
     ".venv/bin/ruff check src tests scripts",
     ".venv/bin/mypy --strict src",
     ".venv/bin/python scripts/prepare_offline_bundle.py --check-locks",
@@ -502,13 +508,36 @@ def _assert_the_workflow_gates_every_change(name: str, text: str) -> None:
     # ...and a failing check fails the run: nothing swallows its exit status,
     # skips it or narrows it. The default shell is 'bash -e' in the checkout's root.
     _assert_keys(name, wf, _WORKFLOW_KEYS)
-    # One job, which sets up, installs, then runs every check in this order: a
-    # check's condition reads the install's outcome from its own job's steps,
-    # and before the install ran, or in another job, that is null and the
-    # check is skipped.
-    assert len(wf["jobs"]) == 1, f"{name}: jobs {sorted(wf['jobs'])}"
-    ((job_name, job),) = wf["jobs"].items()
-    where = f"{name}:{job_name}"
+    # Two jobs, each of which sets up, installs, then runs its checks in this
+    # order: a check's condition reads the install's outcome from its own job's
+    # steps, and before the install ran, or in another job, that is null and
+    # the check is skipped.
+    assert sorted(wf["jobs"]) == sorted(_JOBS), f"{name}: jobs {sorted(wf['jobs'])}, not {sorted(_JOBS)}"
+    runs = {job_name: _job_runs(f"{name}:{job_name}", job) for job_name, job in wf["jobs"].items()}
+    setup = [*_SETUP_ACTIONS, _INSTALL]
+    checks, split = runs["checks"], runs["installer-tests"]
+    unit = _UNIT_RUN.fullmatch(checks[len(setup)]) if len(checks) > len(setup) else None
+    listed = _SPLIT_RUN.fullmatch(split[len(setup)]) if len(split) > len(setup) else None
+    assert unit, f"{name}:checks: no unit test step of the form {_UNIT_RUN.pattern}: {checks}"
+    assert listed, f"{name}:installer-tests: no test step of the form {_SPLIT_RUN.pattern}: {split}"
+    expected = [*setup, unit.group(0), *_CHECKS, _AUDIT.pattern]
+    assert checks == expected, f"{name}:checks: runs {checks}, not {expected}"
+    assert split == [*setup, listed.group(0)], f"{name}:installer-tests: runs {split}"
+    # Every test runs once: checks leaves out exactly the files installer-tests runs.
+    ignored = unit.group(1).replace("--ignore=", "").split()
+    files = listed.group(1).split()
+    assert len(set(ignored)) == len(ignored) and len(set(files)) == len(files), f"{name}: a file is named twice"
+    assert set(ignored) == set(files), (
+        f"{name}: checks leaves out {sorted(set(ignored) - set(files))} that installer-tests does not run,"
+        f" and installer-tests runs {sorted(set(files) - set(ignored))} that checks runs too"
+    )
+    missing = [file for file in files if not (REPO / file).is_file()]
+    assert not missing, f"{name}: installer-tests names files that do not exist: {missing}"
+
+
+def _job_runs(where: str, job: dict[str, Any]) -> list[str]:
+    """What one job runs, step by step, after checking that nothing in the job
+    can skip a step, swallow its exit status or change what it runs."""
     _assert_keys(where, job, _JOB_KEYS)
     assert job.get("runs-on") == _RUNNER, f"{where}: runs-on {job.get('runs-on')!r}, not {_RUNNER}"
     runs: list[str] = []
@@ -534,8 +563,7 @@ def _assert_the_workflow_gates_every_change(name: str, text: str) -> None:
         else:
             assert step.get("if", _AFTER_THE_INSTALL) == _AFTER_THE_INSTALL, f"{label}: if: {step['if']}"
         runs.append(_AUDIT.pattern if _AUDIT.fullmatch(script) else script)
-    expected = [*_SETUP_ACTIONS, _INSTALL, *_CHECKS, _AUDIT.pattern]
-    assert runs == expected, f"{where}: runs {runs}, not {expected}"
+    return runs
 
 
 # The files pytest reads its options from, in the order it looks for them in
@@ -1021,7 +1049,12 @@ def test_a_workflow_runs_the_unit_suite_ruff_and_mypy_on_every_push_and_pull_req
 
 
 _UNIT_STEP = "      - name: Unit tests\n"
-_PYTEST_RUN = "run: .venv/bin/python -m pytest tests/unit"
+_PYTEST_RUN = ".venv/bin/python -m pytest tests/unit \\\n"
+# The last line of the checks job's unit test command, and the installer-tests job.
+_LAST_IGNORE = "--ignore=tests/unit/test_hardening_gates.py\n"
+_SPLIT_JOB = "  installer-tests:\n    runs-on: ubuntu-24.04\n"
+_SPLIT_STEP = "      - name: Installer and packaging tests\n"
+_SPLIT_PYTEST = ".venv/bin/python -m pytest \\\n"
 _EXCLUDE_NEWER = "--exclude-newer 2026-09-27T00:00:00Z"
 _PERMISSIONS = "permissions:\n  contents: read\n"
 _CHECKOUT_WITH = "          persist-credentials: false\n"
@@ -1035,12 +1068,25 @@ _CHECKOUT_WITH = "          persist-credentials: false\n"
         (_UNIT_STEP, _UNIT_STEP + "        env:\n          PYTEST_ADDOPTS: --collect-only\n"),
         (_PERMISSIONS, _PERMISSIONS + "\nenv:\n  PYTEST_ADDOPTS: --co\n"),
         ("    timeout-minutes: 45\n", "    timeout-minutes: 30\n    env:\n      UV_NO_SYNC: '1'\n"),
-        (_PYTEST_RUN, _PYTEST_RUN + " -k 'not guard'"),
-        (_PYTEST_RUN, _PYTEST_RUN + " --ignore=tests/unit/test_sql_guard.py"),
-        (_PYTEST_RUN, "run: if .venv/bin/python -m pytest tests/unit; then :; fi"),
-        (_PYTEST_RUN, "run: '! .venv/bin/python -m pytest tests/unit'"),
-        (_PYTEST_RUN, "run: |\n          .venv/bin/python -m pytest tests/unit && echo ok\n          echo done"),
-        (_PYTEST_RUN, _PYTEST_RUN + " || true"),
+        (_PYTEST_RUN, _PYTEST_RUN.replace(" \\\n", " -k 'not guard' \\\n")),
+        (_PYTEST_RUN, _PYTEST_RUN.replace(" \\\n", " --ignore=tests/unit/test_sql_guard.py \\\n")),
+        (_PYTEST_RUN, "if " + _PYTEST_RUN),
+        (_PYTEST_RUN, "! " + _PYTEST_RUN),
+        (_LAST_IGNORE, _LAST_IGNORE.replace("\n", "; then :; fi\n")),
+        (_LAST_IGNORE, _LAST_IGNORE.replace("\n", " && echo ok\n          echo done\n")),
+        (_LAST_IGNORE, _LAST_IGNORE.replace("\n", " || true\n")),
+        # The split: a file left out of checks that installer-tests does not run,
+        # a file run by both, a narrowed or skipped installer-tests, a third job.
+        ("            tests/unit/test_cr3_msi.py \\\n", ""),
+        ("            --ignore=tests/unit/test_cr3_msi.py \\\n", ""),
+        ("            tests/unit/test_cr3_msi.py \\\n", "            tests/unit/test_cr3_msj.py \\\n"),
+        (_SPLIT_PYTEST, _SPLIT_PYTEST.replace(" \\\n", " -k 'not msi' \\\n")),
+        (_SPLIT_PYTEST, _SPLIT_PYTEST.replace(" \\\n", " --collect-only \\\n")),
+        (_SPLIT_STEP, _SPLIT_STEP + "        if: github.event_name == 'push'\n"),
+        (_SPLIT_STEP, _SPLIT_STEP + "        continue-on-error: true\n"),
+        (_SPLIT_JOB, _SPLIT_JOB + "    continue-on-error: true\n"),
+        (_SPLIT_JOB, _SPLIT_JOB + "    if: false\n"),
+        (_SPLIT_JOB, "  extra:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo\n\n" + _SPLIT_JOB),
         (_UNIT_STEP, "      - run: rm tests/unit/test_sql_guard.py\n" + _UNIT_STEP),
         (_UNIT_STEP, "      - uses: ./.github/actions/prepare\n" + _UNIT_STEP),
         ("ruff check src tests scripts", "ruff check --exit-zero src tests scripts"),
@@ -1090,7 +1136,7 @@ _CHECKOUT_WITH = "          persist-credentials: false\n"
         # YAML 1.1 (this test's parser) ends a line at NEL, so it reads what
         # follows as a comment; a YAML 1.2 parser keeps it, and bash then runs
         # 'pytest tests/unit<NEL># || true', which exits 0.
-        (_PYTEST_RUN + "\n", _PYTEST_RUN + "\x85# || true\n"),
+        (_LAST_IGNORE, _LAST_IGNORE.replace("\n", "\x85# || true\n")),
         ("ruff check src tests scripts", "ruff check src tests\u00a0scripts"),
         # The same characters from a double-quoted scalar's escapes (\_ is a
         # no-break space), and a step that names its run twice.
@@ -1131,7 +1177,7 @@ def test_the_ci_gate_rejects_checks_that_run_before_the_install_or_in_another_jo
     # Each check's condition reads the install's outcome, which is null before
     # the install ran or in another job: the check is skipped and the job passes.
     wf = yaml.safe_load((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))
-    ((job_name, job),) = wf["jobs"].items()
+    job_name, job = "checks", wf["jobs"]["checks"]
     steps: list[dict[str, Any]] = job["steps"]
     install = next(step for step in steps if step.get("id") == "sync")
     unit = next(step for step in steps if step.get("name") == "Unit tests")
@@ -1146,7 +1192,9 @@ def test_the_ci_gate_rejects_checks_that_run_before_the_install_or_in_another_jo
         grouped = {
             name: {**job, "steps": [s for part in order.split() for s in parts[part]]} for name, order in jobs.items()
         }
-        return yaml.safe_dump({**wf, "jobs": grouped}, sort_keys=False)
+        # installer-tests stays as it is: the regrouped job is the checks job.
+        with_split: dict[str, Any] = {**grouped, "installer-tests": wf["jobs"]["installer-tests"]}
+        return yaml.safe_dump({**wf, "jobs": with_split}, sort_keys=False)
 
     _assert_the_workflow_gates_every_change("ci.yml", regrouped({job_name: "setup install unit checks"}))
     with pytest.raises(AssertionError):
@@ -2081,6 +2129,26 @@ def test_ci_audits_the_shipped_locks_and_fails_when_they_are_stale() -> None:
                 assert re.search(rf"--exclude-newer[ =]{_TIMESTAMP}(?!\S)", tool), tool
 
 
+def test_the_weekly_audit_runs_ci_s_audit_on_a_schedule() -> None:
+    """audit.yml runs CI's audit step, pinned the same way, every week: an
+    advisory against a pinned version fails a run between commits too."""
+    workflows = _workflows()
+    audit = workflows["audit.yml"]
+    triggers = _triggers(audit)
+    assert set(triggers) == {"schedule", "workflow_dispatch"}, triggers
+    (schedule,) = triggers["schedule"]
+    assert re.fullmatch(r"\d{1,2} \d{1,2} \* \* [0-6]", schedule["cron"]), f"not weekly: {schedule}"
+    _assert_keys("audit.yml", audit, _WORKFLOW_KEYS)
+    ((job_name, job),) = audit["jobs"].items()
+    # The same rules as CI's jobs: nothing can skip the audit or swallow its status.
+    assert _job_runs(f"audit.yml:{job_name}", job) == [*_SETUP_ACTIONS, _AUDIT.pattern]
+
+    def audits(steps: Iterable[dict[str, Any]]) -> list[str]:
+        return [script for step in steps if _AUDIT.fullmatch(script := _script(step.get("run", "")))]
+
+    assert audits(job["steps"]) == audits(_steps(workflows["ci.yml"])), "the weekly audit differs from CI's"
+
+
 def test_ci_gives_the_unit_suite_a_hashed_pip_so_the_bundle_builder_tests_run() -> None:
     # `uv sync` makes a venv without pip, and the offline bundle builder's tests
     # (test_hardening_2026_09_27_packaging.py) skip without one: the install
@@ -2088,7 +2156,7 @@ def test_ci_gives_the_unit_suite_a_hashed_pip_so_the_bundle_builder_tests_run() 
     # Dependabot bumps it.
     for name, wf in _gating_workflows().items():
         installs = [_script(step["run"]) for step in _steps(wf) if step.get("id") == "sync"]
-        assert installs == [_INSTALL], f"{name}: {installs}"
+        assert installs == [_INSTALL] * len(wf["jobs"]), f"{name}: {installs}"
         assert any(_AUDIT.fullmatch(_script(step.get("run", ""))) for step in _steps(wf)), name
     pin = _ci_pip_pin(REPO / _CI_PIP)
     dependabot = yaml.safe_load((REPO / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
@@ -2361,9 +2429,9 @@ def test_dependabot_skips_every_release_past_a_pyproject_cap() -> None:
             for versions in rule["versions"]:
                 assert versions.startswith(">="), rule
                 ignored[canonicalize_name(rule["dependency-name"])] = Version(versions[2:])
-        for name, bound in caps.items():
+        for capped, bound in caps.items():
             where = update["directory"]
-            assert name in ignored and ignored[name] <= bound, f"{where}: {name} >= {bound} is not ignored"
+            assert capped in ignored and ignored[capped] <= bound, f"{where}: {capped} >= {bound} is not ignored"
 
 
 def test_scripts_ruff_config_extends_the_project_config_with_file_scoped_ignores() -> None:

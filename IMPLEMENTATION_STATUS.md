@@ -1265,8 +1265,15 @@ the residuals).
   tests' `/usr/bin:/bin` PATH (now a directory of links without `dotnet`
   and `wix`). The next run was green: every step, including the
   `GITHUB_ACTIONS`-only pip and pwsh probes, 12,769 passed, 85 skipped, 1
-  xfailed. The job-scoped Pages workflow has not run (Pages is not enabled
-  yet). Before that, the workflows passed `actionlint` and CI's install was
+  xfailed. Since then every push to `main` has a result, Pages is enabled and
+  deploys the landing page from `main`, and on 2026-10-09 the unit suite was
+  split between two parallel jobs (`checks`, `installer-tests`; the hygiene
+  gate checks that together they run every test once), which brought a run
+  from about 20 minutes to about 9. The split's first run surfaced one more
+  timing assumption: a 0.05 s deadline that a busy runner can pass before
+  the worker thread starts (now 0.5 s, like the sibling tests). A weekly
+  `audit.yml` runs CI's pip-audit between commits; Dependabot is monthly.
+  Before that, the workflows passed `actionlint` and CI's install was
   replayed locally in Ubuntu 24.04 and Debian containers. On 2026-09-29 the whole `checks` job (`uv sync --locked --all-extras`, the
   hashed pip install, `pytest tests/unit`, ruff, `mypy --strict src`,
   `--check-locks`, pip-audit over every lock) was replayed as a non-root
@@ -1278,8 +1285,8 @@ the residuals).
   makes an internal `UPDATE sqlite_master` check that the connector's
   read-only authorizer denies, so row estimates are None there by design;
   3.45 on Ubuntu 24.04 is not affected; `tests/unit/helpers_sqlite.py`).
-  Unconfirmed: a result for a push to `main`, and Dependabot's pickup of
-  the `/.github` pip entry.
+  Dependabot picks up all four entries (uv, the shipped locks, the
+  `/.github` pip and the actions).
 - **Apple signing:** the `.pkg` is unsigned (no Developer ID identity). The
   convergence wave's postinstall steps (the newsyslog rule removed,
   `/Library/Logs/universal-db-mcp` provisioned, the app assembled in
