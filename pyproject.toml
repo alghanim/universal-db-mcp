@@ -1,6 +1,6 @@
 [build-system]
 # 1.27: PEP 639 license expression and license-files
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -22,7 +22,7 @@ dependencies = [
     "uvicorn>=0.52.4,<0.54",
     "h11>=0.16,<0.17",
     # security floor: mcp's pyjwt[crypto] (and PyMySQL[rsa]) accept older releases
-    "cryptography>=50",
+    "cryptography>=50.0.2",
 ]
 
 [project.urls]
@@ -34,12 +34,12 @@ Security = "https://github.com/alghanim/universal-db-mcp/security/policy"
 [project.optional-dependencies]
 dev = [
     "pytest>=9",
-    "ruff>=0.16",
+    "ruff>=0.16.10",
     "mypy>=2.4.0",
     "types-PyYAML",
-    "build>=1.2",
+    "build>=1.6.1",
 ]
-pg = ["psycopg[binary]>=3.2,<4"]
+pg = ["psycopg[binary]>=3.3.6,<4"]
 # 1.2.0 is the tested pin (CVE-2024-36039 is fixed from 1.1.1); ed25519 and rsa
 # carry the MariaDB ed25519 and MySQL 8 caching_sha2 auth plugins; PyNaCl 1.6.2
 # fixes CVE-2025-69277, which PyMySQL[ed25519] alone would let an install keep
