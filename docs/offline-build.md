@@ -38,6 +38,20 @@ it would raise the bundle's glibc floor to 2.34. `.github/dependabot.yml`
 skips every release past these caps (and ibm-db 3.3); its grouped runtime
 pull requests stay red until the locks are refreshed as above.
 
+**Microsoft's ODBC driver and public releases.** By default the Linux
+bundle vendors the SQL Server connector's OS closure, unixODBC plus
+Microsoft ODBC Driver 18 (`msodbcsql18`, under Microsoft's EULA), so a site
+installs it with no network. A release published for anyone to download
+must not redistribute Microsoft's driver: build it with
+`--without-mssql-driver` (`release_usb.sh` passes it when
+`UDBMCP_WITHOUT_MSSQL_DRIVER=1`). That bundle, and the `.deb` built from it,
+ships no OS packages; the manifest declares the driver administrator
+supplied, which the verifier accepts, and the site installs it from
+Microsoft (`docs/offline-deployment.md`). The flag is allowed with
+`--signing-key`, because it is a recorded choice rather than an incomplete
+closure, and refused if a closure is staged anyway. A site's own stick can
+keep the driver.
+
 **Residual trust:** the lock hashes are whatever the index advertises when
 the locks are refreshed, so an upstream release that is already compromised
 at that moment would be locked too: review the lock diff before committing
