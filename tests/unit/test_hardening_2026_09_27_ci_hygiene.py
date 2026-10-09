@@ -383,8 +383,17 @@ def _steps(workflow: dict[str, Any]) -> Iterator[dict[str, Any]]:
         yield from job.get("steps", [])
 
 
+# CodeQL runs on pushes and pull requests too, but it analyzes the code rather
+# than gating changes: test_codeql_only_analyzes_the_code pins its shape.
+_ANALYSIS_WORKFLOWS = frozenset({"codeql.yml"})
+
+
 def _gating_workflows() -> dict[str, dict[str, Any]]:
-    return {name: wf for name, wf in _workflows().items() if {"push", "pull_request"} <= set(_triggers(wf))}
+    return {
+        name: wf
+        for name, wf in _workflows().items()
+        if {"push", "pull_request"} <= set(_triggers(wf)) and name not in _ANALYSIS_WORKFLOWS
+    }
 
 
 def _strings(node: object) -> Iterator[str]:
@@ -2390,6 +2399,17 @@ _WRITER_JOBS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str], frozen
         }),
         frozenset({"push", "schedule", "branch_protection_rule", "workflow_dispatch"}),
     ),
+    # CodeQL uploads its findings; on a pull request from a fork the token is
+    # read-only whatever the workflow asks for.
+    ("codeql.yml", "analyze"): (
+        frozenset({"security-events"}),
+        frozenset({
+            _CHECKOUT_ACTION,
+            "github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d",
+            "github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d",
+        }),
+        frozenset({"push", "pull_request", "schedule"}),
+    ),
 }
 
 
@@ -2566,3 +2586,23 @@ def test_the_mcp_registry_entry_names_the_image_the_container_workflow_labels() 
     workflow = (WORKFLOWS / "container.yml").read_text(encoding="utf-8")
     assert '--label "io.modelcontextprotocol.server.name=io.github.$GITHUB_REPOSITORY"' in workflow
     assert '"io.github.$GITHUB_REPOSITORY"' in workflow, "the registry job checks the name against the label"
+
+
+def test_codeql_only_analyzes_the_code() -> None:
+    """codeql.yml is exempt from the gating checks because it gates nothing:
+    one job, the checkout and CodeQL's own init and analyze, no script, no
+    other write than its findings."""
+    wf = _workflows()["codeql.yml"]
+    assert set(wf) <= {"name", "on", True, "permissions", "jobs"}, sorted(map(str, wf))
+    assert wf["permissions"] == {}
+    ((job_name, job),) = wf["jobs"].items()
+    assert set(job) <= {"runs-on", "timeout-minutes", "permissions", "strategy", "steps"}, sorted(job)
+    assert job["permissions"] == {"contents": "read", "security-events": "write"}
+    steps = job["steps"]
+    assert not [step for step in steps if "run" in step], "CodeQL runs no scripts"
+    assert [step["uses"] for step in steps] == [
+        _CHECKOUT_ACTION,
+        "github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d",
+        "github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d",
+    ]
+    assert job["strategy"]["matrix"]["language"] == ["python", "actions"]

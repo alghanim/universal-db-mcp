@@ -7,8 +7,10 @@ it can reach. Thank you for reporting one privately.
 ## Reporting a vulnerability
 
 Report it through **GitHub private vulnerability reporting** on this
-repository: open the **Security** tab, choose **Report a vulnerability**, and
-fill in the form. That is the only reporting channel. Please do not open a
+repository, at
+<https://github.com/alghanim/universal-db-mcp/security/advisories/new> (or open
+the **Security** tab and choose **Report a vulnerability**), and fill in the
+form. That is the only reporting channel. Please do not open a
 public issue, pull request or discussion for a suspected vulnerability, and do
 not send it anywhere else. No e-mail address is published for reports: the
 one in the `.deb`'s Maintainer field, which Debian requires, is a placeholder
@@ -35,10 +37,11 @@ credentials, real data from a production database, or a key.
 
 ## What happens next
 
-Reports are acknowledged as soon as practical. There is no fixed response
-time. We will confirm whether we can reproduce the issue, keep you informed
-while a fix is prepared, and agree with you when and how it is disclosed. We
-credit reporters in the advisory unless you ask us not to.
+Every report is acknowledged within 7 days. We will confirm whether we can
+reproduce the issue, keep you informed while a fix is prepared, and agree
+with you when and how it is disclosed (coordinated disclosure: the advisory
+is published once a fixed release is available). We credit reporters in the
+advisory unless you ask us not to.
 
 ## Supported versions
 
