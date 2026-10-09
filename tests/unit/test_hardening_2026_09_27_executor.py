@@ -2858,6 +2858,15 @@ def test_call_on_a_later_event_loop_is_woken_when_tokens_handed_back_to_closed_o
     assert out == "ok", out
     assert ended < 1.5, ended
     assert calls == [conn.connection.name for conn in statements]
+    # The call needed one token back; the other workers end on their own
+    # schedule, and one that hands its token back after every loop has closed
+    # leaves it pending (_hand_back). Each borrowed token is pending once
+    # every worker has handed back, and the next request returns them all.
+    deadline = time.monotonic() + 10
+    while _borrowed(svc) != len(svc._pending):
+        assert time.monotonic() < deadline, "an abandoned worker never handed its token back"
+        time.sleep(0.01)
+    assert anyio.run(step, waiting, lambda c: "ok", 0.2) == "ok"
     assert (_borrowed(svc), svc._pending, svc._holding) == (0, {}, {})
 
 
