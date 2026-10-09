@@ -101,6 +101,24 @@ read from the stick itself (`RELEASE-KEY-FINGERPRINT.txt`) proves nothing on
 its own, because whoever can change the stick can change that file too.
 `docs/site-upgrade-runbook.md` has the full procedure.
 
+## Release signing key
+
+Releases from v0.1.0 on are signed with one Ed25519 release key. Its
+fingerprint, the SHA-256 of the DER-encoded public key (what `bootstrap.sh`
+and `release_usb.sh` print), is:
+
+```
+4d27906ec57c098f7c86942fb78803fdec9f753735afbc7c68a01c778ec62179
+```
+
+Each GitHub release carries the public key (`release.pub.pem`), `SHA256SUMS`
+and `SHA256SUMS.sig`. This file is one channel for the fingerprint: before a
+first install, confirm it through a second one as well. A key change is
+announced here, in the release notes, and through that second channel, and
+is installed at a site only with `bootstrap.sh --rotate-key`. Builds signed
+with the demo key (`release_usb.sh --demo`) are for testing and are never
+published.
+
 ## Scope
 
 In scope: the server and its tools (`src/universal_db_mcp`), the SQL guard,
