@@ -157,8 +157,10 @@ docker pull ghcr.io/alghanim/universal-db-mcp:0.1.0
 gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.1.0 --repo alghanim/universal-db-mcp
 ```
 
-Mount your config and its secrets read-only and run it over stdio or HTTP as
-`docs/offline-deployment.md` (Container mode) describes. The image has no SQL
+It is listed in the official [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.alghanim/universal-db-mcp`, so clients that browse the registry
+can install it. Mount your config and its secrets read-only and run it over
+stdio or HTTP as `docs/offline-deployment.md` (Container mode) describes. The image has no SQL
 Server driver; the same section shows how to add Microsoft's.
 
 ## A minimal connection
