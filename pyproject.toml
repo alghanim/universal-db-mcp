@@ -35,7 +35,7 @@ Security = "https://github.com/alghanim/universal-db-mcp/security/policy"
 dev = [
     "pytest>=9",
     "ruff>=0.16",
-    "mypy>=2.3",
+    "mypy>=2.4.0",
     "types-PyYAML",
     "build>=1.2",
 ]
