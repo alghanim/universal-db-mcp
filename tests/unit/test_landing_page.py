@@ -12,6 +12,7 @@ import asyncio
 import glob
 import json
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,40 @@ def test_the_page_lists_exactly_the_registered_tools(tmp_path: Path) -> None:
     assert set(listed) == registered
     count = len(registered)
     assert f"See all {count} tools" in PAGE and f"{count} tools · 8 databases" in PAGE and f"{count} tools turn" in PAGE
+
+
+def _shield_text(part: str) -> str:
+    """A shields.io static badge path segment as it renders: '--' is a dash."""
+    return part.replace("--", "\0").replace("-", " ").replace("\0", "-").replace("%20", " ").replace("_", " ")
+
+
+def test_the_readme_badges_state_what_the_code_and_evidence_say(tmp_path: Path) -> None:
+    """The README's badge row makes the same kind of claim as this page."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    badges: dict[str, str] = {}
+    for alt, path in re.findall(r'<img alt="([^"]+)" src="https://img\.shields\.io/badge/([^"]+)"', readme):
+        shown = re.fullmatch(r"((?:[^-]|--)+)-((?:[^-]|--)+)-[0-9a-f]{3,6}", path)
+        assert shown, path
+        label, message = _shield_text(shown.group(1)), _shield_text(shown.group(2))
+        assert alt == f"{label}: {message}", (alt, path)
+        badges[label] = message
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert badges["license"] == project["license"]
+    assert badges["python"] == project["requires-python"].removeprefix(">=")
+    assert badges["MCP"] == f"{len(_registered_tools(tmp_path))} tools"
+    assert f"tools · {badges['databases']} databases" in PAGE, "the page counts the same databases"
+    assert badges.keys() == {"license", "python", "MCP", "databases", "access", "deploy"}
+    status = r"img\.shields\.io/github/actions/workflow/status/alghanim/universal-db-mcp/([^?]+)\?branch=main"
+    ci = re.search(status, readme)
+    assert ci and (ROOT / ".github" / "workflows" / ci.group(1)).is_file()
+    # every in-page link lands on a heading (GitHub's anchor rule), every relative link on a file
+    headings = re.findall(r"^#{1,6} (.+)$", readme, re.M)
+    anchors = {re.sub(r"[^\w\- ]", "", heading.strip().lower()).replace(" ", "-") for heading in headings}
+    for target in re.findall(r'href="([^"]+)"', readme):
+        if target.startswith("#"):
+            assert target[1:] in anchors, target
+        elif not target.startswith("https://"):
+            assert (ROOT / target).exists(), target
 
 
 def test_the_version_matrix_figures_match_the_evidence() -> None:
