@@ -14,7 +14,7 @@ pyjwt>=2.15.0
 
 # Connector wheels (lazy-imported; missing wheels must be declared in the
 # bundle manifest rather than skipped silently):
-psycopg[binary]==3.3.5
+psycopg[binary]==3.3.6
 PyMySQL==1.2.3
 clickhouse-connect==1.8.0
 oracledb==4.0.2
@@ -27,4 +27,4 @@ ibm-db==3.2.9  # tested wheel in the bundle wheelhouse
 # only transitively via oracledb, so a profile built without the oracle extra
 # would have broken MySQL 8 logins with no wheel available to fix it offline.
 PyNaCl==1.6.2
-cryptography==50.0.1
+cryptography==50.0.2
