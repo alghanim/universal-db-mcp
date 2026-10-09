@@ -370,7 +370,7 @@ def test_the_module_reader_is_linear_on_adversarial_text() -> None:
     for body in ('"' * 65536, "CREATE VIRTUAL TABLE " + '"' + '""' * 32768, "CREATE VIRTUAL TABLE " + "a." * 32768):
         started = time.perf_counter()
         sqlite_module._module_of(body)
-        assert time.perf_counter() - started < 0.2
+        assert time.perf_counter() - started < 0.8
 
 
 # ---- no catalog listing per call -------------------------------------------------

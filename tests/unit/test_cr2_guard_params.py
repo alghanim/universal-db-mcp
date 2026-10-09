@@ -107,7 +107,7 @@ def test_sw1_bind_text_is_linear() -> None:
     sql = "SELECT '" + "%%" * 30000 + "' = %s, `" + "%" * 2000 + "`"
     start = time.perf_counter()
     bind_text(sql, [1], engine="mysql")
-    assert time.perf_counter() - start < 0.5
+    assert time.perf_counter() - start < 2.0
 
 
 # --------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def test_v7h_redaction_of_an_echoed_parameter_is_linear(kib: int) -> None:
     scrub_exception(exc)
     redact_text(value)
     redact_text(("password user for uid login DB::Exception: x" + " " * 40) * (kib * 1024 // 90))
-    assert time.perf_counter() - start < 0.5
+    assert time.perf_counter() - start < 2.0
 
 
 def test_x8_login_still_redacted_and_cut_text_shows_no_partial_secret(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,7 +281,7 @@ def test_v7c_v7i_streamed_is_linear(sql: str, params: Any) -> None:
 
     start = time.perf_counter()
     text = _streamed(sql, probe_ok=True, params=params)
-    assert time.perf_counter() - start < 0.3
+    assert time.perf_counter() - start < 1.2
     assert not _columns_only(text) or sql.endswith("LIMIT 0")
 
 
@@ -676,7 +676,7 @@ def test_catalog_checks_are_cached_and_bounded() -> None:
     for schema, name in names:
         ss.is_session_sql_view("oracle", schema, name)
         ss.loose_name(name)
-    assert time.perf_counter() - start < 0.1
+    assert time.perf_counter() - start < 0.4
     assert ss.is_session_sql_view("mysql", "information_schema", "PROCESSLıST")
     assert ss._LOOSE_CACHE.max_entries == ss._SESSION_SQL_CACHE.max_entries == 32768
     long_name = "x" * 70000

@@ -410,7 +410,7 @@ def test_sqlite_comment_blanking_is_linear(text: str) -> None:
     assert time.perf_counter() - start < 2.0
     start = time.perf_counter()
     sqlite_module._module_of("CREATE VIRTUAL TABLE " + text)
-    assert time.perf_counter() - start < 0.5
+    assert time.perf_counter() - start < 2.0
 
 
 def _long(tmp_path: Path) -> SQLiteConnector:

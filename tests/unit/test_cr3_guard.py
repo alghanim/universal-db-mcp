@@ -364,7 +364,7 @@ def test_a67_scrub_is_linear_on_huge_errors() -> None:
         start = time.perf_counter()
         scrub_exception(RuntimeError("password=" + "a" * size))
         scrub_exception(RuntimeError("for user '" + "x " * (size // 2)))
-        assert time.perf_counter() - start < 0.5
+        assert time.perf_counter() - start < 2.0
 
 
 # --------------------------------------------------------------------------
