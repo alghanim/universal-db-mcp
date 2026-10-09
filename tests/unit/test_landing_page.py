@@ -75,7 +75,7 @@ def test_the_readme_badges_state_what_the_code_and_evidence_say(tmp_path: Path) 
     assert badges["python"] == project["requires-python"].removeprefix(">=")
     assert badges["MCP"] == f"{len(_registered_tools(tmp_path))} tools"
     assert f"tools · {badges['databases']} databases" in PAGE, "the page counts the same databases"
-    assert badges.keys() == {"license", "python", "MCP", "databases", "access", "deploy"}
+    assert badges.keys() == {"license", "python", "MCP", "databases", "access", "install"}
     status = r"img\.shields\.io/github/actions/workflow/status/alghanim/universal-db-mcp/([^?]+)\?branch=main"
     ci = re.search(status, readme)
     assert ci and (ROOT / ".github" / "workflows" / ci.group(1)).is_file()

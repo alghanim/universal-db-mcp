@@ -7,7 +7,7 @@
   <a href="docs/tools.md"><img alt="MCP: 29 tools" src="https://img.shields.io/badge/MCP-29%20tools-6f42c1"></a>
   <a href="#what-it-does"><img alt="databases: 8" src="https://img.shields.io/badge/databases-8-e67e22"></a>
   <a href="#how-it-keeps-the-databases-safe"><img alt="access: read-only" src="https://img.shields.io/badge/access-read--only-0e8a7d"></a>
-  <a href="#install-on-an-air-gapped-site"><img alt="deploy: air-gapped" src="https://img.shields.io/badge/deploy-air--gapped-5b5bd6"></a>
+  <a href="#install-on-an-air-gapped-site"><img alt="install: offline-ready" src="https://img.shields.io/badge/install-offline--ready-5b5bd6"></a>
 </p>
 
 <p align="center">
