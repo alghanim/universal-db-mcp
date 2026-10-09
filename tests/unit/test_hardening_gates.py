@@ -5623,8 +5623,12 @@ async def test_poison_set_does_not_leak_into_recycled_connectors(anyio_backend: 
 
     svc = ExecutionService(max_concurrent=2)
     conn = SlowConnector.__new__(SlowConnector)
-    with pytest.raises(ToolFailure):
-        await svc.run_bounded(conn, lambda c: c.execute_query(QuerySpec(sql="x")), 0.05, description="t")
+    # Long enough for the worker to start on a busy runner (a call whose
+    # deadline fires before it starts is refused and poisons nothing), far
+    # short of the 5 s query.
+    with pytest.raises(ToolFailure) as failure:
+        await svc.run_bounded(conn, lambda c: c.execute_query(QuerySpec(sql="x")), 0.5, description="t")
+    assert "did not start" not in str(failure.value), failure.value
     assert svc.is_poisoned(conn)
     # let the abandoned worker thread finish so it releases its reference
     import anyio
