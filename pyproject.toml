@@ -13,7 +13,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "universal-db-mcp maintainers" }]
 dependencies = [
-    "mcp>=2.2.0,<3",
+    "mcp>=2.3.0,<3",
     "PyYAML>=6.0.2,<7",
     # the SQL guard is tested on this parser series only (the bundle pins 30.18.0)
     "sqlglot~=30.18.0",

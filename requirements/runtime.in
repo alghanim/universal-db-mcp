@@ -1,7 +1,7 @@
 # Runtime dependencies (target: linux-x86_64, glibc, CPython 3.12).
 # The offline bundle builder resolves this to a fully pinned, hashed
 # runtime.lock. Do not install from this file in production.
-mcp==2.2.0
+mcp==2.3.0
 PyYAML==6.0.3
 sqlglot==30.18.0
 # The HTTP transport subclasses uvicorn's h11 protocol and reads h11 state
