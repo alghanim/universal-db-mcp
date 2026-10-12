@@ -3,6 +3,7 @@
 <p align="center">
   <a href="https://github.com/alghanim/universal-db-mcp/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/alghanim/universal-db-mcp/ci.yml?branch=main&label=CI"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/alghanim/universal-db-mcp"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/alghanim/universal-db-mcp/badge"></a>
+  <a href="https://m8ven.ai/mcp/alghanim-universal-db-mcp-s7tavw?s=readme"><img alt="M8ven Score" src="https://m8ven.ai/badge/mcp/alghanim-universal-db-mcp-s7tavw?v=5eb12f3910935759c86d7f0e5e0874ec"></a>
   <a href="LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-4c1"></a>
   <a href="pyproject.toml"><img alt="python: 3.12" src="https://img.shields.io/badge/python-3.12-3776ab"></a>
   <a href="docs/tools.md"><img alt="MCP: 29 tools" src="https://img.shields.io/badge/MCP-29%20tools-6f42c1"></a>
