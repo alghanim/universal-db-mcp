@@ -100,6 +100,22 @@ def test_unknown_dialect_parse_failure_is_policy_denial_not_internal() -> None:
         guard.validate_select("SELECT 1")
 
 
+@pytest.mark.parametrize(
+    ("engine", "method", "sql"),
+    [(engine, "validate_select", "SELECT {:} FROM t")
+     for engine in ("postgres", "mysql", "clickhouse", "oracle", "mssql", "db2", "sqlite")]
+    + [(engine, "validate_explain", "EXPLAIN SELECT {:} FROM t")
+       for engine in ("postgres", "mysql", "clickhouse", "mssql", "sqlite")],
+)
+def test_a_parser_crash_is_a_denial_not_an_internal_error(engine: str, method: str, sql: str) -> None:
+    # sqlglot's parser raised AttributeError on an empty '{:}' map literal in
+    # every dialect the guard uses (found by the fuzzer): it escaped the guard
+    # and reached the agent as INTERNAL_ERROR, audited as an error, not a deny.
+    guard = SqlGuard(engine, FakePolicy(engine=engine), StaticResolver({(None, "t")}))  # type: ignore[arg-type]
+    with pytest.raises(ToolFailure, match="could not be parsed"):
+        getattr(guard, method)(sql)
+
+
 def test_oversized_statement_rejected_with_validation_category() -> None:
     policy = FakePolicy(engine="sqlite")
     guard = SqlGuard("sqlite", policy, StaticResolver({(None, "customers")}))  # type: ignore[arg-type]

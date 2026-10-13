@@ -22,7 +22,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
-import sqlglot
 from sqlglot import Token, TokenType, exp
 from sqlglot.dialects.dialect import Dialect
 
@@ -1659,10 +1658,13 @@ class SqlGuard:
                 tokens = dialect.tokenize(candidate)
                 statements = dialect.parser().parse(tokens, candidate)
                 break
-            except (sqlglot.errors.SqlglotError, ValueError, RecursionError) as exc:
-                # SqlglotError is the base of ParseError and of the tokenizer's
-                # TokenError (unterminated literal, comment or [identifier]),
-                # which used to escape as INTERNAL_ERROR instead of a denial.
+            except Exception as exc:  # noqa: BLE001 - anything the parser cannot take is unparsed SQL
+                # Not only SqlglotError (ParseError, the tokenizer's TokenError),
+                # ValueError and RecursionError: sqlglot's own bugs on malformed
+                # text raise whatever they raise (AttributeError on an empty
+                # '{:}' map literal in every dialect, found by the fuzzer), and
+                # each used to escape as INTERNAL_ERROR instead of a denial.
+                # Only sqlglot runs inside this try.
                 last_exc = exc
         else:
             # A parser failure (or unsupported dialect / pathological nesting)
