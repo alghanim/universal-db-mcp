@@ -4,7 +4,8 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "universal-db-mcp"
+# PyPI: `universal-db-mcp` there is another project; the import package is universal_db_mcp
+name = "udbmcp"
 version = "0.1.0"
 description = "Read-only MCP server that gives AI agents safe access to your databases"
 readme = "README.md"
@@ -12,6 +13,24 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "universal-db-mcp maintainers" }]
+keywords = [
+    "mcp", "model-context-protocol", "ai-agents", "database", "sql", "read-only",
+    "postgresql", "mysql", "mariadb", "clickhouse", "oracle", "sql-server", "db2", "sqlite",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Security",
+]
 dependencies = [
     "mcp>=2.2.0,<3",
     "PyYAML>=6.0.2,<7",
@@ -49,6 +68,9 @@ clickhouse = ["clickhouse-connect>=1.8,<1.9"]
 oracle = ["oracledb>=4,<5"]
 mssql = ["pyodbc>=5.1,<6"]
 db2 = ["ibm-db>=3.2,<4"]
+# The drivers that install from wheels on Linux, macOS and Windows alike; SQL
+# Server (mssql) and Db2 (db2) need a native client library besides theirs.
+all = ["udbmcp[pg,mysql,clickhouse,oracle]"]
 
 [project.scripts]
 udbmcp = "universal_db_mcp.__main__:main"

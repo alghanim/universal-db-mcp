@@ -2622,9 +2622,11 @@ def _pyproject_requirements() -> list[Any]:
 
     project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
     extras = project["optional-dependencies"]
-    return [Requirement(r) for r in project["dependencies"]] + [
+    reqs = [Requirement(r) for r in project["dependencies"]] + [
         Requirement(r) for extra, reqs in extras.items() if extra != "dev" for r in reqs
     ]
+    # an extra made of other extras ("all") names the project itself
+    return [r for r in reqs if _canonical(r.name) != _canonical(project["name"])]
 
 
 def _canonical(name: str) -> str:
@@ -2733,7 +2735,8 @@ def test_f59_uv_lock_resolves_the_shipped_closure() -> None:
     shipped = builder.parse_lock(builder.lock_path(_profiles()[LINUX_PROFILE]).read_text(encoding="utf-8"))
     for name, entry in shipped.items():
         assert versions.get(name) == entry.version, f"uv.lock has {name} {versions.get(name)}, lock {entry.version}"
-    project = next(p for p in packages if p["name"] == "universal-db-mcp")
+    name = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["name"]
+    project = next(p for p in packages if p["name"] == name)
     requires = {r["name"]: r for r in project["metadata"]["requires-dist"]}
     assert SpecifierSet(requires["sqlglot"]["specifier"]) == SpecifierSet("~=30.18.0")
     assert SpecifierSet(requires["pymysql"]["specifier"]) == SpecifierSet(">=1.2.0,<2")

@@ -30,7 +30,7 @@ _V = r"(?P<v>\d+\.\d+\.\d+)"
 FILES: tuple[tuple[str, str], ...] = (
     ("pyproject.toml", rf'(?m)^version = "{_V}"$'),
     ("src/universal_db_mcp/__init__.py", rf'(?m)^__version__ = "{_V}"$'),
-    ("uv.lock", rf'(?m)^name = "universal-db-mcp"\nversion = "{_V}"$'),
+    ("uv.lock", rf'(?m)^name = "udbmcp"\nversion = "{_V}"$'),
     ("packaging/compose.offline.yaml", rf"(?m)^    image: udbmcp/universal-db-mcp:{_V}-"),
     ("packaging/deb/control", rf"(?m)^Version: {_V}$"),
     ("packaging/msi/udbmcp.wxs", rf'<\?define ProductVersion = "{_V}" \?>'),

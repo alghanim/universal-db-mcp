@@ -1441,7 +1441,7 @@ wheels = [
 ]
 
 [[package]]
-name = "universal-db-mcp"
+name = "udbmcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -1454,6 +1454,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "clickhouse-connect" },
+    { name = "oracledb" },
+    { name = "psycopg", extra = ["binary"] },
+    { name = "pymysql", extra = ["ed25519", "rsa"] },
+    { name = "pynacl" },
+]
 clickhouse = [
     { name = "clickhouse-connect" },
 ]
@@ -1500,9 +1507,10 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16" },
     { name = "sqlglot", specifier = "~=30.18.0" },
     { name = "types-pyyaml", marker = "extra == 'dev'" },
+    { name = "udbmcp", extras = ["pg", "mysql", "clickhouse", "oracle"], marker = "extra == 'all'" },
     { name = "uvicorn", specifier = ">=0.52.4,<0.54" },
 ]
-provides-extras = ["dev", "pg", "mysql", "clickhouse", "oracle", "mssql", "db2"]
+provides-extras = ["dev", "pg", "mysql", "clickhouse", "oracle", "mssql", "db2", "all"]
 
 [[package]]
 name = "urllib3"
