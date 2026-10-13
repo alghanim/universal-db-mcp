@@ -39,6 +39,19 @@ def test_upgrade_case_keeps_the_admin_config_and_refuses_an_outdated_installer()
     assert 'dpkg --compare-versions "$NEWVER" gt "0.1.0~' in body and "upgrade_version_ordering" in body
 
 
+def test_upgrade_case_orders_build_stamps_within_the_packages_own_version() -> None:
+    # The stamp checks named 0.1.0: the 0.2.0 release gate failed because
+    # 0.2.0+<stamp> is (rightly) newer than every 0.1.0 build.
+    body = _upgrade_script()
+    block = body[body.index("# --- version ordering"):body.index("# --- doctor reports the installed release")]
+    assert 'UPSTREAM="${NEWVER%%+*}"' in block
+    assert 'gt "$UPSTREAM+190001010000.g0000000"' in block
+    assert '! dpkg --compare-versions "$NEWVER" gt "$UPSTREAM+299912312359.g0000000"' in block
+    # every later release upgrades every 0.1.0 build; the ~<hash> scheme only ever existed at 0.1.0
+    assert 'gt "0.1.0+299912312359.g0000000"' in block and 'gt "0.1.0~ffff' in block
+    assert not re.search(r'gt "0\.1\.0\+1900', block)
+
+
 def test_upgrade_case_runs_in_its_own_no_network_container_and_is_merged() -> None:
     block = GATE[GATE.index("# -------------------------------------------------------------- upgrade case"):]
     block = block[: block.index("# ------------------------------------------------------------- negative case")]

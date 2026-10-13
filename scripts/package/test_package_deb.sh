@@ -1161,13 +1161,16 @@ else
   rec upgrade_refuses_unmarked_installer failed "could not derive a marker-less installer copy from /trust/install_offline.sh"
 fi
 
-# --- version ordering: this package must upgrade a legacy 0.1.0~<hash> install
-#     and any package with an older build stamp ---------------------------------
+# --- version ordering: this package must upgrade a legacy 0.1.0~<hash> install,
+#     every 0.1.0 build of a later release, and any package of its own version
+#     with an older build stamp; a newer stamp of its version must upgrade it --
 NEWVER="$(dpkg-deb -f "$DEB" Version)"
+UPSTREAM="${NEWVER%%+*}"
 if dpkg --compare-versions "$NEWVER" gt "0.1.0~ffffffffffffffffffffffffffffffffffffffff" \
-   && dpkg --compare-versions "$NEWVER" gt "0.1.0+190001010000.g0000000" \
-   && ! dpkg --compare-versions "$NEWVER" gt "0.1.0+299912312359.g0000000"; then
-  rec upgrade_version_ordering passed "version $NEWVER upgrades a legacy 0.1.0~<hash> install and an older build stamp, and is older than a newer stamp"
+   && { [ "$UPSTREAM" = 0.1.0 ] || dpkg --compare-versions "$NEWVER" gt "0.1.0+299912312359.g0000000"; } \
+   && dpkg --compare-versions "$NEWVER" gt "$UPSTREAM+190001010000.g0000000" \
+   && ! dpkg --compare-versions "$NEWVER" gt "$UPSTREAM+299912312359.g0000000"; then
+  rec upgrade_version_ordering passed "version $NEWVER upgrades a legacy 0.1.0~<hash> install, every earlier release and an older build stamp, and is older than a newer stamp"
 else
   rec upgrade_version_ordering failed "version $NEWVER does not order as an upgrade over the legacy scheme / older stamps"
 fi
