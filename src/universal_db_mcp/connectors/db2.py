@@ -334,6 +334,7 @@ class Db2Connector(DatabaseConnector):
         budget = max(1.0, float(cfg.connect_timeout_seconds))
         deadline = time.monotonic() + budget
         probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        probe.minimum_version = ssl.TLSVersion.TLSv1_2  # Python's default since 3.10, stated
         probe.check_hostname = False
         probe.verify_mode = ssl.CERT_NONE
         stage = "tcp"  # what the peer has yet to do: accept, handshake, answer
