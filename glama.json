@@ -1,0 +1,22 @@
+{
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
+  "maintainers": ["alghanim"],
+  "baseImage": "python:3.12-slim",
+  "pythonVersion": "3.12",
+  "buildSteps": [
+    "python -m venv /app/.venv && /app/.venv/bin/pip install --no-cache-dir .",
+    "/app/.venv/bin/python examples/sqlite-demo/create_demo.py --path /app/examples/sqlite-demo/finlink_demo.db"
+  ],
+  "cmdArguments": [
+    "mcp-proxy",
+    "--",
+    "/app/.venv/bin/udbmcp",
+    "serve",
+    "--transport",
+    "stdio",
+    "--config",
+    "/app/examples/sqlite-demo/config.yaml"
+  ],
+  "placeholderArguments": {},
+  "pinnedCommit": null
+}
