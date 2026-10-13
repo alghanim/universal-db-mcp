@@ -52,6 +52,14 @@ Microsoft (`docs/offline-deployment.md`). The flag is allowed with
 closure, and refused if a closure is staged anyway. A site's own stick can
 keep the driver.
 
+**Setting the version.** `pyproject.toml`'s `version` is the release. The
+bundle builder reads it (the signed manifest's `release`, which the `.deb`,
+`.pkg` and MSI builders take theirs from); `python scripts/bump_version.py
+X.Y.Z` rewrites the copies that cannot read it (`__init__.py`, `uv.lock`,
+`server.json`, the package templates and the artifact names in the docs), and
+`--check`, which the unit suite runs, fails while any of them disagrees.
+Commit the bump before `release_usb.sh`, which builds only a clean tree.
+
 **Publishing a GitHub release.** After `release_usb.sh` has built `HEAD`
 with the release key and `UDBMCP_WITHOUT_MSSQL_DRIVER=1`,
 `scripts/package/publish_github_release.sh` (same `UDBMCP_RELEASE_KEY` and

@@ -448,6 +448,12 @@ def build_requires() -> list[str]:
     return list(pyproject["build-system"]["requires"])
 
 
+def project_version() -> str:
+    """The release this bundle carries: pyproject.toml's version (scripts/bump_version.py sets it)."""
+    pyproject = tomllib.loads((PROJECT / "pyproject.toml").read_text(encoding="utf-8"))
+    return str(pyproject["project"]["version"])
+
+
 def lock_resolver(text: str) -> str | None:
     """The uv version --refresh-locks recorded in a lock, if any."""
     m = re.search(r"^# resolver: (.+)$", text, flags=re.MULTILINE)
@@ -873,7 +879,7 @@ def main() -> None:
     connectors = ["core"] + [c for c in args.connectors.split(",") if c != "core"]
     missing: list[str] = []
 
-    out = Path(args.out) / f"universal-db-mcp-0.1.0-{args.profile}"
+    out = Path(args.out) / f"universal-db-mcp-{project_version()}-{args.profile}"
     if out.exists():
         shutil.rmtree(out)
     for d in ("requirements", "wheelhouse", "native-drivers", "os-packages", "images",
@@ -1064,7 +1070,7 @@ def main() -> None:
             )
     build_backend = parse_lock(BUILD_LOCK.read_text(encoding="utf-8"))
     manifest = {
-        "release": "0.1.0",
+        "release": project_version(),
         "profile": args.profile,
         "source_rev": source_rev,
         # anti-rollback order, covered by the signed SHA256SUMS: the verifier
