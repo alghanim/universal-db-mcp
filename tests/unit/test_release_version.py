@@ -54,9 +54,8 @@ def _copy_tree(dst: Path) -> None:
 
 def test_a_bump_rewrites_every_reference_and_only_those(tmp_path: Path) -> None:
     _copy_tree(tmp_path)
-    old = BUMP.project_version()
     deployment = (tmp_path / "docs/offline-deployment.md").read_text(encoding="utf-8")
-    history = [line for line in deployment.splitlines() if f"(`{old}`)" in line]
+    history = [line for line in deployment.splitlines() if "(`0.1.0`)" in line]  # MSIs before release_seq
 
     BUMP.bump("9.8.7", root=tmp_path)
 
@@ -70,7 +69,7 @@ def test_a_bump_rewrites_every_reference_and_only_those(tmp_path: Path) -> None:
     # history names the old release in other words and keeps it
     after = (tmp_path / "docs/offline-deployment.md").read_text(encoding="utf-8")
     assert history and all(line in after.splitlines() for line in history)
-    assert f"Releases from v{old} on" in (tmp_path / "SECURITY.md").read_text(encoding="utf-8")
+    assert "Releases from v0.1.0 on" in (tmp_path / "SECURITY.md").read_text(encoding="utf-8")
 
 
 def test_a_stale_artifact_name_in_the_docs_is_reported(tmp_path: Path) -> None:
