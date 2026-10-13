@@ -1321,6 +1321,20 @@ def _isolated_import_problem(python: str) -> str | None:
     return lines[-1] if lines else f"exit status {proc.returncode}"
 
 
+# Throwaway environments, as (tool, a directory of its cache): `uvx` runs from
+# uv's cache and `pipx run` from pipx's, and both prune them without notice.
+_THROWAWAY_ENVIRONMENTS = (("uv", "archive-v0"), ("pipx", ".cache"))
+
+
+def _throwaway_environment(python: str) -> str | None:
+    """The tool whose cache holds ``python``'s environment, or None."""
+    parts = PureWindowsPath(python).parts if PureWindowsPath(python).drive else Path(python).parts
+    for tool, cache_dir in _THROWAWAY_ENVIRONMENTS:
+        if cache_dir in parts and tool in parts[: parts.index(cache_dir)]:
+            return tool
+    return None
+
+
 def require_isolated_import(python: str) -> None:
     """Refuse (``CONFIG_ERROR``) to register ``python`` when it cannot start the server.
 
@@ -1331,7 +1345,19 @@ def require_isolated_import(python: str) -> None:
     is tried once per interpreter and process. Adapters call this for the
     interpreter they pick themselves; an explicit ``UDBMCP_VENV_PYTHON`` is
     the operator's choice and is not checked.
+
+    An interpreter in a package manager's cache (``uvx``, ``pipx run``) is
+    refused too: it imports today and is gone after the next cache prune,
+    and every harness start fails from then on.
     """
+    tool = _throwaway_environment(python)
+    if tool is not None:
+        raise ConfigError(
+            f"{python} is in {tool}'s cache, which {tool} prunes without notice: a registration that "
+            "starts it stops working after the next prune. Install the server for good "
+            "(`uv tool install udbmcp` or `pipx install udbmcp`) and run `udbmcp configure-agents` "
+            "from that install"
+        )
     problem = _isolated_import_problem(python)
     if problem is not None:
         raise ConfigError(

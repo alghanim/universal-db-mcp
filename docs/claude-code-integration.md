@@ -112,6 +112,15 @@ universal_db_mcp.server ...`. Install into a virtual environment, or set
 path is recommended; a bare name is resolved on `PATH` at configure time and
 stored absolute).
 
+An interpreter in a package manager's cache is refused as well:
+`uvx udbmcp configure-agents` would register
+`~/.cache/uv/archive-v0/<id>/bin/python`, which imports today and is gone
+after the next `uv cache prune` (`pipx run` keeps its environments in
+`~/.local/pipx/.cache` the same way). Install the server for good (PyPI
+carries `udbmcp` from 0.2.0 on) with
+`uv tool install 'udbmcp[all]'` or `pipx install 'udbmcp[all]'` and run
+`udbmcp configure-agents` from that install.
+
 An existing `universal-db` entry that starts the server without `-I` is
 reported, with where the `-I` goes:
 

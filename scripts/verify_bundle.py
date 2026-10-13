@@ -913,7 +913,9 @@ def main() -> int:
                     fail(f"wheelhouse artifact does not match lock: {line[:40]} vs {w}")
             n += 1
         print(f"runtime.lock: {n} pinned requirements checked against wheelhouse")
-        app_wheel = [k for k in wheels if k.rsplit("/", 1)[1].startswith("universal_db_mcp-")]
+        # udbmcp from 0.2.0 on (the PyPI name); universal_db_mcp before, kept so
+        # this verifier still checks an earlier release's bundle
+        app_wheel = [k for k in wheels if k.rsplit("/", 1)[1].startswith(("udbmcp-", "universal_db_mcp-"))]
         if not app_wheel:
             fail("application wheel is not in the wheelhouse (source installs are not permitted)")
 

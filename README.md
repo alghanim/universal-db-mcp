@@ -1,5 +1,7 @@
 <h1 align="center">universal-db-mcp</h1>
 
+<!-- mcp-name: io.github.alghanim/universal-db-mcp -->
+
 <p align="center">
   <a href="https://github.com/alghanim/universal-db-mcp/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/alghanim/universal-db-mcp/ci.yml?branch=main&label=CI"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/alghanim/universal-db-mcp"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/alghanim/universal-db-mcp/badge"></a>
