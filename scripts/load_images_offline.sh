@@ -404,7 +404,7 @@ APP_REF=$($sudo_ok cat "$STAGING/manifest.json" | python3 -I -S -c '
 import json, sys
 m = json.load(sys.stdin)
 ident = m.get("image_identity") or {}
-print(ident.get("application_image", "udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312"))
+print(ident.get("application_image") or "udbmcp/universal-db-mcp:%s-%s" % (m["release"], m["profile"]))
 ')
 
 load_one "$STAGING/images/udbmcp-baseline-ubuntu24.04-cp312.tar" "udbmcp-baseline:ubuntu24.04-cp312"

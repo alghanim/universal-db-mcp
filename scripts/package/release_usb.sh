@@ -130,6 +130,7 @@ if [ -n "$SIGN_STICK" ]; then
   exit 0
 fi
 SHA="$(git rev-parse HEAD)"; SHA7="${SHA:0:7}"
+VERSION="$("$PY" -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
 [ -z "$(git status --porcelain)" ] || { echo "FAIL: working tree not clean at $SHA7 (the bundle must carry the commit)" >&2; exit 1; }
 echo "=== release build at $SHA7 $(date -u +%FT%TZ)"
 # The bundles ship exactly the committed hashed locks (requirements/locks/);
@@ -163,7 +164,7 @@ DEB="$(ls -t dist/universal-db-mcp_*.g${SHA7}_amd64.deb 2>/dev/null | head -1 ||
 
 echo "=== pkg gate (reuses the signed macos bundle, builds and inspects the .pkg)"
 UDBMCP_PUBKEY="$PUB" bash scripts/package/test_package_pkg.sh
-PKG=dist/universal-db-mcp-0.1.0-macos-arm64.pkg
+PKG="dist/universal-db-mcp-$VERSION-macos-arm64.pkg"
 [ -f "$PKG" ] || { echo "FAIL: no .pkg in dist/" >&2; exit 1; }
 
 echo "=== USB folder"
