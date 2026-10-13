@@ -1,0 +1,100 @@
+# Publishes udbmcp to PyPI for each published release, and on demand for an
+# existing release tag. What it uploads is the wheel the release's signed Linux
+# bundle carries, byte for byte: the bundle is downloaded from the release and
+# its signed SHA256SUMS and its own signature are checked against the release
+# key whose fingerprint SECURITY.md publishes at the release tag, with the same
+# two steps as container.yml (the CI hygiene test keeps them identical). No
+# sdist: the bundle carries none, and a build here would not be the signed one.
+#
+# PyPI's Trusted Publishing takes GitHub's OIDC token for this workflow file
+# and the pypi environment: there is no API token to leak. The upload carries
+# PEP 740 attestations. The job's token may request the OIDC token only; the
+# CI hygiene test allows that here only, on release and manual runs, never on
+# a push or a pull request.
+name: PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release tag to publish, v<major>.<minor>.<patch>"
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: pypi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: pypi
+      url: https://pypi.org/project/udbmcp/
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Passed to scripts through the environment, never spliced into them.
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Check the release tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: '$TAG'" >&2; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ env.TAG }}
+
+      - name: Download the release's Linux bundle and its verification files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" \
+            --pattern 'universal-db-mcp-*-linux-x86_64-*.tar.gz' --pattern release.pub.pem \
+            --pattern SHA256SUMS --pattern SHA256SUMS.sig
+
+      - name: Verify the bundle against the published release key
+        run: |
+          set -euo pipefail
+          release="$RUNNER_TEMP/release"
+          published="$(python3 - <<'PY'
+          import re
+          text = open("SECURITY.md", encoding="utf-8").read()
+          section = text.split("## Release signing key", 1)[1].split("\n## ", 1)[0] if "## Release signing key" in text else ""
+          found = re.findall(r"^([0-9a-f]{64})$", section, re.M)
+          print(found[0] if len(found) == 1 else "")
+          PY
+          )"
+          [ -n "$published" ] || { echo "SECURITY.md publishes no release key fingerprint" >&2; exit 1; }
+          key="$(openssl pkey -pubin -in "$release/release.pub.pem" -outform DER | sha256sum | awk '{print $1}')"
+          [ "$key" = "$published" ] || { echo "release.pub.pem ($key) is not the published key ($published)" >&2; exit 1; }
+          python3 scripts/verify_bundle.py --verify-file "$release/SHA256SUMS" \
+            --signature "$release/SHA256SUMS.sig" --pubkey "$release/release.pub.pem"
+          tarball="$(cd "$release" && ls universal-db-mcp-*-linux-x86_64-*.tar.gz)"
+          (cd "$release" && grep -E "  (\./)?${tarball//./\\.}\$" SHA256SUMS | sha256sum -c -)
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xzf "$release/$tarball" -C "$RUNNER_TEMP/bundle"
+          bundle="$RUNNER_TEMP/bundle/${tarball%.tar.gz}"
+          python3 scripts/verify_bundle.py --bundle "$bundle" --pubkey "$release/release.pub.pem" --no-installed-manifest
+          echo "BUNDLE=$bundle" >> "$GITHUB_ENV"
+
+      # Inside the workspace: the publish action runs in a container that sees
+      # the workspace, not the runner's temp directory.
+      - name: Take the wheel the signed bundle carries
+        run: |
+          set -euo pipefail
+          wheel="$BUNDLE/wheelhouse/udbmcp-${TAG#v}-py3-none-any.whl"
+          [ -f "$wheel" ] || { echo "the signed bundle carries no $(basename "$wheel")" >&2; exit 1; }
+          mkdir -p dist
+          cp "$wheel" dist/
+          sha256sum dist/*
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/
