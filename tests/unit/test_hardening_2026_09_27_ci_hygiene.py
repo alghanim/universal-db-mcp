@@ -2375,7 +2375,9 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
 
 # The release publish jobs: container.yml's image job pushes to GitHub
 # Packages and stores a provenance attestation; its registry job lists the
-# release in the MCP Registry with a GitHub OIDC token. Each may write exactly
+# release in the MCP Registry with a GitHub OIDC token; pypi.yml's publish
+# job uploads the signed bundle's wheel to PyPI with Trusted Publishing (an
+# OIDC token, no API token). Each may write exactly
 # these, on a published release or a manual run only (never code from a push
 # or a pull request), with no action but the reviewed commits listed: every
 # step of a job gets its token.
@@ -2390,6 +2392,11 @@ _WRITER_JOBS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str], frozen
         _RELEASE_TRIGGERS,
     ),
     ("container.yml", "registry"): (frozenset({"id-token"}), frozenset({_CHECKOUT_ACTION}), _RELEASE_TRIGGERS),
+    ("pypi.yml", "publish"): (
+        frozenset({"id-token"}),
+        frozenset({_CHECKOUT_ACTION, "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"}),
+        _RELEASE_TRIGGERS,
+    ),
     ("scorecard.yml", "analysis"): (
         frozenset({"security-events", "id-token"}),
         frozenset({
@@ -2499,6 +2506,59 @@ def test_the_scorecard_job_cannot_widen_its_token(old: str, new: str) -> None:
         _assert_tokens_are_read_only_unless_a_job_needs_more(
             {**workflows, "scorecard.yml": _load_yaml(text.replace(old, new, 1))}
         )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request:\n"),
+        ("  workflow_dispatch:\n", "  workflow_dispatch:\n  push:\n"),
+        ("      id-token: write\n", "      id-token: write\n      contents: write\n"),
+        ("permissions: {}\n", "permissions:\n  id-token: write\n"),
+        ("pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
+         "pypa/gh-action-pypi-publish@" + "4" * 40),
+        ("      - name: Take the wheel the signed bundle carries\n",
+         "      - uses: actions/setup-python@" + "5" * 40 + "\n"
+         "      - name: Take the wheel the signed bundle carries\n"),
+    ],
+)
+def test_the_pypi_job_cannot_widen_its_token(old: str, new: str) -> None:
+    workflows = _workflows()
+    _assert_tokens_are_read_only_unless_a_job_needs_more(workflows)
+    text = (WORKFLOWS / "pypi.yml").read_text(encoding="utf-8")
+    assert old in text
+    with pytest.raises(AssertionError):
+        _assert_tokens_are_read_only_unless_a_job_needs_more(
+            {**workflows, "pypi.yml": _load_yaml(text.replace(old, new, 1))}
+        )
+
+
+def _steps_named(workflow: str, job: str) -> dict[str, dict[str, Any]]:
+    return {s["name"]: s for s in _workflows()[workflow]["jobs"][job]["steps"] if "name" in s}
+
+
+def test_the_pypi_job_verifies_the_bundle_exactly_as_the_container_job_does() -> None:
+    """Both publish what the release's signed Linux bundle carries, checked
+    against the key SECURITY.md publishes; a fix to one check is a fix to both."""
+    image, publish = _steps_named("container.yml", "image"), _steps_named("pypi.yml", "publish")
+    for name in ("Check the release tag", "Download the release's Linux bundle and its verification files",
+                 "Verify the bundle against the published release key"):
+        assert publish[name] == image[name], name
+    order = [s.get("name", s.get("uses")) for s in _workflows()["pypi.yml"]["jobs"]["publish"]["steps"]]
+    assert order.index("Verify the bundle against the published release key") < order.index(
+        "Take the wheel the signed bundle carries")
+
+
+def test_the_pypi_job_uploads_only_the_signed_wheel_from_the_publisher_pypi_trusts() -> None:
+    """PyPI's trusted publisher names this workflow file and the pypi
+    environment; the upload is the bundle's udbmcp wheel and nothing else."""
+    job = _workflows()["pypi.yml"]["jobs"]["publish"]
+    assert job["environment"]["name"] == "pypi"
+    take = _steps_named("pypi.yml", "publish")["Take the wheel the signed bundle carries"]["run"]
+    assert 'wheel="$BUNDLE/wheelhouse/udbmcp-${TAG#v}-py3-none-any.whl"' in take
+    assert "mkdir -p dist\n" in take and 'cp "$wheel" dist/\n' in take
+    (upload,) = [s for s in job["steps"] if str(s.get("uses", "")).startswith("pypa/gh-action-pypi-publish@")]
+    assert upload["with"] == {"packages-dir": "dist/"}
 
 
 def test_checkouts_do_not_leave_the_token_in_the_git_config() -> None:

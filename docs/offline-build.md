@@ -76,6 +76,17 @@ demo signature, no Microsoft driver in the `.deb`). With `--publish
 `--stable`) once CI has passed for `HEAD`, then downloads the published
 files and checks them again.
 
+Publishing the release starts two workflows, each of which downloads the
+release's Linux bundle and checks it against the key `SECURITY.md` publishes
+at the tag before it uses anything in it. `.github/workflows/container.yml`
+builds and pushes the image and lists the release in the MCP Registry.
+`.github/workflows/pypi.yml` uploads the bundle's own
+`udbmcp-<version>-py3-none-any.whl` to PyPI through Trusted Publishing (the
+`pypi` environment; PyPI's trusted publisher names this workflow file), with
+PEP 740 attestations, so `pip install udbmcp` gets the signed wheel byte for
+byte. PyPI never takes a version number twice: a release that has reached
+PyPI is fixed there.
+
 **Residual trust:** the lock hashes are whatever the index advertises when
 the locks are refreshed, so an upstream release that is already compromised
 at that moment would be locked too: review the lock diff before committing
