@@ -30,11 +30,11 @@ reference copies (`docs/offline-deployment.md`, "Trust bootstrap"). Then:
 
 ```bash
 sudo python3 -I /usr/local/lib/udbmcp-trust/verify_bundle.py \
-    --bundle universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312 \
+    --bundle universal-db-mcp-0.2.0-linux-x86_64-ubuntu24.04-cp312 \
     --pubkey /etc/universal-db-mcp/keys/release.pub.pem   # FAILS CLOSED on any mismatch
 sudo UDBMCP_RELEASE_PUBKEY=/etc/universal-db-mcp/keys/release.pub.pem \
     bash /usr/local/lib/udbmcp-trust/install_offline.sh \
-    universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312 /opt/universal-db-mcp
+    universal-db-mcp-0.2.0-linux-x86_64-ubuntu24.04-cp312 /opt/universal-db-mcp
 ```
 
 On the install target the verifier also compares the bundle with the
@@ -52,7 +52,7 @@ in place, readable by the service account only:
 
 ```bash
 sudo install -m 640 -o root -g udbmcp \
-    universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312/config-templates/config.yaml \
+    universal-db-mcp-0.2.0-linux-x86_64-ubuntu24.04-cp312/config-templates/config.yaml \
     /etc/universal-db-mcp/config.yaml
 ```
 

@@ -381,8 +381,8 @@ version in the official MCP Registry as `io.github.alghanim/universal-db-mcp`
 Check it before running it:
 
 ```bash
-gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.1.0 --repo alghanim/universal-db-mcp
-docker run --rm ghcr.io/alghanim/universal-db-mcp:0.1.0 version
+gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.2.0 --repo alghanim/universal-db-mcp
+docker run --rm ghcr.io/alghanim/universal-db-mcp:0.2.0 version
 ```
 
 It is a `linux/amd64` image with no configuration inside: mount
@@ -391,7 +391,7 @@ below does. It carries no ODBC stack, so SQL Server connections need an
 image built on top of it with Microsoft's driver, whose EULA you accept:
 
 ```dockerfile
-FROM ghcr.io/alghanim/universal-db-mcp:0.1.0
+FROM ghcr.io/alghanim/universal-db-mcp:0.2.0
 USER root
 # Add Microsoft's package repository for Ubuntu 24.04 as Microsoft's
 # "Install the Microsoft ODBC driver for SQL Server (Linux)" page describes, then:
@@ -442,7 +442,7 @@ release's `trusted-tools/` into the trust dir first; the bundle's
 sudo install -m 755 <trusted-channel>/load_images_offline.sh /usr/local/lib/udbmcp-trust/
 sudo UDBMCP_RELEASE_PUBKEY=/etc/universal-db-mcp/keys/release.pub.pem \
   bash /usr/local/lib/udbmcp-trust/load_images_offline.sh <bundle-dir>   # [--allow-downgrade]
-docker image inspect udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312  # identity check
+docker image inspect udbmcp/universal-db-mcp:0.2.0-linux-x86_64-ubuntu24.04-cp312  # identity check
 docker network create --internal udbmcp-internal   # admin-managed
 # the bundle ships the compose file under operations/, not packaging/
 # (there is no packaging/ directory on the target):
@@ -640,7 +640,7 @@ a non-admin; inspect it, remove it, and rerun.
 ### Install
 
 ```bat
-msiexec /i dist\universal-db-mcp-0.1.0-win-x86_64.msi /l*v udbmcp-install.log
+msiexec /i dist\universal-db-mcp-0.2.0-win-x86_64.msi /l*v udbmcp-install.log
 ```
 
 Always pass `/l*v`: the MSI log is the install's post-mortem record.
@@ -1025,7 +1025,7 @@ stick, install the checked copy `bootstrap.sh` made and printed, never the
 stick's file:
 
 ```bash
-sudo dpkg -i /var/cache/udbmcp-trust/universal-db-mcp_0.1.0+<build-stamp>.g<rev7>_amd64.deb
+sudo dpkg -i /var/cache/udbmcp-trust/universal-db-mcp_0.2.0+<build-stamp>.g<rev7>_amd64.deb
 ```
 
 (The exact version string is derived from the signed manifest — upstream

@@ -5,7 +5,7 @@
 # - no docker socket mounted; no public networks
 services:
   universal-db-mcp:
-    image: udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312
+    image: udbmcp/universal-db-mcp:0.2.0-linux-x86_64-ubuntu24.04-cp312
     pull_policy: never
     container_name: universal-db-mcp
     user: udbmcp

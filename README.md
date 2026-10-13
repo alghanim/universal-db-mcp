@@ -128,6 +128,22 @@ Defence in depth; details and limitations in `docs/security.md` and
 
 ## Quick start
 
+### From PyPI
+
+```bash
+uv tool install 'udbmcp[all]'   # or: pipx install 'udbmcp[all]'
+udbmcp add-connection            # writes ~/.universal-db-mcp/config.yaml, secrets in private files beside it
+udbmcp configure-agents          # registers it with Claude Code, Claude Desktop, Cursor, VS Code, Cline
+```
+
+`[all]` brings the PostgreSQL, MySQL/MariaDB, ClickHouse and Oracle (thin
+mode) drivers; SQLite needs none. SQL Server (`udbmcp[mssql]`) and Db2
+(`udbmcp[db2]`) also need their vendors' client libraries. The wheel on PyPI
+is the one the release's signed bundle carries, uploaded with PEP 740
+attestations. Run `configure-agents` from an install like this one, not
+through `uvx`: `uvx` runs from a cache that uv prunes, and `configure-agents`
+refuses to register an interpreter there.
+
 ### From source
 
 ```bash
@@ -157,8 +173,8 @@ secrets and (with `--connectivity`) every database.
 ### With the container image
 
 ```bash
-docker pull ghcr.io/alghanim/universal-db-mcp:0.1.0
-gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.1.0 --repo alghanim/universal-db-mcp
+docker pull ghcr.io/alghanim/universal-db-mcp:0.2.0
+gh attestation verify oci://ghcr.io/alghanim/universal-db-mcp:0.2.0 --repo alghanim/universal-db-mcp
 ```
 
 It is listed in the official [MCP Registry](https://registry.modelcontextprotocol.io)

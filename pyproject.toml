@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 [project]
 # PyPI: `universal-db-mcp` there is another project; the import package is universal_db_mcp
 name = "udbmcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only MCP server that gives AI agents safe access to your databases"
 readme = "README.md"
 requires-python = ">=3.12"

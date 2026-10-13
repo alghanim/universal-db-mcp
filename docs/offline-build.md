@@ -169,9 +169,9 @@ UDBMCP_RELEASE_KEY=udbmcp-release.pem bash scripts/prepare_baseline_image.sh
 
 # 4. container-mode application image (optional mode), on the digest-pinned
 #    Ubuntu 24.04 that packaging/Dockerfile names (BASE_IMAGE)
-docker build --platform linux/amd64 -t udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312 \
-  -f packaging/Dockerfile out/bundle/universal-db-mcp-0.1.0-linux-x86_64-ubuntu24.04-cp312
-docker save udbmcp/universal-db-mcp:0.1.0-linux-x86_64-ubuntu24.04-cp312 \
+docker build --platform linux/amd64 -t udbmcp/universal-db-mcp:0.2.0-linux-x86_64-ubuntu24.04-cp312 \
+  -f packaging/Dockerfile out/bundle/universal-db-mcp-0.2.0-linux-x86_64-ubuntu24.04-cp312
+docker save udbmcp/universal-db-mcp:0.2.0-linux-x86_64-ubuntu24.04-cp312 \
   -o out/bundle/universal-db-mcp-*/images/universal-db-mcp.tar
 
 # 4b. the image tar changed the bundle: refresh SHA256SUMS + SIGNATURE over
