@@ -1680,6 +1680,35 @@ pip-audit on every lock clean. Tests that use the loopback mock databases now
 run only with `UDBMCP_LIVE_FIXTURES=1` (§6): a TCP probe also succeeds against a
 paused container, and the pkg gate's unit run had waited on one.
 
+## 3g. 0.2.0: one version, and the PyPI distribution `udbmcp` (2026-10-13)
+
+- **Version:** `pyproject.toml`'s `version` is the release; the bundle builder
+  reads it, and `scripts/bump_version.py` keeps the copies that cannot
+  (`--check` runs in the unit suite). Before, `0.1.0` was a literal in the
+  builder and the next release would have shipped bundles labelled 0.1.0. A
+  dry-run bump to 0.2.0 passed the whole suite before the real one.
+- **Distribution:** `udbmcp` on PyPI (`universal-db-mcp` there is another
+  project); import package unchanged; `all` extra = pg, mysql, clickhouse,
+  oracle. The bundle's application wheel is `udbmcp-<v>-py3-none-any.whl`;
+  `verify_bundle.py` accepts either name. Sites must refresh the trusted tools
+  first (runbook step 1, as on every upgrade); an older verifier fails closed
+  on the new wheel name.
+- **Publishing:** `.github/workflows/pypi.yml` uploads the signed bundle's own
+  wheel through Trusted Publishing (environment `pypi`), after the same
+  verification `container.yml` runs. Not in the MCP Registry entry: a
+  registry client would run `uvx udbmcp` without extras (SQLite only).
+- **configure-agents** refuses an interpreter in uv's or pipx's cache.
+- **Guard:** whatever sqlglot's tokenizer or parser raises is a denial. The
+  fuzzer found `SELECT {:} FROM t` raising AttributeError in every dialect,
+  which escaped as INTERNAL_ERROR (nothing ran); 12 unit cases and the crash
+  input as fuzz seed `seed-22-oracle` keep it fixed.
+- **Verified:** full suite with the container tests; `uv build` + twine 7.0.0
+  `check`; an end-to-end rehearsal in a throwaway HOME (`uv tool install
+  'udbmcp[all]'`, `add-connection`, `configure-agents`, an MCP read through
+  the registered command, a `DELETE` refused, `uvx` refused).
+- **Not verified until the release runs:** the PyPI upload itself (the
+  workflow has not run yet) and `pip install udbmcp` from PyPI.
+
 ## 4. Gates not (fully) run (recorded truthfully)
 
 - **Gate D (egress observation):** harness provided

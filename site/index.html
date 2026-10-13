@@ -719,32 +719,26 @@ LIMIT 50</pre>
     <div class="section__head center" data-reveal>
       <span class="eyebrow">Quickstart</span>
       <h2 class="h2">Running in <em class="serif">five minutes.</em></h2>
-      <p class="lede">Python 3.12 and <code>uv</code>. Pick the drivers you need: <code>pg</code>, <code>mysql</code>, <code>clickhouse</code>, <code>oracle</code>, <code>mssql</code>, <code>db2</code>.</p>
+      <p class="lede">Python 3.12 and <code>uv</code> (or <code>pipx</code>). <code>[all]</code> brings the PostgreSQL, MySQL/MariaDB, ClickHouse and Oracle drivers; SQLite needs none. Add <code>mssql</code> or <code>db2</code> for SQL Server or Db2.</p>
     </div>
     <div class="steps">
       <article class="step" data-reveal>
         <div class="step__text"><span class="step__n">1</span>
         <h3>Install</h3>
-        <p>Nothing is fetched at runtime. For isolated networks, build a signed offline bundle instead.</p></div>
-        <div class="code"><pre><span class="p">$ </span>git clone <span data-repo-text>&lt;repository-url&gt;</span> universal-db-mcp
-<span class="p">$ </span>cd universal-db-mcp
-<span class="p">$ </span>uv venv --python 3.12 .venv
-<span class="p">$ </span>uv pip install --python .venv/bin/python \
-    -e '.[pg,mysql]'</pre><button class="copy" type="button" aria-label="Copy the install commands"></button></div>
+        <p>From PyPI, the wheel the signed release bundle carries. Nothing is fetched at runtime. For isolated networks, install the signed offline bundle instead.</p></div>
+        <div class="code"><pre><span class="p">$ </span>uv tool install 'udbmcp[all]'</pre><button class="copy" type="button" aria-label="Copy the install command"></button></div>
       </article>
       <article class="step" data-reveal>
         <div class="step__text"><span class="step__n">2</span>
         <h3>Add a connection</h3>
-        <p>An interactive wizard that tests the connection live. Credentials go to 0600 files, never into the config. No database handy? Build the demo SQLite file first and point the wizard at it.</p></div>
-        <div class="codes"><div class="code"><pre><span class="p">$ </span>.venv/bin/udbmcp add-connection</pre><button class="copy" type="button" aria-label="Copy the add-connection command"></button></div>
-        <div class="code"><pre><span class="cm"># no database handy? build the demo first</span>
-<span class="p">$ </span>.venv/bin/python examples/sqlite-demo/create_demo.py</pre><button class="copy" type="button" aria-label="Copy the demo command"></button></div></div>
+        <p>An interactive wizard that tests the connection live. Credentials go to 0600 files, never into the config. No database handy? Point it at any SQLite file.</p></div>
+        <div class="code"><pre><span class="p">$ </span>udbmcp add-connection</pre><button class="copy" type="button" aria-label="Copy the add-connection command"></button></div>
       </article>
       <article class="step" data-reveal>
         <div class="step__text"><span class="step__n">3</span>
         <h3>Connect your agent</h3>
         <p>Detects Claude Code, Claude Desktop, Cursor, VS Code and Cline, and asks before writing any config. Restart the agent and you're in.</p></div>
-        <div class="code"><pre><span class="p">$ </span>.venv/bin/udbmcp configure-agents</pre><button class="copy" type="button" aria-label="Copy the configure-agents command"></button></div>
+        <div class="code"><pre><span class="p">$ </span>udbmcp configure-agents</pre><button class="copy" type="button" aria-label="Copy the configure-agents command"></button></div>
       </article>
     </div>
     <div class="after" data-reveal>
@@ -792,7 +786,7 @@ LIMIT 50</pre>
   <div class="wrap foot__in">
     <div>
       <a class="logo" href="#top">Universal DB MCP</a>
-      <small>v0.1.0 · Python 3.12 · MCP SDK 2.2 · Test count as of 29 September 2026; version matrix, timings and HTTP figures as of 18 September 2026</small>
+      <small>v0.2.0 · Python 3.12 · MCP SDK 2.3 · Test count as of 29 September 2026; version matrix, timings and HTTP figures as of 18 September 2026</small>
     </div>
     <div class="foot__links">
       <a data-repo href="#top">GitHub</a>

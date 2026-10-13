@@ -50,7 +50,7 @@
     silently stamp a stale version or placeholder config path into the MSI.
   -->
   <?ifndef ProductVersion ?>
-  <?define ProductVersion = "0.1.0" ?>
+  <?define ProductVersion = "0.2.0" ?>
   <?endif?>
   <?ifndef ConfigTemplateSource ?>
   <!-- Overridden by build_msi.sh: -define ConfigTemplateSource=<abs path> -->

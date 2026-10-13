@@ -20,7 +20,7 @@ What is on the stick:
 |---|---|
 | `SHA256SUMS` | SHA-256 of every other file on the stick |
 | `SHA256SUMS.sig` | Ed25519 signature of `SHA256SUMS`, made with the release key; this is what makes the list trustworthy |
-| `universal-db-mcp_0.1.0+<build stamp>.g<sha7>_amd64.deb` | the package (its payload is the signed offline bundle); the version rises with every build |
+| `universal-db-mcp_0.2.0+<build stamp>.g<sha7>_amd64.deb` | the package (its payload is the signed offline bundle); the version rises with every build |
 | `trust-bootstrap-linux/` | the trusted verifier, installer, `bootstrap.sh`, the release public key and `RELEASE`, this stick's release number (its bundle's `release_seq`) |
 | `RELEASE-KEY-FINGERPRINT.txt` | SHA-256 fingerprint of the release public key on this stick, written by the release build. It is on the same stick, so it proves nothing on its own: compare fingerprints with the value your release administrator gave you out of band |
 | `oracle-instantclient/` | Oracle Instant Client 19.28, `libaio` and `unzip`, only for thick-mode Oracle connections |
