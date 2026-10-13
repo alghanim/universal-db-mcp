@@ -1698,6 +1698,10 @@ paused container, and the pkg gate's unit run had waited on one.
   verification `container.yml` runs. Not in the MCP Registry entry: a
   registry client would run `uvx udbmcp` without extras (SQLite only).
 - **configure-agents** refuses an interpreter in uv's or pipx's cache.
+- **Guard:** whatever sqlglot's tokenizer or parser raises is a denial. The
+  fuzzer found `SELECT {:} FROM t` raising AttributeError in every dialect,
+  which escaped as INTERNAL_ERROR (nothing ran); 12 unit cases and the crash
+  input as fuzz seed `seed-22-oracle` keep it fixed.
 - **Verified:** full suite with the container tests; `uv build` + twine 7.0.0
   `check`; an end-to-end rehearsal in a throwaway HOME (`uv tool install
   'udbmcp[all]'`, `add-connection`, `configure-agents`, an MCP read through
