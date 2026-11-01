@@ -1,7 +1,7 @@
 # Development/build machine only — never shipped or installed on targets.
-pytest==9.1.1
-ruff==0.16.10
-mypy==2.4.0
+pytest==9.2.0
+ruff==0.17.3
+mypy==2.4.1
 types-PyYAML==6.0.12.20260906
 build==1.6.1
 # Fallback Ed25519 signer for scripts/prepare_offline_bundle.py and
